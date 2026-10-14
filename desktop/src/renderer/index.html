@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- 窗口标题。主进程里也做了锁定（page-title-updated 被拦截），两边一致。 -->
+    <title>投广管理客户端</title>
+    <!--
+      TODO（打包前必做）：加 Content-Security-Policy，限制只允许加载本地资源。
+      现在先不加是因为 Vite 开发模式依赖内联脚本和 HMR 连接，加了会开不起来。
+    -->
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

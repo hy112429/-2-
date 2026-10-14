@@ -1,0 +1,71 @@
+/* ============================================================
+   全局样式与设计变量
+   所有颜色、尺寸都定义成 CSS 变量，改主题只需改这一处。
+   ============================================================ */
+
+:root {
+  /* --- 颜色 --- */
+  --bg-app: #f4f5f7;          /* 应用底色 */
+  --bg-panel: #ffffff;        /* 内容面板 */
+  --bg-top: #2b3145;          /* 顶部菜单栏 */
+  --bg-nav: #1f2430;          /* 左侧导航 */
+  --bg-nav-hover: #2b3242;
+  --bg-status: #fafbfc;       /* 底部状态栏 */
+  --bg-placeholder: #eef1f5;  /* 占位区块 */
+
+  --border: #e3e6eb;
+  --border-dark: #343b4d;
+
+  --text: #1f2430;
+  --text-muted: #6b7280;
+  --text-on-dark: #c9ced8;
+  --text-on-dark-strong: #ffffff;
+
+  --brand: #3b82f6;
+  --brand-soft: rgba(59, 130, 246, 0.12);
+
+  /* --- 尺寸 --- */
+  --h-top: 52px;      /* 顶部菜单高度 */
+  --h-status: 30px;   /* 底部状态栏高度 */
+  --w-nav: 184px;     /* 左侧导航宽度 */
+
+  --radius: 6px;
+
+  font-family: 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+
+  /* 让 Chromium 渲染中文更细腻 */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg-app);
+  /* 桌面客户端不应该出现整页滚动条，滚动交给内部区域 */
+  overflow: hidden;
+  /* 禁止选中文本造成的"网页感"，需要选中的地方单独放开 */
+  user-select: none;
+}
+
+button {
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}

@@ -1,0 +1,28 @@
+# ---- 依赖与构建产物 ----
+node_modules/
+desktop/out/
+desktop/dist/
+desktop/release/
+engine/.venv/
+__pycache__/
+*.pyc
+
+# ---- 敏感数据（凭证/数据库，严禁入库） ----
+*.enc
+*.db
+*.db-wal
+*.db-shm
+*_credential*
+
+# ---- 运行时/会话残留 ----
+Partitions/
+*.log
+*.tmp
+*.part
+.thumbs/
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
