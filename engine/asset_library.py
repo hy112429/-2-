@@ -179,11 +179,15 @@ def ensure_thumb(root: Path, file_path: Path, ffmpeg: str) -> Optional[str]:
 
 
 def resolve_ffmpeg() -> str:
+    bundled = str(Path(__file__).resolve().parent / "bin" / "ffmpeg.exe")
     for candidate in [
+        bundled,
         r"C:\Users\9\AppData\Local\Microsoft\WinGet\Links\ffmpeg.EXE",
         "ffmpeg",
     ]:
         if candidate == "ffmpeg" and not shutil_which(candidate):
+            continue
+        if candidate != "ffmpeg" and not os.path.exists(candidate):
             continue
         return candidate
     return "ffmpeg"

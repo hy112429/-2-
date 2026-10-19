@@ -173,13 +173,20 @@ def extract(raw_input: str, options: Optional[Dict[str, Any]] = None) -> Dict[st
                 "error": "该笔记没有可下载的视频流（可能是图文笔记，或视频已被删除/需登录）",
             }
 
-        # 笔记标题：noteDataMap → note 标题；取不到就给空
+        # 笔记标题：/explore/ 路径用 note.noteDataMap、/discovery/item/ 路径用 note.noteDetailMap，
+        # 两种页面结构都要兼容；取不到就给空
         title = ""
-        note_data = state.get("note", {}).get("noteDataMap") if isinstance(state.get("note"), dict) else None
-        if note_data:
-            first = next(iter(note_data.values()), None)
-            if isinstance(first, dict):
-                title = (first.get("note") or {}).get("title") or ""
+        note_node = state.get("note")
+        if isinstance(note_node, dict):
+            for map_key in ("noteDataMap", "noteDetailMap"):
+                note_data = note_node.get(map_key)
+                if not isinstance(note_data, dict):
+                    continue
+                first = next(iter(note_data.values()), None)
+                if isinstance(first, dict) and isinstance(first.get("note"), dict):
+                    title = (first["note"] or {}).get("title") or ""
+                    if title:
+                        break
 
         return {
             "ok": True,
@@ -208,5 +215,6 @@ def extract(raw_input: str, options: Optional[Dict[str, Any]] = None) -> Dict[st
 
 
 def _extract_note_id(final_url: str) -> Optional[str]:
-    m = re.search(r"/explore/([0-9a-zA-Z]+)", final_url)
+    """从落地 URL 提取笔记 ID：兼容 /explore/{id} 与 /discovery/item/{id} 两种路径。"""
+    m = re.search(r"/(?:explore|discovery/item)/([0-9a-zA-Z]+)", final_url)
     return m.group(1) if m else None

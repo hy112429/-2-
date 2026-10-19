@@ -1,0 +1,44 @@
+# electron-builder 打包配置
+# 产物：NSIS 安装包（甲方交付）+ zip 便携版
+
+appId: com.touguang.client
+productName: 投广管理客户端
+copyright: Copyright © 2026
+
+directories:
+  output: release
+  buildResources: build   # 图标等构建资源：desktop/build/
+
+files:
+  - out/**/*               # electron-vite 输出（main/preload/renderer）
+  - package.json
+
+asar: true
+
+# Python 引擎 + ffmpeg 随包内置（resources/engine）
+# 来源：D:/software/tg_pkg_staging/engine（干净 venv + 引擎脚本 + bin/ffmpeg）
+extraResources:
+  - from: D:/software/tg_pkg_staging/engine
+    to: engine
+    filter:
+      - "**/*"
+      - "!**/__pycache__/**"
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+  icon: build/icon.png
+  executableName: touguang-client
+
+nsis:
+  oneClick: false          # 向导式安装（可选目录）
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 投广管理客户端
+
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/

@@ -1,4 +1,4 @@
-import { BrowserWindow, WebContentsView, ipcMain, session, safeStorage } from 'electron'
+import { BrowserWindow, WebContentsView, ipcMain, safeStorage, session, shell } from 'electron'
 import type { Cookie } from 'electron'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
@@ -179,6 +179,36 @@ function buildCookieHeader(list: Cookie[]): string {
   return list.map((c) => `${c.name}=${c.value}`).join('; ')
 }
 
+// ---------------------------------------------------------------- 外站链接外开（2026-10-14，用户要求）
+
+/**
+ * 平台域白名单：这些域内的常规跳转继续留在登录视图（登录/扫码/探针/批量链路需要），
+ * 其余域名一律视为「外站」，用系统浏览器打开，避免把外站页面塞进软件内造成串号/混淆。
+ */
+const INTERNAL_NAV_DOMAINS = [
+  'douyin.com',
+  'jinritemai.com',
+  'douyinec.com',
+  'oceanengine.com',
+  'xiaohongshu.com',
+  'xhslink.com',
+  'toutiao.com',
+  'ixigua.com',
+  'toutiaovod.com',
+  'kwaixiaodian.com',
+  'amemv.com'
+]
+
+/** 判断跳转目标是否为外站（非平台域白名单 = 外站；解析失败按外站处理） */
+function isExternalNav(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase()
+    return !INTERNAL_NAV_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))
+  } catch {
+    return true
+  }
+}
+
 // ---------------------------------------------------------------- WebContentsView 管理
 
 function ensureView(targetId: string = currentTargetId): WebContentsView {
@@ -208,10 +238,18 @@ function ensureView(targetId: string = currentTargetId): WebContentsView {
 
   const wc = view.webContents
 
-  // 页面里的 target="_blank" 一律在同一个视图里打开，不要弹新窗口
+  // 页面里的 target="_blank" 一律用系统浏览器打开（外站外开），不再在视图内加载
   wc.setWindowOpenHandler(({ url }) => {
-    wc.loadURL(url)
+    void shell.openExternal(url)
     return { action: 'deny' }
+  })
+
+  // 主框架跳到外站域名 → 拦截并转系统浏览器打开；平台域内跳转（登录/扫码/回跳）不受影响
+  wc.on('will-navigate', (event, url) => {
+    if (isExternalNav(url)) {
+      event.preventDefault()
+      void shell.openExternal(url)
+    }
   })
 
   const refresh = (): void => {
@@ -302,10 +340,17 @@ export function detachLoginView(): void {
 function detachView(): void {
   const win = getHostWindow()
   const view = loginView
-  if (win && view && viewAttached) {
+  if (!win || win.isDestroyed() || !view || view.webContents.isDestroyed()) return
+  // 幂等：无论 viewAttached 标记如何，先强制隐藏再移除。
+  // 之前实现被 viewAttached 守卫短路，导致第二次 close（如 WorkArea watch 兜底）
+  // 不再执行 removeChildView，残留可见浏览器视图挡在界面上方。
+  try {
+    view.setVisible(false)
     win.contentView.removeChildView(view)
-    viewAttached = false
+  } catch {
+    /* 视图可能已被移除，忽略 */
   }
+  viewAttached = false
 }
 
 /** 发给渲染进程（带窗口存活检查） */

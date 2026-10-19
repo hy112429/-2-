@@ -191,12 +191,17 @@ def finish_progress_line() -> None:
 
 
 def resolve_tool(name: str, override: Optional[str] = None) -> str:
-    """定位 ffmpeg / ffprobe。优先用 --ffmpeg 指定的路径，否则从 PATH 里找。"""
+    """定位 ffmpeg / ffprobe。优先级：--参数 > 随包 <引擎目录>/bin/<name>.exe > PATH。"""
     if override:
         path = Path(override)
         if not path.exists():
             raise FileNotFoundError(f"指定的 {name} 不存在：{override}")
         return str(path)
+
+    # 打包环境：ffmpeg/ffprobe 随 engine 一起内置在 <engine>/bin/ 下（甲方机器无 WinGet 路径）
+    bundled = Path(__file__).resolve().parent / "bin" / (name + ".exe")
+    if bundled.exists():
+        return str(bundled)
 
     found = shutil.which(name)
     if not found:

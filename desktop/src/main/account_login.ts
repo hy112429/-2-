@@ -29,6 +29,34 @@ const LOGIN_COOKIE_CANDIDATES = ['sessionid', 'sessionid_ss', 'sid_tt', 'sid_gua
 const QC_LOGIN_URL = 'https://qianchuan.jinritemai.com/dashboard'
 const QC_DOMAINS = ['jinritemai.com', 'oceanengine.com']
 
+/**
+ * 外站链接外开（2026-10-14，用户要求）：账号分区视图内点击跳外站的链接
+ * 一律走系统浏览器（shell.openExternal），避免外站页面混入登录视图造成串号/混淆。
+ * 平台域白名单内的正常跳转（登录/扫码/回跳）仍留在视图内。
+ */
+const INTERNAL_NAV_DOMAINS = [
+  'douyin.com',
+  'jinritemai.com',
+  'douyinec.com',
+  'oceanengine.com',
+  'xiaohongshu.com',
+  'xhslink.com',
+  'toutiao.com',
+  'ixigua.com',
+  'toutiaovod.com',
+  'kwaixiaodian.com',
+  'amemv.com'
+]
+
+function isExternalNav(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase()
+    return !INTERNAL_NAV_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))
+  } catch {
+    return true
+  }
+}
+
 /** 素材根目录：打开素材文件夹时拼 {账号名} */
 const DOWNLOADS_DIR = 'D:\\software\\投广客户端\\downloads'
 
@@ -140,9 +168,18 @@ function ensureView(subject: SessionSubject): WebContentsView {
   view.setBackgroundColor('#ffffff')
   const wc = view.webContents
 
+  // 页面里的 target="_blank" 一律用系统浏览器打开（外站外开），不再在视图内加载
   wc.setWindowOpenHandler(({ url }) => {
-    wc.loadURL(url)
+    void shell.openExternal(url)
     return { action: 'deny' }
+  })
+
+  // 主框架跳到外站域名 → 拦截并转系统浏览器打开；平台域内跳转（登录/扫码/回跳）不受影响
+  wc.on('will-navigate', (event, url) => {
+    if (isExternalNav(url)) {
+      event.preventDefault()
+      void shell.openExternal(url)
+    }
   })
 
   wc.on('did-navigate', () => emitViewState())
@@ -187,10 +224,16 @@ function attachView(): boolean {
 
 function detachView(): void {
   const win = getHostWindow()
-  if (win && currentView && viewAttached) {
+  if (!win || win.isDestroyed() || !currentView || currentView.webContents.isDestroyed()) return
+  // 幂等：无论 viewAttached 标记如何，先强制隐藏再移除（与 login.ts 同口径修复，
+  // 避免守卫短路导致残留可见浏览器视图挡在界面上方）
+  try {
+    currentView.setVisible(false)
     win.contentView.removeChildView(currentView)
-    viewAttached = false
+  } catch {
+    /* 视图可能已被移除，忽略 */
   }
+  viewAttached = false
 }
 
 function emitViewState(): void {
@@ -446,11 +489,16 @@ export function registerAccountLoginIpc(): void {
     return openUrl(subject, douyin ? douyin.url : 'https://www.douyin.com/')
   })
 
-  // 打开精选页（百应选品广场入口）
-  ipcMain.handle('account:openJingxuan', (_e, accountId: number) => {
-    const subject: SessionSubject = { kind: 'acct', id: accountId, name: `账号${accountId}` }
+  // 打开精选页（百应选品广场入口）→ 2026-10-14 起系统浏览器外开（用户要求：除登录类外一律外开）
+  ipcMain.handle('account:openJingxuan', async (_e, accountId: number) => {
     const baiying = LOGIN_TARGETS.find((t) => t.id === 'baiying')
-    return openUrl(subject, baiying ? baiying.url : 'https://buyin.jinritemai.com/')
+    const url = baiying ? baiying.url : 'https://buyin.jinritemai.com/'
+    try {
+      await shell.openExternal(url)
+      return { ok: true, url, accountId }
+    } catch (error) {
+      return { ok: false, url, error: String(error) }
+    }
   })
 
   // 登录千川（千川账户分区，多开隔离）

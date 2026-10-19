@@ -205,6 +205,10 @@ export function attachProbe(wc: WebContents): void {
     if (!url.includes('buyin')) {
       // 头条/西瓜视频：探针捕获 vod 直链（页面被 JS 防护，直链是最可行来源）
       if (url.includes('toutiaovod.com')) {
+        // 过滤：只收完整视频流直链（media-video），排除音频流（media-audio）
+        // 与字节范围分片（br=/bt=，如 br=49&bt=49 是 Range 请求仅 1 字节，非可下载文件）。
+        // 实测教训（2026-10-15）：抓到 audio-und-mp4a 分片当视频直链 → 下载 404。
+        if (url.includes('media-audio') || /[?&]br=\d+&bt=\d+/.test(url)) return
         logCompact({ action: 'vod', url: url.slice(0, 400) })
         notifyVodCaptured(url)
       }

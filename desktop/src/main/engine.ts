@@ -38,8 +38,19 @@ const ALLOWED_SCRIPTS = new Set([
   'link_batch.py',
   'read_vod.py',
   'account_manager.py',
-  'remove_watermark.py'
+  'remove_watermark.py',
+  'remove_watermark_ai.py'
 ])
+
+/**
+ * 需要独立解释器的脚本（其依赖不在引擎精简 venv 里）。
+ * AI 去水印需要 torch + moonshine_server（moonshine 独立环境），
+ * 路径可用环境变量 MOONSHINE_PYTHON 覆盖（开发态默认 D 盘固定环境）。
+ */
+const SCRIPT_PYTHON: Record<string, string> = {
+  'remove_watermark_ai.py':
+    process.env['MOONSHINE_PYTHON'] ?? 'D:\\software\\moonshine\\.venv\\Scripts\\python.exe'
+}
 
 /** 正在运行的任务表：taskId -> 句柄（含取消标志与强杀入口） */
 interface TaskHandle {
@@ -160,9 +171,17 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
       resolveOutcome({ ok: false, error: `引擎脚本不存在：${scriptPath}` })
       return
     }
+    const pythonPath = SCRIPT_PYTHON[script] ?? getPythonPath()
+    if (SCRIPT_PYTHON[script] && !existsSync(pythonPath)) {
+      resolveOutcome({
+        ok: false,
+        error: `缺少脚本 ${script} 的运行环境（${pythonPath} 不存在），请先部署 Moonshine 环境（见 docs/TODO.md 去水印方案）`
+      })
+      return
+    }
 
     try {
-      active = spawn(getPythonPath(), [scriptPath, ...(options.args ?? [])], {
+      active = spawn(pythonPath, [scriptPath, ...(options.args ?? [])], {
         cwd: getEngineDir(),
         windowsHide: true,
         env: {

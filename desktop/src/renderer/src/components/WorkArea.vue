@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { watch } from 'vue'
 import BrowserPane from './BrowserPane.vue'
-import EngineConsole from './EngineConsole.vue'
+import LinkToolView from './LinkToolView.vue'
 import ProductQueryView from './ProductQueryView.vue'
 import AssetLibraryView from './AssetLibraryView.vue'
 import AccountManagementView from './AccountManagementView.vue'
@@ -9,6 +10,18 @@ const props = defineProps<{
   top: string
   nav: string
 }>()
+
+// 顶部菜单切走「百应工作台」时，立即隐藏登录视图覆盖层（避免残留浏览器视图挡在别的页面上方）。
+// 登录态保留在分区里不受影响；切回「百应工作台」后点「打开登录页」即重新显示。
+// BrowserPane 卸载时也会 close（双保险，这里兜底解决 v-if 切换时序问题）。
+watch(
+  () => props.top,
+  (top) => {
+    if (top !== '百应工作台') {
+      void window.api.browser.close()
+    }
+  }
+)
 </script>
 
 <template>
@@ -44,9 +57,9 @@ const props = defineProps<{
           <BrowserPane />
         </div>
 
-        <!-- Python 引擎控制台：连通性测试 / 实时进度 / 任务取消（T-11） -->
+        <!-- 链接解析下载工具（T-11 真实任务接入）：单条解析 + 下载 -->
         <div class="panel console">
-          <EngineConsole />
+          <LinkToolView />
         </div>
       </div>
     </template>

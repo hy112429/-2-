@@ -400,6 +400,50 @@ function runRemoveWatermark(pointsStr: string): Promise<void> {
   })
 }
 
+// ---------------------------------------------------------------- AI 去水印（Moonshine：SLBR 检测 + LaMa 填充）
+const aiWmRunning = ref(false)
+const aiWmSummary = ref('')
+const aiWmPath = ref('')
+const aiWmTaskId = ref('')
+
+let offAiWm: (() => void) | undefined
+
+function bindAiWmEvents(): void {
+  offAiWm?.()
+  offAiWm = window.api.engine.onEvent((e) => {
+    if (e.taskId !== aiWmTaskId.value) return
+    if (e.type === 'stage') {
+      aiWmSummary.value = e.stage ?? ''
+    } else if (e.type === 'result') {
+      aiWmRunning.value = false
+      const d = e.data as { file_path?: string } | undefined
+      aiWmPath.value = d?.file_path ?? ''
+      aiWmSummary.value = d?.file_path ? 'AI 去水印完成' : 'AI 去水印完成（未返回路径）'
+    } else if (e.type === 'error') {
+      aiWmRunning.value = false
+      aiWmSummary.value = e.message ?? 'AI 去水印失败'
+    }
+  })
+}
+
+async function startAiWatermark(task: QueueTaskItem): Promise<void> {
+  if (!task.file_path || aiWmRunning.value) return
+  aiWmSummary.value = ''
+  aiWmPath.value = ''
+  bindAiWmEvents()
+  aiWmRunning.value = true
+  const reply = await window.api.engine.run({
+    script: 'remove_watermark_ai.py',
+    stdinJson: { video_path: task.file_path, workers: 2 }
+  })
+  if (!reply.taskId) {
+    aiWmRunning.value = false
+    aiWmSummary.value = reply.error ?? 'AI 去水印启动失败'
+    return
+  }
+  aiWmTaskId.value = reply.taskId
+}
+
 /** 订阅队列引擎事件流（组件卸载时退订） */
 let offQueue: (() => void) | undefined
 function bindQueueEvents(): void {
@@ -957,6 +1001,7 @@ onBeforeUnmount(() => {
   offBatch?.()
   offDy?.()
   offToutiao?.()
+  offAiWm?.()
 })
 </script>
 
@@ -1171,6 +1216,9 @@ onBeforeUnmount(() => {
           <template v-if="(t.status === 'success' || t.status === 'skipped') && t.file_path">
             <button class="btn tiny" title="打开所在文件夹" @click="openQueueFolder(t.file_path!)">📁</button>
             <button class="btn tiny" title="去除移动水印（框选模板）" @click="openWatermark(t)">去水印</button>
+            <button class="btn tiny" :disabled="aiWmRunning" title="AI 自动检测并去除水印（SLBR+LaMa，纯 CPU 较慢）" @click="startAiWatermark(t)">
+              AI去水印
+            </button>
             <span class="q-path mono" :title="t.file_path">{{ t.file_path }}</span>
           </template>
         </li>
@@ -1187,6 +1235,22 @@ onBeforeUnmount(() => {
           </li>
         </ul>
       </div>
+    </div>
+
+    <!-- ---------- AI 去水印进度（Moonshine） ---------- -->
+    <div v-if="aiWmRunning || aiWmSummary || aiWmPath" class="queue-panel">
+      <div class="queue-head">
+        <b>AI 去水印</b>
+        <span class="count">{{ aiWmRunning ? '处理中…' : '状态' }}</span>
+      </div>
+      <p v-if="aiWmSummary" class="notice">{{ aiWmSummary }}</p>
+      <p v-if="aiWmRunning" class="hint-line">纯 CPU 处理较慢，可继续其他操作；完成后自动刷新</p>
+      <template v-if="aiWmPath">
+        <div class="path-row">
+          <button class="btn tiny" title="打开所在文件夹" @click="openQueueFolder(aiWmPath)">📁</button>
+          <span class="q-path mono" :title="aiWmPath">{{ aiWmPath }}</span>
+        </div>
+      </template>
     </div>
 
     <!-- ---------- 预览区 ---------- -->
@@ -1726,6 +1790,19 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-muted);
+}
+
+/* AI 去水印进度区 */
+.hint-line {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.path-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .q-status {

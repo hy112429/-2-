@@ -47,6 +47,10 @@ _db_lock = Lock()
 cancel_flag = {"value": False}
 
 
+class NoRetryError(RuntimeError):
+    """不可重试错误：重试同一 URL 无意义（如签名已过期的直链），直接失败。"""
+
+
 def emit(event: dict) -> None:
     with _event_lock:
         print(json.dumps(event, ensure_ascii=False), flush=True)
@@ -133,11 +137,19 @@ DOWNLOAD_HEADERS = {
 }
 
 
+def _ffprobe() -> str:
+    """定位 ffprobe：打包环境从 <engine>/bin/ffprobe.exe 取，否则走 PATH。"""
+    bundled = Path(__file__).resolve().parent / "bin" / "ffprobe.exe"
+    if bundled.exists():
+        return str(bundled)
+    return "ffprobe"
+
+
 def probe_codec(dest: Path, stream_sel: str) -> str:
     """查指定流（v:0 / a:0）的编码名；查不到返回空串。"""
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", stream_sel,
+            [_ffprobe(), "-v", "error", "-select_streams", stream_sel,
              "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(dest)],
             capture_output=True, text=True, timeout=60,
         )
@@ -189,6 +201,11 @@ def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float)
         url, headers=DOWNLOAD_HEADERS, timeout=timeout, stream=True, allow_redirects=True
     ) as response:
         if response.status_code != 200:
+            # 小红书带时效签名的直链（sns-*.xhscdn.com + sign&t）抓取后需尽快下载，
+            # 过时会返回 403。给出针对性中文提示；且这是「不可重试」错误——
+            # 重试同一个已过期的 URL 毫无意义（实测 3 次徒劳重试白等退避延迟）。
+            if response.status_code == 403 and "xhscdn.com" in url:
+                raise NoRetryError("直链签名已过期（403）：请重新解析该链接获取新直链后下载")
             raise RuntimeError(f"HTTP {response.status_code}")
 
         total = int(response.headers.get("Content-Length") or 0)
@@ -273,6 +290,18 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
                 upsert_task(db_con, task["id"], task["url"], "failed", attempt, 0, "任务已取消")
                 emit({"type": "task", "status": "failed", "tid": task["id"], "percent": 0, "attempts": attempt, "message": "任务已取消"})
                 return {"status": "failed", "id": task["id"], "message": "任务已取消"}
+            # 不可重试错误（如签名过期直链）：不白等退避重试，直接判失败
+            if isinstance(exc, NoRetryError):
+                upsert_task(db_con, task["id"], task["url"], "failed", attempt, 0, last_error)
+                emit({
+                    "type": "task",
+                    "status": "failed",
+                    "tid": task["id"],
+                    "percent": 0,
+                    "attempts": attempt,
+                    "message": f"失败：{last_error}",
+                })
+                return {"status": "failed", "id": task["id"], "message": last_error}
             if attempt < max_retries:
                 delay = 2 ** attempt  # 指数退避：1s → 2s → 4s → 8s
                 emit({

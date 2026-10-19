@@ -15,6 +15,7 @@ link_parser.py —— 通用链接解析统一入口（二期 Step 10）
     python link_parser.py --input "https://v.douyin.com/xxxx/"
     python link_parser.py --input "7.68 复制打开抖音… https://v.douyin.com/xxxx/"
     python link_parser.py --input 7300000000000000000
+    echo {"cookie":"..."} | python link_parser.py --input "小红书链接"   # 登录态走 stdin，不落盘
 """
 
 from __future__ import annotations
@@ -50,9 +51,19 @@ def main() -> int:
     parser.add_argument("--cookie", default="", help="小红书等需登录平台的 Cookie 请求头（可选）")
     args = parser.parse_args()
 
+    # stdin 可选登录态：{"cookie": "..."} —— 与 link_batch.py 同约定，cookie 不经过进程命令行
+    stdin_cookie = ""
+    raw = sys.stdin.read()
+    if raw.strip():
+        try:
+            stdin_cookie = str((json.loads(raw) or {}).get("cookie", ""))
+        except Exception:
+            stdin_cookie = ""
+
+    cookie = stdin_cookie or args.cookie
     options: Dict[str, Any] = {"timeout": args.timeout, "max_attempts": args.max_attempts}
-    if args.cookie:
-        options["cookie"] = args.cookie
+    if cookie:
+        options["cookie"] = cookie
     result = parse_single(args.input, options)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0 if result.get("ok") else 1
