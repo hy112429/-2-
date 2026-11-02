@@ -51,10 +51,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
-# ============================================================ 常量
+try:
+    from .client_paths import DEFAULT_DB_PATH
+except ImportError:
+    from client_paths import DEFAULT_DB_PATH
 
-# 默认数据库位置（与视频下载目录分开，便于独立备份与清理）
-DEFAULT_DB_PATH = r"D:\software\投广客户端\data\ad_client.db"
+try:
+    from .selection_settings import banned_words_from_connection, find_banned_word
+except ImportError:
+    from selection_settings import banned_words_from_connection, find_banned_word
+
+# ============================================================ 常量
 
 # 表结构版本号。以后改表结构时 +1，便于写迁移逻辑。
 SCHEMA_VERSION = 2
@@ -576,7 +583,17 @@ def product_list(
         """,
         params,
     ).fetchall()
-    return {"ok": True, "count": len(rows), "products": rows_to_list(rows)}
+    banned_words = banned_words_from_connection(connection)
+    products = [
+        product for product in rows_to_list(rows)
+        if not find_banned_word(product.get("title"), banned_words)
+    ]
+    return {
+        "ok": True,
+        "count": len(products),
+        "products": products,
+        "filteredCount": len(rows) - len(products),
+    }
 
 
 def stats(connection: sqlite3.Connection) -> Dict[str, Any]:

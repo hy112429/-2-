@@ -16,13 +16,36 @@ files:
 asar: true
 
 # Python 引擎 + ffmpeg 随包内置（resources/engine）
-# 来源：D:/software/tg_pkg_staging/engine（干净 venv + 引擎脚本 + bin/ffmpeg）
+# 业务源码始终来自当前工作区；仅 Python 虚拟环境和 FFmpeg 使用已验证的 staging 运行时。
 extraResources:
-  - from: D:/software/tg_pkg_staging/engine
+  - from: ../engine
     to: engine
+    filter:
+      - "*.py"
+      - requirements.txt
+      - extractors/**/*
+      - resources/**/*
+      - "!**/__pycache__/**"
+      - "!test_*.py"
+  # 运行时依赖只放入不与当前源码重叠的目录，避免 electron-builder 并行复制时覆盖源码。
+  - from: D:/software/tg_pkg_staging/engine/.venv
+    to: engine/.venv
     filter:
       - "**/*"
       - "!**/__pycache__/**"
+      - "!pyvenv.cfg"
+      - "!Scripts/**"
+  # 随包带独立 CPython 标准运行时；安装版不得依赖构建机的绝对 Python 路径。
+  - from: D:/software/tg_pkg_staging/engine/runtime
+    to: engine/runtime
+    filter:
+      - "**/*"
+      - "!**/__pycache__/**"
+  - from: D:/software/tg_pkg_staging/engine/bin
+    to: engine/bin
+    filter:
+      - "**/*"
+  # 百应目录快照来自本机历史真实响应，仅用于新客户端首次启动种子。
 
 win:
   target:
@@ -34,8 +57,10 @@ win:
   executableName: touguang-client
 
 nsis:
-  oneClick: false          # 向导式安装（可选目录）
+  oneClick: false          # 使用向导安装，提供安装目录选择页
+  perMachine: false        # 当前 Windows 用户安装，不要求管理员权限
   allowToChangeInstallationDirectory: true
+  runAfterFinish: false    # 安装完成不自动启动客户端调度器
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: 投广管理客户端

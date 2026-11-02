@@ -1,0 +1,24 @@
+server:
+  port: ${REGISTRY_PORT:8094}
+  address: 0.0.0.0
+spring:
+  application:
+    name: selection-registry
+  datasource:
+    url: ${DB_URL:jdbc:mysql://mysql:3306/selection_registry?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai}
+    username: ${DB_USER:selection_registry}
+    password: ${DB_PASSWORD:}
+    hikari:
+      maximum-pool-size: 12
+      connection-timeout: 5000
+  flyway:
+    enabled: true
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true

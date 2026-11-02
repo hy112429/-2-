@@ -18,7 +18,7 @@ baiying_cache.py —— 百应商品数据缓存（T-15 探针方案的落库端
         captured_at 抓取时间
 
 设计要点
-    · 与 ad_client.db 同库（D:/software/投广客户端/data/ad_client.db），WAL + 每连接外键。
+    · 与当前客户端 ad_client.db 同库，WAL + 每连接外键；安装版路径由 Electron 注入。
     · 输出统一 JSON（indent=2），与 db.py 一致，供 Electron 消费。
     · upsert 幂等：重复抓取同一个商品只更新字段，不产生重复行。
 
@@ -43,10 +43,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Sequence
 
-# ============================================================ 常量
+try:
+    from .client_paths import DEFAULT_DB_PATH
+except ImportError:
+    from client_paths import DEFAULT_DB_PATH
 
-# 与 db.py 同一个数据库文件
-DEFAULT_DB_PATH = r"D:\software\投广客户端\data\ad_client.db"
+try:
+    from .selection_settings import banned_words_from_connection, find_banned_word
+except ImportError:
+    from selection_settings import banned_words_from_connection, find_banned_word
+
+# ============================================================ 常量
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS baiying_products (
@@ -56,6 +63,7 @@ CREATE TABLE IF NOT EXISTS baiying_products (
     cover_url   TEXT,
     cos_ratio   REAL,                            -- 佣金率（%），如 5.0 = 5%
     video_url   TEXT,                            -- 商品素材视频直链
+    gallery_json TEXT,                           -- 百应商品详情图 URL 列表
     captured_at TEXT    NOT NULL                 -- 抓取时间（本地 ISO8601）
 );
 """
@@ -63,6 +71,7 @@ CREATE TABLE IF NOT EXISTS baiying_products (
 # 老库迁移：补充 commodity_id 列（列已存在时忽略）
 MIGRATION_ALTERS = [
     "ALTER TABLE baiying_products ADD COLUMN commodity_id TEXT",
+    "ALTER TABLE baiying_products ADD COLUMN gallery_json TEXT",
 ]
 
 
@@ -85,6 +94,12 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     try:
+        connection.executescript(SCHEMA_SQL)
+        for alter in MIGRATION_ALTERS:
+            try:
+                connection.execute(alter)
+            except sqlite3.OperationalError:
+                pass
         yield connection
         connection.commit()
     except Exception:
@@ -96,6 +111,15 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     return dict(row) if row is not None else None
+
+
+def global_banned_words(connection: sqlite3.Connection) -> list[str]:
+    """读取共享的全局屏蔽词；旧库/未初始化时使用统一内置词表。"""
+    return banned_words_from_connection(connection)
+
+
+def ban_match(title: Optional[str], words: Sequence[str]) -> Optional[str]:
+    return find_banned_word(title, words)
 
 
 # ============================================================ 命令
@@ -127,22 +151,25 @@ def upsert_product(
     title: Optional[str],
     cover_url: Optional[str],
     cos_ratio: Optional[float],
-    video_url: str,
+    video_url: Optional[str] = None,
     commodity_id: Optional[str] = None,
+    gallery: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     with connect(db_path) as connection:
         existing = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
         ).fetchone()
         connection.execute(
-            "INSERT INTO baiying_products (product_id, commodity_id, title, cover_url, cos_ratio, video_url, captured_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO baiying_products (product_id, commodity_id, title, cover_url, cos_ratio, video_url, gallery_json, captured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(product_id) DO UPDATE SET "
             "commodity_id = COALESCE(excluded.commodity_id, baiying_products.commodity_id), "
             "title = excluded.title, cover_url = excluded.cover_url, "
-            "cos_ratio = excluded.cos_ratio, video_url = excluded.video_url, "
+            "cos_ratio = excluded.cos_ratio, video_url = COALESCE(excluded.video_url, baiying_products.video_url), "
+            "gallery_json = COALESCE(excluded.gallery_json, baiying_products.gallery_json), "
             "captured_at = excluded.captured_at",
-            (product_id, commodity_id, title, cover_url, cos_ratio, video_url, now_text()),
+            (product_id, commodity_id, title, cover_url, cos_ratio, video_url,
+             json.dumps(list(gallery), ensure_ascii=False) if gallery else None, now_text()),
         )
         row = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
@@ -177,7 +204,16 @@ def get_product(db_path: Path, product_id: str) -> Dict[str, Any]:
         row = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
         ).fetchone()
+        words = global_banned_words(connection)
     product = row_to_dict(row)
+    if product and product.get("gallery_json"):
+        try:
+            product["gallery"] = json.loads(product["gallery_json"])
+        except json.JSONDecodeError:
+            product["gallery"] = []
+    matched_word = ban_match(product.get("title") if product else None, words)
+    if matched_word:
+        return {"ok": True, "found": False, "filtered": True, "reason": f"商品名称命中全局屏蔽词：{matched_word}"}
     return {"ok": True, "found": product is not None, "product": product}
 
 
@@ -185,9 +221,11 @@ def list_products(db_path: Path, limit: int) -> Dict[str, Any]:
     with connect(db_path) as connection:
         rows = connection.execute(
             "SELECT * FROM baiying_products ORDER BY captured_at DESC, product_id LIMIT ?",
-            (limit,),
+            (max(limit * 5, limit),),
         ).fetchall()
-    return {"ok": True, "count": len(rows), "products": [dict(r) for r in rows]}
+        words = global_banned_words(connection)
+    products = [dict(row) for row in rows if not ban_match(row["title"], words)][:limit]
+    return {"ok": True, "count": len(products), "products": products}
 
 
 def count_products(db_path: Path) -> Dict[str, Any]:
@@ -212,7 +250,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_upsert.add_argument("--title", default=None)
     p_upsert.add_argument("--cover", default=None)
     p_upsert.add_argument("--cos-ratio", type=float, default=None)
-    p_upsert.add_argument("--video-url", required=True)
+    p_upsert.add_argument("--video-url", default=None)
+    p_upsert.add_argument("--gallery-stdin", action="store_true", help="从 stdin 读取商品详情图 URL JSON 列表")
 
     p_commodity = sub.add_parser("set-commodity", help="补全 product_id 的 commodity_id（推广ID）")
     p_commodity.add_argument("--product-id", required=True)
@@ -233,6 +272,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "init":
             payload = init_db(db_path)
         elif args.command == "upsert":
+            gallery = None
+            if args.gallery_stdin:
+                raw_gallery = sys.stdin.readline()
+                gallery_value = json.loads(raw_gallery) if raw_gallery else []
+                gallery = gallery_value if isinstance(gallery_value, list) else []
             payload = upsert_product(
                 db_path,
                 args.product_id,
@@ -241,6 +285,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.cos_ratio,
                 args.video_url,
                 args.commodity_id,
+                gallery,
             )
         elif args.command == "set-commodity":
             payload = set_commodity(db_path, args.product_id, args.commodity_id)

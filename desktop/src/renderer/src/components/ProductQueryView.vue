@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { notifyGlobal } from '../utils/notifications'
 
 /**
  * 商品查询主界面（真实数据链路）
@@ -137,6 +138,10 @@ interface QueueTaskItem {
   message: string
   /** 落盘路径（下载成功/跳过时由引擎回传） */
   file_path?: string
+  /** 下载来源明确提供平台无水印视频；只有这类素材可自动进入发布队列 */
+  sourceNoWatermark?: boolean
+  /** 下载后素材处理状态，仅保存在本次页面会话 */
+  watermarkStatus?: 'clean' | 'needs_review' | 'failed'
 }
 
 /** 去水印半自动标注用的一帧（由 watermark:getFrames 返回） */
@@ -156,6 +161,7 @@ const queueEngineId = ref('')
 const queueRunning = ref(false)
 const queueSummary = ref('')
 const queueHistory = ref<QueueTaskItem[]>([])
+const finalizedDownloadIds = new Set<string>()
 
 const STATUS_TEXT: Record<string, string> = {
   pending: '等待',
@@ -400,48 +406,100 @@ function runRemoveWatermark(pointsStr: string): Promise<void> {
   })
 }
 
-// ---------------------------------------------------------------- AI 去水印（Moonshine：SLBR 检测 + LaMa 填充）
-const aiWmRunning = ref(false)
-const aiWmSummary = ref('')
-const aiWmPath = ref('')
-const aiWmTaskId = ref('')
-
-let offAiWm: (() => void) | undefined
-
-function bindAiWmEvents(): void {
-  offAiWm?.()
-  offAiWm = window.api.engine.onEvent((e) => {
-    if (e.taskId !== aiWmTaskId.value) return
-    if (e.type === 'stage') {
-      aiWmSummary.value = e.stage ?? ''
-    } else if (e.type === 'result') {
-      aiWmRunning.value = false
-      const d = e.data as { file_path?: string } | undefined
-      aiWmPath.value = d?.file_path ?? ''
-      aiWmSummary.value = d?.file_path ? 'AI 去水印完成' : 'AI 去水印完成（未返回路径）'
-    } else if (e.type === 'error') {
-      aiWmRunning.value = false
-      aiWmSummary.value = e.message ?? 'AI 去水印失败'
+/** 引擎命令的单次结果包装；订阅先于启动，避免快速结果事件丢失。 */
+function runEngineResult(
+  script: string,
+  args: string[] = [],
+  stdinJson?: unknown,
+  timeoutMs = 90 * 60_000
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let taskId: string | null = null
+    let settled = false
+    let timer = 0
+    let off: () => void = () => undefined
+    const pending: EngineEventPayload[] = []
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timer)
+      off()
+      callback()
     }
+    const handle = (event: EngineEventPayload): void => {
+      if (event.type === 'result') {
+        finish(() => resolve((event.data ?? {}) as Record<string, unknown>))
+      } else if (event.type === 'error') {
+        finish(() => reject(new Error(event.message ?? '自动处理失败')))
+      }
+    }
+    off = window.api.engine.onEvent((event) => {
+      if (!taskId) pending.push(event)
+      else if (event.taskId === taskId) handle(event)
+    })
+    timer = window.setTimeout(() => {
+      if (taskId) void window.api.engine.cancel(taskId)
+      finish(() => reject(new Error('任务超时，已请求停止')))
+    }, timeoutMs)
+    void window.api.engine.run({ script, args, stdinJson }).then((reply) => {
+      if (!reply.taskId) {
+        finish(() => reject(new Error(reply.error ?? '本地任务启动失败')))
+        return
+      }
+      taskId = reply.taskId
+      for (const event of pending.splice(0)) {
+        if (event.taskId === taskId) handle(event)
+      }
+    }).catch((error: unknown) => {
+      finish(() => reject(error instanceof Error ? error : new Error(String(error))))
+    })
   })
 }
 
-async function startAiWatermark(task: QueueTaskItem): Promise<void> {
-  if (!task.file_path || aiWmRunning.value) return
-  aiWmSummary.value = ''
-  aiWmPath.value = ''
-  bindAiWmEvents()
-  aiWmRunning.value = true
-  const reply = await window.api.engine.run({
-    script: 'remove_watermark_ai.py',
-    stdinJson: { video_path: task.file_path, workers: 2 }
-  })
-  if (!reply.taskId) {
-    aiWmRunning.value = false
-    aiWmSummary.value = reply.error ?? 'AI 去水印启动失败'
+/** 只有明确来自平台无水印源的文件才自动送入待确认发布队列。 */
+async function handleDownloadedAsset(task: QueueTaskItem): Promise<void> {
+  if (!task.file_path || finalizedDownloadIds.has(task.id)) return
+  finalizedDownloadIds.add(task.id)
+  task.percent = 100
+
+  if (task.sourceNoWatermark !== true) {
+    task.watermarkStatus = 'needs_review'
+    task.message = '来源未确认无平台水印；原视频已保留，未加入发布队列'
     return
   }
-  aiWmTaskId.value = reply.taskId
+
+  task.watermarkStatus = 'clean'
+  task.message = '已确认使用平台无水印源，保留原视频并关联待确认发布队列…'
+  try {
+    const queued = await runEngineResult('publish_queue.py', [
+      '--db', DB_PATH, 'add-downloaded', '--product-id', task.id, '--video-path', task.file_path
+    ])
+    const entries = Array.isArray(queued.queued) ? queued.queued as Array<Record<string, unknown>> : []
+    const accepted = entries.filter((entry) => entry.ok === true)
+    const rejected = entries.filter((entry) => entry.ok !== true)
+    if (queued.unmatched === true) {
+      task.message = '已确认使用平台无水印源并保留原视频；未匹配到已加车商品，未加入发布队列'
+    } else if (accepted.length > 0 && rejected.length === 0) {
+      task.message = '已确认使用平台无水印源并保留原视频；已加入 ' + accepted.length + ' 个账号的待确认发布队列'
+    } else if (accepted.length > 0) {
+      task.message = '已保留平台无水印源；' + accepted.length + ' 个账号已入队，' + rejected.length + ' 个账号入队失败'
+    } else {
+      const reasons = rejected.map((entry) => String(entry.error ?? '')).filter(Boolean).join('；')
+      task.message = '已保留平台无水印源；发布队列未接收：' + (reasons || '未返回匹配结果')
+    }
+  } catch (error) {
+    task.message = '已保留平台无水印源；加入发布队列失败：' + String(error)
+  }
+}
+
+function isVerifiedToutiaoNoWatermarkUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl)
+    return url.hostname.toLowerCase().endsWith('toutiaovod.com') &&
+      url.searchParams.get('lr')?.toLowerCase() === 'unwatermarked'
+  } catch {
+    return false
+  }
 }
 
 /** 订阅队列引擎事件流（组件卸载时退订） */
@@ -457,6 +515,9 @@ function bindQueueEvents(): void {
         t.attempts = e.attempts ?? t.attempts
         t.message = e.message ?? ''
         t.file_path = e.file_path ?? t.file_path
+        if ((t.status === 'success' || t.status === 'skipped') && t.file_path) {
+          void handleDownloadedAsset(t)
+        }
       }
     } else if (e.type === 'result') {
       const d = e.data as
@@ -718,11 +779,13 @@ async function downloadCached(): Promise<void> {
   const date = new Date().toISOString().slice(0, 10)
   const tasks = rows.map((p) => ({
     id: p.product_id,
+    product_id: p.product_id,
     url: p.video_url as string,
     dest: `${downloadDir.value}\\百应素材\\${date}\\${p.product_id}\\${p.product_id}.mp4`
   }))
   queueTasks.value = tasks.map((t) => ({
     ...t,
+    sourceNoWatermark: true,
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -750,12 +813,14 @@ async function downloadFound(): Promise<void> {
   const tasks = [
     {
       id: p.product_id,
+      product_id: p.product_id,
       url: p.video_url,
       dest: `${downloadDir.value}\\百应素材\\${date}\\${p.product_id}\\${p.product_id}.mp4`
     }
   ]
   queueTasks.value = tasks.map((t) => ({
     ...t,
+    sourceNoWatermark: true,
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -803,6 +868,31 @@ const dyRunning = ref(false)
 const dyEngineId = ref('')
 const dySummary = ref('')
 
+watch(error, (message) => {
+  if (message) notifyGlobal(message)
+})
+watch(dirNotice, (message) => {
+  if (message) notifyGlobal(message)
+})
+watch(queueSummary, (message) => {
+  if (message && !queueRunning.value) notifyGlobal(message)
+})
+watch(batchSummary, (message) => {
+  if (message && !batchRunning.value) notifyGlobal(message)
+})
+watch(cachedNotice, (message) => {
+  if (message && /失败|错误|超时|异常/.test(message)) notifyGlobal(message, 'error')
+})
+watch(dySummary, (message) => {
+  if (message && !dyRunning.value) notifyGlobal(message)
+})
+watch(wmResult, (message) => {
+  if (message) notifyGlobal(message, 'success')
+})
+watch(wmError, (message) => {
+  if (message) notifyGlobal(message, 'error')
+})
+
 const DY_STATUS_TEXT: Record<DyBatchItem['status'], string> = {
   pending: '等待',
   success: '成功',
@@ -849,6 +939,7 @@ async function downloadToutiaoItems(okItems: Array<{ input: string; ok: boolean;
   }))
   queueTasks.value = tasks.map((t) => ({
     ...t,
+    sourceNoWatermark: isVerifiedToutiaoNoWatermarkUrl(t.url),
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -967,6 +1058,7 @@ async function downloadDyItems(okItems: DyParsedItem[]): Promise<void> {
   })
   queueTasks.value = tasks.map((t) => ({
     ...t,
+    sourceNoWatermark: true,
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -1001,7 +1093,6 @@ onBeforeUnmount(() => {
   offBatch?.()
   offDy?.()
   offToutiao?.()
-  offAiWm?.()
 })
 </script>
 
@@ -1171,7 +1262,7 @@ onBeforeUnmount(() => {
         v-model="dyLinksText"
         class="batch-input"
         rows="3"
-        placeholder="每行一条：抖音分享链接 / 视频页链接 / 口令文本 / 视频ID（如 https://v.douyin.com/xxxx/ 或 7693062724168249969）。解析成功后自动去水印并进入下载队列"
+        placeholder="每行一条：抖音分享链接 / 视频页链接 / 口令文本 / 视频ID（如 https://v.douyin.com/xxxx/ 或 7693062724168249969）。解析成功后使用无水印视频源并进入下载队列"
         :disabled="dyRunning"
       />
 
@@ -1215,10 +1306,7 @@ onBeforeUnmount(() => {
           <span class="q-msg">{{ t.message }}</span>
           <template v-if="(t.status === 'success' || t.status === 'skipped') && t.file_path">
             <button class="btn tiny" title="打开所在文件夹" @click="openQueueFolder(t.file_path!)">📁</button>
-            <button class="btn tiny" title="去除移动水印（框选模板）" @click="openWatermark(t)">去水印</button>
-            <button class="btn tiny" :disabled="aiWmRunning" title="AI 自动检测并去除水印（SLBR+LaMa，纯 CPU 较慢）" @click="startAiWatermark(t)">
-              AI去水印
-            </button>
+            <button class="btn tiny" :disabled="wmRunning" title="手动校正移动水印位置" @click="openWatermark(t)">手动去水印</button>
             <span class="q-path mono" :title="t.file_path">{{ t.file_path }}</span>
           </template>
         </li>
@@ -1235,22 +1323,6 @@ onBeforeUnmount(() => {
           </li>
         </ul>
       </div>
-    </div>
-
-    <!-- ---------- AI 去水印进度（Moonshine） ---------- -->
-    <div v-if="aiWmRunning || aiWmSummary || aiWmPath" class="queue-panel">
-      <div class="queue-head">
-        <b>AI 去水印</b>
-        <span class="count">{{ aiWmRunning ? '处理中…' : '状态' }}</span>
-      </div>
-      <p v-if="aiWmSummary" class="notice">{{ aiWmSummary }}</p>
-      <p v-if="aiWmRunning" class="hint-line">纯 CPU 处理较慢，可继续其他操作；完成后自动刷新</p>
-      <template v-if="aiWmPath">
-        <div class="path-row">
-          <button class="btn tiny" title="打开所在文件夹" @click="openQueueFolder(aiWmPath)">📁</button>
-          <span class="q-path mono" :title="aiWmPath">{{ aiWmPath }}</span>
-        </div>
-      </template>
     </div>
 
     <!-- ---------- 预览区 ---------- -->
@@ -1789,13 +1861,6 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-muted);
-}
-
-/* AI 去水印进度区 */
-.hint-line {
-  margin: 0;
-  font-size: 12px;
   color: var(--text-muted);
 }
 

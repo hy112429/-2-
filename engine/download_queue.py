@@ -36,8 +36,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-# 与 db.py 保持一致的默认数据库路径（tasks 表）
-DEFAULT_DB_PATH = r"D:\software\投广客户端\data\ad_client.db"
+try:
+    from .client_paths import DEFAULT_DB_PATH
+    from .asset_library import ensure_schema as ensure_asset_schema, register_asset
+except ImportError:
+    from client_paths import DEFAULT_DB_PATH
+    from asset_library import ensure_schema as ensure_asset_schema, register_asset
 
 TASK_STATUSES = {"pending", "running", "success", "failed", "skipped"}
 
@@ -273,6 +277,23 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
         upsert_task(db_con, task["id"], task["url"], "running", attempt, 0, "下载中")
         try:
             result = download_one(session, task, dest, timeout)
+            # 只有本次真实下载成功，才足以证明 web_download 来源；已有文件跳过不作来源推断。
+            if result["status"] == "success":
+                try:
+                    with _db_lock:
+                        ensure_asset_schema(db_con)
+                        explicit_account = task.get("account_id")
+                        register_asset(
+                            db_con, str(dest), "web_download",
+                            int(explicit_account) if explicit_account is not None else None,
+                            str(task["product_id"]) if task.get("product_id") else None,
+                        )
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    result["message"] = result.get("message", "下载完成") + f"；素材库登记待核查：{error}"
+                    emit({
+                        "type": "asset_registration_warning", "tid": task["id"],
+                        "message": f"文件下载成功，但素材来源登记失败：{error}",
+                    })
             upsert_task(db_con, task["id"], task["url"], result["status"], attempt, 100, result.get("message", ""))
             emit({
                 "type": "task",

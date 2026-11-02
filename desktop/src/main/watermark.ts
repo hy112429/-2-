@@ -1,8 +1,9 @@
 import { ipcMain, protocol, net } from 'electron'
 import { execFile } from 'child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { getEngineDir } from './engine'
 
 /**
  * 去水印 UI 辅助（Step 11 补充）
@@ -32,6 +33,13 @@ export interface WmFrame {
 
 const FRAME_DIR = join(tmpdir(), 'wm_frames')
 
+/** 安装版优先使用随包 ffmpeg/ffprobe，开发态或缺少随包文件时回退到 PATH。 */
+function resolveMediaTool(name: 'ffmpeg' | 'ffprobe'): string {
+  const executable = process.platform === 'win32' ? `${name}.exe` : name
+  const bundled = join(getEngineDir(), 'bin', executable)
+  return existsSync(bundled) ? bundled : name
+}
+
 /** 解析 ffprobe 输出（如 "25/1" → 25） */
 function parseRate(value: string): number {
   const [a, b] = value.split('/')
@@ -44,7 +52,7 @@ function parseRate(value: string): number {
 
 function runFfprobe(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile('ffprobe', args, { windowsHide: true }, (err, stdout) => {
+    execFile(resolveMediaTool('ffprobe'), args, { windowsHide: true }, (err, stdout) => {
       if (err) reject(new Error(err.message ?? 'ffprobe 失败'))
       else resolve(stdout.trim())
     })
@@ -54,7 +62,7 @@ function runFfprobe(args: string[]): Promise<string> {
 function runFfmpegFrame(ts: number, videoPath: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     execFile(
-      'ffmpeg',
+      resolveMediaTool('ffmpeg'),
       [
         '-y', '-loglevel', 'error',
         '-ss', String(ts), '-i', videoPath,
@@ -98,7 +106,7 @@ export function registerWatermarkIpc(): void {
     (_event, videoPath: string): Promise<{ ok: boolean; dataUrl?: string; error?: string }> => {
       return new Promise((resolve) => {
         execFile(
-          'ffmpeg',
+          resolveMediaTool('ffmpeg'),
           ['-y', '-loglevel', 'error', '-ss', '0', '-i', videoPath, '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'],
           { maxBuffer: 24 * 1024 * 1024, windowsHide: true },
           (err, stdout) => {

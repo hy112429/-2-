@@ -89,6 +89,34 @@ declare global {
     file_path?: string
   }
 
+  interface SelectionProgressPayload {
+    accountId: number
+    stage: string
+    message?: string
+    index?: number
+    total?: number
+    percent?: number
+    unit?: string
+    indeterminate?: boolean
+    productId?: string
+    productTitle?: string
+  }
+
+  interface PublishProgressPayload {
+    state: 'idle' | 'running' | 'succeeded' | 'warning' | 'failed'
+    accountId?: number
+    queueId?: number
+    productName?: string
+    stage: string
+    message?: string
+    percent?: number
+    indeterminate?: boolean
+    updatedAt?: string
+    error?: string
+    classification?: string
+    canConfirmNoDraft?: boolean
+  }
+
   /** engine:run 入参 */
   interface EngineRunParams {
     script: string
@@ -221,12 +249,88 @@ declare global {
     api: {
       appInfo: {
         name: string
-        version: string
+        getVersion(): Promise<string>
       }
-      /** 内置浏览器视图（登录用） */
+      /** 当前运行版本的本地数据目录 */
+      appPaths: {
+        get(): Promise<{
+          rootDir: string
+          dataDir: string
+          databasePath: string
+          databaseExists: boolean
+          downloadsDir: string
+          browserProfilesDir: string
+        }>
+      }
+      /** 限流冷却结束自动续选；deadline 由主进程计时，失焦或隐藏时仍会到点通知。 */
+      selectionCooldown: {
+        schedule(params: { batchId: string; deadline: number }): Promise<{ ok: boolean; error?: string }>
+        acknowledge(params: { batchId: string; deadline: number; resumeQueued?: boolean }): Promise<{ ok: boolean; matched: boolean }>
+        trace(params: { batchId?: string; stage: string; details?: Record<string, unknown> }): Promise<{ ok: boolean }>
+        cancel(): Promise<{ ok: boolean }>
+        onExpired(cb: (event: { batchId: string; deadline: number; sendCount: number }) => void): () => void
+      }
+      /** 托管外部 Chrome 登录入口（页面通过本机 CDP 接入） */
       browser: {
         getTargets(): Promise<LoginTarget[]>
-        open(targetId: string): Promise<{ ok: boolean; url: string }>
+        open(
+          targetId: string,
+          options?: { profileKey?: string; profilePath?: string }
+        ): Promise<{ ok: boolean; url: string; external: boolean; profilePath?: string; port?: number; title?: string; error?: string }>
+        inspectBaiyingSelection(options: { profileKey: string; profilePath?: string; includeCategoryTree?: boolean }): Promise<Record<string, unknown>>
+        checkAccountLogins(params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>>
+        inspectAccountPages(params: { accountId: number; profilePath?: string }): Promise<{
+          ok: boolean
+          inspectable: boolean
+          baiyingOpen: boolean
+          creatorCenterOpen: boolean
+        }>
+        validateProfilePath(options: { profileKey: string; profilePath?: string }): Promise<{ ok: boolean; path?: string; error?: string }>
+        runBaiyingSelection(params: {
+          profileKey: string
+          profilePath?: string
+          settings: Record<string, unknown>
+          accountId: number
+          accountKey?: string
+          downloadPath: string
+          selectedIndexes?: number[]
+          candidateSnapshot?: unknown[]
+          refreshCandidatesById?: boolean
+          analyzeBeforeCart?: boolean
+          maxSelectedProducts?: number
+          stopAfterCart?: boolean
+          previewOnly?: boolean
+        }): Promise<Record<string, unknown>>
+        getSelectionRegistrySnapshot(accountKey: string, candidates: Array<{ productId: string; leafCategoryId: string }>): Promise<{
+          usedProductIds: string[]
+          accountUsedCategoryIds: string[]
+          categoryUsage: Record<string, number>
+          mode: 'local'
+        }>
+        onSelectionProgress(cb: (progress: SelectionProgressPayload) => void): () => void
+        prepareDouyinPublish(params: {
+          accountId: number
+          queueId?: number
+          profilePath?: string
+          productId: string
+          productName: string
+          productUrl: string
+          videoPath: string
+          description: string
+          autoPublish?: boolean
+        }): Promise<Record<string, unknown>>
+        submitDouyinPublish(params: {
+          accountId: number
+          queueId: number
+          profilePath?: string
+          productId: string
+          productName: string
+          productUrl: string
+          videoPath: string
+          description: string
+        }): Promise<Record<string, unknown>>
+        onPublishProgress(cb: (progress: PublishProgressPayload) => void): () => void
+        openDouyinCreator(params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>>
         close(): Promise<{ ok: boolean }>
         setBounds(rect: BoundsRect): void
         goBack(): Promise<{ ok: boolean }>
@@ -236,6 +340,13 @@ declare global {
         onStateChanged(cb: (state: BrowserViewState) => void): () => void
         onNeedBounds(cb: () => void): () => void
         onLoadFailed(cb: (e: { code: number; desc: string; url: string }) => void): () => void
+      }
+      publish: {
+        getProgress(): Promise<PublishProgressPayload>
+        runNow(queueId: number): Promise<PublishProgressPayload>
+        runImmediately(queueId: number): Promise<PublishProgressPayload>
+        retryManually(queueId: number, options?: { confirmedNotSubmitted?: boolean; confirmedNoDraft?: boolean }): Promise<PublishProgressPayload>
+        onProgress(cb: (progress: PublishProgressPayload) => void): () => void
       }
       /** 登录态 */
       login: {
@@ -259,8 +370,20 @@ declare global {
       dir: {
         /** 当前下载目录 */
         getDownloadDir(): Promise<string>
+        /** 订阅全局下载目录变更 */
+        onDownloadDirChanged(cb: (path: string) => void): () => void
+        /** 选择本地 MP4 视频文件，取消返回 null */
+        choosePublishVideoFile(): Promise<string | null>
         /** 系统目录选择器，返回新目录或 null（取消） */
         chooseDownloadDir(): Promise<string | null>
+        /** 选择账号浏览器缓存目录 */
+        chooseProfileDir(): Promise<string | null>
+        /** 选择账号下载目录 */
+        chooseAccountDownloadDir(): Promise<string | null>
+        /** 校验缓存目录内存在 Default 子目录 */
+        validateProfileDir(path: string): Promise<{ ok: boolean; path?: string; error?: string }>
+        /** 将本机路径解析为规范绝对路径，用于账号隔离校验 */
+        canonicalizePath(path: string): Promise<{ ok: boolean; path?: string; error?: string }>
       }
       /** 素材库辅助（缩略图 / 打开文件夹） */
       assets: {
@@ -289,9 +412,9 @@ declare global {
       }
       /** 账号级登录态（Step 11：一账号一分区 + 指纹 + 加密备份） */
       account: {
-        openBrowser(accountId: number): Promise<{ ok: boolean; url: string; error?: string }>
+        openBrowser(accountId: number, profilePath?: string): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }>
         closeBrowser(): Promise<{ ok: boolean }>
-        openJingxuan(accountId: number): Promise<{ ok: boolean; url: string; error?: string }>
+        openJingxuan(accountId: number, profilePath?: string): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }>
         pullInfo(params: { accountId: number; douyinId: string }): Promise<AccountUserInfo | { error: string } | null>
         checkLogin(accountId: number): Promise<AccountLoginState>
         exportForEngine(accountId: number): Promise<AccountEngineSession>
@@ -306,10 +429,20 @@ declare global {
       }
       /** 千川账户登录态（Step 11：独立分区多开隔离，SRS A-12） */
       qianchuan: {
-        openLogin(qcId: number): Promise<{ ok: boolean; url: string; error?: string }>
+        openLogin(qcId: number): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }>
         checkLogin(qcId: number): Promise<AccountLoginState>
         exportForEngine(qcId: number): Promise<AccountEngineSession>
         clearLogin(qcId: number): Promise<{ ok: boolean }>
+        uploadTargets(): Promise<Record<string, unknown>>
+        eligibleAssets(accountId: number): Promise<Record<string, unknown>>
+        uploadJobs(accountId?: number): Promise<Record<string, unknown>>
+        enqueueUpload(params: { accountId: number; assetIds: number[]; qianchuanAccountId: number }): Promise<Record<string, unknown>>
+        runUpload(jobId: number): Promise<Record<string, unknown>>
+        retrySafeUpload(jobId: number): Promise<Record<string, unknown>>
+        reviewUploadAbsent(params: { id: number; note: string }): Promise<Record<string, unknown>>
+        reviewUploadPresent(params: { id: number; remoteMaterialId: string }): Promise<Record<string, unknown>>
+        quotaConfig(accountId?: number): Promise<Record<string, unknown>>
+        setQuotaConfig(params: { accountId: number; perProductVideos: number; perAccountProducts: number; perAccountVideos: number }): Promise<Record<string, unknown>>
       }
       /** 去水印辅助（动态水印去除的框选模板交互） */
       watermark: {

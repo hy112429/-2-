@@ -27,6 +27,9 @@ const DEBOUNCE_MS = 5000
  * 用于在用户浏览选品时自动补全 commodity_id（pack_detail 触发所必需）。
  */
 const LIST_API_RE = /(selection_square|search\/query\/recommend|material_list|channel_activity|selection\/common)/
+const CATEGORY_API_RE = /(category|cate_info|cate_list|cate_tree|cat_list)/i
+const CATEGORY_CONTAINER_RE = /(categories|category_list|category_tree|category_nodes|cate_info|cate_list|cate_tree|cat_list|first_level_categories|first_category_list)/i
+let lastCategorySignature = ''
 
 /** 捕获通知（批量浏览驱动靠它感知某个商品已抓到视频直链） */
 export interface ProductCaptured {
@@ -83,7 +86,8 @@ interface PackDetail {
   title: string
   cover: string
   cosRatio: number | null
-  videoUrl: string
+  videoUrl: string | null
+  images: string[]
 }
 
 function logCompact(entry: Record<string, unknown>): void {
@@ -103,16 +107,32 @@ function parsePackDetail(body: string): PackDetail | null {
     const media = base?.media
     const cos = product?.product_cos?.cos_label?.cos?.cos_ratio
     const productId = data?.product_id
-    const videoUrl = media?.video_url
-    if (typeof productId !== 'string' || typeof videoUrl !== 'string' || !videoUrl) {
+    const rawVideoUrl = media?.video_url
+    if (typeof productId !== 'string') {
       return null
     }
+    const collectUrls = (value: unknown): string[] => {
+      if (!Array.isArray(value)) return []
+      return value.flatMap((item) => {
+        const url = typeof item === 'string' ? item
+          : item && typeof item === 'object'
+            ? String((item as Record<string, unknown>).url ?? (item as Record<string, unknown>).origin_url ?? '')
+            : ''
+        return /^https?:\/\//i.test(url) ? [url] : []
+      })
+    }
+    const images = [...new Set([...collectUrls(base?.big_imgs), ...collectUrls(base?.images), ...collectUrls(base?.white_background)])].slice(0, 25)
+    const videoUrl = typeof rawVideoUrl === 'string' && rawVideoUrl ? rawVideoUrl : null
+    const cover = typeof media?.cover_url === 'string' ? media.cover_url
+      : typeof base?.cover === 'string' ? base.cover : ''
+    if (!videoUrl && !images.length) return null
     return {
       productId,
       title: typeof base?.title === 'string' ? base.title : '',
-      cover: typeof media?.cover_url === 'string' ? media.cover_url : '',
+      cover,
       cosRatio: typeof cos === 'number' ? cos : null,
-      videoUrl
+      videoUrl,
+      images
     }
   } catch {
     return null
@@ -130,11 +150,12 @@ function upsertProduct(p: PackDetail): void {
     '--product-id', p.productId,
     '--title', p.title,
     '--cover', p.cover,
-    '--video-url', p.videoUrl
   ]
+  if (p.videoUrl) args.push('--video-url', p.videoUrl)
+  if (p.images.length) args.push('--gallery-stdin')
   if (p.cosRatio !== null) args.push('--cos-ratio', String(p.cosRatio))
 
-  const handle = runScript('baiying_cache.py', { args, onEvent: () => undefined })
+  const handle = runScript('baiying_cache.py', { args, stdinJson: p.images.length ? p.images : undefined, onEvent: () => undefined })
   void handle.promise.then((outcome) => {
     logCompact({
       action: 'upsert',
@@ -190,6 +211,141 @@ function linkCommodities(pairs: Array<{ productId: string; commodityId: string }
   }
 }
 
+/** 从百应真实响应中提取带父子关系的类目节点；只读取平台返回内容，不构造请求参数。 */
+function extractCategoryTree(body: unknown): Array<{ id: string; name: string; children: unknown[] }> {
+  const idKeys = ['category_id', 'cate_id', 'cat_id', 'first_category_id', 'second_category_id', 'third_category_id', 'id', 'value']
+  const nameKeys = ['category_name', 'cate_name', 'cat_name', 'first_category_name', 'second_category_name', 'third_category_name', 'name', 'label']
+  const childKeys = ['children', 'childs', 'child_list', 'sub_categories', 'sub_category_list', 'child_category', 'category_list', 'cate_list', 'cate_info']
+
+  const normalize = (value: unknown): Array<{ id: string; name: string; children: unknown[] }> => {
+    if (!Array.isArray(value)) return []
+    const nodes: Array<{ id: string; name: string; children: unknown[] }> = []
+    for (const item of value) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue
+      const record = item as Record<string, unknown>
+      const idValue = idKeys.map((key) => record[key]).find((entry) => typeof entry === 'string' || typeof entry === 'number')
+      const nameValue = nameKeys.map((key) => record[key]).find((entry) => typeof entry === 'string')
+      if (idValue === undefined || typeof nameValue !== 'string' || !nameValue.trim()) continue
+      const rawChildren = childKeys.map((key) => record[key]).find(Array.isArray)
+      nodes.push({ id: String(idValue), name: nameValue.trim(), children: rawChildren ? normalize(rawChildren) : [] })
+    }
+    return nodes
+  }
+
+  const visit = (value: unknown, underCategoryKey = false): Array<{ id: string; name: string; children: unknown[] }> => {
+    if (!value || typeof value !== 'object') return []
+    if (Array.isArray(value)) return underCategoryKey ? normalize(value) : value.flatMap((item) => visit(item, false))
+    const record = value as Record<string, unknown>
+    for (const [key, child] of Object.entries(record)) {
+      if (CATEGORY_CONTAINER_RE.test(key)) {
+        const found = normalize(child)
+        if (found.length) return found
+        const nested = visit(child, true)
+        if (nested.length) return nested
+      }
+    }
+    for (const child of Object.values(record)) {
+      const nested = visit(child, false)
+      if (nested.length) return nested
+    }
+    return []
+  }
+
+  const catalog = visit(body)
+  return catalog
+}
+
+function captureCategoryCatalog(body: string, url: string): void {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return
+  }
+  const categories = extractCategoryTree(parsed)
+  const categoryPaths: string[] = []
+  const scanShape = (value: unknown, path: string, depth: number): void => {
+    if (depth > 7 || !value || typeof value !== 'object') return
+    if (Array.isArray(value)) {
+      if (/categor|cate|cat/i.test(path)) categoryPaths.push(`${path}[${value.length}]`)
+      value.slice(0, 2).forEach((item, index) => scanShape(item, `${path}[${index}]`, depth + 1))
+      return
+    }
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const childPath = path ? `${path}.${key}` : key
+      if (/categor|cate|cat/i.test(key)) {
+        const size = Array.isArray(child) ? `[${child.length}]` : ''
+        categoryPaths.push(`${childPath}${size}`)
+      }
+      scanShape(child, childPath, depth + 1)
+    }
+  }
+  scanShape(parsed, '', 0)
+  if (categoryPaths.length) {
+    let path = ''
+    try { path = new URL(url).pathname } catch { path = '百应接口' }
+    logCompact({ action: 'category-scan', path, extracted: categories.length, fields: Array.from(new Set(categoryPaths)).slice(0, 30) })
+  }
+  if (!categories.length) return
+  let mode = 'merge'
+  let parentId = ''
+  try {
+    const params = new URL(url).searchParams
+    const categoryType = params.get('cate_type') ?? params.get('category_type') ?? ''
+    parentId = params.get('parent_id') ?? params.get('parent_category_id') ?? params.get('category_id') ?? params.get('cate_id') ?? ''
+    if (categoryType === '1') mode = 'root-snapshot'
+    else if (categoryType && categoryType !== '1' && parentId) mode = 'children'
+  } catch {
+    /* 没有可解析的请求参数时按增量目录合并 */
+  }
+  const signature = JSON.stringify(categories)
+  if (`${mode}:${parentId}:${signature}` === lastCategorySignature) return
+  lastCategorySignature = `${mode}:${parentId}:${signature}`
+  const args = ['catalog', 'save', '--mode', mode]
+  if (parentId) args.push('--parent-id', parentId)
+  const handle = runScript('selection_settings.py', {
+    args,
+    stdinJson: { categories },
+    onEvent: () => undefined
+  })
+  void handle.promise.then((outcome) => {
+    let source = '百应类目接口'
+    try { source = new URL(url).pathname } catch { /* 保留脱敏来源名 */ }
+    logCompact({ action: 'category-catalog', count: categories.length, source, ok: outcome.ok })
+    if (!outcome.ok && lastCategorySignature === `${mode}:${parentId}:${signature}`) lastCategorySignature = ''
+  })
+}
+
+/** 处理来自 Electron 探针或外部托管 Chrome CDP 桥接的百应响应。 */
+export function captureExternalBaiyingResponse(url: string, body: string): void {
+  if (!url.includes('buyin')) return
+
+  if (url.includes('pack_detail')) {
+    const parsed = parsePackDetail(body)
+    if (parsed) {
+      logCompact({ action: 'capture', productId: parsed.productId, path: new URL(url).pathname, hasVideo: Boolean(parsed.videoUrl), imageCount: parsed.images.length, source: 'cdp' })
+      if (parsed.videoUrl) notifyCaptured(parsed.productId, parsed.videoUrl)
+      upsertProduct(parsed)
+    }
+    return
+  }
+
+  if (!LIST_API_RE.test(url) && !CATEGORY_API_RE.test(url)) return
+  let parsedBody: unknown
+  try {
+    parsedBody = JSON.parse(body)
+  } catch {
+    return
+  }
+  captureCategoryCatalog(body, url)
+  const pairs: Array<{ productId: string; commodityId: string }> = []
+  collectCommodityPairs(parsedBody, pairs)
+  if (pairs.length > 0) {
+    logCompact({ action: 'list', path: new URL(url).pathname, pairs: pairs.length, source: 'cdp' })
+    linkCommodities(pairs)
+  }
+}
+
 export function attachProbe(wc: WebContents): void {
   try {
     wc.debugger.attach('1.3')
@@ -217,45 +373,13 @@ export function attachProbe(wc: WebContents): void {
     const requestId = params?.requestId as string | undefined
     if (!requestId) return
 
-    // 详情接口 pack_detail：解析并落库商品完整信息
-    if (url.includes('pack_detail')) {
+    // 商品详情、选品列表/搜索和类目接口统一走同一响应处理器。
+    if (url.includes('pack_detail') || LIST_API_RE.test(url) || CATEGORY_API_RE.test(url)) {
       try {
         void wc.debugger
           .sendCommand('Network.getResponseBody', { requestId })
           .then(({ body }) => {
-            const parsed = body ? parsePackDetail(body) : null
-            if (parsed) {
-              logCompact({ action: 'capture', productId: parsed.productId, url: url.slice(0, 120) })
-              notifyCaptured(parsed.productId, parsed.videoUrl)
-              upsertProduct(parsed)
-            }
-          })
-          .catch(() => undefined)
-      } catch {
-        /* 忽略 */
-      }
-      return
-    }
-
-    // 选品列表/搜索接口：补全 product_id → commodity_id 映射
-    if (LIST_API_RE.test(url)) {
-      try {
-        void wc.debugger
-          .sendCommand('Network.getResponseBody', { requestId })
-          .then(({ body }) => {
-            if (!body) return
-            let parsedBody: unknown
-            try {
-              parsedBody = JSON.parse(body)
-            } catch {
-              return
-            }
-            const pairs: Array<{ productId: string; commodityId: string }> = []
-            collectCommodityPairs(parsedBody, pairs)
-            if (pairs.length > 0) {
-              logCompact({ action: 'list', url: url.slice(0, 120), pairs: pairs.length })
-              linkCommodities(pairs)
-            }
+            if (body) captureExternalBaiyingResponse(url, body)
           })
           .catch(() => undefined)
       } catch {

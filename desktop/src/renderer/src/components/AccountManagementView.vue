@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import SelectionSettingsView from './SelectionSettingsView.vue'
+import { notifyGlobal } from '../utils/notifications'
 
 /**
  * 账号管理（Step 11 · 多账号矩阵）
@@ -19,6 +21,8 @@ interface AccountRow {
   douyin_id: string | null
   qianchuan_id: string | null
   category: string | null
+  selection_category: string
+  success_count: number | null
   phone: string | null
   status: string
   nickname: string | null
@@ -30,9 +34,9 @@ interface AccountRow {
   qc_bind_count: number
   material_count: number
   pending_publish: number
-  publish_rate: number
-  karl_rate: number
-  ad_count: number
+  publish_rate: number | null
+  karl_rate: number | null
+  ad_count: number | null
 }
 
 interface GroupRow {
@@ -62,6 +66,12 @@ interface StatsRow {
   qianchuan_count: number
 }
 
+interface AccountBrowserPageStatus {
+  state: 'checking' | 'unavailable' | 'checked'
+  baiyingOpen: boolean
+  creatorCenterOpen: boolean
+}
+
 const DB_PATH = 'D:\\software\\投广客户端\\data\\ad_client.db'
 const TABS = ['账号列表', '账号分组', '千川账户'] as const
 
@@ -73,9 +83,18 @@ const accounts = ref<AccountRow[]>([])
 const groups = ref<GroupRow[]>([])
 const qcs = ref<QcRow[]>([])
 const selected = ref<Set<number>>(new Set())
+const accountPage = ref(1)
+const accountPageSize = ref(20)
 const busy = ref(false)
 const notice = ref('')
 const errorMsg = ref('')
+
+watch(notice, (message) => {
+  if (message) notifyGlobal(message)
+})
+watch(errorMsg, (message) => {
+  if (message) notifyGlobal(message, 'error')
+})
 
 // 新建/编辑账号表单
 const accountForm = reactive({
@@ -103,6 +122,20 @@ const showBindPanel = ref(false)
 
 // 批量移动分组
 const moveGroupId = ref<number | null>(null)
+const selectionSettingsAccountId = ref<number | null>(null)
+
+const accountPageCount = computed(() => Math.max(1, Math.ceil(accounts.value.length / accountPageSize.value)))
+const visibleAccounts = computed(() => {
+  const start = (accountPage.value - 1) * accountPageSize.value
+  return accounts.value.slice(start, start + accountPageSize.value)
+})
+const visibleAccountsSelected = computed(() =>
+  visibleAccounts.value.length > 0 && visibleAccounts.value.every((account) => selected.value.has(account.id))
+)
+
+watch([() => accounts.value.length, accountPageSize], () => {
+  accountPage.value = Math.min(accountPage.value, accountPageCount.value)
+})
 
 // 浏览器视图宿主 + 账号级登录态
 const browserHost = ref<HTMLDivElement | null>(null)
@@ -110,11 +143,15 @@ const scrollEl = ref<HTMLDivElement | null>(null)
 const viewState = ref<AccountViewState>({ open: false })
 const loginMap = reactive<Record<number, AccountLoginState>>({})
 const qcLoginMap = reactive<Record<number, AccountLoginState>>({})
+const browserPageStatus = reactive<Record<number, AccountBrowserPageStatus>>({})
+const browserProfilePathCache = new Map<number, string | undefined>()
 let unsubscribers: Array<() => void> = []
+let browserPageScanTimer: number | undefined
+let browserPageScanInFlight = false
 
 // ---------------------------------------------------------------- 引擎调用
 
-function runCli(args: string[]): Promise<Record<string, unknown>> {
+function runCli(args: string[], script = 'account_manager.py'): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     let settled = false
     let taskId: string | null = null
@@ -135,7 +172,7 @@ function runCli(args: string[]): Promise<Record<string, unknown>> {
     })
     window.setTimeout(() => settle(() => reject(new Error('命令超时（30 秒）'))), 30_000)
     void window.api.engine
-      .run({ script: 'account_manager.py', args })
+      .run({ script, args })
       .then((reply) => {
         if (!reply.taskId) settle(() => reject(new Error(reply.error ?? '命令启动失败')))
         else taskId = reply.taskId
@@ -166,6 +203,16 @@ async function loadStats(): Promise<void> {
 async function loadAccounts(): Promise<void> {
   const data = await runCli(['--db', DB_PATH, 'account-list'])
   accounts.value = (data.accounts ?? []) as AccountRow[]
+  accountPage.value = Math.min(accountPage.value, accountPageCount.value)
+}
+
+function toggleVisibleAccountSelection(): void {
+  if (visibleAccountsSelected.value) visibleAccounts.value.forEach((account) => selected.value.delete(account.id))
+  else visibleAccounts.value.forEach((account) => selected.value.add(account.id))
+}
+
+function metricLabel(value: number | null): string {
+  return value === null || value === undefined ? '—' : String(value)
 }
 
 async function loadGroups(): Promise<void> {
@@ -179,10 +226,60 @@ async function loadQcs(): Promise<void> {
 }
 
 async function loadAll(): Promise<void> {
+  browserProfilePathCache.clear()
   await withBusy(async () => {
     await Promise.all([loadStats(), loadAccounts(), loadGroups(), loadQcs()])
   })
+  void refreshOpenBrowserPages()
 }
+
+async function getAccountBrowserProfilePath(accountId: number): Promise<string | undefined> {
+  const result = await runCli(['--db', DB_PATH, 'get', '--account-id', String(accountId)], 'selection_settings.py')
+  const settings = result.settings as { account?: Record<string, unknown> } | undefined
+  const profilePath = settings?.account?.browserProfilePath
+  const resolved = typeof profilePath === 'string' && profilePath.trim() ? profilePath : undefined
+  browserProfilePathCache.set(accountId, resolved)
+  return resolved
+}
+
+/** 只检查托管 Chrome 是否已有目标页面；不可读取时显示中性状态，不报登录错误。 */
+async function refreshOpenBrowserPages(): Promise<void> {
+  if (activeTab.value !== '账号列表' || browserPageScanInFlight) return
+  const targets = [...visibleAccounts.value]
+  if (targets.length === 0) return
+  browserPageScanInFlight = true
+  try {
+    await Promise.all(targets.map(async (row) => {
+      browserPageStatus[row.id] = { state: 'checking', baiyingOpen: false, creatorCenterOpen: false }
+      try {
+        let profilePath: string | undefined
+        if (browserProfilePathCache.has(row.id)) {
+          profilePath = browserProfilePathCache.get(row.id)
+        } else {
+          profilePath = await getAccountBrowserProfilePath(row.id)
+          browserProfilePathCache.set(row.id, profilePath)
+        }
+        const result = await window.api.browser.inspectAccountPages({ accountId: row.id, profilePath })
+        browserPageStatus[row.id] = result.ok && result.inspectable
+          ? {
+              state: 'checked',
+              baiyingOpen: result.baiyingOpen,
+              creatorCenterOpen: result.creatorCenterOpen
+            }
+          : { state: 'unavailable', baiyingOpen: false, creatorCenterOpen: false }
+      } catch {
+        browserPageStatus[row.id] = { state: 'unavailable', baiyingOpen: false, creatorCenterOpen: false }
+      }
+    }))
+  } finally {
+    browserPageScanInFlight = false
+  }
+}
+
+watch(
+  () => `${activeTab.value}:${accountPage.value}:${visibleAccounts.value.map((row) => row.id).join(',')}`,
+  () => { void refreshOpenBrowserPages() }
+)
 
 // ---------------------------------------------------------------- 账号增删改查
 
@@ -210,7 +307,7 @@ function openEditAccount(row: AccountRow): void {
 async function saveAccount(): Promise<void> {
   await withBusy(async () => {
     if (accountForm.id === 0) {
-      await runCli([
+      const result = await runCli([
         '--db', DB_PATH, 'account-add',
         '--name', accountForm.name,
         '--douyin-id', accountForm.douyin_id,
@@ -220,6 +317,41 @@ async function saveAccount(): Promise<void> {
         '--remark', accountForm.remark,
         '--status', accountForm.status
       ])
+      const account = result.account as { id?: number; name?: string } | undefined
+      const accountId = Number(account?.id)
+      if (!Number.isInteger(accountId) || accountId <= 0) {
+        throw new Error('账号已提交，但引擎未返回账号编号；请刷新账号列表后再打开登录页。')
+      }
+      showAccountForm.value = false
+      await Promise.all([loadAccounts(), loadStats()])
+      const openFailures: string[] = []
+      let profilePath: string | undefined
+      try {
+        profilePath = await getAccountBrowserProfilePath(accountId)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        openFailures.push(`账号 profile：${reason}`)
+      }
+      try {
+        const opened = await window.api.account.openJingxuan(accountId, profilePath)
+        if (!opened.ok) throw new Error(opened.error ?? '外部登录页未能打开')
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        openFailures.push(`百应：${reason}`)
+      }
+      try {
+        const opened = await window.api.browser.openDouyinCreator({ accountId, profilePath })
+        if (opened['ok'] !== true) throw new Error(String(opened['error'] ?? '创作者中心页面未能打开'))
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        openFailures.push(`创作者中心：${reason}`)
+      }
+      const accountName = account?.name ?? accountForm.name
+      if (openFailures.length > 0) {
+        errorMsg.value = `账号「${accountName}」已保存。以下登录入口未能打开：${openFailures.join('；')}。账号记录已保留，可在账号列表分别点击“打开百应”或“打开创作者中心”重试。`
+      } else {
+        setNotice(`账号「${accountName}」已保存，已在该账号专属 Chrome profile 打开百应和创作者中心。请分别在两个页面扫码/登录；登录态会保留在此账号的浏览器资料中。客户端只打开页面，不会自动判定两处登录是否完成。`)
+      }
     } else {
       const args = ['--db', DB_PATH, 'account-update', '--id', String(accountForm.id)]
       if (accountForm.name) args.push('--name', accountForm.name)
@@ -230,9 +362,9 @@ async function saveAccount(): Promise<void> {
       if (accountForm.remark) args.push('--remark', accountForm.remark)
       if (accountForm.status) args.push('--status', accountForm.status)
       await runCli(args)
+      showAccountForm.value = false
+      await Promise.all([loadAccounts(), loadStats()])
     }
-    showAccountForm.value = false
-    await Promise.all([loadAccounts(), loadStats()])
   })
 }
 
@@ -432,19 +564,12 @@ function copyText(text: string): void {
   )
 }
 
-/** 登录千川 + 检查登录态（在线状态回写） */
+/** 在千川专属托管 Chrome profile 打开登录页；Electron 缓存状态仍单独显示。 */
 async function openQcLogin(row: QcRow): Promise<void> {
   await withBusy(async () => {
     const r = await window.api.qianchuan.openLogin(row.id)
     if (!r.ok) throw new Error(r.error ?? '打开千川登录失败')
-    const state = await window.api.qianchuan.checkLogin(row.id)
-    qcLoginMap[row.id] = state
-    const stateText = state.loggedIn ? 'online' : 'offline'
-    await runCli([
-      '--db', DB_PATH, 'qianchuan-update', '--id', String(row.id),
-      '--login-state', stateText, '--last-check', new Date().toISOString()
-    ])
-    await loadQcs()
+    setNotice(`已在独立 Chrome profile 打开千川登录页；Playwright CDP 会复用该 profile，客户端 Electron 缓存仍独立。`)
   })
 }
 
@@ -452,12 +577,7 @@ async function checkQcLogin(row: QcRow): Promise<void> {
   await withBusy(async () => {
     const state = await window.api.qianchuan.checkLogin(row.id)
     qcLoginMap[row.id] = state
-    await runCli([
-      '--db', DB_PATH, 'qianchuan-update', '--id', String(row.id),
-      '--login-state', state.loggedIn ? 'online' : 'offline',
-      '--last-check', new Date().toISOString()
-    ])
-    await loadQcs()
+    setNotice(state.loggedIn ? `千川${row.id} 的客户端缓存已有登录凭证（${state.cookieCount} 条）。` : `千川${row.id} 的客户端缓存没有登录凭证；外部浏览器状态不在此处读取。`)
   })
 }
 
@@ -482,13 +602,11 @@ function onScroll(): void {
 
 async function openBrowser(row: AccountRow): Promise<void> {
   await withBusy(async () => {
-    syncBounds()
-    const r = await window.api.account.openBrowser(row.id)
+    const profilePath = await getAccountBrowserProfilePath(row.id)
+    const r = await window.api.account.openBrowser(row.id, profilePath)
     if (!r.ok) throw new Error(r.error ?? '打开浏览器失败')
     viewState.value = await window.api.account.getState()
-    const state = await window.api.account.checkLogin(row.id)
-    loginMap[row.id] = state
-    if (state.loggedIn) setNotice(`账号「${row.name}」已登录`)
+    setNotice(`已在「${row.name}」专属 Chrome profile 打开抖音登录页；CDP 自动化复用此 profile，Electron 内置缓存独立。`)
   })
 }
 
@@ -499,27 +617,42 @@ async function closeBrowser(): Promise<void> {
 
 async function openJingxuan(row: AccountRow): Promise<void> {
   await withBusy(async () => {
-    syncBounds()
-    const r = await window.api.account.openJingxuan(row.id)
+    const profilePath = await getAccountBrowserProfilePath(row.id)
+    const r = await window.api.account.openJingxuan(row.id, profilePath)
     if (!r.ok) throw new Error(r.error ?? '打开精选页失败')
-    viewState.value = await window.api.account.getState()
+    setNotice(`已在「${row.name}」专属 Chrome profile 打开百应精选页；自动化将通过 CDP 复用此 profile。`)
+    window.setTimeout(() => { void refreshOpenBrowserPages() }, 500)
   })
+}
+
+async function openCreatorCenter(row: AccountRow): Promise<void> {
+  await withBusy(async () => {
+    const profilePath = await getAccountBrowserProfilePath(row.id)
+    const result = await window.api.browser.openDouyinCreator({ accountId: row.id, profilePath })
+    if (result.ok !== true) throw new Error(String(result.error ?? '打开抖音创作者中心失败'))
+    setNotice(`已为「${row.name}」在账号专属 Chrome profile 打开创作者中心；需要登录或授权时，请在页面扫码并手动完成。`)
+    window.setTimeout(() => { void refreshOpenBrowserPages() }, 500)
+  })
+}
+
+function openSelectionSettings(row: AccountRow): void {
+  browserProfilePathCache.delete(row.id)
+  selectionSettingsAccountId.value = row.id
 }
 
 async function checkAccountLogin(row: AccountRow): Promise<void> {
   const state = await window.api.account.checkLogin(row.id)
   loginMap[row.id] = state
-  setNotice(state.loggedIn ? `「${row.name}」已登录（cookie ${state.cookieCount} 条，已加密备份）` : `「${row.name}」未登录`)
+    setNotice(state.loggedIn ? `「${row.name}」的客户端缓存已有登录凭证（cookie ${state.cookieCount} 条，已加密备份）。托管 Chrome profile 的状态由 CDP 使用。` : `「${row.name}」的客户端缓存没有登录凭证；托管 Chrome profile 登录状态不显示在此处。`)
 }
 
 async function pullInfo(row: AccountRow): Promise<void> {
   if (!row.douyin_id) return setNotice(`「${row.name}」未填抖音号，无法拉取`)
   await withBusy(async () => {
-    syncBounds()
     setNotice(`正在从平台拉取「${row.name}」公开信息…`)
     const info = await window.api.account.pullInfo({ accountId: row.id, douyinId: row.douyin_id! })
     if (!info) {
-      setNotice(`「${row.name}」拉取失败：主页未抓到用户数据（请确认该账号已登录且抖音号正确）`)
+      setNotice(`「${row.name}」拉取失败：客户端缓存会话未获取到用户数据（外部浏览器登录态不会同步；请确认客户端缓存已登录且抖音号正确）`)
       return
     }
     if ('error' in info) throw new Error(info.error)
@@ -544,6 +677,7 @@ async function openMaterialFolder(row: AccountRow): Promise<void> {
 
 onMounted(() => {
   void loadAll()
+  browserPageScanTimer = window.setInterval(() => { void refreshOpenBrowserPages() }, 10_000)
   const off1 = window.api.account.onStateChanged((s) => (viewState.value = s))
   const off2 = window.api.account.onLoginStateChanged((s) => {
     if (s.kind === 'acct') loginMap[s.id] = s
@@ -556,6 +690,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  if (browserPageScanTimer !== undefined) window.clearInterval(browserPageScanTimer)
   scrollEl.value?.removeEventListener('scroll', onScroll)
   unsubscribers.forEach((off) => off())
 })
@@ -565,6 +700,20 @@ onBeforeUnmount(() => {
 function fmtCount(v: number | null | undefined): string {
   if (v == null) return '—'
   return String(v)
+}
+
+function selectionCategoryDisplay(value: string): { summary: string; paths: string[] } {
+  const separator = value.indexOf('：')
+  if (separator < 0) return { summary: value || '不限', paths: [] }
+  const source = value.slice(0, separator).trim()
+  const categoryText = value.slice(separator + 1).trim()
+  if (!categoryText || categoryText === '不限' || categoryText === '已设置（类目目录待同步）') {
+    return { summary: `${source}：${categoryText || '不限'}`, paths: [] }
+  }
+  const paths = categoryText.split(/[；;]/).map((item) => item.trim()).filter(Boolean)
+  return paths.length
+    ? { summary: `${source}：${paths.length} 个类目`, paths }
+    : { summary: `${source}：${categoryText}`, paths: [] }
 }
 
 function statusText(row: AccountRow): string {
@@ -635,10 +784,13 @@ function toggleSelectBind(id: number): void {
         <table class="grid">
           <thead>
             <tr>
-              <th style="width: 36px"></th>
+              <th style="width: 36px"><input type="checkbox" :checked="visibleAccountsSelected" @change="toggleVisibleAccountSelection" /></th>
+              <th>序号</th>
               <th>名称</th>
               <th>抖音号</th>
               <th>千川ID</th>
+              <th>类目</th>
+              <th>成功数</th>
               <th>运营分类</th>
               <th>手机号</th>
               <th>账号状态</th>
@@ -647,53 +799,90 @@ function toggleSelectBind(id: number): void {
               <th>卡优率</th>
               <th>广告条数</th>
               <th>分组</th>
-              <th>登录态</th>
+              <th>客户端缓存态</th>
+              <th title="每 10 秒只读检查账号专属 Chrome 的页面标签，不检查登录状态">托管浏览器页面</th>
               <th style="width: 330px">账号级操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="row in accounts" :key="row.id">
+            <tr v-for="(row, index) in visibleAccounts" :key="row.id">
               <td><input type="checkbox" :checked="selected.has(row.id)" @change="toggleSelect(row.id)" /></td>
+              <td>{{ (accountPage - 1) * accountPageSize + index + 1 }}</td>
               <td>
                 <div class="cell-main">{{ row.name }}</div>
                 <div v-if="row.nickname" class="cell-sub">{{ row.nickname }} · 粉丝 {{ fmtCount(row.follower_count) }} · 作品 {{ fmtCount(row.aweme_count) }}</div>
               </td>
               <td>{{ row.douyin_id ?? '—' }}</td>
               <td>{{ row.qianchuan_id ?? '—' }}</td>
+              <td class="selection-category" :title="row.selection_category">
+                <details v-if="selectionCategoryDisplay(row.selection_category).paths.length" class="selection-category-details">
+                  <summary>{{ selectionCategoryDisplay(row.selection_category).summary }}</summary>
+                  <ul>
+                    <li v-for="path in selectionCategoryDisplay(row.selection_category).paths" :key="path">{{ path }}</li>
+                  </ul>
+                </details>
+                <span v-else>{{ selectionCategoryDisplay(row.selection_category).summary }}</span>
+              </td>
+              <td :title="row.success_count === null ? '本机尚无可用的成功加车事件记录' : '按账号内成功加车商品去重统计'">{{ row.success_count ?? '—' }}</td>
               <td>{{ row.category ?? '—' }}</td>
               <td>{{ row.phone ?? '—' }}</td>
               <td>
                 <span class="tag" :class="row.status === 'active' ? 'ok' : 'muted'">{{ statusText(row) }}</span>
               </td>
               <td>{{ row.material_count }}</td>
-              <td>{{ row.publish_rate }}</td>
-              <td>{{ row.karl_rate }}</td>
-              <td>{{ row.ad_count }}</td>
+              <td>{{ metricLabel(row.publish_rate) }}</td>
+              <td>{{ metricLabel(row.karl_rate) }}</td>
+              <td>{{ metricLabel(row.ad_count) }}</td>
               <td>
                 <span v-for="g in row.groups" :key="g" class="tag ok">{{ g }}</span>
                 <span v-if="row.groups.length === 0" class="muted">未分组</span>
               </td>
               <td>
                 <span class="tag" :class="loginMap[row.id]?.loggedIn ? 'ok' : 'muted'">
-                  {{ loginMap[row.id] ? (loginMap[row.id]!.loggedIn ? '已登录' : '未登录') : '未知' }}
+                  {{ loginMap[row.id] ? (loginMap[row.id]!.loggedIn ? '有客户端凭证' : '无客户端凭证') : '未检查' }}
                 </span>
               </td>
+              <td :title="browserPageStatus[row.id]?.state === 'unavailable' ? '当前账号浏览器没有可读取的 CDP 会话；页面状态未知，不代表未打开。' : '仅表示页面已打开，不代表已登录。'">
+                <template v-if="browserPageStatus[row.id]?.state === 'checking'">检测中…</template>
+                <span v-else-if="browserPageStatus[row.id]?.state === 'unavailable'" class="muted">暂不可读取</span>
+                <template v-else-if="browserPageStatus[row.id]?.state === 'checked'">
+                  <span v-if="browserPageStatus[row.id]?.baiyingOpen" class="tag ok">百应已打开</span>
+                  <span v-if="browserPageStatus[row.id]?.creatorCenterOpen" class="tag ok">创作者已打开</span>
+                  <span v-if="!browserPageStatus[row.id]?.baiyingOpen && !browserPageStatus[row.id]?.creatorCenterOpen" class="muted">目标页面未打开</span>
+                </template>
+                <span v-else class="muted">等待检测</span>
+              </td>
               <td class="ops">
-                <button type="button" class="btn mini" @click="openBrowser(row)">打开浏览器</button>
-                <button type="button" class="btn mini" @click="openJingxuan(row)">精选页</button>
-                <button type="button" class="btn mini" @click="pullInfo(row)">拉取信息</button>
-                <button type="button" class="btn mini" @click="openMaterialFolder(row)">素材夹</button>
-                <button type="button" class="btn mini" @click="checkAccountLogin(row)">查登录态</button>
-                <button type="button" class="btn mini" @click="toggleStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</button>
-                <button type="button" class="btn mini" @click="openEditAccount(row)">编辑</button>
-                <button type="button" class="btn mini danger" @click="deleteAccount(row)">删除</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="openJingxuan(row)">打开百应</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="openBrowser(row)">抖音主站</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="openCreatorCenter(row)">打开创作者中心</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="openSelectionSettings(row)">选品设置</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="pullInfo(row)">拉取信息</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="openMaterialFolder(row)">素材夹</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="checkAccountLogin(row)">查客户端缓存</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="openEditAccount(row)">编辑</button>
+                <button type="button" class="btn mini" :disabled="busy" @click="toggleStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</button>
+                <button type="button" class="btn mini danger" :disabled="busy" @click="deleteAccount(row)">删除</button>
               </td>
             </tr>
             <tr v-if="accounts.length === 0">
-              <td colspan="14" class="empty">暂无账号，点右上「新建账号」开始</td>
+              <td colspan="18" class="empty">暂无账号，点右上「新建账号」开始</td>
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <div class="pagination-bar">
+        <span>共 {{ accounts.length }} 个账号，已选 {{ selected.size }} 个</span>
+        <label>每页
+          <select v-model.number="accountPageSize" @change="accountPage = 1">
+            <option v-for="size in [10, 20, 30, 40, 50, 80, 100]" :key="size" :value="size">{{ size }}</option>
+          </select>
+          条
+        </label>
+        <button type="button" class="btn mini" :disabled="accountPage <= 1" @click="accountPage--">上一页</button>
+        <span>{{ accountPage }} / {{ accountPageCount }}</span>
+        <button type="button" class="btn mini" :disabled="accountPage >= accountPageCount" @click="accountPage++">下一页</button>
       </div>
 
       <!-- 浏览器视图宿主（覆盖图层，位置由本容器上报） -->
@@ -745,7 +934,7 @@ function toggleSelectBind(id: number): void {
               <th>千川ID</th>
               <th>所属主体</th>
               <th>在线状态</th>
-              <th>登录态</th>
+              <th>客户端缓存态</th>
               <th>绑定账号数</th>
               <th>最近校验</th>
               <th>备注</th>
@@ -765,7 +954,7 @@ function toggleSelectBind(id: number): void {
               </td>
               <td>
                 <span class="tag" :class="qcLoginMap[row.id]?.loggedIn ? 'ok' : 'muted'">
-                  {{ qcLoginMap[row.id] ? (qcLoginMap[row.id]!.loggedIn ? '已登录' : '未登录') : '—' }}
+                  {{ qcLoginMap[row.id] ? (qcLoginMap[row.id]!.loggedIn ? '有客户端凭证' : '无客户端凭证') : '未检查' }}
                 </span>
               </td>
               <td>{{ row.bind_count }}</td>
@@ -773,7 +962,7 @@ function toggleSelectBind(id: number): void {
               <td>{{ row.remark ?? '—' }}</td>
               <td class="ops">
                 <button type="button" class="btn mini" @click="openQcLogin(row)">登录千川</button>
-                <button type="button" class="btn mini" @click="checkQcLogin(row)">查状态</button>
+                <button type="button" class="btn mini" @click="checkQcLogin(row)">查客户端缓存</button>
                 <button type="button" class="btn mini" @click="openBindPanel(row)">绑定账号</button>
                 <button type="button" class="btn mini" @click="qcForm.id = row.id; qcForm.qc_name = row.qc_name ?? ''; qcForm.qc_id = row.qc_id ?? ''; qcForm.subject = row.subject ?? ''; qcForm.remark = row.remark ?? ''; showQcForm = true">编辑</button>
                 <button type="button" class="btn mini danger" @click="deleteQc(row)">删除</button>
@@ -791,6 +980,7 @@ function toggleSelectBind(id: number): void {
     <div v-if="showAccountForm" class="modal-mask" @click.self="showAccountForm = false">
       <div class="modal">
         <h3>{{ accountForm.id === 0 ? '新建账号' : '编辑账号' }}</h3>
+        <p v-if="accountForm.id === 0" class="muted">保存后会在该账号专属 Chrome profile 分别打开百应和创作者中心。请在两个页面扫码/登录；登录态会保留在本机该账号的浏览器资料中。抖音主站登录不代表这两个入口都已登录。</p>
         <div class="form-grid">
           <label>名称 *<input v-model="accountForm.name" placeholder="账号名（也是素材目录名）" /></label>
           <label>抖音号<input v-model="accountForm.douyin_id" placeholder="抖音号 / sec_uid" /></label>
@@ -860,6 +1050,15 @@ function toggleSelectBind(id: number): void {
         </div>
       </div>
     </div>
+
+    <SelectionSettingsView
+      v-if="selectionSettingsAccountId !== null"
+      :key="selectionSettingsAccountId"
+      :initial-account-id="selectionSettingsAccountId"
+      dialog-only
+      @close="selectionSettingsAccountId = null"
+      @saved="() => loadAll()"
+    />
   </div>
 </template>
 
@@ -1040,8 +1239,34 @@ function toggleSelectBind(id: number): void {
 
 .ops {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
 }
+
+.selection-category {
+  min-width: 130px;
+  max-width: 170px;
+  white-space: nowrap !important;
+  line-height: 1.45;
+}
+
+.selection-category-details { max-width: 170px; }
+.selection-category-details > summary { overflow: hidden; cursor: pointer; text-overflow: ellipsis; white-space: nowrap; }
+.selection-category-details ul { max-height: 180px; margin: 5px 0; padding-left: 18px; overflow: auto; white-space: normal; }
+.selection-category-details li { margin: 2px 0; line-height: 1.4; }
+
+.pagination-bar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 10px 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.pagination-bar label { display: flex; align-items: center; gap: 5px; }
+.pagination-bar select { min-width: 64px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-panel); color: var(--text); }
 
 .empty {
   text-align: center;

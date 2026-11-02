@@ -52,6 +52,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from .client_paths import DEFAULT_DOWNLOAD_ROOT
+except ImportError:
+    from client_paths import DEFAULT_DOWNLOAD_ROOT
+
 import requests
 
 # 复用 Step 1 的解析逻辑。download.py 必须和 douyin_parse.py 放在同一个目录。
@@ -71,10 +76,8 @@ except ImportError:
 # 注意：严格数学意义上的指数退避是 1/2/4/8，这里按你的规格用 1/2/5。
 RETRY_DELAYS: Tuple[float, ...] = (1.0, 2.0, 5.0)
 
-# 默认根目录（对应规格里的「根目录」）。
-# 已确认分层：视频落「D:\software\投广客户端\downloads」，数据库落「D:\software\投广客户端\data」，
-# 两者分开，便于各自独立备份与清理（视频会很大，数据库很小）。
-DEFAULT_ROOT = r"D:\software\投广客户端\downloads"
+# 默认根目录（对应规格里的「根目录」）。由 Electron 运行时注入安装版或开发态目录。
+DEFAULT_ROOT = DEFAULT_DOWNLOAD_ROOT
 
 # 下载分块大小：256KB。太小会频繁写盘，太大进度条不流畅。
 CHUNK_SIZE = 256 * 1024

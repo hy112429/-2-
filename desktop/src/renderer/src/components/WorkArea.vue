@@ -1,19 +1,30 @@
 <script setup lang="ts">
-import { watch } from 'vue'
+import { ref, watch } from 'vue'
 import BrowserPane from './BrowserPane.vue'
 import LinkToolView from './LinkToolView.vue'
 import ProductQueryView from './ProductQueryView.vue'
 import AssetLibraryView from './AssetLibraryView.vue'
 import AccountManagementView from './AccountManagementView.vue'
+import SelectionSettingsView from './SelectionSettingsView.vue'
+import SelectionLogsView from './SelectionLogsView.vue'
+import PublishQueueView from './PublishQueueView.vue'
+import DashboardView from './DashboardView.vue'
+import QianchuanOverviewView from './QianchuanOverviewView.vue'
 
 const props = defineProps<{
   top: string
   nav: string
 }>()
 
-// 顶部菜单切走「百应工作台」时，立即隐藏登录视图覆盖层（避免残留浏览器视图挡在别的页面上方）。
-// 登录态保留在分区里不受影响；切回「百应工作台」后点「打开登录页」即重新显示。
-// BrowserPane 卸载时也会 close（双保险，这里兜底解决 v-if 切换时序问题）。
+const emit = defineEmits<{ (event: 'navigate', value: string): void }>()
+const selectionSettingsOpened = ref(false)
+
+watch(() => props.nav, (nav) => {
+  if (nav === '选品设置') selectionSettingsOpened.value = true
+}, { immediate: true })
+
+// 顶部菜单切走「百应工作台」时，摘除客户端内置会话视图；系统浏览器窗口不受影响。
+// 内置视图仍供后台探针和自动化流程使用，不承担登录页面展示。
 watch(
   () => props.top,
   (top) => {
@@ -28,10 +39,24 @@ watch(
   <main class="work">
     <div class="crumb">{{ props.top }} / {{ props.nav }}</div>
 
+    <!-- 发布计划在两个顶部菜单下都可访问 -->
+    <template v-if="props.nav === '发布队列'">
+      <div class="query-body">
+        <PublishQueueView />
+      </div>
+    </template>
+
     <!-- 顶部菜单「商品查询」：商品查询主界面 -->
-    <template v-if="props.top === '商品查询'">
+    <template v-else-if="props.top === '商品查询'">
       <div class="query-body">
         <ProductQueryView />
+      </div>
+    </template>
+
+    <!-- 默认入口是实际运营看板；浏览器与链接工具保留在其他工作区中。 -->
+    <template v-else-if="props.nav === '投放看板'">
+      <div class="query-body dashboard-body">
+        <DashboardView @navigate="emit('navigate', $event)" />
       </div>
     </template>
 
@@ -49,10 +74,22 @@ watch(
       </div>
     </template>
 
-    <!-- 默认「百应工作台」：登录面板 + 引擎控制台 -->
-    <template v-else>
+    <template v-else-if="props.nav === '千川管理'">
+      <div class="query-body">
+        <QianchuanOverviewView @navigate="emit('navigate', $event)" />
+      </div>
+    </template>
+
+    <template v-else-if="props.nav === '选品日志'">
+      <div class="query-body">
+        <SelectionLogsView />
+      </div>
+    </template>
+
+    <!-- 账号连接与单条链接解析工具 -->
+    <template v-else-if="props.nav !== '选品设置'">
       <div class="content">
-        <!-- 登录面板：工具栏 + 内置浏览器视图（WebContentsView） -->
+        <!-- 登录面板：系统浏览器打开入口 + 客户端缓存态检查 -->
         <div class="panel browser">
           <BrowserPane />
         </div>
@@ -63,6 +100,11 @@ watch(
         </div>
       </div>
     </template>
+
+    <!-- 首次打开选品后保持组件挂载，切换导航时冷却恢复协调器仍可接收主进程到期事件。 -->
+    <div v-if="selectionSettingsOpened" v-show="props.nav === '选品设置' && props.top !== '商品查询'" class="query-body">
+      <SelectionSettingsView @navigate="emit('navigate', $event)" />
+    </div>
   </main>
 </template>
 
@@ -120,5 +162,9 @@ watch(
   min-width: 0;
   min-height: 0;
   display: flex;
+}
+
+.dashboard-body {
+  overflow: hidden;
 }
 </style>

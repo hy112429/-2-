@@ -6,19 +6,116 @@ import { electronAPI } from '@electron-toolkit/preload'
  *
  * 安全原则：渲染进程不能直接用 Node，也不能拿到原始 ipcRenderer，
  * 只能调用这里**显式暴露**的方法。每暴露一个方法就等于开一个口子，
- * 所以下面按「登录相关」和「内置浏览器」两组严格限定。
+ * 所以下面按「登录相关」和「浏览器入口」两组严格限定。
  */
 
-// ---------------------------------------------------------------- 内置浏览器视图
+// ---------------------------------------------------------------- 托管外部 Chrome 入口
+
+/** 将渲染进程数据转换为 Electron IPC 可安全克隆的普通 JSON 数据。 */
+function toPlainIpcPayload<T>(value: T): T {
+  const serialized = JSON.stringify(value)
+  if (serialized === undefined) {
+    throw new Error('百应选品参数无法转换为跨进程数据。')
+  }
+  return JSON.parse(serialized) as T
+}
 
 const browser = {
   /** 登录目标清单（抖音主站 / 巨量百应） */
   getTargets: (): Promise<Array<{ id: string; name: string; url: string }>> =>
     ipcRenderer.invoke('login:getTargets'),
 
-  /** 打开登录页（会创建/显示内置浏览器视图） */
-  open: (targetId: string): Promise<{ ok: boolean; url: string }> =>
-    ipcRenderer.invoke('browser:open', targetId),
+  /** 使用客户端托管的外部 Chrome profile 打开登录页，并通过 CDP 接入页面 */
+  open: (
+    targetId: string,
+    options?: { profileKey?: string; profilePath?: string }
+  ): Promise<{ ok: boolean; url: string; external: boolean; profilePath?: string; port?: number; title?: string; error?: string }> =>
+    ipcRenderer.invoke('browser:open', targetId, options),
+
+  /** 只读读取当前百应选品广场中真实显示的筛选项与动态选项。 */
+  inspectBaiyingSelection: (options: { profileKey: string; profilePath?: string; includeCategoryTree?: boolean }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('browser:inspectBaiyingSelection', options),
+
+  /** 复用账号专属外部 Chrome profile，只读核验百应和创作者中心登录态。 */
+  checkAccountLogins: (params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('browser:checkAccountLogins', toPlainIpcPayload(params)),
+
+  /** 只读读取账号专属 Chrome 中百应与创作者中心页面是否已打开；不会启动浏览器或检查登录态。 */
+  inspectAccountPages: (params: { accountId: number; profilePath?: string }): Promise<{
+    ok: boolean
+    inspectable: boolean
+    baiyingOpen: boolean
+    creatorCenterOpen: boolean
+  }> => ipcRenderer.invoke('browser:inspectAccountPages', toPlainIpcPayload(params)),
+
+  /** 只解析 profile 并校验自定义目录含 Default，不会启动 Chrome。 */
+  validateProfilePath: (options: { profileKey: string; profilePath?: string }): Promise<{ ok: boolean; path?: string; error?: string }> =>
+    ipcRenderer.invoke('browser:validateProfilePath', options),
+
+  /** 按已保存设置在当前账号的百应选品广场执行一次选品。 */
+  runBaiyingSelection: (params: {
+    profileKey: string
+    profilePath?: string
+    settings: Record<string, unknown>
+    accountId: number
+    accountKey?: string
+    downloadPath: string
+    selectedIndexes?: number[]
+    candidateSnapshot?: unknown[]
+    refreshCandidatesById?: boolean
+    analyzeBeforeCart?: boolean
+    maxSelectedProducts?: number
+    stopAfterCart?: boolean
+    previewOnly?: boolean
+  }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('browser:runBaiyingSelection', toPlainIpcPayload(params)),
+
+  /** 本机选品登记快照；记录仅写入当前客户端 SQLite。 */
+  getSelectionRegistrySnapshot: (accountKey: string, candidates: Array<{ productId: string; leafCategoryId: string }>): Promise<{
+    usedProductIds: string[]
+    accountUsedCategoryIds: string[]
+    categoryUsage: Record<string, number>
+    mode: 'local'
+  }> => ipcRenderer.invoke('selection-registry:snapshot', accountKey, toPlainIpcPayload(candidates)),
+
+  /** 订阅百应选品的实时阶段、类目和商品处理进度。 */
+  onSelectionProgress: (cb: (progress: SelectionProgressPayload) => void): (() => void) =>
+    subscribe('browser:selectionProgress', cb),
+
+  /** 在指定账号的托管 Chrome 中准备作品；autoPublish 仅用于已启用的全自动队列。 */
+  prepareDouyinPublish: (params: {
+    accountId: number
+    profilePath?: string
+    productId: string
+    productName: string
+    productUrl: string
+    videoPath: string
+    description: string
+    queueId?: number
+    autoPublish?: boolean
+  }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('browser:prepareDouyinPublish', toPlainIpcPayload(params)),
+
+  /** 提交本账号已经上传并核对过的视频，不重新上传或关联商品。 */
+  submitDouyinPublish: (params: {
+    accountId: number
+    queueId: number
+    profilePath?: string
+    productId: string
+    productName: string
+    productUrl: string
+    videoPath: string
+    description: string
+  }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('browser:submitDouyinPublish', toPlainIpcPayload(params)),
+
+  /** 订阅手动发布准备过程中的实时阶段。 */
+  onPublishProgress: (cb: (progress: PublishProgressPayload) => void): (() => void) =>
+    subscribe('browser:publishProgress', cb),
+
+  /** 在指定账号专属 profile 中打开创作者中心上传页，不上传或发布。 */
+  openDouyinCreator: (params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('browser:openDouyinCreator', toPlainIpcPayload(params)),
 
   /** 关闭视图（**不会**清登录态，cookie 仍保留） */
   close: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('browser:close'),
@@ -98,9 +195,46 @@ const engine = {
 const dir = {
   /** 当前下载目录（未设置时返回默认值） */
   getDownloadDir: (): Promise<string> => ipcRenderer.invoke('dir:getDownloadDir'),
+  /** 下载目录改变时通知所有窗口 */
+  onDownloadDirChanged: (cb: (path: string) => void): (() => void) =>
+    subscribe('app:downloadDirChanged', cb),
+
+  /** 选择本地 MP4 视频文件；取消返回 null */
+  choosePublishVideoFile: (): Promise<string | null> => ipcRenderer.invoke('dir:choosePublishVideoFile'),
 
   /** 弹出系统目录选择器；返回新目录，取消返回 null */
-  chooseDownloadDir: (): Promise<string | null> => ipcRenderer.invoke('dir:chooseDownloadDir')
+  chooseDownloadDir: (): Promise<string | null> => ipcRenderer.invoke('dir:chooseDownloadDir'),
+  chooseAccountDownloadDir: (): Promise<string | null> => ipcRenderer.invoke('selection:chooseDownloadDir'),
+  chooseProfileDir: (): Promise<string | null> => ipcRenderer.invoke('selection:chooseProfileDir'),
+  validateProfileDir: (path: string): Promise<{ ok: boolean; path?: string; error?: string }> =>
+    ipcRenderer.invoke('selection:validateProfileDir', path),
+  canonicalizePath: (path: string): Promise<{ ok: boolean; path?: string; error?: string }> =>
+    ipcRenderer.invoke('selection:canonicalizePath', path)
+}
+
+/** 冷却 deadline 由 Electron 主进程计时，避免后台渲染进程节流漏掉自动续选。 */
+const selectionCooldown = {
+  schedule: (params: { batchId: string; deadline: number }): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('selection-cooldown:schedule', params),
+  acknowledge: (params: { batchId: string; deadline: number; resumeQueued?: boolean }): Promise<{ ok: boolean; matched: boolean }> =>
+    ipcRenderer.invoke('selection-cooldown:ack', params),
+  trace: (params: { batchId?: string; stage: string; details?: Record<string, unknown> }): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke('selection-cooldown:trace', params),
+  cancel: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('selection-cooldown:cancel'),
+  onExpired: (cb: (event: { batchId: string; deadline: number; sendCount: number }) => void): (() => void) =>
+    subscribe('selection-cooldown:expired', cb)
+}
+
+/** 当前运行版本的数据目录（安装版与开发态隔离）。 */
+const appPaths = {
+  get: (): Promise<{
+    rootDir: string
+    dataDir: string
+    databasePath: string
+    databaseExists: boolean
+    downloadsDir: string
+    browserProfilesDir: string
+  }> => ipcRenderer.invoke('app:getPaths')
 }
 
 // ---------------------------------------------------------------- 素材库辅助（缩略图 / 打开文件夹）
@@ -158,16 +292,16 @@ const toutiao = {
  * 切换即换分区天然不串号；safeStorage 加密备份；指纹隔离。
  */
 const account = {
-  /** 打开浏览器登录（该账号独立分区） */
-  openBrowser: (accountId: number): Promise<{ ok: boolean; url: string; error?: string }> =>
-    ipcRenderer.invoke('account:openBrowser', accountId),
+  /** 在该账号专属托管 Chrome profile 打开抖音登录页 */
+  openBrowser: (accountId: number, profilePath?: string): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }> =>
+    ipcRenderer.invoke('account:openBrowser', { accountId, profilePath }),
 
   /** 关闭浏览器视图（登录态保留） */
   closeBrowser: (): Promise<{ ok: boolean }> => ipcRenderer.invoke('account:closeBrowser'),
 
   /** 打开精选页（巨量百应选品广场，SRS FR-G4-01） */
-  openJingxuan: (accountId: number): Promise<{ ok: boolean; url: string; error?: string }> =>
-    ipcRenderer.invoke('account:openJingxuan', accountId),
+  openJingxuan: (accountId: number, profilePath?: string): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }> =>
+    ipcRenderer.invoke('account:openJingxuan', { accountId, profilePath }),
 
   /** 拉取账号公开信息（昵称/粉丝数/作品数，写库由渲染进程调引擎完成） */
   pullInfo: (params: { accountId: number; douyinId: string }): Promise<AccountUserInfo | { error: string } | null> =>
@@ -206,8 +340,8 @@ const account = {
 
 /** 千川账户登录态：独立分区（persist:qc-{id}），与抖音账号分区互不共用（A-12 多开隔离） */
 const qianchuan = {
-  /** 登录千川（该千川账户独立分区） */
-  openLogin: (qcId: number): Promise<{ ok: boolean; url: string; error?: string }> =>
+  /** 在该千川账户专属托管 Chrome profile 打开登录页 */
+  openLogin: (qcId: number): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }> =>
     ipcRenderer.invoke('qianchuan:openLogin', qcId),
 
   checkLogin: (qcId: number): Promise<AccountLoginState> =>
@@ -217,7 +351,26 @@ const qianchuan = {
     ipcRenderer.invoke('qianchuan:exportForEngine', qcId),
 
   clearLogin: (qcId: number): Promise<{ ok: boolean }> =>
-    ipcRenderer.invoke('qianchuan:clearLogin', qcId)
+    ipcRenderer.invoke('qianchuan:clearLogin', qcId),
+
+  /** Step 17 上传队列：所有可写操作由主进程校验并落库。 */
+  uploadTargets: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:targets'),
+  eligibleAssets: (accountId: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:eligibleAssets', accountId),
+  uploadJobs: (accountId?: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:jobs', accountId),
+  enqueueUpload: (params: { accountId: number; assetIds: number[]; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:enqueue', params),
+  runUpload: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:run', jobId),
+  retrySafeUpload: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:retrySafe', jobId),
+  reviewUploadAbsent: (params: { id: number; note: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:reviewAbsent', params),
+  reviewUploadPresent: (params: { id: number; remoteMaterialId: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:reviewPresent', params),
+  quotaConfig: (accountId?: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:quotaConfig', accountId),
+  setQuotaConfig: (params: { accountId: number; perProductVideos: number; perAccountProducts: number; perAccountVideos: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:setQuotaConfig', params)
 }
 
 /** 去水印辅助：抽视频帧 + 暂存用户框选的水印模板 */
@@ -260,9 +413,20 @@ function subscribe<T>(channel: string, cb: (payload: T) => void): () => void {
 const api = {
   appInfo: {
     name: '投广管理客户端',
-    version: '0.0.1'
+    getVersion: (): Promise<string> => ipcRenderer.invoke('app:getVersion')
   },
+  appPaths,
   browser,
+  selectionCooldown,
+  publish: {
+    getProgress: (): Promise<PublishProgressPayload> => ipcRenderer.invoke('publish:autoProgress:get'),
+    runNow: (queueId: number): Promise<PublishProgressPayload> => ipcRenderer.invoke('publish:autoRun', queueId),
+    runImmediately: (queueId: number): Promise<PublishProgressPayload> => ipcRenderer.invoke('publish:runImmediately', queueId),
+    retryManually: (queueId: number, options: { confirmedNotSubmitted?: boolean; confirmedNoDraft?: boolean } = {}): Promise<PublishProgressPayload> =>
+      ipcRenderer.invoke('publish:retryManually', queueId, toPlainIpcPayload(options)),
+    onProgress: (cb: (progress: PublishProgressPayload) => void): (() => void) =>
+      subscribe('publish:autoProgress', cb)
+  },
   login,
   engine,
   dir,
@@ -395,6 +559,36 @@ export interface EngineEventPayload {
   attempts?: number
   /** 队列任务落盘路径（success / skipped 时携带） */
   file_path?: string
+}
+
+/** 百应选品过程实时进度（账号/类目/商品维度）。 */
+export interface SelectionProgressPayload {
+  accountId: number
+  stage: string
+  message?: string
+  index?: number
+  total?: number
+  percent?: number
+  unit?: string
+  indeterminate?: boolean
+  productId?: string
+  productTitle?: string
+}
+
+/** 自动发布或手动上传准备的队列进度。 */
+export interface PublishProgressPayload {
+  state: 'idle' | 'running' | 'succeeded' | 'warning' | 'failed'
+  accountId?: number
+  queueId?: number
+  productName?: string
+  stage: string
+  message?: string
+  percent?: number
+  indeterminate?: boolean
+  updatedAt?: string
+  error?: string
+  classification?: string
+  canConfirmNoDraft?: boolean
 }
 
 /** engine:run 入参 */

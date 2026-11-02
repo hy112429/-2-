@@ -1,20 +1,18 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { notifyGlobal } from '../utils/notifications'
 
-/**
- * 登录面板 = 工具栏 + 内置浏览器视图的宿主容器
- *
- * 关键机制：WebContentsView 不是 DOM 元素，而是**覆盖在页面之上的独立图层**。
- * 所以这里只负责测出「宿主容器在窗口里的位置」并上报给主进程，
- * 主进程再照着这个位置摆放真正的浏览器视图。
- */
+const props = defineProps<{ defaultTarget?: string; profileKey?: string; profilePath?: string }>()
 
 const targets = ref<LoginTarget[]>([])
 const targetId = ref('')
-const viewState = ref<BrowserViewState>({ open: false })
 const loginState = ref<LoginState | null>(null)
 const busy = ref(false)
 const notice = ref('')
+
+watch(notice, (message) => {
+  if (message) notifyGlobal(message)
+})
 
 /** 最近一次「导出给引擎」的自检结果（不含任何 cookie 值） */
 const lastExport = ref<{
@@ -24,25 +22,7 @@ const lastExport = ref<{
   userAgent: string
 } | null>(null)
 
-const hostEl = ref<HTMLDivElement | null>(null)
-
-let resizeObserver: ResizeObserver | null = null
 const unsubscribers: Array<() => void> = []
-
-// ---------------------------------------------------------------- 位置同步
-
-/** 测出宿主容器的位置与尺寸，上报给主进程 */
-function syncBounds(): void {
-  const el = hostEl.value
-  if (!el) return
-  const rect = el.getBoundingClientRect()
-  window.api.browser.setBounds({
-    x: Math.round(rect.left),
-    y: Math.round(rect.top),
-    width: Math.round(rect.width),
-    height: Math.round(rect.height)
-  })
-}
 
 // ---------------------------------------------------------------- 操作
 
@@ -50,34 +30,30 @@ async function openLogin(): Promise<void> {
   busy.value = true
   notice.value = ''
   try {
-    // 必须先上报位置再打开：主进程是按「上次上报的位置」摆放视图的，
-    // 顺序反了会先闪一个错位的窗口
-    syncBounds()
-    await window.api.browser.open(targetId.value)
-    viewState.value = await window.api.browser.getState()
+    const result = await window.api.browser.open(targetId.value, {
+      profileKey: props.profileKey ?? 'general',
+      profilePath: props.profilePath || undefined
+    })
+    if (!result.ok) throw new Error(result.error ?? '托管 Chrome 打开失败')
+    const targetName = targets.value.find((item) => item.id === targetId.value)?.name ?? '登录页'
+    let destination = ''
+    let platformLoginLanding = false
+    try {
+      const current = new URL(result.url)
+      destination = `${current.origin}${current.pathname}`
+      platformLoginLanding = targetId.value === 'baiying' &&
+        (current.hostname.endsWith('douyinec.com') || current.pathname.includes('/mpa/account/login'))
+    } catch {
+      /* 页面地址解析失败不影响已打开的 Chrome 会话 */
+    }
+    notice.value = platformLoginLanding
+      ? `已在托管 Chrome 打开百应入口，但平台当前跳转到了登录页/首页${destination ? `（${destination}）` : ''}。请在这个 Chrome profile 登录百应，再点击一次“在托管 Chrome 打开”。CDP 已连接。`
+      : `已在独立 Chrome profile 打开${targetName}${destination ? `（${destination}）` : ''}。CDP 已连接，自动化会使用同一 profile；Electron 内置缓存仍相互独立。`
   } catch (error) {
     notice.value = `打开登录页失败：${String(error)}`
   } finally {
     busy.value = false
   }
-}
-
-async function closeView(): Promise<void> {
-  await window.api.browser.close()
-  viewState.value = await window.api.browser.getState()
-}
-
-// 模板里不能直接写 window.xxx（Vue 模板作用域不含 window），必须包一层
-async function goBack(): Promise<void> {
-  await window.api.browser.goBack()
-}
-
-async function goForward(): Promise<void> {
-  await window.api.browser.goForward()
-}
-
-async function reload(): Promise<void> {
-  await window.api.browser.reload()
 }
 
 async function checkLogin(): Promise<void> {
@@ -90,14 +66,14 @@ async function checkLogin(): Promise<void> {
 }
 
 async function logout(): Promise<void> {
-  const ok = window.confirm('确定要退出登录吗？将清除抖音 / 百应相关的 cookie。')
+  const ok = window.confirm('确定清除客户端内置登录缓存吗？这不会退出托管 Chrome profile 中的账号。')
   if (!ok) return
   busy.value = true
   try {
     await window.api.login.clear()
     loginState.value = await window.api.login.check()
     lastExport.value = null
-    notice.value = '已清除登录态'
+    notice.value = '已清除客户端内置登录缓存；托管 Chrome profile 登录态未更改。'
   } finally {
     busy.value = false
   }
@@ -121,7 +97,7 @@ async function exportForEngine(): Promise<void> {
       userAgent: session.userAgent
     }
     if (session.cookieCount === 0) {
-      notice.value = '没有可导出的 cookie，请先完成扫码登录'
+      notice.value = '客户端内置分区没有可导出的 cookie。托管 Chrome profile 登录态不会复制到这里。'
     }
   } catch (error) {
     notice.value = `导出失败：${String(error)}`
@@ -150,43 +126,22 @@ const backupText = computed(() => {
 // ---------------------------------------------------------------- 生命周期
 
 onMounted(async () => {
+  // 切换版本后若进程里还挂着旧内置登录视图，先摘除覆盖层；登录缓存本身不清除。
+  await window.api.browser.close()
   targets.value = await window.api.browser.getTargets()
-  if (targets.value.length > 0) targetId.value = targets.value[0].id
-
-  viewState.value = await window.api.browser.getState()
-  loginState.value = await window.api.login.check()
-
-  // 监听宿主容器尺寸变化（侧栏折叠、窗口缩放都会触发）
-  if (hostEl.value) {
-    resizeObserver = new ResizeObserver(() => syncBounds())
-    resizeObserver.observe(hostEl.value)
+  if (targets.value.length > 0) {
+    targetId.value = targets.value.find((target) => target.id === props.defaultTarget)?.id ?? targets.value[0].id
   }
 
-  unsubscribers.push(window.api.browser.onStateChanged((s) => (viewState.value = s)))
-
-  // 主进程在窗口 resize 时会主动要一次位置
-  unsubscribers.push(window.api.browser.onNeedBounds(() => syncBounds()))
-
-  unsubscribers.push(
-    window.api.browser.onLoadFailed((e) => {
-      notice.value = `页面加载失败（${e.code} ${e.desc}）`
-    })
-  )
-
-  // 扫码成功后主进程会自动推送，不用手动点按钮
+  loginState.value = await window.api.login.check()
+  // 只显示客户端内置分区的状态；托管 Chrome profile 的状态由 CDP 连接使用。
   unsubscribers.push(window.api.login.onStateChanged((s) => (loginState.value = s)))
-
-  // 布局稳定后再量一次，避免首帧尺寸为 0
-  requestAnimationFrame(() => syncBounds())
 })
 
 onBeforeUnmount(() => {
-  resizeObserver?.disconnect()
-  resizeObserver = null
+  void window.api.browser.close()
   unsubscribers.forEach((off) => off())
   unsubscribers.length = 0
-  // 组件卸载时把覆盖层收掉，避免残留一个看不见的浏览器视图挡住界面
-  void window.api.browser.close()
 })
 </script>
 
@@ -200,29 +155,20 @@ onBeforeUnmount(() => {
         <option v-for="t in targets" :key="t.id" :value="t.id">{{ t.name }}</option>
       </select>
 
-      <button class="btn primary" :disabled="busy" @click="openLogin">
-        {{ viewState.open ? '重新打开登录页' : '打开登录页' }}
-      </button>
-
-      <button class="btn" :disabled="busy || !viewState.open" @click="closeView">关闭视图</button>
-
-      <span class="divider" />
-
-      <button class="btn" :disabled="busy || !viewState.open" title="后退" @click="goBack">←</button>
-      <button class="btn" :disabled="busy || !viewState.open" title="前进" @click="goForward">→</button>
-      <button class="btn" :disabled="busy || !viewState.open" title="刷新" @click="reload">⟳</button>
+      <button class="btn primary" :disabled="busy" @click="openLogin">在托管 Chrome 打开</button>
 
       <span class="spacer" />
 
-      <button class="btn" :disabled="busy" @click="checkLogin">检查登录状态</button>
-      <button class="btn" :disabled="busy" @click="exportForEngine">导出给引擎（自检）</button>
-      <button class="btn danger" :disabled="busy" @click="logout">登出</button>
+      <button class="btn" :disabled="busy" @click="checkLogin">检查客户端缓存态</button>
+      <button class="btn" :disabled="busy" @click="exportForEngine">检查客户端缓存导出</button>
+      <button class="btn danger" :disabled="busy" @click="logout">清除客户端缓存</button>
     </div>
 
     <!-- ---------- 登录态摘要 ---------- -->
+    <div class="session-note">以下只显示客户端内置分区缓存；托管 Chrome profile 登录态由 Playwright CDP 使用。</div>
     <div class="status">
       <span class="badge" :class="currentTargetState()?.loggedIn ? 'on' : 'off'">
-        {{ currentTargetState()?.loggedIn ? '● 已登录' : '○ 未登录' }}
+        {{ currentTargetState()?.loggedIn ? '● 客户端缓存已登录' : '○ 客户端缓存未登录' }}
       </span>
 
       <span class="meta">
@@ -261,13 +207,9 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- ---------- 浏览器视图宿主 ---------- -->
-    <div ref="hostEl" class="host">
-      <div v-if="!viewState.open" class="host-placeholder">
-        <div class="ph-title">内置浏览器视图</div>
-        <div class="ph-sub">选择目标后点「打开登录页」，用手机扫码完成登录</div>
-        <div class="ph-hint">登录态会加密保存在本地，下次启动自动恢复</div>
-      </div>
+    <div class="external-note">
+      <div class="ph-title">登录页面在 Electron 外部的托管 Chrome 打开</div>
+      <div class="ph-sub">客户端通过仅限本机的 CDP 连接复用该 Chrome profile，供页面捕获和自动化使用；登录态不会复制进 Electron 内置缓存。</div>
     </div>
   </section>
 </template>
@@ -280,6 +222,20 @@ onBeforeUnmount(() => {
   min-height: 0;
   height: 100%;
 }
+
+.session-note,
+.external-note {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.external-note { margin-top: auto; }
+.ph-title { margin-bottom: 4px; color: var(--text); font-weight: 600; }
 
 /* ---------- 工具栏 ---------- */
 .toolbar {

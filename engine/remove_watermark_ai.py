@@ -14,6 +14,7 @@ remove_watermark_ai.py —— AI 视频去水印（Moonshine：SLBR 检测 + LaM
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing
 import os
 import shutil
@@ -159,6 +160,68 @@ def _write_progress(path, worker_id, count, done=False):
         pass
 
 
+def detect_video_watermark(video_path: str, sample_count: int = 5) -> dict:
+    """抽样检测水印；少量命中时返回待核查，避免把场景文字误当水印自动修掉。"""
+    import cv2
+    from moonshine_server.moonshine.slbr_runner import SlbrRunner
+
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 0:
+        cap.release()
+        raise ValueError("无法读取视频帧数")
+
+    frames = sorted({round(i * (total - 1) / max(1, sample_count - 1)) for i in range(sample_count)})
+    slbr = SlbrRunner(MODEL_DIR, device="cpu")
+    slbr._load_model()
+    hits = []
+    positions = []
+    for frame_no in frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        height, width = frame.shape[:2]
+        low_height = max(64, int(round(height * 360 / width)))
+        low = cv2.resize(frame, (360, low_height))
+        _, mask = slbr.infer_bgr(low, tile_size=256, tile_batch=4)
+        value = mask[:, :, 0] if mask.ndim == 3 else mask
+        full_mask = cv2.resize(value, (width, height), interpolation=cv2.INTER_NEAREST)
+        boxes = main_mask_boxes(full_mask, width, height)
+        if boxes:
+            hits.append(frame_no)
+            x0 = min(box[0] for box in boxes)
+            y0 = min(box[1] for box in boxes)
+            x1 = max(box[2] for box in boxes)
+            y1 = max(box[3] for box in boxes)
+            positions.append(((x0 + x1) / 2, (y0 + y1) / 2))
+    cap.release()
+
+    if not hits:
+        return {"status": "no_watermark", "detected_frames": 0, "sampled_frames": frames}
+    if len(hits) < 2:
+        return {
+            "status": "needs_review",
+            "detected_frames": len(hits),
+            "sampled_frames": frames,
+            "message": "只在少数抽样帧检测到遮挡，自动判定不可靠",
+        }
+    movement = max(
+        (math.dist(left, right) for left in positions for right in positions),
+        default=0.0,
+    )
+    movement_threshold = max(12.0, math.hypot(width, height) * 0.015)
+    if movement < movement_threshold:
+        return {
+            "status": "needs_review",
+            "detected_frames": len(hits),
+            "sampled_frames": frames,
+            "movement_px": round(movement, 1),
+            "message": "检测到固定位置遮挡，可能是包装文字或字幕；自动流程保留原视频并转待核查",
+        }
+    return {"status": "watermark_detected", "detected_frames": len(hits), "sampled_frames": frames}
+
+
 # ---------------------------------------------------------------- ffmpeg 定位
 
 def resolve_ffmpeg() -> str:
@@ -188,6 +251,7 @@ def main() -> int:
     video_path = str(data.get("video_path") or "")
     workers = int(data.get("workers") or 2)
     out_path = str(data.get("out_path") or "")
+    auto_detect = data.get("auto_detect") is True
 
     if not video_path or not Path(video_path).is_file():
         emit({"type": "error", "message": "视频文件不存在，请重新选择"})
@@ -208,6 +272,25 @@ def main() -> int:
         return 1
 
     _setup_env()
+    if auto_detect:
+        emit({"type": "stage", "stage": "AI 抽样检测水印中…", "percent": 2})
+        try:
+            detection = detect_video_watermark(video_path)
+        except Exception as exc:  # noqa: BLE001
+            emit({"type": "error", "message": f"AI 水印检测失败：{exc}"})
+            return 1
+        if detection["status"] != "watermark_detected":
+            emit({
+                "type": "result",
+                "data": {
+                    "ok": detection["status"] == "no_watermark",
+                    **detection,
+                    "file_path": video_path,
+                    "processed": False,
+                },
+            })
+            return 0 if detection["status"] == "no_watermark" else 2
+
     workers = max(1, min(workers, total_frames, 8))
     emit({"type": "stage", "stage": f"AI 去水印：共 {total_frames} 帧，{workers} 进程并行（纯 CPU，耗时较长）", "percent": 0})
 

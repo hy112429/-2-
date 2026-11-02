@@ -1,0 +1,3756 @@
+{
+  "formatVersion": 1,
+  "source": "本机已捕获的百应真实响应缓存",
+  "capturedAt": {
+    "categories": "2026-10-23T20:24:54",
+    "filters": "2026-10-21T18:38:03"
+  },
+  "categories": [
+    {
+      "id": "4",
+      "name": "服饰内衣",
+      "children": []
+    },
+    {
+      "id": "9",
+      "name": "美妆",
+      "children": []
+    },
+    {
+      "id": "13",
+      "name": "食品饮料",
+      "children": [
+        {
+          "id": "1000000724",
+          "name": "休闲食品",
+          "children": [
+            {
+              "id": "1000000738",
+              "name": "其他零食",
+              "children": []
+            },
+            {
+              "id": "1000009094",
+              "name": "冰淇淋",
+              "children": []
+            },
+            {
+              "id": "1000000728",
+              "name": "坚果炒货",
+              "children": []
+            },
+            {
+              "id": "1000000732",
+              "name": "巧克力",
+              "children": []
+            },
+            {
+              "id": "1000000727",
+              "name": "海味零食",
+              "children": []
+            },
+            {
+              "id": "1000000730",
+              "name": "糕点/点心",
+              "children": []
+            },
+            {
+              "id": "1000009095",
+              "name": "糖果/果冻/布丁",
+              "children": []
+            },
+            {
+              "id": "1000000734",
+              "name": "素食零食",
+              "children": []
+            },
+            {
+              "id": "1000000735",
+              "name": "肉蛋零食",
+              "children": []
+            },
+            {
+              "id": "1000000736",
+              "name": "膨化食品",
+              "children": []
+            },
+            {
+              "id": "1000000737",
+              "name": "蜜饯果干",
+              "children": []
+            },
+            {
+              "id": "1000000729",
+              "name": "面包",
+              "children": []
+            },
+            {
+              "id": "1000000731",
+              "name": "饼干",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "1000001823",
+          "name": "水饮冲调",
+          "children": [
+            {
+              "id": "1000001833",
+              "name": "乳制品",
+              "children": []
+            },
+            {
+              "id": "1000001832",
+              "name": "冲饮谷物",
+              "children": []
+            },
+            {
+              "id": "1000001834",
+              "name": "咖啡及辅料",
+              "children": []
+            },
+            {
+              "id": "1000001837",
+              "name": "茶叶",
+              "children": []
+            },
+            {
+              "id": "1000001836",
+              "name": "饮料",
+              "children": []
+            },
+            {
+              "id": "1000001835",
+              "name": "饮用水",
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "1000009090",
+          "name": "粮油干货/方便速食",
+          "children": [
+            {
+              "id": "1000009123",
+              "name": "五谷杂粮",
+              "children": []
+            },
+            {
+              "id": "1000009124",
+              "name": "干货",
+              "children": []
+            },
+            {
+              "id": "1000009125",
+              "name": "方便速食",
+              "children": []
+            },
+            {
+              "id": "1000009126",
+              "name": "烘焙材料",
+              "children": []
+            },
+            {
+              "id": "1000009127",
+              "name": "罐头",
+              "children": []
+            },
+            {
+              "id": "1000009128",
+              "name": "调味品",
+              "children": []
+            },
+            {
+              "id": "1000009129",
+              "name": "食品添加剂",
+              "children": []
+            },
+            {
+              "id": "1000009130",
+              "name": "食用油",
+              "children": []
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "5",
+      "name": "个护家清",
+      "children": []
+    },
+    {
+      "id": "16",
+      "name": "鞋靴箱包",
+      "children": []
+    },
+    {
+      "id": "19",
+      "name": "钟表配饰",
+      "children": []
+    },
+    {
+      "id": "10",
+      "name": "母婴宠物",
+      "children": []
+    },
+    {
+      "id": "15",
+      "name": "图书教育",
+      "children": []
+    },
+    {
+      "id": "7",
+      "name": "智能家居",
+      "children": []
+    },
+    {
+      "id": "14",
+      "name": "3C数码家电",
+      "children": []
+    },
+    {
+      "id": "18",
+      "name": "运动户外",
+      "children": []
+    },
+    {
+      "id": "11",
+      "name": "鲜花园艺",
+      "children": []
+    },
+    {
+      "id": "2",
+      "name": "玩具乐器",
+      "children": []
+    },
+    {
+      "id": "8",
+      "name": "生鲜",
+      "children": []
+    },
+    {
+      "id": "17",
+      "name": "虚拟充值",
+      "children": []
+    },
+    {
+      "id": "12",
+      "name": "本地生活",
+      "children": []
+    },
+    {
+      "id": "20",
+      "name": "珠宝文玩",
+      "children": []
+    }
+  ],
+  "filterCatalog": {
+    "filters": {
+      "月销": [
+        "不限",
+        "500以下",
+        "≥500",
+        "≥1000",
+        "≥5000",
+        "≥1w",
+        "≥5w",
+        "≥10w",
+        "≥50w",
+        "≥100w"
+      ],
+      "浏览量": [
+        "不限",
+        "500以下",
+        "≥500",
+        "≥1000",
+        "≥5000",
+        "≥1w",
+        "≥5w",
+        "≥10w",
+        "≥50w",
+        "≥100w"
+      ],
+      "带货达人数": [
+        "不限",
+        "500以下",
+        "≥500",
+        "≥1000",
+        "≥5000",
+        "≥1w",
+        "≥5w",
+        "≥10w",
+        "≥50w",
+        "≥100w"
+      ],
+      "售价区间": [
+        "不限",
+        "￥0-￥10",
+        "￥10-￥30",
+        "￥30-￥50",
+        "￥50-￥100",
+        "￥100-￥500",
+        "≥￥500"
+      ],
+      "佣金区间": [
+        "不限",
+        "0%-10%",
+        "10%-20%",
+        "20%-30%",
+        "30%-40%",
+        "40%-50%",
+        "≥50%"
+      ],
+      "商家体验分": [
+        "不限",
+        "80分以上",
+        "85分以上",
+        "90分以上",
+        "95分以上"
+      ],
+      "好评率": [
+        "不限",
+        "≥80%",
+        "≥85%",
+        "≥90%",
+        "≥95%"
+      ],
+      "服务与权益": [
+        "现货",
+        "免费申样",
+        "包邮",
+        "运费险",
+        "分期免息",
+        "短视频随心推",
+        "正品溯源"
+      ],
+      "流量助推": [
+        "商家投千川",
+        "自动投千川"
+      ]
+    },
+    "filterGroups": {
+      "带货情况": [
+        {
+          "label": "月销",
+          "options": [
+            "不限",
+            "500以下",
+            "≥500",
+            "≥1000",
+            "≥5000",
+            "≥1w",
+            "≥5w",
+            "≥10w",
+            "≥50w",
+            "≥100w"
+          ],
+          "multiple": false
+        },
+        {
+          "label": "浏览量",
+          "options": [
+            "不限",
+            "500以下",
+            "≥500",
+            "≥1000",
+            "≥5000",
+            "≥1w",
+            "≥5w",
+            "≥10w",
+            "≥50w",
+            "≥100w"
+          ],
+          "multiple": false
+        },
+        {
+          "label": "带货达人数",
+          "options": [
+            "不限",
+            "500以下",
+            "≥500",
+            "≥1000",
+            "≥5000",
+            "≥1w",
+            "≥5w",
+            "≥10w",
+            "≥50w",
+            "≥100w"
+          ],
+          "multiple": false
+        }
+      ],
+      "商品信息": [
+        {
+          "label": "售价区间",
+          "options": [
+            "不限",
+            "￥0-￥10",
+            "￥10-￥30",
+            "￥30-￥50",
+            "￥50-￥100",
+            "￥100-￥500",
+            "≥￥500"
+          ],
+          "multiple": false
+        },
+        {
+          "label": "佣金区间",
+          "options": [
+            "不限",
+            "0%-10%",
+            "10%-20%",
+            "20%-30%",
+            "30%-40%",
+            "40%-50%",
+            "≥50%"
+          ],
+          "multiple": false
+        },
+        {
+          "label": "商家体验分",
+          "options": [
+            "不限",
+            "80分以上",
+            "85分以上",
+            "90分以上",
+            "95分以上"
+          ],
+          "multiple": false
+        },
+        {
+          "label": "好评率",
+          "options": [
+            "不限",
+            "≥80%",
+            "≥85%",
+            "≥90%",
+            "≥95%"
+          ],
+          "multiple": false
+        },
+        {
+          "label": "服务与权益",
+          "options": [
+            "现货",
+            "免费申样",
+            "包邮",
+            "运费险",
+            "分期免息",
+            "短视频随心推",
+            "正品溯源"
+          ],
+          "multiple": true
+        },
+        {
+          "label": "流量助推",
+          "options": [
+            "商家投千川",
+            "自动投千川"
+          ],
+          "multiple": true
+        }
+      ],
+      "特色货品": []
+    },
+    "features": [
+      "高结算率",
+      "品牌",
+      "新品",
+      "低价好货"
+    ],
+    "categoryRoots": [
+      {
+        "id": "4",
+        "name": "服饰内衣",
+        "children": [
+          {
+            "id": "1000003282",
+            "name": "服装",
+            "children": [
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003290",
+                "name": "儿童配饰",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000009114",
+                "name": "内衣裤袜",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003288",
+                "name": "功能性运动服",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000007899",
+                "name": "奢品服饰",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003285",
+                "name": "女装",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000007901",
+                "name": "户外潮服（鉴真）",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003289",
+                "name": "服装配饰",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003284",
+                "name": "特殊服装",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003287",
+                "name": "男装",
+                "children": []
+              },
+              {
+                "id": "1000003282__RC_CASCADER_SPLIT__1000003283",
+                "name": "童装",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "9",
+        "name": "美妆",
+        "children": [
+          {
+            "id": "1000002395",
+            "name": "彩妆香水",
+            "children": [
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000002413",
+                "name": "其他彩妆用品",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000002412",
+                "name": "唇部彩妆",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000007909",
+                "name": "奢品彩妆",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000002411",
+                "name": "眼部彩妆",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000002410",
+                "name": "美妆工具",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000009111",
+                "name": "美甲产品",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000002408",
+                "name": "面部彩妆",
+                "children": []
+              },
+              {
+                "id": "1000002395__RC_CASCADER_SPLIT__1000002407",
+                "name": "香水/香膏",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "13",
+        "name": "食品饮料",
+        "children": [
+          {
+            "id": "1000000724",
+            "name": "休闲食品",
+            "children": [
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000738",
+                "name": "其他零食",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000009094",
+                "name": "冰淇淋",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000728",
+                "name": "坚果炒货",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000732",
+                "name": "巧克力",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000727",
+                "name": "海味零食",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000730",
+                "name": "糕点/点心",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000009095",
+                "name": "糖果/果冻/布丁",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000734",
+                "name": "素食零食",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000735",
+                "name": "肉蛋零食",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000736",
+                "name": "膨化食品",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000737",
+                "name": "蜜饯果干",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000729",
+                "name": "面包",
+                "children": []
+              },
+              {
+                "id": "1000000724__RC_CASCADER_SPLIT__1000000731",
+                "name": "饼干",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000001823",
+            "name": "水饮冲调",
+            "children": [
+              {
+                "id": "1000001823__RC_CASCADER_SPLIT__1000001833",
+                "name": "乳制品",
+                "children": []
+              },
+              {
+                "id": "1000001823__RC_CASCADER_SPLIT__1000001832",
+                "name": "冲饮谷物",
+                "children": []
+              },
+              {
+                "id": "1000001823__RC_CASCADER_SPLIT__1000001834",
+                "name": "咖啡及辅料",
+                "children": []
+              },
+              {
+                "id": "1000001823__RC_CASCADER_SPLIT__1000001837",
+                "name": "茶叶",
+                "children": []
+              },
+              {
+                "id": "1000001823__RC_CASCADER_SPLIT__1000001836",
+                "name": "饮料",
+                "children": []
+              },
+              {
+                "id": "1000001823__RC_CASCADER_SPLIT__1000001835",
+                "name": "饮用水",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000009090",
+            "name": "粮油干货/方便速食",
+            "children": [
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009123",
+                "name": "五谷杂粮",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009124",
+                "name": "干货",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009125",
+                "name": "方便速食",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009126",
+                "name": "烘焙材料",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009127",
+                "name": "罐头",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009128",
+                "name": "调味品",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009129",
+                "name": "食品添加剂",
+                "children": []
+              },
+              {
+                "id": "1000009090__RC_CASCADER_SPLIT__1000009130",
+                "name": "食用油",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "5",
+        "name": "个护家清",
+        "children": [
+          {
+            "id": "1000003462",
+            "name": "个人护理",
+            "children": [
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003473",
+                "name": "假发",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003474",
+                "name": "口腔护理",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003467",
+                "name": "唇部护理",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000009093",
+                "name": "奢品护肤",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003475",
+                "name": "成人护理",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003464",
+                "name": "手部洗护",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003472",
+                "name": "染发烫发",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003471",
+                "name": "洗发护发",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003470",
+                "name": "洗护美用具",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003469",
+                "name": "眼部护理",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003468",
+                "name": "私处洗护",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003466",
+                "name": "身体护理",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003465",
+                "name": "身体清洁",
+                "children": []
+              },
+              {
+                "id": "1000003462__RC_CASCADER_SPLIT__1000003463",
+                "name": "面部洗护",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000004647",
+            "name": "家清纸品",
+            "children": [
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004656",
+                "name": "家务工具",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004649",
+                "name": "家庭环境清洁",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004658",
+                "name": "消毒用品",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004657",
+                "name": "湿巾",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004654",
+                "name": "灭蝇用品",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004650",
+                "name": "电器清洁",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004660",
+                "name": "纸品",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004659",
+                "name": "衣物清洁",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004648",
+                "name": "除臭用品",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004652",
+                "name": "除螨用品",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004655",
+                "name": "驱虫用品",
+                "children": []
+              },
+              {
+                "id": "1000004647__RC_CASCADER_SPLIT__1000004651",
+                "name": "驱蚊用品",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "16",
+        "name": "鞋靴箱包",
+        "children": [
+          {
+            "id": "1000000958",
+            "name": "箱包",
+            "children": [
+              {
+                "id": "1000000958__RC_CASCADER_SPLIT__1000000963",
+                "name": "功能箱包",
+                "children": []
+              },
+              {
+                "id": "1000000958__RC_CASCADER_SPLIT__1000007872",
+                "name": "奢品箱包",
+                "children": []
+              },
+              {
+                "id": "1000000958__RC_CASCADER_SPLIT__1000000964",
+                "name": "时尚箱包",
+                "children": []
+              },
+              {
+                "id": "1000000958__RC_CASCADER_SPLIT__1000000966",
+                "name": "箱包配件",
+                "children": []
+              },
+              {
+                "id": "1000000958__RC_CASCADER_SPLIT__1000007912",
+                "name": "箱包（鉴真）",
+                "children": []
+              },
+              {
+                "id": "1000000958__RC_CASCADER_SPLIT__1000000965",
+                "name": "随身小包",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000000957",
+            "name": "鞋靴",
+            "children": [
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000007891",
+                "name": "奢品鞋靴",
+                "children": []
+              },
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000000961",
+                "name": "女鞋",
+                "children": []
+              },
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000007905",
+                "name": "潮鞋（鉴真）",
+                "children": []
+              },
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000000962",
+                "name": "男鞋",
+                "children": []
+              },
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000000960",
+                "name": "童鞋",
+                "children": []
+              },
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000000959",
+                "name": "运动户外及功能鞋",
+                "children": []
+              },
+              {
+                "id": "1000000957__RC_CASCADER_SPLIT__1000000967",
+                "name": "鞋配件",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "19",
+        "name": "钟表配饰",
+        "children": [
+          {
+            "id": "1000001822",
+            "name": "时尚饰品",
+            "children": [
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001831",
+                "name": "DIY配件",
+                "children": []
+              },
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001829",
+                "name": "功能饰品",
+                "children": []
+              },
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001828",
+                "name": "发饰",
+                "children": []
+              },
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001830",
+                "name": "婚庆饰品",
+                "children": []
+              },
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001826",
+                "name": "手饰",
+                "children": []
+              },
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001827",
+                "name": "耳饰",
+                "children": []
+              },
+              {
+                "id": "1000001822__RC_CASCADER_SPLIT__1000001825",
+                "name": "项链",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000000026",
+            "name": "钟表眼镜",
+            "children": [
+              {
+                "id": "1000000026__RC_CASCADER_SPLIT__1000007887",
+                "name": "眼镜及配件",
+                "children": []
+              },
+              {
+                "id": "1000000026__RC_CASCADER_SPLIT__1000000079",
+                "name": "钟表类",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "10",
+        "name": "母婴宠物",
+        "children": [
+          {
+            "id": "1000002529",
+            "name": "宠物生活",
+            "children": [
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002545",
+                "name": "兔类食品/用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002547",
+                "name": "宠物周边",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002541",
+                "name": "宠物智能设备",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002540",
+                "name": "宠物服饰及配件",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002530",
+                "name": "宠物活体",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002542",
+                "name": "宠物药品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002539",
+                "name": "小宠食品/用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002537",
+                "name": "水族食品/用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000009099",
+                "name": "爬宠鸣虫食品/用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002532",
+                "name": "狗食品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002544",
+                "name": "猫/狗医疗用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002535",
+                "name": "猫/狗日用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002534",
+                "name": "猫/狗玩具",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002536",
+                "name": "猫/狗美容清洁用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002543",
+                "name": "猫/狗营养保健",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002533",
+                "name": "猫/狗通用食品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002531",
+                "name": "猫食品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000009100",
+                "name": "马类食品/用品",
+                "children": []
+              },
+              {
+                "id": "1000002529__RC_CASCADER_SPLIT__1000002538",
+                "name": "鸟类用品",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000005784",
+            "name": "母婴用品",
+            "children": [
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005792",
+                "name": "儿童彩妆",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005789",
+                "name": "出行用品",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005788",
+                "name": "喂养用品",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005786",
+                "name": "婴童奶粉",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005793",
+                "name": "婴童床品",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005791",
+                "name": "婴童洗护",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000009119",
+                "name": "婴童液态奶",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000007496",
+                "name": "婴童营养品",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000007495",
+                "name": "婴童零食",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005794",
+                "name": "孕产妇用品",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005790",
+                "name": "安全防护",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000007494",
+                "name": "宝宝辅食",
+                "children": []
+              },
+              {
+                "id": "1000005784__RC_CASCADER_SPLIT__1000005785",
+                "name": "尿裤",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "15",
+        "name": "图书教育",
+        "children": [
+          {
+            "id": "1000006345",
+            "name": "书籍/杂志/报纸",
+            "children": [
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006373",
+                "name": "书课包",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000007640",
+                "name": "二手图书",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006356",
+                "name": "传记",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000007911",
+                "name": "作家手作/原稿",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006354",
+                "name": "保健/心理类书籍",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006358",
+                "name": "儿童读物/童书",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000007904",
+                "name": "其他书籍/杂志/报纸",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006380",
+                "name": "医学卫生",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006349",
+                "name": "历史",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006384",
+                "name": "哲学和宗教",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006357",
+                "name": "地图/地理",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006348",
+                "name": "外语/语言文字",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006382",
+                "name": "娱乐时尚",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006362",
+                "name": "婚恋与两性",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000007907",
+                "name": "字帖/练字帖/练字板/毛笔字贴",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006378",
+                "name": "小说",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006352",
+                "name": "工业/农业技术",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006360",
+                "name": "工具书/百科全书",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006353",
+                "name": "报纸/期刊订阅",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006383",
+                "name": "政治军事",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006377",
+                "name": "文化/信息与知识传播",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006347",
+                "name": "文学",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006367",
+                "name": "旅游",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006369",
+                "name": "期刊报纸现刊/单刊/过刊",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006355",
+                "name": "残损库存品/外观瑕疵品",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006359",
+                "name": "法律",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006368",
+                "name": "漫画/动漫/漫画集",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006371",
+                "name": "生活",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006385",
+                "name": "知识服务/读书卡",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006372",
+                "name": "社会科学",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006366",
+                "name": "科学/科学研究",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000007888",
+                "name": "科普读物",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006361",
+                "name": "管理",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000007910",
+                "name": "组合套装",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006364",
+                "name": "经济",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006376",
+                "name": "网络原创",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006350",
+                "name": "考试/教材/教辅/论文",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006381",
+                "name": "育儿书籍",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006386",
+                "name": "自我实现/励志",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006346",
+                "name": "自然科学",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006379",
+                "name": "艺术",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006365",
+                "name": "计算机/网络",
+                "children": []
+              },
+              {
+                "id": "1000006345__RC_CASCADER_SPLIT__1000006351",
+                "name": "进口原版书(含港台)",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000003616",
+            "name": "教育培训",
+            "children": [
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003635",
+                "name": "免费公开课",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003639",
+                "name": "其他教育培训",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003636",
+                "name": "学历/职业资格考试",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003632",
+                "name": "家庭教育/中小幼教育",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003631",
+                "name": "常识兴趣",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003633",
+                "name": "技能培训",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003634",
+                "name": "留学",
+                "children": []
+              },
+              {
+                "id": "1000003616__RC_CASCADER_SPLIT__1000003637",
+                "name": "语言培训",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000001648",
+            "name": "文教文化用品",
+            "children": [
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001655",
+                "name": "办公用品",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001654",
+                "name": "收纳/陈列用品",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001649",
+                "name": "教学/实验用品",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001652",
+                "name": "文具",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001651",
+                "name": "本册纸签",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001656",
+                "name": "画具画材/书法用品",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001650",
+                "name": "笔类/书写工具",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001657",
+                "name": "绘图计算用品",
+                "children": []
+              },
+              {
+                "id": "1000001648__RC_CASCADER_SPLIT__1000001653",
+                "name": "装订用品",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "7",
+        "name": "智能家居",
+        "children": [
+          {
+            "id": "1000001142",
+            "name": "五金/工具",
+            "children": [
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001148",
+                "name": "仪器仪表",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001144",
+                "name": "劳保用品",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001156",
+                "name": "安全检查设备",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001155",
+                "name": "工位器具",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001154",
+                "name": "工具配件/耗材",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001143",
+                "name": "手动工具",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001152",
+                "name": "机械五金",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001145",
+                "name": "机电五金",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001151",
+                "name": "气动工具",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001153",
+                "name": "测量工具",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001149",
+                "name": "液压/起重工具",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001147",
+                "name": "电动工具",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001146",
+                "name": "电气控制",
+                "children": []
+              },
+              {
+                "id": "1000001142__RC_CASCADER_SPLIT__1000001150",
+                "name": "紧固件",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000004471",
+            "name": "家具",
+            "children": [
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004482",
+                "name": "儿童家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004487",
+                "name": "其他家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004476",
+                "name": "几类",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004478",
+                "name": "凳子",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004481",
+                "name": "台案",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004484",
+                "name": "商业/办公家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004486",
+                "name": "家具配件及辅料",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004480",
+                "name": "床",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004479",
+                "name": "床垫",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004485",
+                "name": "庭院户外家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000007432",
+                "name": "架类",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004477",
+                "name": "柜子",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004473",
+                "name": "桌子",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004474",
+                "name": "椅子",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004475",
+                "name": "沙发",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000009101",
+                "name": "硬木家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000007900",
+                "name": "红木家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004488",
+                "name": "组合家具/一体家具/套装家具",
+                "children": []
+              },
+              {
+                "id": "1000004471__RC_CASCADER_SPLIT__1000004483",
+                "name": "适老家具",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000004788",
+            "name": "家装建材",
+            "children": [
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004809",
+                "name": "全屋智能",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004811",
+                "name": "其他家装建材",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004790",
+                "name": "卫浴五金",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004789",
+                "name": "卫浴建材",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009102",
+                "name": "卫浴配件",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004792",
+                "name": "厨房功能五金",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000007896",
+                "name": "地暖/暖气片/散热器",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000007889",
+                "name": "地板及附件",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004806",
+                "name": "垃圾处理",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004795",
+                "name": "墙面材料",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004803",
+                "name": "家具五金",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009103",
+                "name": "家用阀门",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004804",
+                "name": "建筑五金",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004794",
+                "name": "板材",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000007885",
+                "name": "楼梯及配件",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004805",
+                "name": "水处理",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004791",
+                "name": "水槽与龙头",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004802",
+                "name": "水泥砂石",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004800",
+                "name": "水电管材",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009104",
+                "name": "油漆及辅料",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004799",
+                "name": "涂料辅料",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009105",
+                "name": "玻璃",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009106",
+                "name": "瓷砖/砖",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004796",
+                "name": "石材",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000007902",
+                "name": "窗及配件",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009107",
+                "name": "线条",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004798",
+                "name": "胶粘剂",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000007881",
+                "name": "门及配件",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004808",
+                "name": "防护材料",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000009108",
+                "name": "阳台",
+                "children": []
+              },
+              {
+                "id": "1000004788__RC_CASCADER_SPLIT__1000004807",
+                "name": "隔音保温",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000004472",
+            "name": "家装灯饰光源",
+            "children": [
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004490",
+                "name": "光源",
+                "children": []
+              },
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004495",
+                "name": "分区照明灯饰",
+                "children": []
+              },
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004489",
+                "name": "功能性灯具",
+                "children": []
+              },
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004494",
+                "name": "室外灯饰",
+                "children": []
+              },
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004492",
+                "name": "家居类灯饰",
+                "children": []
+              },
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004493",
+                "name": "家装类灯饰",
+                "children": []
+              },
+              {
+                "id": "1000004472__RC_CASCADER_SPLIT__1000004491",
+                "name": "护眼灯饰",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000005069",
+            "name": "居家日用",
+            "children": [
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005081",
+                "name": "其他家居日用",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005075",
+                "name": "卫浴用具",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005078",
+                "name": "婚庆用品",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005072",
+                "name": "居家布艺",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005071",
+                "name": "居家饰品",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005070",
+                "name": "床上用品",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005074",
+                "name": "收纳整理工具",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000009109",
+                "name": "日常护理",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005080",
+                "name": "殡葬用品",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005077",
+                "name": "火机烟具",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000009110",
+                "name": "缝纫DIY配件及工具",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005079",
+                "name": "节日/装扮用品",
+                "children": []
+              },
+              {
+                "id": "1000005069__RC_CASCADER_SPLIT__1000005076",
+                "name": "雨具",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000007490",
+            "name": "摩托车/电动车/自行车用品",
+            "children": [
+              {
+                "id": "1000007490__RC_CASCADER_SPLIT__1000007492",
+                "name": "摩托车养护",
+                "children": []
+              },
+              {
+                "id": "1000007490__RC_CASCADER_SPLIT__1000007493",
+                "name": "维修工具",
+                "children": []
+              },
+              {
+                "id": "1000007490__RC_CASCADER_SPLIT__1000007491",
+                "name": "骑行装备",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000007248",
+            "name": "整车及配件",
+            "children": [
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007257",
+                "name": "摩托车及配件",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007256",
+                "name": "汽车其他系统",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007252",
+                "name": "汽车制动系统",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007258",
+                "name": "汽车整车",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007254",
+                "name": "汽车油水分离系统",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007255",
+                "name": "汽车点火系统",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007253",
+                "name": "汽车照明系统",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007251",
+                "name": "汽车零配件",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007250",
+                "name": "电动车及配件",
+                "children": []
+              },
+              {
+                "id": "1000007248__RC_CASCADER_SPLIT__1000007249",
+                "name": "自行车及配件",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000006002",
+            "name": "汽车用品",
+            "children": [
+              {
+                "id": "1000006002__RC_CASCADER_SPLIT__1000006004",
+                "name": "汽车内饰用品",
+                "children": []
+              },
+              {
+                "id": "1000006002__RC_CASCADER_SPLIT__1000006006",
+                "name": "汽车外饰/加装",
+                "children": []
+              },
+              {
+                "id": "1000006002__RC_CASCADER_SPLIT__1000006005",
+                "name": "汽车电子/电器",
+                "children": []
+              },
+              {
+                "id": "1000006002__RC_CASCADER_SPLIT__1000006009",
+                "name": "汽车防护用品",
+                "children": []
+              },
+              {
+                "id": "1000006002__RC_CASCADER_SPLIT__1000006007",
+                "name": "美容维修/汽保工具",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000002719",
+            "name": "电子/电工",
+            "children": [
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002752",
+                "name": "专业处理设备",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002740",
+                "name": "布线安装",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002735",
+                "name": "开关插座",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002754",
+                "name": "成套系统",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002746",
+                "name": "报警系统",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002748",
+                "name": "报警输出设备",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002747",
+                "name": "探测器与传感器",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002736",
+                "name": "插座与排插",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002749",
+                "name": "智能家居安防",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002753",
+                "name": "消防设备",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002741",
+                "name": "电工配件",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002739",
+                "name": "电线电缆",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002743",
+                "name": "监控存储处理",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002742",
+                "name": "监控摄像机",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002744",
+                "name": "监控显示设备",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002745",
+                "name": "监控配件",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002750",
+                "name": "网络设备",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002737",
+                "name": "转换器与转换头",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002738",
+                "name": "配电保护",
+                "children": []
+              },
+              {
+                "id": "1000002719__RC_CASCADER_SPLIT__1000002751",
+                "name": "音视频设备",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000009092",
+            "name": "餐饮厨具",
+            "children": [
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009139",
+                "name": "一次性餐桌用品",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009140",
+                "name": "刀具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009141",
+                "name": "勺铲",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009142",
+                "name": "厨房小工具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009143",
+                "name": "咖啡器具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009144",
+                "name": "水具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009145",
+                "name": "烘焙用具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009146",
+                "name": "烹饪工具套装",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009147",
+                "name": "砧板/菜板",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009148",
+                "name": "茶具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009149",
+                "name": "酒具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009150",
+                "name": "野炊/烧烤用具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009151",
+                "name": "锅具",
+                "children": []
+              },
+              {
+                "id": "1000009092__RC_CASCADER_SPLIT__1000009152",
+                "name": "餐具",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "14",
+        "name": "3C数码家电",
+        "children": [
+          {
+            "id": "1000007020",
+            "name": "3C数码及配件",
+            "children": [
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007030",
+                "name": "3C数码设备及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007627",
+                "name": "二手3C数码",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007634",
+                "name": "二手3C数码配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007628",
+                "name": "二手手机",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007629",
+                "name": "二手摄影/摄像",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007631",
+                "name": "二手电玩及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007630",
+                "name": "二手电脑",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007633",
+                "name": "二手电脑外设及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007632",
+                "name": "二手电脑组件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007029",
+                "name": "影音设备及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007028",
+                "name": "手机及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007027",
+                "name": "摄影摄像及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007021",
+                "name": "智能设备",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007026",
+                "name": "电子教育及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007025",
+                "name": "电玩及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007022",
+                "name": "电脑",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007023",
+                "name": "电脑外设及配件",
+                "children": []
+              },
+              {
+                "id": "1000007020__RC_CASCADER_SPLIT__1000007024",
+                "name": "电脑组件",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000000025",
+            "name": "元器件",
+            "children": [
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000042",
+                "name": "DIY与开源硬件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000037",
+                "name": "PCB与模块",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000035",
+                "name": "光电器件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000038",
+                "name": "冷却系统",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000029",
+                "name": "分立器件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000040",
+                "name": "开发与测试工具",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000034",
+                "name": "显示与触控器件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000036",
+                "name": "机电元件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000033",
+                "name": "电声器件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000032",
+                "name": "电源模块",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000045",
+                "name": "系统与方案",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000041",
+                "name": "线材",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000031",
+                "name": "被动元件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000044",
+                "name": "计算机系统",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000039",
+                "name": "辅助材料",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000030",
+                "name": "连接器件",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000043",
+                "name": "通信设备",
+                "children": []
+              },
+              {
+                "id": "1000000025__RC_CASCADER_SPLIT__1000000028",
+                "name": "集成电路",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000002394",
+            "name": "办公设备及耗材",
+            "children": [
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000007636",
+                "name": "二手打印设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002406",
+                "name": "办公用纸",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002405",
+                "name": "办公耗材",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002398",
+                "name": "办公设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002397",
+                "name": "广告印刷/绘图设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002401",
+                "name": "影像与监控设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002396",
+                "name": "打印设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002400",
+                "name": "投影与显示设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002399",
+                "name": "收银设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002402",
+                "name": "网络设备",
+                "children": []
+              },
+              {
+                "id": "1000002394__RC_CASCADER_SPLIT__1000002403",
+                "name": "门禁安防设备",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000003143",
+            "name": "电器",
+            "children": [
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003146",
+                "name": "个护健康电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000007638",
+                "name": "二手家电",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000007637",
+                "name": "二手影音电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003145",
+                "name": "冷藏电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003144",
+                "name": "厨房电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000009121",
+                "name": "商用电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003147",
+                "name": "大家电",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003150",
+                "name": "影音电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003149",
+                "name": "清洁电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003148",
+                "name": "环境电器",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000009122",
+                "name": "电动行李箱",
+                "children": []
+              },
+              {
+                "id": "1000003143__RC_CASCADER_SPLIT__1000003151",
+                "name": "电器配件",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000008907",
+            "name": "行业服务权益",
+            "children": [
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008911",
+                "name": "冰箱维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008913",
+                "name": "厨卫维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008912",
+                "name": "厨房电器维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008921",
+                "name": "家电安装",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008918",
+                "name": "家电维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008909",
+                "name": "家装安装",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008920",
+                "name": "平板电脑维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008923",
+                "name": "手机维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008917",
+                "name": "护理电器维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008925",
+                "name": "智能手表维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008926",
+                "name": "智能数码维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008914",
+                "name": "汽摩安装",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008924",
+                "name": "洗衣机维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008922",
+                "name": "生活电器维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008915",
+                "name": "电脑办公维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008916",
+                "name": "电视维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008919",
+                "name": "空调维修",
+                "children": []
+              },
+              {
+                "id": "1000008907__RC_CASCADER_SPLIT__1000008910",
+                "name": "笔记本电脑维修",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "18",
+        "name": "运动户外",
+        "children": [
+          {
+            "id": "1000004259",
+            "name": "户外装备",
+            "children": [
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004270",
+                "name": "其他户外装备",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004267",
+                "name": "冲浪装备",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004260",
+                "name": "垂钓装备",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004262",
+                "name": "帐篷/天幕及配件",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004272",
+                "name": "户外刀具/多用工具",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004261",
+                "name": "户外照明",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004273",
+                "name": "户外盛水容器",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000009112",
+                "name": "户外睡袋/垫子",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004263",
+                "name": "望远镜/夜视仪",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004274",
+                "name": "水上船艇",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004264",
+                "name": "滑雪装备",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004266",
+                "name": "潜水装备",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004265",
+                "name": "登山/攀岩/攀冰装备",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004269",
+                "name": "通讯/导航/户外仪",
+                "children": []
+              },
+              {
+                "id": "1000004259__RC_CASCADER_SPLIT__1000004268",
+                "name": "防护/救生装备",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000000024",
+            "name": "运动休闲用品",
+            "children": [
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000061",
+                "name": "乒乓球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000049",
+                "name": "保龄球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000060",
+                "name": "健身器械",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000078",
+                "name": "其他运动休闲用品",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000050",
+                "name": "冰上运动",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000056",
+                "name": "击剑运动",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000062",
+                "name": "匹克球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000065",
+                "name": "台球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000070",
+                "name": "场馆设施",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000051",
+                "name": "壁球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000064",
+                "name": "射箭",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000059",
+                "name": "排球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000063",
+                "name": "曲棍球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000057",
+                "name": "棋牌麻将",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000048",
+                "name": "棒球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000053",
+                "name": "橄榄球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000055",
+                "name": "民间运动",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000071",
+                "name": "游泳",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000075",
+                "name": "球迷用品",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000074",
+                "name": "瑜伽",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000067",
+                "name": "田径运动器材",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000047",
+                "name": "篮球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000068",
+                "name": "网球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000073",
+                "name": "羽毛球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000069",
+                "name": "舞蹈/健美操/体操",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000076",
+                "name": "裁判/教练用品",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000077",
+                "name": "训练辅助用具",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000046",
+                "name": "足球",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000066",
+                "name": "跆拳道/武术/搏击",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000027",
+                "name": "轮滑/滑板/极限运动",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000072",
+                "name": "运动护具",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000052",
+                "name": "飞镖/桌上足球/室内休闲",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000058",
+                "name": "马术运动",
+                "children": []
+              },
+              {
+                "id": "1000000024__RC_CASCADER_SPLIT__1000000054",
+                "name": "高尔夫",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "11",
+        "name": "鲜花园艺",
+        "children": [
+          {
+            "id": "1000005603",
+            "name": "农资园艺",
+            "children": [
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005619",
+                "name": "仿真花材/装饰",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005629",
+                "name": "其他农用物资",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005628",
+                "name": "农机/农具",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005626",
+                "name": "农药",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005617",
+                "name": "园艺用品",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005618",
+                "name": "婚庆用花",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005622",
+                "name": "干燥花材",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005621",
+                "name": "生活鲜花",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005606",
+                "name": "畜牧/养殖物资",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005624",
+                "name": "种子",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000009096",
+                "name": "肥料",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005616",
+                "name": "花盆花器",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005623",
+                "name": "花艺资材",
+                "children": []
+              },
+              {
+                "id": "1000005603__RC_CASCADER_SPLIT__1000005620",
+                "name": "鲜活植物",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "2",
+        "name": "玩具乐器",
+        "children": [
+          {
+            "id": "1000005222",
+            "name": "乐器及配件",
+            "children": [
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005238",
+                "name": "MIDI设备",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005236",
+                "name": "专业音频设备",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005245",
+                "name": "乐器周边",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005244",
+                "name": "乐器服务",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005235",
+                "name": "乐器配件",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000007639",
+                "name": "二手乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005234",
+                "name": "儿童乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005243",
+                "name": "其他乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005233",
+                "name": "口簧乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005223",
+                "name": "吉他",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005237",
+                "name": "效果器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005240",
+                "name": "智能乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005231",
+                "name": "民族弦乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005232",
+                "name": "民族弹拨乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005227",
+                "name": "民族打击乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005229",
+                "name": "民族管乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005230",
+                "name": "西洋弦乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005226",
+                "name": "西洋打击乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005228",
+                "name": "西洋管乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005224",
+                "name": "贝司",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005239",
+                "name": "踏板设备",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005242",
+                "name": "锣镲乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005225",
+                "name": "键盘乐器",
+                "children": []
+              },
+              {
+                "id": "1000005222__RC_CASCADER_SPLIT__1000005241",
+                "name": "音乐软件",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000001467",
+            "name": "玩具",
+            "children": [
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000007641",
+                "name": "二手玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001471",
+                "name": "儿童骑乘类玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001484",
+                "name": "其他特色玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001481",
+                "name": "创意手工玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001480",
+                "name": "动漫周边与卡牌",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001483",
+                "name": "婴幼儿玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001472",
+                "name": "户外运动玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001479",
+                "name": "模型手办与收藏",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001476",
+                "name": "毛绒布艺玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001470",
+                "name": "玩具枪",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001475",
+                "name": "电动发声玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001474",
+                "name": "电动遥控玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001477",
+                "name": "益智早教玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001478",
+                "name": "积木拼插玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001473",
+                "name": "角色扮演玩具",
+                "children": []
+              },
+              {
+                "id": "1000001467__RC_CASCADER_SPLIT__1000001482",
+                "name": "音乐乐器玩具",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "8",
+        "name": "生鲜",
+        "children": [
+          {
+            "id": "1000009089",
+            "name": "冷冻/冷藏制品",
+            "children": [
+              {
+                "id": "1000009089__RC_CASCADER_SPLIT__1000009097",
+                "name": "丸滑制品",
+                "children": []
+              },
+              {
+                "id": "1000009089__RC_CASCADER_SPLIT__1000009098",
+                "name": "面点",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000001991",
+            "name": "水果蔬菜",
+            "children": [
+              {
+                "id": "1000001991__RC_CASCADER_SPLIT__1000001993",
+                "name": "水果",
+                "children": []
+              },
+              {
+                "id": "1000001991__RC_CASCADER_SPLIT__1000010696",
+                "name": "水果蔬菜卡券",
+                "children": []
+              },
+              {
+                "id": "1000001991__RC_CASCADER_SPLIT__1000001994",
+                "name": "蔬菜/豆制品",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000003801",
+            "name": "海鲜水产",
+            "children": [
+              {
+                "id": "1000003801__RC_CASCADER_SPLIT__1000003802",
+                "name": "冷冻水产",
+                "children": []
+              },
+              {
+                "id": "1000003801__RC_CASCADER_SPLIT__1000003804",
+                "name": "海鲜水产制品",
+                "children": []
+              },
+              {
+                "id": "1000003801__RC_CASCADER_SPLIT__1000009120",
+                "name": "海鲜水产卡券/礼盒",
+                "children": []
+              },
+              {
+                "id": "1000003801__RC_CASCADER_SPLIT__1000003803",
+                "name": "鲜活水产",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000006263",
+            "name": "肉禽蛋品",
+            "children": [
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000009131",
+                "name": "其他肉类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000006271",
+                "name": "动物油脂",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000006267",
+                "name": "牛肉类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000006264",
+                "name": "猪肉类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000006266",
+                "name": "羊肉类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000009132",
+                "name": "肉禽制品",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000010697",
+                "name": "肉禽蛋品卡券",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000009133",
+                "name": "蛋类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000006268",
+                "name": "鸡肉类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000006265",
+                "name": "鸭肉类",
+                "children": []
+              },
+              {
+                "id": "1000006263__RC_CASCADER_SPLIT__1000009134",
+                "name": "鹅肉类",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "17",
+        "name": "虚拟充值",
+        "children": [
+          {
+            "id": "1000008906",
+            "name": "有价券",
+            "children": [
+              {
+                "id": "1000008906__RC_CASCADER_SPLIT__1000008908",
+                "name": "有价券",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "12",
+        "name": "本地生活",
+        "children": [
+          {
+            "id": "1000001469",
+            "name": "文娱",
+            "children": [
+              {
+                "id": "1000001469__RC_CASCADER_SPLIT__1000001500",
+                "name": "教育音像",
+                "children": []
+              },
+              {
+                "id": "1000001469__RC_CASCADER_SPLIT__1000001498",
+                "name": "游戏服务",
+                "children": []
+              },
+              {
+                "id": "1000001469__RC_CASCADER_SPLIT__1000001499",
+                "name": "生活娱乐充值",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000002143",
+            "name": "本地生活服务",
+            "children": [
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002148",
+                "name": "便民服务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002145",
+                "name": "保险",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000009116",
+                "name": "兑换提货卡券",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002163",
+                "name": "其他生活服务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000009117",
+                "name": "加油服务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002150",
+                "name": "多媒体服务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002154",
+                "name": "婚庆/摄影摄像服务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000009118",
+                "name": "房产",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002144",
+                "name": "汽车服务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002147",
+                "name": "演出票务",
+                "children": []
+              },
+              {
+                "id": "1000002143__RC_CASCADER_SPLIT__1000002157",
+                "name": "装修服务",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000001824",
+            "name": "通讯充值",
+            "children": [
+              {
+                "id": "1000001824__RC_CASCADER_SPLIT__1000001841",
+                "name": "增值业务",
+                "children": []
+              },
+              {
+                "id": "1000001824__RC_CASCADER_SPLIT__1000001839",
+                "name": "新入网手机号套餐",
+                "children": []
+              },
+              {
+                "id": "1000001824__RC_CASCADER_SPLIT__1000001842",
+                "name": "无线上网设备",
+                "children": []
+              },
+              {
+                "id": "1000001824__RC_CASCADER_SPLIT__1000001840",
+                "name": "有线宽带",
+                "children": []
+              },
+              {
+                "id": "1000001824__RC_CASCADER_SPLIT__1000009138",
+                "name": "流量业务",
+                "children": []
+              },
+              {
+                "id": "1000001824__RC_CASCADER_SPLIT__1000001838",
+                "name": "话费充值",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "20",
+        "name": "珠宝文玩",
+        "children": [
+          {
+            "id": "1000007741",
+            "name": "工艺品",
+            "children": [
+              {
+                "id": "1000007741__RC_CASCADER_SPLIT__1000007903",
+                "name": "其他工艺品",
+                "children": []
+              },
+              {
+                "id": "1000007741__RC_CASCADER_SPLIT__1000007897",
+                "name": "紫砂",
+                "children": []
+              },
+              {
+                "id": "1000007741__RC_CASCADER_SPLIT__1000007876",
+                "name": "陶瓷",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000001468",
+            "name": "文玩收藏",
+            "children": [
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001489",
+                "name": "书画艺术",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001495",
+                "name": "其他收藏品",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001493",
+                "name": "古玩杂项",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000007873",
+                "name": "古董艺术品",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000007893",
+                "name": "喜马拉雅艺术品",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000007895",
+                "name": "增香沉香木",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001497",
+                "name": "工具与材料",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001496",
+                "name": "文玩收纳与包装",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001492",
+                "name": "文玩配饰与配件",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001488",
+                "name": "木艺制品",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000007884",
+                "name": "沉香",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000009113",
+                "name": "烟/酒具",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001487",
+                "name": "菩提/核桃",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001486",
+                "name": "邮品",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000007908",
+                "name": "金石篆刻",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001485",
+                "name": "钱币",
+                "children": []
+              },
+              {
+                "id": "1000001468__RC_CASCADER_SPLIT__1000001490",
+                "name": "香文化",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000005604",
+            "name": "民俗工艺/非遗",
+            "children": [
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005609",
+                "name": "其他民俗工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005615",
+                "name": "剪刻工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005608",
+                "name": "海外工艺品",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005611",
+                "name": "烧造工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005610",
+                "name": "织染工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005613",
+                "name": "编扎工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005614",
+                "name": "锻冶工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005607",
+                "name": "雕塑工艺",
+                "children": []
+              },
+              {
+                "id": "1000005604__RC_CASCADER_SPLIT__1000005612",
+                "name": "髹饰（漆器）工艺",
+                "children": []
+              }
+            ]
+          },
+          {
+            "id": "1000007740",
+            "name": "黄金珠宝玉石",
+            "children": [
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007878",
+                "name": "合成宝石",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007892",
+                "name": "处理珠宝玉石",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007875",
+                "name": "天然宝石",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000009153",
+                "name": "天然有机宝石",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007877",
+                "name": "天然玉石",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007880",
+                "name": "奢品珠宝",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007883",
+                "name": "珍珠",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007879",
+                "name": "珠宝鉴定工具",
+                "children": []
+              },
+              {
+                "id": "1000007740__RC_CASCADER_SPLIT__1000007874",
+                "name": "贵金属",
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

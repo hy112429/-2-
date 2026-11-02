@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { notifyGlobal } from '../utils/notifications'
 
 /**
  * 单条链接解析下载工具（T-11 真实任务接入 UI）
@@ -53,6 +54,10 @@ const parsing = ref(false)
 const parseEngineId = ref('')
 const parseOutcome = ref<ParseOutcome | null>(null)
 const parseErr = ref('')
+
+watch(parseErr, (message) => {
+  if (message) notifyGlobal(message, 'error')
+})
 
 const PLATFORM_TEXT: Record<string, string> = {
   douyin: '抖音',
@@ -129,6 +134,10 @@ const queueEngineId = ref('')
 const queueTask = ref<QueueTaskView | null>(null)
 const queueSummary = ref('')
 
+watch(queueSummary, (message) => {
+  if (message && !queueRunning.value) notifyGlobal(message)
+})
+
 const STATUS_TEXT: Record<QueueTaskView['status'], string> = {
   pending: '等待',
   running: '下载中',
@@ -193,6 +202,9 @@ function onEngineEvent(e: EngineEventPayload): void {
       parseErr.value = parseOutcome.value?.ok
         ? ''
         : (parseOutcome.value?.error ?? '解析失败')
+      if (parseOutcome.value?.ok) {
+        notifyGlobal(`解析成功：${parseOutcome.value.title || PLATFORM_TEXT[parseOutcome.value.platform ?? ''] || '视频'}`, 'success')
+      }
     } else if (e.type === 'error') {
       parsing.value = false
       parseEngineId.value = ''

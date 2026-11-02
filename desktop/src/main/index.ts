@@ -1,14 +1,31 @@
-import { app, shell, BrowserWindow, protocol } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, protocol } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { registerLoginIpc, disposeLogin } from './login'
 import { registerEngineIpc, disposeEngine } from './engine'
-import { registerAppDirsIpc } from './app-dirs'
+import { getIsolatedTestRoot, registerAppDirsIpc } from './app-dirs'
 import { registerAssetsIpc } from './assets'
 import { registerBaiyingBatchIpc, disposeBaiyingBatch } from './baiying_batch'
 import { registerToutiaoBatchIpc, disposeToutiaoBatch } from './toutiao_batch'
 import { registerAccountLoginIpc, disposeAccountLogin } from './account_login'
+import { disposeExternalBrowserBridges } from './external_browser'
 import { registerWatermarkIpc, registerFrameProtocol } from './watermark'
+import { getAutoPublisherProgress, runAutoPublisherNow, runImmediatePublishNow, runManualRetryPublishNow, startAutoPublisher, disposeAutoPublisher } from './auto_publisher'
+import { disposeSelectionCooldown, registerSelectionCooldownIpc } from './selection_cooldown'
+import { disposeQianchuanUploadScheduler, registerQianchuanUploadIpc, startQianchuanUploadScheduler } from './qianchuan_upload'
+
+// 安装版使用全新的本地数据命名空间；开发态只有显式设置测试根目录时才隔离 userData。
+const isolatedTestRoot = getIsolatedTestRoot()
+if (isolatedTestRoot) {
+  const isolatedUserData = join(isolatedTestRoot, 'user-data')
+  app.setPath('userData', isolatedUserData)
+  app.setPath('sessionData', join(isolatedUserData, 'session-data'))
+} else if (app.isPackaged) {
+  const appDataName = `${app.getName()}-client-data-v1`.replace(/[<>:"/\\|?*]/g, '-')
+  const isolatedUserData = join(app.getPath('appData'), appDataName)
+  app.setPath('userData', isolatedUserData)
+  app.setPath('sessionData', join(isolatedUserData, 'session-data'))
+}
 
 // ---- 窗口基础参数（需求 3）----
 const WINDOW_TITLE = '投广管理客户端'
@@ -19,6 +36,20 @@ protocol.registerSchemesAsPrivileged([
   { scheme: 'frame', privileges: { standard: true, secure: true, supportFetchAPI: false } }
 ])
 const WINDOW_HEIGHT = 800
+
+// 阻止多个客户端实例同时恢复同一个本地批次。
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    const mainWindow = BrowserWindow.getAllWindows().find((window) => !window.isDestroyed())
+    if (!mainWindow) return
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    if (!mainWindow.isVisible()) mainWindow.show()
+    mainWindow.focus()
+  })
+}
 
 /** 创建主窗口 */
 function createWindow(): void {
@@ -67,15 +98,24 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return
   // 让 Windows 任务栏正确识别本应用（通知、任务栏分组都依赖它）
   electronApp.setAppUserModelId('com.touguang.client')
 
-  // 注册登录相关 IPC（内置浏览器视图 / 登录态查询 / 导出给 Python 引擎）
+  // 注册系统浏览器登录入口，以及客户端缓存态查询 / 导出给 Python 引擎
   // 必须在 whenReady 之后，因为里面要用到 session 和 safeStorage
   registerLoginIpc()
+  registerSelectionCooldownIpc()
+  ipcMain.handle('app:getVersion', () => app.getVersion())
+  ipcMain.handle('publish:autoProgress:get', () => getAutoPublisherProgress())
+  ipcMain.handle('publish:autoRun', (_event, queueId: number) => runAutoPublisherNow(queueId))
+  ipcMain.handle('publish:runImmediately', (_event, queueId: number) => runImmediatePublishNow(queueId))
+  ipcMain.handle('publish:retryManually', (_event, queueId: number, options: { confirmedNotSubmitted?: boolean; confirmedNoDraft?: boolean }) =>
+    runManualRetryPublishNow(queueId, options))
 
   // 注册 Python 引擎 IPC（子进程拉起 / 进度转发 / 取消）
   registerEngineIpc()
+  registerQianchuanUploadIpc()
 
   // 注册应用本地设置 IPC（下载目录选择与持久化）
   registerAppDirsIpc()
@@ -97,6 +137,10 @@ app.whenReady().then(() => {
   // 注册 frame:// 协议（渲染进程加载去水印帧图）
   registerFrameProtocol()
 
+  // 全自动发布仅处理用户已启用且到达本地计划时间的新任务。
+  if (!isolatedTestRoot) startAutoPublisher()
+  if (!isolatedTestRoot) startQianchuanUploadScheduler()
+
   // 开发时保留 F12 开发者工具、Ctrl+R 刷新等快捷键；生产环境自动禁用
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
@@ -112,7 +156,11 @@ app.whenReady().then(() => {
 
 // 退出前释放内置浏览器视图 + 杀掉所有引擎子进程 + 停掉批量抓取
 app.on('before-quit', () => {
+  disposeAutoPublisher()
+  disposeQianchuanUploadScheduler()
+  disposeSelectionCooldown()
   disposeLogin()
+  disposeExternalBrowserBridges()
   disposeEngine()
   disposeBaiyingBatch()
   disposeToutiaoBatch()

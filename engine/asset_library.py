@@ -14,6 +14,8 @@
       product_id    TEXT                          -- 目录结构解析出的商品 ID
       video_id      TEXT                          -- 文件名解析出的视频 ID
       account       TEXT                          -- 账号目录名
+      account_id    INTEGER                       -- 明确归属的抖音账号 ID；未知时为空
+      source_type   TEXT     NOT NULL DEFAULT 'unknown' -- web_download / detail_generated / unknown
       category      TEXT     NOT NULL DEFAULT '未分类'
       status        TEXT     NOT NULL DEFAULT 'ready'   -- ready / archived
       thumb_path    TEXT                          -- 缩略图缓存绝对路径
@@ -38,8 +40,12 @@
 
 命令：
     python asset_library.py scan [--root DIR] [--db PATH]
-    python asset_library.py list [--product-id X] [--tag T] [--date YYYY-MM-DD]
-                               [--status ready] [--limit N]
+    python asset_library.py list [--account NAME] [--product-id X] [--tag T]
+                               [--date YYYY-MM-DD] [--status ready] [--limit N]
+    python asset_library.py accounts
+    python asset_library.py register --file-path FILE --source-type web_download
+                                    [--account-id N] [--product-id ID]
+    python asset_library.py assign-account --id N --account-id N
     python asset_library.py delete --id N
     python asset_library.py tags
     python asset_library.py categories
@@ -63,8 +69,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-DEFAULT_DB_PATH = r"D:\software\投广客户端\data\ad_client.db"
-DEFAULT_ROOT = r"D:\software\投广客户端\downloads"
+try:
+    from .client_paths import DEFAULT_DB_PATH, DEFAULT_DOWNLOAD_ROOT
+except ImportError:
+    from client_paths import DEFAULT_DB_PATH, DEFAULT_DOWNLOAD_ROOT
+
+DEFAULT_ROOT = DEFAULT_DOWNLOAD_ROOT
+UNASSIGNED_ACCOUNT_FILTER = "__unassigned__"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -75,6 +86,8 @@ CREATE TABLE IF NOT EXISTS assets (
     product_id  TEXT,
     video_id    TEXT,
     account     TEXT,
+    account_id  INTEGER,
+    source_type TEXT    NOT NULL DEFAULT 'unknown',
     category    TEXT    NOT NULL DEFAULT '未分类',
     status      TEXT    NOT NULL DEFAULT 'ready',
     thumb_path  TEXT,
@@ -93,6 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_assets_category ON assets(category);
 CREATE INDEX IF NOT EXISTS idx_assets_tags_tag ON asset_tags(tag);
 """
 
+SOURCE_TYPES = ("web_download", "detail_generated", "unknown")
+
 
 def emit(payload: Dict[str, Any], exit_code: int = 0) -> int:
     print(json.dumps(payload, ensure_ascii=False, default=str))
@@ -109,8 +124,179 @@ def connect(db_path: str) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
     con.execute("PRAGMA journal_mode = WAL")
-    con.executescript(SCHEMA_SQL)
+    ensure_schema(con)
     return con
+
+
+def table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def ensure_schema(con: sqlite3.Connection) -> None:
+    """兼容旧素材表；只补列，不覆盖已登记的来源或归属。"""
+    con.executescript(SCHEMA_SQL)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(assets)")}
+    migrated = False
+    if "account_id" not in columns:
+        con.execute("ALTER TABLE assets ADD COLUMN account_id INTEGER")
+        migrated = True
+    if "source_type" not in columns:
+        con.execute("ALTER TABLE assets ADD COLUMN source_type TEXT NOT NULL DEFAULT 'unknown'")
+        migrated = True
+    con.execute("CREATE INDEX IF NOT EXISTS idx_assets_account_id ON assets(account_id)")
+    if migrated:
+        backfill_legacy_metadata(con)
+    con.commit()
+
+
+def account_name(con: sqlite3.Connection, account_id: int) -> str:
+    if not table_exists(con, "accounts"):
+        raise ValueError("账号表尚未建立，无法确认素材归属")
+    row = con.execute("SELECT name FROM accounts WHERE id = ?", (account_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"账号不存在：{account_id}")
+    return str(row[0])
+
+
+def infer_legacy_metadata(
+    con: sqlite3.Connection, file_path: str, account_label: Optional[str]
+) -> tuple[Optional[int], str]:
+    """仅从精确文件路径和唯一账号名回填；商品 ID/目录名本身不证明来源。"""
+    account_ids: set[int] = set()
+    source_type = "unknown"
+    has_accounts = table_exists(con, "accounts")
+    if has_accounts and account_label and account_label.strip():
+        matches = con.execute(
+            "SELECT id FROM accounts WHERE TRIM(name) = ?", (account_label.strip(),)
+        ).fetchall()
+        if len(matches) == 1:
+            account_ids.add(int(matches[0][0]))
+        elif len(matches) > 1:
+            return None, "unknown"
+    if table_exists(con, "videos"):
+        video_columns = {row[1] for row in con.execute("PRAGMA table_info(videos)")}
+        if {"file_path", "account_row_id", "source_url", "status"} <= video_columns:
+            videos = con.execute(
+                "SELECT account_row_id, source_url, status FROM videos WHERE file_path = ?",
+                (file_path,),
+            ).fetchall()
+            if has_accounts:
+                account_ids.update(
+                    int(row[0]) for row in videos
+                    if row[0] is not None and con.execute(
+                        "SELECT 1 FROM accounts WHERE id = ?", (row[0],)
+                    ).fetchone() is not None
+                )
+            if videos and all(
+                str(row[2]) == "done" and str(row[1] or "").startswith(("https://", "http://"))
+                for row in videos
+            ):
+                source_type = "web_download"
+    return (next(iter(account_ids)) if len(account_ids) == 1 else None), source_type
+
+
+def backfill_legacy_metadata(con: sqlite3.Connection) -> None:
+    for row in con.execute(
+        "SELECT id, file_path, account, account_id, source_type FROM assets"
+    ).fetchall():
+        if row[3] is not None and str(row[4] or "unknown") != "unknown":
+            continue
+        inferred_account_id, inferred_source = infer_legacy_metadata(con, str(row[1]), row[2])
+        inferred_name = account_name(con, inferred_account_id) if inferred_account_id is not None else None
+        con.execute(
+            "UPDATE assets SET account_id = COALESCE(account_id, ?), "
+            "account = CASE WHEN account_id IS NULL AND ? IS NOT NULL THEN ? ELSE account END, "
+            "source_type = CASE WHEN source_type = 'unknown' THEN ? ELSE source_type END WHERE id = ?",
+            (inferred_account_id, inferred_name, inferred_name, inferred_source, row[0]),
+        )
+
+
+def register_asset(
+    con: sqlite3.Connection, file_path: str, source_type: str,
+    account_id: Optional[int] = None, product_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """由确定的生产者登记来源；网页下载在账号未明确时允许暂不归属。"""
+    if source_type not in SOURCE_TYPES or source_type == "unknown":
+        raise ValueError("登记来源必须是 web_download 或 detail_generated")
+    if source_type == "detail_generated" and account_id is None:
+        raise ValueError("详情图生成素材必须指定所属账号 ID")
+    fp = Path(file_path).expanduser().resolve(strict=True)
+    if not fp.is_file() or fp.suffix.lower() != ".mp4" or fp.stat().st_size <= 0:
+        raise ValueError("素材必须是非空 MP4 文件")
+    path = str(fp)
+    name = account_name(con, account_id) if account_id is not None else None
+    row = con.execute(
+        "SELECT id, account_id, account, product_id, source_type FROM assets WHERE file_path = ?",
+        (path,),
+    ).fetchone()
+    if row is not None:
+        current_source = str(row[4] or "unknown")
+        if current_source not in ("unknown", source_type):
+            raise ValueError(f"素材已有其他明确来源：{current_source}")
+        if account_id is not None and row[1] is not None and int(row[1]) != account_id:
+            raise ValueError(f"素材已归属账号 {row[1]}，不能隐式改绑")
+        if product_id and row[3] and str(row[3]) != product_id:
+            raise ValueError("素材已关联其他商品 ID，不能隐式改绑")
+        if account_id is None and row[1] is None:
+            inferred_id, _ = infer_legacy_metadata(con, path, row[2])
+            if inferred_id is not None:
+                account_id = inferred_id
+                name = account_name(con, inferred_id)
+    stat = fp.stat()
+    now = now_text()
+    mtime = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+    if row is None:
+        con.execute(
+            "INSERT INTO assets (file_path, file_name, file_size, product_id, video_id, account, "
+            "account_id, source_type, category, status, thumb_path, file_mtime, scanned_at, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', NULL, ?, ?, ?)",
+            (path, fp.name, stat.st_size, product_id, parse_video_id(fp.name), name,
+             account_id, source_type, name or "未分类", mtime, now, now),
+        )
+        asset_id = int(con.execute("SELECT last_insert_rowid()").fetchone()[0])
+    else:
+        asset_id = int(row[0])
+        con.execute(
+            "UPDATE assets SET file_name = ?, file_size = ?, product_id = COALESCE(?, product_id), "
+            "video_id = ?, account_id = COALESCE(?, account_id), "
+            "account = CASE WHEN ? IS NULL THEN account ELSE ? END, "
+            "category = CASE WHEN ? IS NULL THEN category ELSE ? END, "
+            "source_type = ?, status = 'ready', file_mtime = ?, scanned_at = ? WHERE id = ?",
+            (fp.name, stat.st_size, product_id, parse_video_id(fp.name), account_id,
+             name, name, name, name, source_type, mtime, now, asset_id),
+        )
+    con.commit()
+    saved = con.execute(
+        "SELECT account_id, account, source_type FROM assets WHERE id = ?", (asset_id,)
+    ).fetchone()
+    return {
+        "ok": True, "id": asset_id, "file_path": path,
+        "account_id": saved[0], "account": saved[1], "source_type": saved[2],
+        "already_registered": row is not None,
+    }
+
+
+def assign_asset_account(con: sqlite3.Connection, asset_id: int, account_id: int) -> Dict[str, Any]:
+    """人工明确指定归属；来源仍由生产者证据决定。"""
+    name = account_name(con, account_id)
+    row = con.execute(
+        "SELECT account_id, source_type FROM assets WHERE id = ?", (asset_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"素材不存在：id={asset_id}")
+    if row[0] is not None and int(row[0]) != account_id:
+        raise ValueError(f"素材已归属账号 {row[0]}，不能隐式改绑")
+    con.execute(
+        "UPDATE assets SET account_id = ?, account = ?, category = ? WHERE id = ?",
+        (account_id, name, name, asset_id),
+    )
+    con.commit()
+    return {
+        "ok": True, "id": asset_id, "account_id": account_id,
+        "account": name, "source_type": str(row[1] or "unknown"),
+    }
 
 
 # ============================================================ 目录/文件名解析
@@ -222,26 +408,40 @@ def cmd_scan(con: sqlite3.Connection, root: Path, ffmpeg: str) -> Dict[str, Any]
         if thumb:
             thumbs_ok += 1
 
-        row = con.execute("SELECT id FROM assets WHERE file_path = ?", (str(fp),)).fetchone()
+        row = con.execute(
+            "SELECT id, account_id, source_type, account FROM assets WHERE file_path = ?", (str(fp),)
+        ).fetchone()
+        inferred_id, inferred_source = infer_legacy_metadata(con, str(fp), info.get("account"))
+        resolved_id = int(row[1]) if row is not None and row[1] is not None else inferred_id
+        resolved_source = (
+            str(row[2]) if row is not None and row[2] and row[2] != "unknown" else inferred_source
+        )
+        resolved_account = (
+            account_name(con, resolved_id) if resolved_id is not None
+            else row[3] if row is not None and resolved_source != "unknown"
+            else info.get("account")
+        )
+        resolved_category = resolved_account or info["category"]
         values = (
             str(fp), fp.name, stat.st_size,
-            info.get("product_id"), parse_video_id(fp.name), info.get("account"),
-            info["category"], "ready", thumb, mtime, now, now,
+            info.get("product_id"), parse_video_id(fp.name), resolved_account,
+            resolved_id, resolved_source, resolved_category, "ready", thumb, mtime, now, now,
         )
         if row is None:
             con.execute(
                 "INSERT INTO assets (file_path, file_name, file_size, product_id, video_id, account, "
-                "category, status, thumb_path, file_mtime, scanned_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "account_id, source_type, category, status, thumb_path, file_mtime, scanned_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 values,
             )
             added += 1
         else:
             con.execute(
-                "UPDATE assets SET file_size=?, product_id=?, video_id=?, account=?, category=?, "
+                "UPDATE assets SET file_size=?, product_id=COALESCE(product_id, ?), video_id=?, "
+                "account=?, account_id=?, source_type=?, category=?, "
                 "thumb_path=?, file_mtime=?, scanned_at=? WHERE id=?",
-                (stat.st_size, info.get("product_id"), parse_video_id(fp.name), info.get("account"),
-                 info["category"], thumb, mtime, now, row[0]),
+                (stat.st_size, info.get("product_id"), parse_video_id(fp.name), resolved_account,
+                 resolved_id, resolved_source, resolved_category, thumb, mtime, now, row[0]),
             )
             updated += 1
         con.commit()
@@ -275,6 +475,11 @@ def row_to_dict(con: sqlite3.Connection, r: sqlite3.Row) -> Dict[str, Any]:
 def cmd_list(con: sqlite3.Connection, args: argparse.Namespace) -> Dict[str, Any]:
     where: List[str] = []
     params: List[Any] = []
+    if args.account == UNASSIGNED_ACCOUNT_FILTER:
+        where.append("(account IS NULL OR TRIM(account) = '')")
+    elif args.account:
+        where.append("TRIM(account) = ?")
+        params.append(args.account)
     if args.product_id:
         where.append("product_id = ?")
         params.append(args.product_id)
@@ -285,17 +490,27 @@ def cmd_list(con: sqlite3.Connection, args: argparse.Namespace) -> Dict[str, Any
         # 目录日期语义：{账号}/{YYYY-MM-DD}/{商品ID}/... → 路径含 /日期/ 或 \日期\（Windows）
         where.append("(file_path LIKE ? OR file_path LIKE ?)")
         params.extend([f"%/{args.date}/%", f"%\\{args.date}\\%"])
-    sql = "SELECT * FROM assets"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ?"
-    params.append(args.limit)
-    rows = [row_to_dict(con, r) for r in con.execute(sql, params).fetchall()]
-
-    # 标签过滤（与主条件 AND）：有 tag 参数时二次过滤
     if args.tag:
-        rows = [r for r in rows if args.tag in r["tags"]]
-    return {"ok": True, "count": len(rows), "rows": rows}
+        where.append("EXISTS (SELECT 1 FROM asset_tags AS asset_tag WHERE asset_tag.asset_id = assets.id AND asset_tag.tag = ?)")
+        params.append(args.tag)
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+    sql = "SELECT * FROM assets" + where_sql
+    sql += " ORDER BY id DESC LIMIT ?"
+    rows = [row_to_dict(con, r) for r in con.execute(sql, [*params, args.limit]).fetchall()]
+    account_counts = [dict(row) for row in con.execute(
+        "SELECT COALESCE(NULLIF(TRIM(account), ''), '__unassigned__') AS account_key, COUNT(*) AS count "
+        "FROM assets" + where_sql + " GROUP BY account_key ORDER BY account_key COLLATE NOCASE",
+        params,
+    ).fetchall()]
+    return {"ok": True, "count": len(rows), "rows": rows, "account_counts": account_counts}
+
+
+def cmd_accounts(con: sqlite3.Connection) -> Dict[str, Any]:
+    accounts = [row[0] for row in con.execute(
+        "SELECT DISTINCT TRIM(account) FROM assets "
+        "WHERE account IS NOT NULL AND TRIM(account) <> '' ORDER BY TRIM(account) COLLATE NOCASE"
+    ).fetchall()]
+    return {"ok": True, "accounts": accounts}
 
 
 def cmd_tags(con: sqlite3.Connection) -> Dict[str, Any]:
@@ -370,7 +585,16 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_scan = sub.add_parser("scan", help="扫描下载目录并登记素材")
+    p_register = sub.add_parser("register", help="由下载或生成流程显式登记素材来源")
+    p_register.add_argument("--file-path", required=True)
+    p_register.add_argument("--source-type", choices=SOURCE_TYPES[:2], required=True)
+    p_register.add_argument("--account-id", type=int)
+    p_register.add_argument("--product-id")
+    p_assign = sub.add_parser("assign-account", help="人工确认素材所属抖音账号，不修改来源")
+    p_assign.add_argument("--id", type=int, required=True)
+    p_assign.add_argument("--account-id", type=int, required=True)
     p_list = sub.add_parser("list", help="检索素材")
+    p_list.add_argument("--account", help=f"按账号过滤；使用 {UNASSIGNED_ACCOUNT_FILTER} 过滤未归属账号素材")
     p_list.add_argument("--product-id", help="按商品 ID 过滤")
     p_list.add_argument("--tag", help="按标签过滤")
     p_list.add_argument("--date", help="按目录日期过滤（YYYY-MM-DD）")
@@ -378,6 +602,7 @@ def main() -> int:
     p_list.add_argument("--limit", type=int, default=200)
     p_del = sub.add_parser("delete", help="删除素材（记录+文件）")
     p_del.add_argument("--id", type=int, required=True)
+    sub.add_parser("accounts", help="列出素材记录中的账号")
     sub.add_parser("tags", help="全部标签")
     sub.add_parser("categories", help="全部分类")
     p_tag = sub.add_parser("tag-set", help="设置素材标签")
@@ -391,22 +616,31 @@ def main() -> int:
     root = Path(args.root)
     ffmpeg = resolve_ffmpeg()
 
-    if args.command == "scan":
-        payload = cmd_scan(con, root, ffmpeg)
-    elif args.command == "list":
-        payload = cmd_list(con, args)
-    elif args.command == "delete":
-        payload = cmd_delete(con, root, args)
-    elif args.command == "tags":
-        payload = cmd_tags(con)
-    elif args.command == "categories":
-        payload = cmd_categories(con)
-    elif args.command == "tag-set":
-        payload = cmd_tag_set(con, args)
-    elif args.command == "make-thumb":
-        payload = cmd_make_thumb(con, root, ffmpeg, args)
-    else:
-        payload = {"ok": False, "error": f"未知命令：{args.command}"}
+    try:
+        if args.command == "scan":
+            payload = cmd_scan(con, root, ffmpeg)
+        elif args.command == "register":
+            payload = register_asset(con, args.file_path, args.source_type, args.account_id, args.product_id)
+        elif args.command == "assign-account":
+            payload = assign_asset_account(con, args.id, args.account_id)
+        elif args.command == "list":
+            payload = cmd_list(con, args)
+        elif args.command == "accounts":
+            payload = cmd_accounts(con)
+        elif args.command == "delete":
+            payload = cmd_delete(con, root, args)
+        elif args.command == "tags":
+            payload = cmd_tags(con)
+        elif args.command == "categories":
+            payload = cmd_categories(con)
+        elif args.command == "tag-set":
+            payload = cmd_tag_set(con, args)
+        elif args.command == "make-thumb":
+            payload = cmd_make_thumb(con, root, ffmpeg, args)
+        else:
+            payload = {"ok": False, "error": f"未知命令：{args.command}"}
+    except (OSError, sqlite3.Error, ValueError) as error:
+        payload = {"ok": False, "error": str(error)}
 
     con.close()
     emit(payload)

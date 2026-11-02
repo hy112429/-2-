@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { onMounted, ref } from 'vue'
+
 const props = defineProps<{ active: string }>()
 
 const emit = defineEmits<{
@@ -7,6 +9,13 @@ const emit = defineEmits<{
 
 // 顶部菜单项（需求 4）
 const MENU_ITEMS = ['百应工作台', '商品查询']
+const appVersion = ref('')
+
+onMounted(() => {
+  void window.api.appInfo.getVersion()
+    .then((version) => { appVersion.value = version })
+    .catch(() => { appVersion.value = '未知' })
+})
 </script>
 
 <template>
@@ -29,7 +38,7 @@ const MENU_ITEMS = ['百应工作台', '商品查询']
       </button>
     </nav>
 
-    <div class="version">v0.0.1</div>
+    <div class="version">v{{ appVersion }}</div>
   </header>
 </template>
 

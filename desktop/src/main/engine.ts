@@ -1,8 +1,9 @@
 import { app, ipcMain, type IpcMainInvokeEvent } from 'electron'
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
-import { join, resolve } from 'path'
-import { existsSync } from 'fs'
+import { delimiter, join, relative, resolve, sep } from 'path'
+import { existsSync, readFileSync } from 'fs'
 import { createInterface } from 'readline'
+import { getClientPaths } from './app-dirs'
 
 /**
  * Python 引擎子进程管家（T-11）
@@ -38,19 +39,16 @@ const ALLOWED_SCRIPTS = new Set([
   'link_batch.py',
   'read_vod.py',
   'account_manager.py',
-  'remove_watermark.py',
-  'remove_watermark_ai.py'
+  'selection_settings.py',
+  'selection_recovery.py',
+  'selection_registry_local.py',
+  'publish_queue.py',
+  'image_to_video.py',
+  'remove_watermark.py'
 ])
 
-/**
- * 需要独立解释器的脚本（其依赖不在引擎精简 venv 里）。
- * AI 去水印需要 torch + moonshine_server（moonshine 独立环境），
- * 路径可用环境变量 MOONSHINE_PYTHON 覆盖（开发态默认 D 盘固定环境）。
- */
-const SCRIPT_PYTHON: Record<string, string> = {
-  'remove_watermark_ai.py':
-    process.env['MOONSHINE_PYTHON'] ?? 'D:\\software\\moonshine\\.venv\\Scripts\\python.exe'
-}
+/** 仅主进程可调用：队列终态与千川页面执行不能由渲染进程任意伪造。 */
+const INTERNAL_SCRIPTS = new Set(['qianchuan_upload.py', 'qianchuan_browser.py'])
 
 /** 正在运行的任务表：taskId -> 句柄（含取消标志与强杀入口） */
 interface TaskHandle {
@@ -98,10 +96,75 @@ export function getEngineDir(): string {
   return resolve(app.getAppPath(), '..', 'engine')
 }
 
-/** venv 里的 python.exe；不存在时退回 PATH 上的 python */
+/** 安装版随包携带的独立 Python 运行时，不依赖构建机的用户目录或系统 Python。 */
+function getBundledPythonRuntimeDir(): string | undefined {
+  if (!app.isPackaged) return undefined
+  const runtimeDir = join(getEngineDir(), 'runtime')
+  return existsSync(join(runtimeDir, 'python.exe')) ? runtimeDir : undefined
+}
+
+/** 安装版优先用随包运行时；开发态沿用 venv，基础 Python 缺失时退回 PATH。 */
 export function getPythonPath(): string {
+  const override = process.env['TOUGUANG_PYTHON_EXE']?.trim()
+  if (override) return override
+
+  const bundledRuntimeDir = getBundledPythonRuntimeDir()
+  if (bundledRuntimeDir) return join(bundledRuntimeDir, 'python.exe')
+
   const venv = join(getEngineDir(), '.venv', 'Scripts', 'python.exe')
-  return existsSync(venv) ? venv : 'python'
+  if (!existsSync(venv)) return 'python'
+
+  // Windows venv 的 python.exe 只是启动器，实际仍依赖 pyvenv.cfg 里的基础解释器。
+  // electron-builder 会复制 venv，但目标电脑未必安装构建机上的绝对路径 Python。
+  const configPath = join(getEngineDir(), '.venv', 'pyvenv.cfg')
+  if (existsSync(configPath)) {
+    try {
+      const config = readFileSync(configPath, 'utf8')
+      const executable = config.match(/^\s*executable\s*=\s*(.+?)\s*$/im)?.[1]
+      if (executable && !existsSync(executable)) return 'python'
+    } catch {
+      // 配置不可读时仍沿用现有 venv，让进程返回真实诊断。
+    }
+  }
+  return venv
+}
+
+/** 供所有 Python 子进程共用的运行环境；随包运行时必须显式设置标准库和依赖目录。 */
+export function getPythonSpawnEnvironment(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const spawnEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...extra,
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1'
+  }
+  const bundledRuntimeDir = process.env['TOUGUANG_PYTHON_EXE']?.trim()
+    ? undefined
+    : getBundledPythonRuntimeDir()
+  if (bundledRuntimeDir) {
+    const sitePackages = join(getEngineDir(), '.venv', 'Lib', 'site-packages')
+    spawnEnv.PYTHONHOME = bundledRuntimeDir
+    spawnEnv.PYTHONPATH = [sitePackages, process.env['PYTHONPATH']]
+      .filter((value): value is string => Boolean(value?.trim()))
+      .join(delimiter)
+  }
+  return spawnEnv
+}
+
+/** 将旧界面默认路径映射到当前运行版本的数据目录。 */
+function resolveClientArgs(args: string[]): string[] {
+  const paths = getClientPaths()
+  const legacyDb = resolve('D:\\software\\投广客户端\\data\\ad_client.db').toLowerCase()
+  const legacyDownloads = resolve('D:\\software\\投广客户端\\downloads').toLowerCase()
+  return args.map((arg) => {
+    const normalized = resolve(arg).toLowerCase()
+    if (normalized === legacyDb) return paths.databasePath
+    if (normalized === legacyDownloads) return paths.downloadsDir
+    if (normalized.startsWith(`${legacyDownloads}${sep}`)) {
+      const suffix = relative('D:\\software\\投广客户端\\downloads', arg)
+      return join(paths.downloadsDir, suffix)
+    }
+    return arg
+  })
 }
 
 // ---------------------------------------------------------------- 错误美化
@@ -154,6 +217,7 @@ interface RunOptions {
   args?: string[]
   stdinJson?: unknown
   onEvent: (event: EngineEvent) => void
+  internal?: boolean
 }
 
 /** 拉起脚本直到结束。promise = 终态结论；kill() = 请求取消（幂等） */
@@ -162,7 +226,7 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
   let active: ChildProcessWithoutNullStreams | null = null
 
   const promise = new Promise<ScriptOutcome>((resolveOutcome) => {
-    if (!ALLOWED_SCRIPTS.has(script)) {
+    if (!ALLOWED_SCRIPTS.has(script) && !(options.internal && INTERNAL_SCRIPTS.has(script))) {
       resolveOutcome({ ok: false, error: `不允许执行脚本：${script}（需加入白名单）` })
       return
     }
@@ -171,24 +235,17 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
       resolveOutcome({ ok: false, error: `引擎脚本不存在：${scriptPath}` })
       return
     }
-    const pythonPath = SCRIPT_PYTHON[script] ?? getPythonPath()
-    if (SCRIPT_PYTHON[script] && !existsSync(pythonPath)) {
-      resolveOutcome({
-        ok: false,
-        error: `缺少脚本 ${script} 的运行环境（${pythonPath} 不存在），请先部署 Moonshine 环境（见 docs/TODO.md 去水印方案）`
-      })
-      return
-    }
+    const pythonPath = getPythonPath()
 
     try {
-      active = spawn(pythonPath, [scriptPath, ...(options.args ?? [])], {
+      const spawnEnv = getPythonSpawnEnvironment({
+        TOUGUANG_DATA_DIR: getClientPaths().dataDir,
+        TOUGUANG_DOWNLOADS_DIR: getClientPaths().downloadsDir
+      })
+      active = spawn(pythonPath, [scriptPath, ...resolveClientArgs(options.args ?? [])], {
         cwd: getEngineDir(),
         windowsHide: true,
-        env: {
-          ...process.env,
-          PYTHONIOENCODING: 'utf-8', // 强制 UTF-8，避免中文乱码
-          PYTHONUTF8: '1'
-        }
+        env: spawnEnv
       })
     } catch (err) {
       resolveOutcome({ ok: false, error: `无法启动 Python 子进程：${String(err)}` })
@@ -273,7 +330,7 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
       finish({
         ok: false,
         error: missing
-          ? '找不到 Python 解释器：请确认 engine\\.venv 已创建并装好依赖（见 docs/TODO.md §0.3）'
+          ? '找不到可用的 Python 解释器：请安装 Python 3.10+ 并加入 PATH，或通过 TOUGUANG_PYTHON_EXE 指定 python.exe。'
           : `Python 子进程启动失败：${err.message}`
       })
     })
@@ -284,7 +341,19 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
         return
       }
       if (code !== 0) {
-        finish({ ok: false, code, error: friendlyError(stderrTail, code) })
+        const structuredResult =
+          result !== null && typeof result === 'object' && !Array.isArray(result)
+            ? result as Record<string, unknown>
+            : null
+        const structuredError = structuredResult?.['error']
+        finish({
+          ok: false,
+          code,
+          error:
+            typeof structuredError === 'string' && structuredError.trim()
+              ? `${structuredError}（退出码 ${code}）`
+              : friendlyError(stderrTail, code)
+        })
         return
       }
       if (result !== undefined) {
@@ -310,6 +379,12 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
       }
     }
   }
+}
+
+/** 主进程后台服务执行白名单引擎命令，不依赖某个渲染窗口存活。 */
+export async function runEngineCommand(script: string, args: string[] = []): Promise<ScriptOutcome> {
+  const handle = runScript(script, { args, internal: true, onEvent: () => undefined })
+  return handle.promise
 }
 
 // ---------------------------------------------------------------- IPC 注册

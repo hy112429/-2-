@@ -4,3 +4,11 @@
 # HTTP 请求库。用途：短链跳转跟随、自定义移动端请求头、超时控制、流式读取校验。
 # 为什么不用标准库 urllib：跳转与请求头处理要多写大量样板代码，且异常信息难读。
 requests>=2.32,<3
+
+# Playwright CDP 桥接：连接客户端启动的外部 Chrome profile，捕获百应类目/商品响应并驱动页面。
+# 只安装 Python 包；浏览器继续使用本机 Chrome，不额外下载 Playwright 浏览器。
+playwright>=1.55,<2
+
+# 手动移动水印检测与逐帧修复（使用 headless 构建，不依赖 OpenCV GUI）。
+numpy>=2.1,<3
+opencv-python-headless>=4.11,<5

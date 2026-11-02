@@ -3,12 +3,22 @@ import type { Cookie } from 'electron'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { attachProbe } from './probe'
+import { commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
+import { getClientPaths } from './app-dirs'
+import {
+  beginRegistryReservation,
+  finishRegistryReservation,
+  registerSelectionRegistryIpc,
+  reserveRegistryCandidates,
+  type RegistryCandidate
+} from './selection_registry'
+import { randomUUID } from 'crypto'
 
 /**
- * 抖音 / 百应 登录态管理
+ * 抖音 / 百应 登录态管理与后台探针视图
  *
  * 设计要点
- *  1. 用 WebContentsView（Electron 30+ 正式 API），不用已废弃的 <webview> 标签
+ *  1. 用 WebContentsView（Electron 30+ 正式 API）承载后台探针/自动化，不用于登录页展示
  *  2. 持久化靠 persist: 分区 —— 见 LOGIN_PARTITION 的注释
  *  3. 加密靠系统密钥（Windows DPAPI），由 Chromium 自己完成，我们不做二次明文落盘
  *  4. 交给 Python 引擎时走 stdin，cookie 值不落盘
@@ -42,7 +52,9 @@ export const LOGIN_PARTITION = 'persist:douyin-login'
  *
  * 位置与 ad_client.db 同级（D 盘数据目录）。
  */
-const CREDENTIAL_BACKUP_PATH = join('D:\\software\\投广客户端\\data', 'login_credential.enc')
+function credentialBackupPath(): string {
+  return join(getClientPaths().dataDir, 'login_credential.enc')
+}
 
 /** 加密备份的可见元信息（不含任何 cookie 值） */
 export interface CredentialBackupMeta {
@@ -485,8 +497,9 @@ async function saveCredentialBackup(
     const all = await ses.cookies.get({})
     const mine = dedupeCookies(filterCookiesByTarget(all, target.domains))
     const enc = safeStorage.encryptString(serializeCookies(mine))
-    mkdirSync(dirname(CREDENTIAL_BACKUP_PATH), { recursive: true })
-    writeFileSync(CREDENTIAL_BACKUP_PATH, enc)
+    const backupPath = credentialBackupPath()
+    mkdirSync(dirname(backupPath), { recursive: true })
+    writeFileSync(backupPath, enc)
     return {
       exists: true,
       updatedAt: new Date().toISOString(),
@@ -500,7 +513,7 @@ async function saveCredentialBackup(
 /** 删除加密备份（登出时调用） */
 function removeCredentialBackup(): void {
   try {
-    rmSync(CREDENTIAL_BACKUP_PATH, { force: true })
+    rmSync(credentialBackupPath(), { force: true })
   } catch {
     /* 删除失败不致命 */
   }
@@ -581,20 +594,323 @@ async function clearLoginState(): Promise<void> {
 // ---------------------------------------------------------------- IPC 注册
 
 export function registerLoginIpc(): void {
+  registerSelectionRegistryIpc()
   // 登录目标清单（渲染进程用它渲染下拉框，避免两边各写一份导致漂移）
   ipcMain.handle('login:getTargets', () =>
     LOGIN_TARGETS.map((t) => ({ id: t.id, name: t.name, url: t.url }))
   )
 
-  // 打开登录页
-  ipcMain.handle('browser:open', async (_e, targetId: string) => {
-    currentTargetId = findTarget(targetId).id
+  // 所有登录页均在客户端托管的外部 Chrome profile 打开，并通过 CDP 连接自动化。
+  ipcMain.handle('browser:open', async (_e, targetId: string, options?: { profileKey?: string; profilePath?: string }) => {
     const target = findTarget(targetId)
-    attachView()
-    const view = ensureView()
-    await view.webContents.loadURL(target.url)
+    currentTargetId = target.id
+    detachView()
+    const result = await openManagedBrowser(target.url, {
+      profileKey: options?.profileKey ?? 'general',
+      profilePath: options?.profilePath
+    })
     emitBrowserState()
-    return { ok: true, url: target.url }
+    return result
+  })
+
+  ipcMain.handle('browser:validateProfilePath', (_e, options: { profileKey: string; profilePath?: string }) => {
+    if (!options || typeof options.profileKey !== 'string') return { ok: false, error: '缺少账号 profile 标识' }
+    try {
+      return {
+        ok: true,
+        path: validateManagedProfilePath(options.profileKey, options.profilePath)
+      }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('browser:inspectBaiyingSelection', async (_e, options: { profileKey: string; profilePath?: string; includeCategoryTree?: boolean }) => {
+    if (!options || typeof options.profileKey !== 'string') throw new Error('缺少百应账号浏览器 profile')
+    return commandManagedBrowser('inspect-selection', { includeCategoryTree: options.includeCategoryTree === true }, options)
+  })
+
+  ipcMain.handle('browser:checkAccountLogins', async (_e, params: { accountId: number; profilePath?: string }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('登录预检账号 ID 无效')
+    }
+    return commandManagedBrowser('check-account-logins', {
+      accountId: params.accountId
+    }, {
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    })
+  })
+
+  ipcMain.handle('browser:inspectAccountPages', async (_e, params: { accountId: number; profilePath?: string }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('浏览器页面检查账号 ID 无效')
+    }
+    return inspectManagedBrowserPages({
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    })
+  })
+
+  ipcMain.handle('browser:runBaiyingSelection', async (event, params: {
+    profileKey: string
+    profilePath?: string
+    settings: Record<string, unknown>
+    accountId: number
+    accountKey?: string
+    downloadPath: string
+    selectedIndexes?: number[]
+    candidateSnapshot?: unknown[]
+    refreshCandidatesById?: boolean
+    analyzeBeforeCart?: boolean
+    maxSelectedProducts?: number
+    stopAfterCart?: boolean
+    previewOnly?: boolean
+  }) => {
+    if (!params || typeof params.profileKey !== 'string' || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('百应选品参数无效')
+    }
+    if (!params.settings || typeof params.settings !== 'object' || typeof params.downloadPath !== 'string') {
+      throw new Error('百应选品设置或下载目录无效')
+    }
+    const browserOptions = { profileKey: params.profileKey, profilePath: params.profilePath }
+    const onProgress = (progress: ManagedBrowserProgress): void => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('browser:selectionProgress', { accountId: params.accountId, ...progress })
+      }
+    }
+    if (params.previewOnly === true) {
+      return commandManagedBrowser('run-selection', params, browserOptions, onProgress)
+    }
+
+    const accountKey = `local:${params.accountId}`
+    const snapshot = Array.isArray(params.candidateSnapshot) ? params.candidateSnapshot as Array<Record<string, unknown>> : []
+    const selected = Array.isArray(params.selectedIndexes) ? params.selectedIndexes : []
+    if (!snapshot.length || !selected.length) throw new Error('本次加车缺少候选快照；本机登记前已停止平台操作。')
+    const selectedRows = snapshot.filter((candidate) => selected.includes(candidate.cardIndex as number))
+    if (selectedRows.length !== selected.length) throw new Error('候选索引与商品快照无法一一对应；本机登记前已停止平台操作。')
+    const maxSelected = Number(params.maxSelectedProducts)
+    const reservationLimit = Number.isFinite(maxSelected) && maxSelected > 0
+      ? Math.min(selectedRows.length, Math.max(1, Math.ceil(maxSelected * 2)))
+      : selectedRows.length
+    const rowsToReserve = selectedRows.slice(0, reservationLimit)
+    const items: RegistryCandidate[] = rowsToReserve.map((candidate) => {
+      const path = Array.isArray(candidate.categoryIds) ? candidate.categoryIds.map(String).filter(Boolean) : []
+      const leafCategoryId = params.settings.selectionMode === 'category'
+        ? String(candidate.leafCategoryId ?? path.at(-1) ?? '').trim()
+        : ''
+      return {
+        productId: String(candidate.productId ?? '').trim(),
+        leafCategoryId,
+        title: String(candidate.title ?? '').slice(0, 512)
+      }
+    })
+    const categoryModeRequiresId = params.settings.selectionMode === 'category'
+    if (items.some((item) => !item.productId || (categoryModeRequiresId && !item.leafCategoryId))) {
+      throw new Error('至少一个候选缺少商品 ID' + (categoryModeRequiresId ? ' 或百应末级类目 ID' : '') + '；本机登记前已停止加车。')
+    }
+    const requestId = randomUUID()
+    const reservationResult = await reserveRegistryCandidates(accountKey, requestId, items)
+    const tokenByProduct = new Map(reservationResult.reserved.map((item) => [item.productId, item.token]))
+    const reservedRows = rowsToReserve.filter((candidate) => tokenByProduct.has(String(candidate.productId ?? '')))
+    if (!reservedRows.length) {
+      const reasons = reservationResult.rejected.map((item) => `${item.productId}（${item.reason}）`).join('、')
+      throw new Error(`本机登记没有预留到可加车商品，已停止加车。${reasons}`)
+    }
+    const reservedIndexes = reservedRows.map((candidate) => candidate.cardIndex as number)
+    try {
+      for (const candidate of reservedRows) {
+        const token = tokenByProduct.get(String(candidate.productId ?? ''))
+        if (token) await beginRegistryReservation(token)
+      }
+    } catch (error) {
+      const cleanup: string[] = []
+      for (const candidate of reservedRows) {
+        const token = tokenByProduct.get(String(candidate.productId ?? ''))
+        if (!token) continue
+        try {
+          await finishRegistryReservation(token, 'NOT_ADDED')
+        } catch (releaseError) {
+          cleanup.push(String(releaseError))
+        }
+      }
+      throw new Error(`本机登记预留状态无法确认，未向百应发送加车命令。${cleanup.length ? `部分预留仍需核查：${cleanup[0]}。` : ''}${error instanceof Error ? error.message : String(error)}`)
+    }
+    const runParams = { ...params, selectedIndexes: reservedIndexes }
+    try {
+      const result = await commandManagedBrowser('run-selection', runParams, browserOptions, onProgress)
+      const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
+      const completedById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
+      const settlementWarnings: string[] = []
+      const registryReleaseEvents: Array<{
+        productId: string
+        outcome: 'NOT_ADDED'
+        state: 'RELEASED'
+        reason: 'control failure'
+        diagnosticPath: string
+        settled: boolean
+      }> = []
+      for (const candidate of reservedRows) {
+        const productId = String(candidate.productId ?? '')
+        const token = tokenByProduct.get(productId)
+        if (!token) continue
+        const item = completedById.get(productId)
+        const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' && item.cartAttempted !== true
+        const outcome = item?.cartAdded === true
+          ? 'ADDED'
+          : controlFailure
+            ? 'NOT_ADDED'
+            : item?.cartAttempted === true || !item
+            ? 'UNKNOWN'
+            : 'NOT_ADDED'
+        const releaseEvent = controlFailure ? {
+          productId,
+          outcome: 'NOT_ADDED' as const,
+          state: 'RELEASED' as const,
+          reason: 'control failure' as const,
+          diagnosticPath: String(item?.controlDiagnosticPath ?? ''),
+          settled: false
+        } : null
+        if (releaseEvent) registryReleaseEvents.push(releaseEvent)
+        try {
+          await finishRegistryReservation(token, outcome)
+          if (releaseEvent) releaseEvent.settled = true
+        } catch (error) {
+          settlementWarnings.push(`${productId}本机登记结算暂未确认：${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+      const rejected = reservationResult.rejected.map((item) => ({ ...item }))
+      return {
+        ...result,
+        registryRejected: rejected,
+        registrySettlementWarnings: settlementWarnings,
+        registryReleaseEvents
+      }
+    } catch (error) {
+      const warnings: string[] = []
+      for (const candidate of reservedRows) {
+        const token = tokenByProduct.get(String(candidate.productId ?? ''))
+        if (!token) continue
+        try {
+          await finishRegistryReservation(token, 'UNKNOWN')
+        } catch (settlementError) {
+          warnings.push(String(settlementError))
+        }
+      }
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new Error(`百应执行结果不确定；本机登记已将本批预留保留为待核查，禁止重复选品。${warnings.length ? ` 本机登记结算也未确认：${warnings[0]}` : ''} ${reason}`)
+    }
+  })
+
+  ipcMain.handle('browser:prepareDouyinPublish', async (event, params: {
+    accountId: number
+    queueId?: number
+    profilePath?: string
+    productId: string
+    productName: string
+    productUrl: string
+    videoPath: string
+    description: string
+    autoPublish?: boolean
+  }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('创作者中心上传账号 ID 无效')
+    }
+    if (
+      typeof params.productId !== 'string' || !params.productId.trim() ||
+      typeof params.productName !== 'string' || !params.productName.trim() ||
+      typeof params.productUrl !== 'string' || !params.productUrl.trim() ||
+      typeof params.videoPath !== 'string' || !params.videoPath.trim() ||
+      typeof params.description !== 'string' || !params.description.trim() ||
+      params.description.length > 500 ||
+      (params.queueId !== undefined && (!Number.isInteger(params.queueId) || params.queueId < 1)) ||
+      (params.autoPublish !== undefined && typeof params.autoPublish !== 'boolean')
+    ) {
+      throw new Error('创作者中心上传参数无效，需提供商品、MP4 文件和简介')
+    }
+    return commandManagedBrowser('prepare-douyin-publish', {
+      accountId: params.accountId,
+      ...(params.queueId ? { queueId: params.queueId } : {}),
+      productId: params.productId,
+      productName: params.productName,
+      productUrl: params.productUrl,
+      videoPath: params.videoPath,
+      description: params.description,
+      autoPublish: params.autoPublish === true
+    }, {
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    }, (progress) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('browser:publishProgress', {
+          accountId: params.accountId,
+          queueId: params.queueId,
+          state: 'running',
+          updatedAt: new Date().toISOString(),
+          ...progress
+        })
+      }
+    })
+  })
+
+  ipcMain.handle('browser:submitDouyinPublish', async (event, params: {
+    accountId: number
+    queueId: number
+    profilePath?: string
+    productId: string
+    productName: string
+    productUrl: string
+    videoPath: string
+    description: string
+  }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('创作者中心账号 ID 无效')
+    }
+    if (
+      !Number.isInteger(params.queueId) || params.queueId < 1 ||
+      typeof params.productId !== 'string' || !params.productId.trim() ||
+      typeof params.productName !== 'string' || !params.productName.trim() ||
+      typeof params.productUrl !== 'string' || !params.productUrl.trim() ||
+      typeof params.videoPath !== 'string' || !params.videoPath.trim() ||
+      typeof params.description !== 'string' || !params.description.trim() ||
+      params.description.length > 500
+    ) {
+      throw new Error('抖音最终发布参数无效')
+    }
+    return commandManagedBrowser('submit-douyin-publish', {
+      accountId: params.accountId,
+      queueId: params.queueId,
+      productId: params.productId,
+      productName: params.productName,
+      productUrl: params.productUrl,
+      videoPath: params.videoPath,
+      description: params.description
+    }, {
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    }, (progress) => {
+      if (!event.sender.isDestroyed()) {
+        event.sender.send('browser:publishProgress', {
+          accountId: params.accountId,
+          queueId: params.queueId,
+          state: 'running',
+          updatedAt: new Date().toISOString(),
+          ...progress
+        })
+      }
+    })
+  })
+
+  ipcMain.handle('browser:openDouyinCreator', async (_e, params: { accountId: number; profilePath?: string }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('创作者中心账号 ID 无效')
+    }
+    return commandManagedBrowser('open-douyin-creator', {
+      accountId: params.accountId
+    }, {
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    })
   })
 
   // 关闭视图（cookie 保留）

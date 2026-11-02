@@ -1,11 +1,15 @@
 import { BrowserWindow, WebContentsView, ipcMain, safeStorage, session, shell } from 'electron'
+import { openManagedBrowser } from './external_browser'
 import type { Cookie, Session } from 'electron'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { LOGIN_TARGETS } from './login'
+import { getClientPaths } from './app-dirs'
 
 /**
- * 账号级登录态隔离（Step 11，SRS FR-G5-01 / FR-C1-01 / A-12）
+ * 账号级客户端缓存隔离（Step 11，SRS FR-G5-01 / FR-C1-01 / A-12）。
+ * 登录页由客户端启动的外部 Chrome profile 打开，并由 Playwright 通过本机 CDP 连接；
+ * 该 profile 与这里的 Electron 分区仍相互独立。
  * ─────────────────────────────────────────────────────────────
  * 设计要点
  *  1. 每抖音账号一个独立 Chromium 分区 `persist:acct-{id}`，每千川账户一个独立分区
@@ -19,9 +23,6 @@ import { LOGIN_TARGETS } from './login'
  *     不受影响。
  */
 
-/** 数据目录（与 ad_client.db 同级，D 盘） */
-const DATA_DIR = 'D:\\software\\投广客户端\\data'
-
 /** 抖音登录态判定用的候选 cookie 名（与 login.ts 同口径，命中任一视为已登录） */
 const LOGIN_COOKIE_CANDIDATES = ['sessionid', 'sessionid_ss', 'sid_tt', 'sid_guard', 'web_session']
 
@@ -31,7 +32,7 @@ const QC_DOMAINS = ['jinritemai.com', 'oceanengine.com']
 
 /**
  * 外站链接外开（2026-10-14，用户要求）：账号分区视图内点击跳外站的链接
- * 一律走系统浏览器（shell.openExternal），避免外站页面混入登录视图造成串号/混淆。
+ * 一律在外部托管 Chrome 打开，避免外站页面混入登录视图造成串号/混淆。
  * 平台域白名单内的正常跳转（登录/扫码/回跳）仍留在视图内。
  */
 const INTERNAL_NAV_DOMAINS = [
@@ -57,9 +58,6 @@ function isExternalNav(url: string): boolean {
   }
 }
 
-/** 素材根目录：打开素材文件夹时拼 {账号名} */
-const DOWNLOADS_DIR = 'D:\\software\\投广客户端\\downloads'
-
 /** 会话主体：账号（抖音）或千川账户，二者分区互不共用（多开隔离） */
 export type SessionSubject =
   | { kind: 'acct'; id: number; name: string }
@@ -72,7 +70,7 @@ function partitionOf(subject: SessionSubject): string {
 /** 指纹备份文件路径 */
 function credentialPath(subject: SessionSubject): string {
   const tag = subject.kind === 'acct' ? `acct_${subject.id}` : `qc_${subject.id}`
-  return join(DATA_DIR, `login_credential_${tag}.enc`)
+  return join(getClientPaths().dataDir, `login_credential_${tag}.enc`)
 }
 
 /** 指纹种子：由主体 id 派生，稳定且互异（用于 canvas 噪声注入） */
@@ -168,7 +166,7 @@ function ensureView(subject: SessionSubject): WebContentsView {
   view.setBackgroundColor('#ffffff')
   const wc = view.webContents
 
-  // 页面里的 target="_blank" 一律用系统浏览器打开（外站外开），不再在视图内加载
+  // 页面里的 target="_blank" 一律交给系统浏览器打开（外站外开），不在视图内加载
   wc.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url)
     return { action: 'deny' }
@@ -321,7 +319,7 @@ async function checkLogin(subject: SessionSubject): Promise<AccountLoginState> {
       const enc = safeStorage.encryptString(
         JSON.stringify(mine.map((c) => ({ name: c.name, value: c.value, domain: c.domain ?? '', path: c.path ?? '/' })))
       )
-      mkdirSync(DATA_DIR, { recursive: true })
+      mkdirSync(getClientPaths().dataDir, { recursive: true })
       writeFileSync(credentialPath(subject), enc)
       backupExists = true
     } catch (error) {
@@ -432,12 +430,15 @@ async function pullUserInfo(subject: SessionSubject, douyinId: string): Promise<
 
 // ---------------------------------------------------------------- 操作
 
-function openUrl(subject: SessionSubject, url: string): { ok: boolean; url: string; error?: string } {
-  const view = ensureView(subject)
-  if (!attachView()) return { ok: false, url, error: '无法挂载浏览器视图（没有主窗口）' }
-  void view.webContents.loadURL(url)
-  emitViewState()
-  return { ok: true, url }
+async function openExternalLogin(
+  url: string,
+  profileKey: string,
+  profilePath?: string,
+  accountId?: number
+): Promise<{ ok: boolean; url: string; external: true; profilePath?: string; port?: number; accountId?: number; error?: string }> {
+  closeBrowser()
+  const result = await openManagedBrowser(url, { profileKey, profilePath })
+  return { ...result, ...(accountId === undefined ? {} : { accountId }) }
 }
 
 function closeBrowser(): { ok: boolean } {
@@ -447,7 +448,7 @@ function closeBrowser(): { ok: boolean } {
 }
 
 async function openMaterialFolder(accountName: string): Promise<{ ok: boolean; error?: string }> {
-  const folder = join(DOWNLOADS_DIR, accountName)
+  const folder = join(getClientPaths().downloadsDir, accountName)
   if (!existsSync(folder)) {
     return { ok: false, error: `素材目录不存在：${folder}（该账号尚未下载过素材）` }
   }
@@ -482,29 +483,27 @@ async function clearLogin(subject: SessionSubject): Promise<{ ok: boolean }> {
 // ---------------------------------------------------------------- IPC 注册
 
 export function registerAccountLoginIpc(): void {
-  // 打开浏览器登录（抖音主站，用该账号分区）
-  ipcMain.handle('account:openBrowser', (_e, accountId: number) => {
-    const subject: SessionSubject = { kind: 'acct', id: accountId, name: `账号${accountId}` }
+  // 抖音登录页在账号专属托管 Chrome profile 打开；与 Electron 缓存分区相互独立。
+  ipcMain.handle('account:openBrowser', async (_e, params: { accountId: number; profilePath?: string }) => {
     const douyin = LOGIN_TARGETS.find((t) => t.id === 'douyin')
-    return openUrl(subject, douyin ? douyin.url : 'https://www.douyin.com/')
+    return openExternalLogin(
+      douyin ? douyin.url : 'https://www.douyin.com/',
+      `account-${params.accountId}`,
+      params.profilePath,
+      params.accountId
+    )
   })
 
-  // 打开精选页（百应选品广场入口）→ 2026-10-14 起系统浏览器外开（用户要求：除登录类外一律外开）
-  ipcMain.handle('account:openJingxuan', async (_e, accountId: number) => {
+  // 打开精选页（百应选品广场入口）
+  ipcMain.handle('account:openJingxuan', async (_e, params: { accountId: number; profilePath?: string }) => {
     const baiying = LOGIN_TARGETS.find((t) => t.id === 'baiying')
     const url = baiying ? baiying.url : 'https://buyin.jinritemai.com/'
-    try {
-      await shell.openExternal(url)
-      return { ok: true, url, accountId }
-    } catch (error) {
-      return { ok: false, url, error: String(error) }
-    }
+    return openExternalLogin(url, `account-${params.accountId}`, params.profilePath, params.accountId)
   })
 
-  // 登录千川（千川账户分区，多开隔离）
-  ipcMain.handle('qianchuan:openLogin', (_e, qcId: number) => {
-    const subject: SessionSubject = { kind: 'qc', id: qcId, name: `千川${qcId}` }
-    return openUrl(subject, QC_LOGIN_URL)
+  // 千川登录页在独立的托管 Chrome profile 打开。
+  ipcMain.handle('qianchuan:openLogin', async (_e, qcId: number) => {
+    return openExternalLogin(QC_LOGIN_URL, `qianchuan-${qcId}`, undefined, qcId)
   })
 
   ipcMain.handle('account:closeBrowser', () => closeBrowser())

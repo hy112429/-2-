@@ -31,12 +31,18 @@ account_manager.py —— 投广管理客户端 · 账号管理数据层（Step 
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from db import DEFAULT_DB_PATH, connect, emit, now_text
+
+try:
+    from .selection_settings import read_effective_category_catalog
+except ImportError:
+    from selection_settings import read_effective_category_catalog
 
 # 账号状态与千川在线状态的合法取值（约定，非库约束）
 ACCOUNT_STATUSES = ("active", "disabled")
@@ -137,6 +143,82 @@ def _group_map(connection: sqlite3.Connection) -> Dict[int, List[str]]:
     return mapping
 
 
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _decode_settings(value: Optional[str]) -> Dict[str, Any]:
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _category_path_map(nodes: Any) -> Dict[str, str]:
+    paths: Dict[str, str] = {}
+
+    def visit(items: Any, parent: str = "") -> None:
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            node_id = str(item.get("id", ""))
+            name = str(item.get("name", "")).strip()
+            if not node_id or not name:
+                continue
+            path = f"{parent} / {name}" if parent else name
+            paths[node_id] = path
+            visit(item.get("children", []), path)
+
+    visit(nodes)
+    return paths
+
+
+def _selection_category_label(
+    account_id: int,
+    settings_by_scope: Dict[str, Dict[str, Any]],
+    category_paths: Dict[str, str],
+) -> str:
+    account_settings = settings_by_scope.get(f"account:{account_id}", {})
+    global_settings = settings_by_scope.get("global", {})
+    account_selection = account_settings.get("categorySelection", {})
+    global_selection = global_settings.get("categorySelection", {})
+
+    def selected_ids(selection: Any) -> Dict[str, List[str]]:
+        if not isinstance(selection, dict):
+            return {"level1": [], "level2": [], "level3": []}
+        return {
+            level: [str(value) for value in selection.get(level, []) if str(value)]
+            if isinstance(selection.get(level, []), list) else []
+            for level in ("level1", "level2", "level3")
+        }
+
+    account_ids = selected_ids(account_selection)
+    has_account_categories = any(account_ids.values())
+    effective_ids = account_ids if has_account_categories else selected_ids(global_selection)
+    deepest_ids = effective_ids["level3"] or effective_ids["level2"] or effective_ids["level1"]
+    labels: List[str] = []
+    for selected_id in deepest_ids:
+        label = category_paths.get(selected_id)
+        if label is None:
+            for catalog_id, catalog_path in category_paths.items():
+                if catalog_id.endswith(f"__RC_CASCADER_SPLIT__{selected_id}") or selected_id.endswith(
+                    f"__RC_CASCADER_SPLIT__{catalog_id}"
+                ):
+                    label = catalog_path
+                    break
+        if label and label not in labels:
+            labels.append(label)
+
+    category_text = "；".join(labels) if labels else ("已设置（类目目录待同步）" if deepest_ids else "不限")
+    source_text = "账号" if has_account_categories else "继承通用"
+    return f"{source_text}：{category_text}"
+
+
 def account_list(
     connection: sqlite3.Connection, group_id: Optional[int] = None
 ) -> Dict[str, Any]:
@@ -161,14 +243,46 @@ def account_list(
     ).fetchall()
 
     groups = _group_map(connection)
+    settings_by_scope: Dict[str, Dict[str, Any]] = {}
+    category_paths: Dict[str, str] = {}
+    if _table_exists(connection, "selection_settings"):
+        settings_by_scope = {
+            str(row["scope_key"]): _decode_settings(row["settings_json"])
+            for row in connection.execute("SELECT scope_key, settings_json FROM selection_settings")
+        }
+    if _table_exists(connection, "selection_category_catalog"):
+        try:
+            category_paths = _category_path_map(read_effective_category_catalog(connection))
+        except (sqlite3.Error, TypeError, json.JSONDecodeError):
+            category_paths = {}
+
+    success_counts: Dict[int, int] = {}
+    success_count_available = _table_exists(connection, "selection_quota_events")
+    if success_count_available:
+        try:
+            success_counts = {
+                int(row["account_id"]): int(row["success_count"] or 0)
+                for row in connection.execute(
+                    "SELECT account_id, COUNT(DISTINCT product_id) AS success_count "
+                    "FROM selection_quota_events WHERE event_type = 'cart' GROUP BY account_id"
+                )
+            }
+        except sqlite3.Error:
+            success_count_available = False
+
     accounts = []
     for row in rows:
         item = dict(row)
         item["groups"] = groups.get(row["id"], [])
-        # 计划发布率 / 卡优率 / 广告条数依赖发布与千川模块，接入前暂为 0
-        item["publish_rate"] = 0
-        item["karl_rate"] = 0
-        item["ad_count"] = 0
+        item["selection_category"] = _selection_category_label(
+            int(row["id"]), settings_by_scope, category_paths
+        )
+        # 成功数按成功加车事件按账号+商品去重；旧数据没有事件记录时显示不可用。
+        item["success_count"] = success_counts.get(int(row["id"]), 0) if success_count_available else None
+        # 发布率 / 卡优率 / 广告数依赖真实发布及千川统计，未接入前返回空值，避免伪装为 0。
+        item["publish_rate"] = None
+        item["karl_rate"] = None
+        item["ad_count"] = None
         accounts.append(item)
 
     return {"ok": True, "count": len(accounts), "accounts": accounts}
