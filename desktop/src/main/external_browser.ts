@@ -14,13 +14,6 @@ const CHROME_CANDIDATES = [
   join(process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'), 'Google', 'Chrome', 'Application', 'chrome.exe')
 ].filter((value): value is string => Boolean(value))
 
-const EDGE_CANDIDATES = [
-  process.env['TOUGUANG_EDGE_PATH'],
-  join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-  join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-  join(process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'), 'Microsoft', 'Edge', 'Application', 'msedge.exe')
-].filter((value): value is string => Boolean(value))
-
 const CDP_START_TIMEOUT_MS = 30_000
 const bridgeSessions = new Map<string, BridgeSession>()
 const creatingSessions = new Map<string, Promise<BridgeSession>>()
@@ -71,12 +64,6 @@ function findChrome(): string {
   if (!executable) {
     throw new Error('找不到 Google Chrome。请安装 Chrome，或设置 TOUGUANG_CHROME_PATH 指向 chrome.exe。')
   }
-  return executable
-}
-
-function findEdge(): string {
-  const executable = EDGE_CANDIDATES.find((candidate) => existsSync(candidate))
-  if (!executable) throw new Error('找不到 Microsoft Edge。请安装 Edge，或设置 TOUGUANG_EDGE_PATH 指向 msedge.exe。')
   return executable
 }
 
@@ -570,17 +557,17 @@ export async function openManagedBrowser(
   }
 }
 
-/** 在 Microsoft Edge 默认用户资料中打开 OAuth 页面，复用用户现有登录态。 */
-export function openEdgeUrlInDefaultProfile(url: string): Promise<{ ok: boolean; url: string; profilePath: string }> {
+/** 在客户端专属、持久的 Chrome 用户资料中新开 OAuth 窗口。 */
+export function openQianchuanOAuthInPersistentProfile(url: string): Promise<{ ok: boolean; url: string; profilePath: string }> {
   const parsed = new URL(url)
   if (parsed.protocol !== 'https:' || !['open.oceanengine.com', 'ad.oceanengine.com', 'qianchuan.jinritemai.com'].includes(parsed.hostname)) {
-    throw new Error('只允许在 Microsoft Edge 中打开巨量引擎或千川开放平台 HTTPS 页面。')
+    throw new Error('只允许在 Google Chrome 中打开巨量引擎或千川开放平台 HTTPS 页面。')
   }
-  const edge = findEdge()
-  const localAppData = process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local')
-  const profilePath = join(localAppData, 'Microsoft', 'Edge', 'User Data')
+  const chrome = findChrome()
+  const profilePath = join(getClientPaths().browserProfilesDir, 'qianchuan-product-query-auth')
+  mkdirSync(profilePath, { recursive: true })
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(edge, [`--user-data-dir=${profilePath}`, url], {
+    const child = spawn(chrome, [`--user-data-dir=${profilePath}`, '--profile-directory=Default', '--new-window', url], {
       detached: true,
       stdio: 'ignore',
       windowsHide: false

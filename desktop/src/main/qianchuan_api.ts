@@ -6,7 +6,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { execFile } from 'node:child_process'
 import { getDownloadDir } from './app-dirs'
 import { getEngineDir } from './engine'
-import { openEdgeUrlInDefaultProfile } from './external_browser'
+import { openQianchuanOAuthInPersistentProfile } from './external_browser'
 
 const CALLBACK = 'http://127.0.0.1:8899/callback'
 const API = 'https://api.oceanengine.com'
@@ -323,8 +323,8 @@ async function beginAuth(authUrl: string): Promise<{ ok: boolean; callback: stri
   try {
     await new Promise<void>((resolve, reject) => { listener!.once('error', reject); listener!.listen(8899, '127.0.0.1', resolve) })
     authTimer = setTimeout(() => { listener?.close(); listener = null; pendingState = null; authTimer = null }, timeoutMs)
-    const opened = await openEdgeUrlInDefaultProfile(url.toString())
-    if (!opened.ok) throw new Error('Microsoft Edge 授权窗口未能打开')
+    const opened = await openQianchuanOAuthInPersistentProfile(url.toString())
+    if (!opened.ok) throw new Error('Google Chrome 授权窗口未能打开')
     return { ok: true, callback: CALLBACK, profilePath: opened.profilePath }
   } catch (error) {
     listener?.close(); listener = null; pendingState = null; if (authTimer) clearTimeout(authTimer); authTimer = null

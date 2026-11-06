@@ -53,7 +53,7 @@ function watchAuthCallback(previousRevision: number): void {
           message.value = `本机已收到新授权回调。${message.value}`
         } else if (Date.now() >= deadline) {
           stopAuthPoll()
-          message.value = '本机 15 分钟内未收到授权回调。请在 Microsoft Edge 授权页确认当前登录用户有权访问目标千川广告主，并在授权范围中勾选该广告主后点“确认授权”；浏览器须跳转到本机回调成功页。'
+          message.value = '本机 15 分钟内未收到授权回调。请在 Google Chrome 授权页确认当前登录用户有权访问目标千川广告主，并在授权范围中勾选该广告主后点“确认授权”；浏览器须跳转到本机回调成功页。'
         }
       } catch (error) {
         stopAuthPoll()
@@ -123,7 +123,7 @@ async function authorize(): Promise<void> {
     const opened = await window.api.qianchuan.apiAuthorize(authUrl.value)
     authBrowserPath.value = opened.profilePath
     watchAuthCallback(previousRevision)
-    message.value = '已在 Microsoft Edge 当前默认用户资料中打开授权页，正在等待本机回调。页面右上角显示当前登录用户；请将目标“倩姐严选”千川广告主纳入授权范围并点击页面底部“确认授权”。如需切换登录用户，可点击账号卡片旁的“更换账号授权”。'
+    message.value = '已在千川专用 Chrome 新窗口打开授权页，正在等待本机回调。首次请登录目标账号并完成授权；此浏览器会保留登录态，后续商品查询不需重复授权。请确认页面右上角账号正确，并将目标“倩姐严选”千川广告主纳入授权范围。'
   } catch (error) { stopAuthPoll(); message.value = errText(error); await refresh() }
   finally { busy.value = false }
 }
@@ -378,10 +378,10 @@ onBeforeUnmount(() => { stopAuthPoll(); offEngine?.() })
       </div>
       <div class="qc-row">
         <input v-model="authUrl" class="qc-input wide" placeholder="粘贴开放平台应用详情里生成的授权 URL" aria-label="千川授权 URL" />
-        <button :disabled="busy || !configured || !authUrl" @click="authorize">从本客户端打开授权</button>
+        <button :disabled="busy || !configured || !authUrl" @click="authorize">{{ authorized ? '重新授权 / 补充账户' : '首次授权' }}</button>
       </div>
-      <p class="hint">此入口会在 Microsoft Edge 默认用户资料中打开授权页，复用该 Edge 现有登录态。页面右上角显示当前登录用户；要查询“倩姐严选”，须在授权范围中勾选对应千川广告主。需要更换登录用户时，使用账号卡片旁的“更换账号授权”；请勿直接粘贴原始授权 URL。</p>
-      <p v-if="authBrowserPath" class="hint">Edge 用户资料目录：{{ authBrowserPath }}</p>
+      <p class="hint">首次授权会在客户端专属 Chrome 资料中单独打开新窗口，页面初始未登录。请登录目标账号并确认授权；之后资料会保留登录态，OAuth Token 在本机加密保存并自动刷新，正常查询不用再次执行授权。只有授权被撤销/过期或需要补充授权账户时，才重新授权。请勿直接粘贴原始授权 URL。</p>
+      <p v-if="authBrowserPath" class="hint">千川专用浏览器资料目录：{{ authBrowserPath }}</p>
       <p v-if="authWaiting" class="qc-message" role="status">正在等待本机授权回调（最多 15 分钟）…</p>
       <p class="hint">本机回调：{{ callback }} · {{ authorized ? 'OAuth 已授权' : '未授权' }}<span v-if="authorizedIds.length"> · 千川广告主：{{ authorizedIds.join('、') }}</span><span v-else-if="authorized"> · {{ requiresQianchuanAuthorization ? '本次授权未包含千川广告主' : '千川业务账户待确认' }}</span></p>
       <p v-if="authorizedIdentitySummary" class="hint">本次授权账户：{{ authorizedIdentitySummary }}</p>

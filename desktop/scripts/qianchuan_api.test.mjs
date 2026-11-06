@@ -74,9 +74,9 @@ new Function('exports', 'require', 'module', 'fetch', 'AbortSignal', compiled)(m
   if (name === 'node:child_process') return nodeChild
   if (name === './app-dirs') return { getDownloadDir: () => root }
   if (name === './engine') return { getEngineDir: () => root }
-  if (name === './external_browser') return { openEdgeUrlInDefaultProfile: async (url) => {
+  if (name === './external_browser') return { openQianchuanOAuthInPersistentProfile: async (url) => {
     openedUrl = url
-    openedProfilePath = 'C:\\Users\\9\\AppData\\Local\\Microsoft\\Edge\\User Data'
+    openedProfilePath = 'D:\\software\\投广客户端\\browser-profiles\\qianchuan-product-query-auth'
     return { ok: true, url, profilePath: openedProfilePath }
   } }
   throw new Error(`Unexpected import: ${name}`)
