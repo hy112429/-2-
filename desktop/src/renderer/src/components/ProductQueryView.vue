@@ -1,21 +1,24 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import QianchuanVideoQueryPanel from './QianchuanVideoQueryPanel.vue'
 
 /**
  * 商品查询主界面（真实数据链路）
  *
- * 数据链路：搜索商品 ID → engine:run 拉起 engine/baiying_cache.py get →
- * 读取百应缓存库（探针在用户浏览百应时自动采集）。命中返回真实商品信息 + 视频直链。
+ * 数据链路：商品 ID → 百应缓存；缺视频时在来源账号的已登录百应重新读取详情；
+ * 同时搜索已授权千川账户。各来源只展示实际返回的视频直链。
  */
 
 interface CachedProduct {
   product_id: string
+  account_id?: number | null
   commodity_id?: string | null
   title?: string | null
   cover_url?: string | null
   cos_ratio?: number | null
   video_url?: string | null
+  video_urls?: string[] | null
   captured_at: string
 }
 
@@ -24,11 +27,64 @@ interface CachedProduct {
 const productId = ref('')
 const searchBusy = ref(false)
 const error = ref('')
+const searchStatus = ref('')
 const foundProduct = ref<CachedProduct | null>(null)
+const qianchuanPanel = ref<{ searchProduct: (id: string) => Promise<{ videoCount: number; reason: string; authorized: boolean }> } | null>(null)
+const foundVideoUrls = computed(() => foundProduct.value ? videoUrlsOf(foundProduct.value) : [])
+
+function videoUrlsOf(product: CachedProduct): string[] {
+  const stored = Array.isArray(product.video_urls) ? product.video_urls : []
+  const urls = [...stored, ...(product.video_url ? [product.video_url] : [])]
+  return [...new Set(urls.filter((url): url is string => typeof url === 'string' && /^https?:\/\//i.test(url)))]
+}
+
+function localDate(): string {
+  const now = new Date()
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+}
+
+function fileTimestamp(): string {
+  const now = new Date()
+  return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
+}
+
+function videoIdFromUrl(url: string, index: number): string {
+  try {
+    const segments = new URL(url).pathname.split('/').filter(Boolean)
+    const candidate = [...segments].reverse().find((part) => part.length >= 10 && /^[\w-]+$/.test(part))
+    return candidate ?? `v${index + 1}`
+  } catch {
+    return `v${index + 1}`
+  }
+}
+
+function baiyingAccountFolder(product: CachedProduct): string {
+  return product.account_id && Number.isInteger(product.account_id) && product.account_id > 0
+    ? `账号-${product.account_id}`
+    : '账号-未知'
+}
 
 // 下载目录
 const downloadDir = ref('')
 const dirNotice = ref('')
+
+// ---------------------------------------------------------------- 本地视频自动剪辑
+
+const editSourcePath = ref('')
+const editProductId = ref('')
+const editProductTitle = ref('')
+const editPrice = ref('')
+const editSellingPoint = ref('')
+const editTrimStart = ref(0)
+const editTrimEnd = ref<number | string>('')
+const editBusy = ref(false)
+const editProgress = ref(0)
+const editStatus = ref('')
+const editError = ref('')
+const editOutputPath = ref('')
+const editSubtitlePath = ref('')
+const editEngineId = ref('')
+let offVideoEdit: (() => void) | null = null
 
 // 预览
 const previewText = ref('')
@@ -41,25 +97,32 @@ function queryCachedProduct(id: string): Promise<{ found: boolean; product?: Cac
     let settled = false
     let taskId: string | null = null
     let off: () => void = () => undefined
+    const earlyEvents: EngineEventPayload[] = []
+    let timeout: number | undefined
     const settle = (fn: () => void): void => {
       if (settled) return
       settled = true
+      if (timeout) clearTimeout(timeout)
       off()
       fn()
     }
 
     // 先订阅再启动：引擎脚本秒回，先 run 再订阅会丢 result 事件（竞态）
-    off = window.api.engine.onEvent((e) => {
-      if (taskId && e.taskId !== taskId) return
+    const handle = (e: EngineEventPayload): void => {
+      if (e.taskId !== taskId) return
       if (e.type === 'result') {
         const d = e.data as { found?: boolean; product?: CachedProduct | null }
         settle(() => resolve({ found: Boolean(d?.found), product: d?.product ?? undefined }))
       } else if (e.type === 'error') {
         settle(() => reject(new Error(e.message ?? '引擎返回错误')))
       }
+    }
+    off = window.api.engine.onEvent((e) => {
+      if (!taskId) earlyEvents.push(e)
+      else handle(e)
     })
 
-    window.setTimeout(() => settle(() => reject(new Error('引擎查询超时（30 秒）'))), 30_000)
+    timeout = window.setTimeout(() => settle(() => reject(new Error('引擎查询超时（30 秒）'))), 30_000)
 
     void window.api.engine
       .run({ script: 'baiying_cache.py', args: ['get', '--product-id', id] })
@@ -69,29 +132,101 @@ function queryCachedProduct(id: string): Promise<{ found: boolean; product?: Cac
           return
         }
         taskId = reply.taskId
+        earlyEvents.forEach(handle)
       })
+      .catch((cause: unknown) => settle(() => reject(cause instanceof Error ? cause : new Error(String(cause)))))
   })
 }
 
+async function refreshBaiyingVideos(id: string, product: CachedProduct): Promise<{ product: CachedProduct; reason: string }> {
+  if (!/^\d{8,20}$/.test(product.commodity_id ?? '')) {
+    return { product, reason: '本机没有该商品的推广 ID，无法打开百应详情' }
+  }
+  if (batchRunning.value) return { product, reason: '百应批量抓取正在运行，请完成后再搜索' }
+  const listed = await window.api.baiying.batchAccounts()
+  if (!listed.ok) return { product, reason: listed.error ?? '读取百应采集账号失败' }
+  const accounts = listed.accounts ?? []
+  const owner = accounts.find(row => row.id === product.account_id)
+    ?? accounts.find(row => row.id === batchAccountId.value)
+    ?? (accounts.length === 1 ? accounts[0] : undefined)
+  if (!owner) return { product, reason: accounts.length ? '商品来源账号不明确；请在下方选择百应采集账号' : '没有启用的百应采集账号' }
+
+  searchStatus.value = `正在用百应账号「${owner.name}」读取商品详情视频…`
+  let taskId = ''
+  let resultMessage = ''
+  const buffered: BaiyingBatchEvent[] = []
+  let resolveFinished!: (value: string) => void
+  const finished = new Promise<string>((resolve) => { resolveFinished = resolve })
+  const handle = (event: BaiyingBatchEvent): void => {
+    if (event.taskId !== taskId) return
+    if (event.type === 'product') resultMessage = event.message ?? ''
+    if (event.type === 'error') resolveFinished(event.message ?? '百应详情读取失败')
+    if (event.type === 'result') resolveFinished(resultMessage || '百应详情未返回视频直链')
+  }
+  const off = window.api.baiying.onBatchEvent((event) => {
+    if (!taskId) buffered.push(event)
+    else handle(event)
+  })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const reply = await window.api.baiying.batchStart({
+      productIds: [`${id}:${product.commodity_id}`], accountId: owner.id
+    })
+    if (!reply.taskId) return { product, reason: reply.error ?? '百应详情读取未启动' }
+    taskId = reply.taskId
+    buffered.forEach(handle)
+    timer = setTimeout(() => resolveFinished('百应详情读取超时'), 80_000)
+    const reason = await finished
+    if (reason === '百应详情读取超时') await window.api.baiying.batchCancel(taskId)
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const refreshed = await queryCachedProduct(id)
+      if (refreshed.product && videoUrlsOf(refreshed.product).length) {
+        return { product: refreshed.product, reason: `百应详情取得 ${videoUrlsOf(refreshed.product).length} 条视频直链` }
+      }
+      if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    return { product, reason }
+  } finally {
+    if (timer) clearTimeout(timer)
+    off()
+  }
+}
+
 async function search(): Promise<void> {
+  if (searchBusy.value) return
   const id = productId.value.trim()
-  if (!id) {
-    error.value = '请输入商品 ID'
+  if (!/^\d{8,20}$/.test(id)) {
+    error.value = '请输入 8–20 位数字商品 ID'
     return
   }
   searchBusy.value = true
   error.value = ''
+  searchStatus.value = '正在搜索百应与千川视频…'
   foundProduct.value = null
   previewText.value = ''
+  const qianchuanSearch = qianchuanPanel.value?.searchProduct(id)
+    .catch((cause: unknown) => ({ videoCount: 0, reason: `千川查询失败：${String(cause)}`, authorized: false }))
   try {
     const r = await queryCachedProduct(id)
-    if (!r.found || !r.product) {
-      error.value = '缓存中无此商品：先在百应打开该商品详情，或用下方「批量抓取」收集后重试'
-    } else {
+    let baiyingReason = '百应缓存没有此商品及其推广 ID'
+    if (r.found && r.product) {
       foundProduct.value = r.product
+      if (videoUrlsOf(r.product).length) baiyingReason = `百应缓存已有 ${videoUrlsOf(r.product).length} 条视频直链`
+      else {
+        const refreshed = await refreshBaiyingVideos(id, r.product)
+        foundProduct.value = refreshed.product
+        baiyingReason = refreshed.reason
+      }
+    }
+    const qianchuan = await qianchuanSearch
+    const baiyingCount = foundProduct.value ? videoUrlsOf(foundProduct.value).length : 0
+    const qianchuanCount = qianchuan?.videoCount ?? 0
+    searchStatus.value = `本次找到：百应 ${baiyingCount} 条、千川 ${qianchuanCount} 条。${qianchuanCount ? '千川结果见下方展开区。' : ''}`
+    if (!baiyingCount && !qianchuanCount) {
+      error.value = `未取得视频链接。百应：${baiyingReason}；千川：${qianchuan?.reason ?? '查询入口不可用'}`
     }
   } catch (err) {
-    error.value = String(err)
+    error.value = `商品视频搜索失败：${String(err)}`
   } finally {
     searchBusy.value = false
   }
@@ -105,11 +240,12 @@ function videoPreview(): void {
     previewText.value = '（未选择商品）请先搜索'
     return
   }
-  if (!p.video_url) {
-    previewText.value = '该商品暂无视频直链（需先在百应打开详情刷新缓存）'
+  const urls = videoUrlsOf(p)
+  if (!urls.length) {
+    previewText.value = '百应未返回该商品的视频直链；请查看搜索结果中的千川来源与具体原因。'
     return
   }
-  previewText.value = `【${p.title ?? p.product_id}】\n商品ID：${p.product_id}\n佣金率：${p.cos_ratio ?? '-'}%\n视频地址：${p.video_url}`
+  previewText.value = `【${p.title ?? p.product_id}】\n商品ID：${p.product_id}\n佣金率：${p.cos_ratio ?? '-'}%\n${urls.map((url, index) => `视频 ${index + 1}：${url}`).join('\n')}`
 }
 
 function clearPreview(): void {
@@ -122,6 +258,136 @@ async function chooseDir(): Promise<void> {
     downloadDir.value = picked
     dirNotice.value = `下载目录已设置为：${picked}`
   }
+}
+
+async function chooseVideoToEdit(): Promise<void> {
+  const picked = await window.api.dir.choosePublishVideoFile()
+  if (picked) {
+    editSourcePath.value = picked
+    editError.value = ''
+    editOutputPath.value = ''
+    editSubtitlePath.value = ''
+    editStatus.value = '已选择视频，可设置首尾裁剪时间并生成成片。'
+  }
+}
+
+function fillEditProductFromSearch(): void {
+  const product = foundProduct.value
+  if (!product) return
+  editProductId.value = product.product_id
+  editProductTitle.value = product.title ?? ''
+  editStatus.value = '已从当前查询的百应商品填入 ID 和名称；价格、卖点请按实际商品补充。'
+}
+
+function handleVideoEditEvent(event: { taskId?: string; type?: string; stage?: string; percent?: number; message?: string; data?: unknown; output?: string; subtitle?: string; warning?: string }): void {
+  if (event.type === 'stage') {
+    editStatus.value = event.stage ?? '正在处理…'
+    editProgress.value = event.percent ?? editProgress.value
+    return
+  }
+  if (event.type === 'log') {
+    editStatus.value = event.message ?? editStatus.value
+    return
+  }
+  if (event.type === 'error') {
+    editError.value = event.message ?? '视频剪辑失败'
+    editStatus.value = '处理失败'
+    editBusy.value = false
+    editEngineId.value = ''
+    offVideoEdit?.()
+    offVideoEdit = null
+    return
+  }
+  if (event.type === 'result') {
+    const data = (event.data && typeof event.data === 'object' ? event.data : event) as {
+      output?: string
+      subtitle?: string
+      warning?: string
+      subtitleCount?: number
+    }
+    editOutputPath.value = data.output ?? ''
+    editSubtitlePath.value = data.subtitle ?? ''
+    editProgress.value = 100
+    editStatus.value = data.warning || (data.subtitleCount === 0)
+      ? (data.warning ?? '没有识别到语音字幕，已生成商品信息版视频。')
+      : `完成：生成 ${data.subtitleCount ?? 0} 段同步字幕。`
+    editBusy.value = false
+    editEngineId.value = ''
+    if (editOutputPath.value) notifyGlobal('视频自动剪辑完成，可打开成片位置。', 'success')
+    offVideoEdit?.()
+    offVideoEdit = null
+  }
+}
+
+async function startVideoEdit(): Promise<void> {
+  if (editBusy.value) return
+  if (!editSourcePath.value) {
+    editError.value = '请先选择一个本地 MP4 视频。'
+    return
+  }
+  if (!editProductTitle.value.trim()) {
+    editError.value = '请填写商品名称。'
+    return
+  }
+  if (!downloadDir.value) downloadDir.value = await window.api.dir.getDownloadDir()
+  editError.value = ''
+  editOutputPath.value = ''
+  editSubtitlePath.value = ''
+  editProgress.value = 0
+  editStatus.value = '正在启动本地语音识别与剪辑…首次使用会下载约 500 MB 的中文语音模型。'
+  editBusy.value = true
+
+  let taskId: string | null = null
+  const pendingEvents: Parameters<typeof handleVideoEditEvent>[0][] = []
+  offVideoEdit?.()
+  offVideoEdit = window.api.engine.onEvent((event) => {
+    if (!taskId) {
+      pendingEvents.push(event)
+      return
+    }
+    if (event.taskId !== taskId) return
+    handleVideoEditEvent(event)
+  })
+
+  try {
+    const reply = await window.api.engine.run({
+      script: 'auto_video_editor.py',
+      args: ['--input', editSourcePath.value, '--output-dir', downloadDir.value],
+      stdinJson: {
+        productId: editProductId.value.trim(),
+        title: editProductTitle.value.trim(),
+        price: editPrice.value.trim(),
+        sellingPoint: editSellingPoint.value.trim(),
+        trimStart: Number(editTrimStart.value) || 0,
+        trimEnd: editTrimEnd.value === '' ? null : Number(editTrimEnd.value)
+      }
+    })
+    if (!reply.taskId) {
+      offVideoEdit?.()
+      offVideoEdit = null
+      editBusy.value = false
+      editStatus.value = '启动失败'
+      editError.value = reply.error ?? '无法启动本地剪辑引擎'
+      return
+    }
+    taskId = reply.taskId
+    editEngineId.value = taskId
+    for (const event of pendingEvents) {
+      if (event.taskId === taskId) handleVideoEditEvent(event)
+    }
+  } catch (error) {
+    offVideoEdit?.()
+    offVideoEdit = null
+    editBusy.value = false
+    editStatus.value = '启动失败'
+    editError.value = String(error)
+  }
+}
+
+async function cancelVideoEdit(): Promise<void> {
+  if (!editEngineId.value) return
+  editStatus.value = '正在取消…'
+  await window.api.engine.cancel(editEngineId.value)
 }
 
 // ---------------------------------------------------------------- 下载队列（批量下载）
@@ -583,8 +849,17 @@ interface BatchItem {
   message: string
 }
 
+interface BatchCaptureAccount {
+  id: number
+  name: string
+  profilePath?: string
+}
+
 const batchIdsText = ref('')
 const batchInterval = ref(8) // 秒
+const batchAccounts = ref<BatchCaptureAccount[]>([])
+const batchAccountId = ref<number | null>(null)
+const batchAccountsBusy = ref(false)
 const batchRunning = ref(false)
 const batchTaskId = ref('')
 const batchSummary = ref('')
@@ -605,6 +880,38 @@ function upsertBatchItem(productId: string, patch: Partial<BatchItem>): void {
     list.push({ productId, status: 'loading', message: '', ...patch })
   }
   batchItems.value = list
+}
+
+async function loadBaiyingBatchAccounts(): Promise<void> {
+  batchAccountsBusy.value = true
+  try {
+    const result = await window.api.baiying.batchAccounts()
+    if (result.ok !== true) throw new Error(result.error ?? '读取百应采集账号失败')
+    batchAccounts.value = result.accounts ?? []
+    if (!batchAccounts.value.some((account) => account.id === batchAccountId.value)) batchAccountId.value = null
+  } catch (cause) {
+    batchAccounts.value = []
+    batchAccountId.value = null
+    batchSummary.value = `读取百应采集账号失败：${cause instanceof Error ? cause.message : String(cause)}`
+  } finally {
+    batchAccountsBusy.value = false
+  }
+}
+
+async function openBatchAccountLogin(): Promise<void> {
+  const selected = batchAccounts.value.find((account) => account.id === batchAccountId.value)
+  if (!selected) {
+    batchSummary.value = '请先选择百应采集账号'
+    return
+  }
+  try {
+    const result = await window.api.account.openJingxuan(selected.id, selected.profilePath)
+    batchSummary.value = result.ok
+      ? `已打开账号“${selected.name}”专属百应浏览器；请在这个窗口登录后再开始抓取。`
+      : `打开账号“${selected.name}”百应失败：${result.error ?? '未知错误'}`
+  } catch (cause) {
+    batchSummary.value = `打开账号“${selected.name}”百应失败：${cause instanceof Error ? cause.message : String(cause)}`
+  }
 }
 
 /** 订阅批量抓取事件流（组件卸载时退订） */
@@ -639,8 +946,13 @@ async function startBatch(): Promise<void> {
     batchSummary.value = '请先粘贴商品 ID 列表'
     return
   }
+  if (batchAccountId.value === null) {
+    batchSummary.value = '请先选择本次百应采集使用的账号'
+    return
+  }
   const reply = await window.api.baiying.batchStart({
     productIds: ids,
+    accountId: batchAccountId.value,
     intervalMs: Math.max(2, Math.round(batchInterval.value)) * 1000
   })
   if (!reply.taskId) {
@@ -650,7 +962,8 @@ async function startBatch(): Promise<void> {
   batchTaskId.value = reply.taskId
   batchRunning.value = true
   batchItems.value = []
-  batchSummary.value = `已启动：${ids.length} 个商品，间隔 ${batchInterval.value}s`
+  const accountName = batchAccounts.value.find((account) => account.id === batchAccountId.value)?.name ?? `账号-${batchAccountId.value}`
+  batchSummary.value = `已启动账号“${accountName}”的采集：${ids.length} 个商品，间隔 ${batchInterval.value}s`
 }
 
 async function stopBatch(): Promise<void> {
@@ -754,7 +1067,7 @@ async function refreshCached(): Promise<void> {
 }
 
 function cachedHasVideo(p: CachedProduct): boolean {
-  return Boolean(p.video_url)
+  return videoUrlsOf(p).length > 0
 }
 
 function toggleCached(pid: string): void {
@@ -776,13 +1089,14 @@ const selectedCachedRows = computed<CachedProduct[]>(() =>
 async function downloadCached(): Promise<void> {
   const rows = selectedCachedRows.value
   if (rows.length === 0 || queueRunning.value) return
-  const date = new Date().toISOString().slice(0, 10)
-  const tasks = rows.map((p) => ({
-    id: p.product_id,
+  const date = localDate()
+  const timestamp = fileTimestamp()
+  const tasks = rows.flatMap((p) => videoUrlsOf(p).map((url, index) => ({
+    id: `${p.product_id}-${index + 1}`,
     product_id: p.product_id,
-    url: p.video_url as string,
-    dest: `${downloadDir.value}\\百应素材\\${date}\\${p.product_id}\\${p.product_id}.mp4`
-  }))
+    url,
+    dest: `${downloadDir.value}\\${baiyingAccountFolder(p)}\\${date}\\${p.product_id}\\${p.product_id}_${videoIdFromUrl(url, index)}_${String(index + 1).padStart(3, '0')}_${timestamp}.mp4`
+  })))
   queueTasks.value = tasks.map((t) => ({
     ...t,
     sourceNoWatermark: true,
@@ -808,16 +1122,15 @@ async function downloadCached(): Promise<void> {
 /** 下载当前搜索命中的商品视频（单任务，走同一队列） */
 async function downloadFound(): Promise<void> {
   const p = foundProduct.value
-  if (!p?.video_url || queueRunning.value) return
-  const date = new Date().toISOString().slice(0, 10)
-  const tasks = [
-    {
-      id: p.product_id,
-      product_id: p.product_id,
-      url: p.video_url,
-      dest: `${downloadDir.value}\\百应素材\\${date}\\${p.product_id}\\${p.product_id}.mp4`
-    }
-  ]
+  if (!p || !foundVideoUrls.value.length || queueRunning.value) return
+  const date = localDate()
+  const timestamp = fileTimestamp()
+  const tasks = foundVideoUrls.value.map((url, index) => ({
+    id: `${p.product_id}-${index + 1}`,
+    product_id: p.product_id,
+    url,
+    dest: `${downloadDir.value}\\${baiyingAccountFolder(p)}\\${date}\\${p.product_id}\\${p.product_id}_${videoIdFromUrl(url, index)}_${String(index + 1).padStart(3, '0')}_${timestamp}.mp4`
+  }))
   queueTasks.value = tasks.map((t) => ({
     ...t,
     sourceNoWatermark: true,
@@ -1086,6 +1399,7 @@ onMounted(async () => {
   bindBatchEvents()
   void loadQueueHistory()
   void refreshCached()
+  void loadBaiyingBatchAccounts()
 })
 
 onBeforeUnmount(() => {
@@ -1093,11 +1407,13 @@ onBeforeUnmount(() => {
   offBatch?.()
   offDy?.()
   offToutiao?.()
+  offVideoEdit?.()
 })
 </script>
 
 <template>
   <section class="query">
+    <header class="query-head"><h1>商品查询与下载</h1><span>商品 ID 一次搜索百应与千川视频</span></header>
     <!-- ---------- 搜索区 ---------- -->
     <div class="search-bar">
       <label class="fld">
@@ -1113,8 +1429,13 @@ onBeforeUnmount(() => {
       <button class="btn primary" :disabled="searchBusy" @click="search">
         {{ searchBusy ? '查询中…' : '搜索' }}
       </button>
-      <span v-if="error" class="error">{{ error }}</span>
+      <p v-if="searchStatus" class="notice" role="status">{{ searchStatus }}</p>
+      <div v-if="error" class="search-feedback">
+        <span class="error">{{ error }}</span>
+      </div>
     </div>
+
+    <QianchuanVideoQueryPanel ref="qianchuanPanel" />
 
     <!-- ---------- 真实数据标注 ---------- -->
     <p v-if="foundProduct" class="real-tag">数据来源：百应缓存库（用户在百应浏览时自动采集）</p>
@@ -1129,7 +1450,72 @@ onBeforeUnmount(() => {
       <div class="p-col"><span class="p-label">抓取时间</span>{{ foundProduct.captured_at.slice(0, 16) }}</div>
     </div>
 
-    <!-- ---------- 视频结果（单条：商品素材视频直链） ---------- -->
+    <!-- 常用操作保持在结果上方，普通窗口无需滚到表格底部。 -->
+    <div class="action-bar">
+      <button class="btn primary" :disabled="!foundVideoUrls.length || queueRunning" @click="downloadFound">
+        {{ queueRunning ? '队列运行中…' : `下载全部视频（${foundVideoUrls.length}）` }}
+      </button>
+      <button class="btn danger" :disabled="!queueRunning" @click="cancelAll">取消全部</button>
+      <button class="btn" @click="chooseDir">设置下载目录</button>
+      <button class="btn" :disabled="!foundProduct" @click="videoPreview">视频预览</button>
+      <button class="btn" @click="clearPreview">清空预览</button>
+    </div>
+
+    <!-- ---------- 本地视频自动剪辑 ---------- -->
+    <section class="edit-panel">
+      <div class="edit-heading">
+        <div>
+          <b>视频自动剪辑</b>
+          <span>保留原片，可裁首尾；自动识别语音生成同步字幕并叠加商品信息</span>
+        </div>
+        <button class="btn" :disabled="!foundProduct" @click="fillEditProductFromSearch">从已查询商品填入</button>
+      </div>
+
+      <div class="edit-source-row">
+        <button class="btn" :disabled="editBusy" @click="chooseVideoToEdit">选择本地 MP4</button>
+        <span class="edit-path mono" :title="editSourcePath">{{ editSourcePath || '尚未选择视频' }}</span>
+      </div>
+
+      <div class="edit-fields">
+        <label>
+          <span>商品名称</span>
+          <input v-model="editProductTitle" class="input" maxlength="80" placeholder="填写实际商品名称" :disabled="editBusy" />
+        </label>
+        <label>
+          <span>商品 ID（可选）</span>
+          <input v-model="editProductId" class="input" placeholder="商品 ID" :disabled="editBusy" />
+        </label>
+        <label>
+          <span>价格（可选）</span>
+          <input v-model="editPrice" class="input" maxlength="30" placeholder="如：19.9 元" :disabled="editBusy" />
+        </label>
+        <label>
+          <span>卖点（可选）</span>
+          <input v-model="editSellingPoint" class="input" maxlength="80" placeholder="只填写已核实的商品信息" :disabled="editBusy" />
+        </label>
+      </div>
+
+      <div class="edit-options">
+        <label>从第 <input v-model.number="editTrimStart" class="input edit-time-input" type="number" min="0" step="0.1" :disabled="editBusy" /> 秒开始</label>
+        <label>到第 <input v-model="editTrimEnd" class="input edit-time-input" type="number" min="0" step="0.1" placeholder="视频末尾" :disabled="editBusy" /> 秒结束</label>
+        <span class="edit-output-hint">输出：{{ downloadDir }}\视频自动剪辑（H.264 / AAC 128 kbps）</span>
+      </div>
+
+      <div class="edit-actions">
+        <button class="btn primary" :disabled="editBusy || !editSourcePath || !editProductTitle.trim()" @click="startVideoEdit">
+          {{ editBusy ? '正在识别并剪辑…' : '生成字幕商品视频' }}
+        </button>
+        <button class="btn danger" :disabled="!editBusy || !editEngineId" @click="cancelVideoEdit">取消处理</button>
+        <button v-if="editOutputPath" class="btn" @click="openQueueFolder(editOutputPath)">打开成片位置</button>
+        <span v-if="editStatus" class="edit-status">{{ editStatus }}</span>
+      </div>
+      <div v-if="editBusy" class="edit-progress"><span :style="{ width: `${editProgress}%` }"></span></div>
+      <p v-if="editError" class="error edit-error">{{ editError }}</p>
+      <p v-if="editSubtitlePath" class="edit-subtitle-path">字幕文件：<span class="mono">{{ editSubtitlePath }}</span></p>
+      <p class="edit-model-note">首次运行需联网下载约 500 MB 的中文语音模型，模型缓存在当前下载目录；后续识别可离线使用。</p>
+    </section>
+
+    <!-- ---------- 视频结果（展示该商品采集到的全部素材视频直链） ---------- -->
     <div class="table-wrap">
       <table class="grid">
         <thead>
@@ -1141,38 +1527,26 @@ onBeforeUnmount(() => {
         </thead>
         <tbody>
           <template v-if="foundProduct">
-            <tr :class="{ checked: foundProduct.video_url }">
+            <tr v-for="(url, videoIndex) in foundVideoUrls" :key="`${foundProduct.product_id}-${videoIndex}`" class="checked">
               <td class="c-check">
-                <input type="checkbox" :checked="Boolean(foundProduct.video_url)" disabled />
+                <input type="checkbox" checked disabled />
               </td>
               <td class="c-video">
-                <span class="q-video" :class="foundProduct.video_url ? 'ok' : 'bad'">
-                  {{ foundProduct.video_url ? '有视频直链' : '无视频' }}
+                <span class="q-video ok">
+                  视频 {{ videoIndex + 1 }} / {{ foundVideoUrls.length }}
                 </span>
               </td>
-              <td class="c-url mono" :title="foundProduct.video_url ?? ''">
-                {{ foundProduct.video_url ?? '（需先在百应打开该商品详情刷新缓存）' }}
+              <td class="c-url mono" :title="url">
+                {{ url }}
               </td>
             </tr>
+            <tr v-if="!foundVideoUrls.length"><td colspan="3">百应没有可用视频直链；本次搜索也会自动查询已授权的千川账户，结果见上方千川区。</td></tr>
           </template>
           <template v-else>
             <tr class="empty-row"><td colspan="3">搜索商品 ID 后展示真实商品视频直链</td></tr>
           </template>
         </tbody>
       </table>
-    </div>
-
-    <!-- ---------- 底部操作条 ---------- -->
-    <div class="action-bar">
-      <button class="btn primary" :disabled="!foundProduct?.video_url || queueRunning" @click="downloadFound">
-        {{ queueRunning ? '队列运行中…' : '下载该视频' }}
-      </button>
-      <button class="btn danger" :disabled="!queueRunning" @click="cancelAll">取消全部</button>
-      <button class="btn" @click="chooseDir">设置下载目录</button>
-      <button class="btn" :disabled="!foundProduct" @click="videoPreview">视频预览</button>
-      <button class="btn" @click="clearPreview">清空预览</button>
-
-      <span class="spacer" />
     </div>
 
     <p v-if="dirNotice" class="notice">{{ dirNotice }}</p>
@@ -1183,10 +1557,19 @@ onBeforeUnmount(() => {
       <div class="queue-head">
         <b>百应批量抓取</b>
         <label class="cfg">
+          采集账号
+          <select v-model.number="batchAccountId" class="input" :disabled="batchRunning || batchAccountsBusy">
+            <option :value="null">{{ batchAccountsBusy ? '正在读取账号…' : '请选择账号' }}</option>
+            <option v-for="account in batchAccounts" :key="account.id" :value="account.id">{{ account.name }}（ID {{ account.id }}）</option>
+          </select>
+        </label>
+        <button class="btn" :disabled="batchRunning || batchAccountId === null" @click="openBatchAccountLogin">打开该账号百应登录</button>
+        <button class="btn" :disabled="batchRunning || batchAccountsBusy" @click="loadBaiyingBatchAccounts">刷新账号</button>
+        <label class="cfg">
           间隔（秒）
           <input v-model.number="batchInterval" class="input cfg-input" type="number" min="2" max="60" />
         </label>
-        <button class="btn primary" :disabled="batchRunning" @click="startBatch">开始抓取</button>
+        <button class="btn primary" :disabled="batchRunning || batchAccountId === null" @click="startBatch">开始抓取</button>
         <button class="btn danger" :disabled="!batchRunning" @click="stopBatch">停止</button>
       </div>
 
@@ -1208,7 +1591,7 @@ onBeforeUnmount(() => {
         </li>
       </ul>
       <p v-else class="q-empty">
-        说明：需先在「巨量百应」工作台扫码登录；抓取在登录视图中后台进行，成功后商品进入百应缓存库
+        先选择采集账号，并用“打开该账号百应登录”进入它的专属 Chrome profile。批量抓取只使用选中账号的登录态；缓存记录会保存本地账号 ID，未能确认来源的旧记录显示为未知。
       </p>
     </div>
 
@@ -1238,9 +1621,10 @@ onBeforeUnmount(() => {
           </span>
           <span class="q-id mono" :title="p.title ?? ''">{{ p.product_id }}</span>
           <span class="q-title" :title="p.title ?? ''">{{ p.title ?? '（未抓取详情）' }}</span>
+          <span class="q-source" :title="p.account_id ? `百应本地账号 ID ${p.account_id}` : '旧缓存或通用登录视图，无法确认账号来源'">{{ p.account_id ? `账号-${p.account_id}` : '账号-未知' }}</span>
           <span v-if="p.cos_ratio != null" class="q-rate">佣金 {{ p.cos_ratio }}%</span>
           <span class="q-video" :class="cachedHasVideo(p) ? 'ok' : 'bad'">
-            {{ cachedHasVideo(p) ? '有视频直链' : '无视频' }}
+            {{ cachedHasVideo(p) ? `${videoUrlsOf(p).length} 条视频直链` : '无视频' }}
           </span>
           <span class="q-time">{{ p.captured_at.slice(0, 16) }}</span>
         </li>
@@ -1334,7 +1718,7 @@ onBeforeUnmount(() => {
         <h3>去水印 — {{ wmTask ? (wmTask.file_path ?? '').split('\\').pop() : '' }}</h3>
         <p class="wm-hint">第 {{ wmIdx + 1 }}/{{ wmFrames.length }} 帧（约 {{ wmCur?.t }}s）：<b>点击水印文字中心</b>标注位置，共需 ≥2 帧；再点同一红点可取消。</p>
         <div class="wm-frame-box">
-          <img v-if="wmCur" ref="wmImgEl" :src="wmFrameUrl" class="wm-frame-img" @click="wmClick" alt="帧" />
+          <img v-if="wmCur" ref="wmImgEl" :src="wmFrameUrl" class="wm-frame-img" @click="wmClick" alt="当前视频帧；可点击水印位置标注，也可使用下方自动找水印按钮" />
           <div
             v-if="wmCur && wmMarks[wmIdx]"
             class="wm-dot"
@@ -1384,11 +1768,15 @@ onBeforeUnmount(() => {
   padding: 12px;
   /* 内容超高时自身滚动（子元素不压缩，保证溢出产生滚动条） */
   overflow: hidden auto;
+  box-shadow: var(--shadow-card);
 }
 
 .query > * {
   flex-shrink: 0;
 }
+.query-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.query-head h1 { margin: 0; color: var(--text); font-size: 18px; }
+.query-head span { color: var(--text-muted); font-size: 11px; }
 
 /* ---------- 搜索区 ---------- */
 .search-bar {
@@ -1397,6 +1785,13 @@ onBeforeUnmount(() => {
   gap: 10px;
   flex-wrap: wrap;
   flex-shrink: 0;
+}
+
+.search-feedback {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .fld {
@@ -1498,7 +1893,7 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 24px;
   padding: 10px 12px;
-  background: var(--bg-status);
+  background: linear-gradient(105deg, #f7faff, #ffffff);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: 13px;
@@ -1658,11 +2053,19 @@ onBeforeUnmount(() => {
 
 /* ---------- 底部操作条 ---------- */
 .action-bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
   flex-wrap: wrap;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, .97);
+  box-shadow: var(--shadow-card);
 }
 
 .spacer {
@@ -1995,6 +2398,14 @@ onBeforeUnmount(() => {
   color: #d97706;
 }
 
+.q-source {
+  flex-shrink: 0;
+  width: 76px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
 .q-video {
   flex-shrink: 0;
   width: 86px;
@@ -2068,5 +2479,148 @@ onBeforeUnmount(() => {
   white-space: pre-wrap;
   word-break: break-all;
   flex-shrink: 0;
+}
+
+/* ---------- 本地视频自动剪辑 ---------- */
+.edit-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: linear-gradient(110deg, #f5f8ff, var(--bg-panel) 55%);
+  flex-shrink: 0;
+}
+
+.edit-heading,
+.edit-source-row,
+.edit-options,
+.edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.edit-heading {
+  justify-content: space-between;
+}
+
+.edit-heading > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.edit-heading b {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.edit-heading span,
+.edit-model-note,
+.edit-output-hint,
+.edit-status,
+.edit-subtitle-path {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.edit-path {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.edit-fields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 8px;
+}
+
+.edit-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.edit-fields .input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.edit-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.edit-time-input {
+  width: 84px;
+}
+
+.edit-output-hint {
+  min-width: 200px;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.edit-actions {
+  min-height: 28px;
+}
+
+.edit-status {
+  flex: 1;
+  min-width: 180px;
+}
+
+.edit-progress {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.edit-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand);
+  transition: width 180ms ease;
+}
+
+.edit-error {
+  margin: 0;
+}
+
+.edit-subtitle-path,
+.edit-model-note {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 900px) {
+  .edit-fields {
+    grid-template-columns: repeat(2, minmax(140px, 1fr));
+  }
+}
+
+@media (max-width: 540px) {
+  .edit-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>

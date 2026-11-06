@@ -22,6 +22,20 @@ declare global {
     canGoForward?: boolean
   }
 
+  interface SelectionScheduleDue {
+    date: string
+    time: string
+    triggeredAt: number
+  }
+
+  interface SelectionScheduleSnapshot {
+    enabled: boolean
+    time: string
+    launchAtLogin: boolean
+    canLaunchAtLogin: boolean
+    pendingDue: SelectionScheduleDue | null
+  }
+
   /** 单个登录目标的登录态 */
   interface TargetLoginState {
     id: string
@@ -117,6 +131,24 @@ declare global {
     canConfirmNoDraft?: boolean
   }
 
+  interface ProductListRow {
+    accountId: number
+    accountName: string
+    productId: string
+    title: string
+    commodityId: string
+    sourceUrl: string
+    coverUrl: string
+    sku: string
+    categoryLabels: string[]
+    status: string
+    failureReason: string
+    batchId: string
+    candidateSnapshot: Record<string, unknown>
+    selectedAt: string
+    updatedAt: string
+  }
+
   /** engine:run 入参 */
   interface EngineRunParams {
     script: string
@@ -147,6 +179,12 @@ declare global {
     ok?: boolean
     taskId?: string
     error?: string
+  }
+
+  interface BaiyingBatchAccount {
+    id: number
+    name: string
+    profilePath?: string
   }
 
   /** 批量抓取事件（主进程 → 渲染进程，baiying:event） */
@@ -270,6 +308,17 @@ declare global {
         cancel(): Promise<{ ok: boolean }>
         onExpired(cb: (event: { batchId: string; deadline: number; sendCount: number }) => void): () => void
       }
+      selectionSchedule: {
+        get(): Promise<SelectionScheduleSnapshot>
+        save(params: { enabled: boolean; time: string; launchAtLogin: boolean }): Promise<{
+          ok: boolean
+          schedule?: SelectionScheduleSnapshot
+          error?: string
+        }>
+        acknowledge(date: string, outcome?: string): Promise<{ ok: boolean; matched: boolean; cleared: boolean }>
+        trace(params: { date: string; stage: string; attempt?: number; delayMs?: number }): Promise<{ ok: boolean }>
+        onDue(cb: (event: SelectionScheduleDue) => void): () => void
+      }
       /** 托管外部 Chrome 登录入口（页面通过本机 CDP 接入） */
       browser: {
         getTargets(): Promise<LoginTarget[]>
@@ -295,6 +344,8 @@ declare global {
           downloadPath: string
           selectedIndexes?: number[]
           candidateSnapshot?: unknown[]
+          allowCandidateFallback?: boolean
+          recoverExistingCart?: boolean
           refreshCandidatesById?: boolean
           analyzeBeforeCart?: boolean
           maxSelectedProducts?: number
@@ -346,7 +397,24 @@ declare global {
         runNow(queueId: number): Promise<PublishProgressPayload>
         runImmediately(queueId: number): Promise<PublishProgressPayload>
         retryManually(queueId: number, options?: { confirmedNotSubmitted?: boolean; confirmedNoDraft?: boolean }): Promise<PublishProgressPayload>
+        markPublished(queueId: number): Promise<Record<string, unknown>>
+        notifyPostPublish(queueId: number, platformStatus: string): Promise<Record<string, unknown>>
+        exportReceipts(): Promise<{ ok: boolean; cancelled?: boolean; path?: string; count?: number; error?: string }>
+        openScreenshot(path: string): Promise<{ ok: boolean; error?: string }>
         onProgress(cb: (progress: PublishProgressPayload) => void): () => void
+      }
+      productList: {
+        list(params: { accountId?: number | null; status?: string; query?: string; limit?: number; offset?: number }): Promise<{
+          ok: boolean
+          rows: ProductListRow[]
+          total: number
+          limit: number
+          offset: number
+          accounts: Array<{ id: number; name: string }>
+        }>
+        update(params: { accountId: number; productId: string; title: string; sku?: string; categoryLabels?: string[] }): Promise<{ ok: boolean }>
+        delete(params: { accountId: number; productId: string }): Promise<{ ok: boolean }>
+        cartOutcome(params: { accountId: number; productId: string; status: 'cart_added' | 'selection_failed' | 'needs_review'; reason?: string }): Promise<{ ok: boolean; status?: string }>
       }
       /** 登录态 */
       login: {
@@ -394,8 +462,10 @@ declare global {
       }
       /** 百应批量抓取（T-15） */
       baiying: {
-        /** 启动批量抓取：按商品ID列表驱动登录视图逐页抓取缓存 */
-        batchStart(params: { productIds: string[]; intervalMs?: number }): Promise<BaiyingBatchStartReply>
+        /** 读取启用账号与各自专属百应浏览器 profile。 */
+        batchAccounts(): Promise<{ ok?: boolean; accounts?: BaiyingBatchAccount[]; error?: string }>
+        /** 使用选中账号的专属百应 profile 按商品 ID 逐页抓取缓存。 */
+        batchStart(params: { productIds: string[]; accountId: number; intervalMs?: number }): Promise<BaiyingBatchStartReply>
         /** 停止批量抓取 */
         batchCancel(taskId: string): Promise<{ ok: boolean; alreadyEnded?: boolean }>
         /** 订阅批量抓取事件流，返回取消订阅函数 */
@@ -429,6 +499,13 @@ declare global {
       }
       /** 千川账户登录态（Step 11：独立分区多开隔离，SRS A-12） */
       qianchuan: {
+        apiStatus(): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number }>
+        apiConfigure(params: { appId: string; secret: string }): Promise<Record<string, unknown>>
+        apiAuthorize(url: string): Promise<{ ok: boolean; callback: string; profilePath: string }>
+        apiVideos(params: { advertiserId: string; productId: string; awemeId: string; cursor?: string }): Promise<{ videos: Array<{ videoId: string; awemeItemId: string; title: string; url: string; duration: number | null }>; hasMore: boolean; cursor: string; totalReturned: number }>
+        apiAccounts(): Promise<{ accounts: Array<{ id: string; name: string; source: string }>; identities: Array<{ id: string; type: string; name: string }>; warnings: string[]; requiresQianchuanAuthorization: boolean }>
+        apiAwemes(advertiserId: string): Promise<Array<{ id: string; name: string }>>
+        apiVerifyVideo(path: string): Promise<{ ok: boolean; path: string; bytes?: number; reason?: string }>
         openLogin(qcId: number): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }>
         checkLogin(qcId: number): Promise<AccountLoginState>
         exportForEngine(qcId: number): Promise<AccountEngineSession>
@@ -442,7 +519,20 @@ declare global {
         reviewUploadAbsent(params: { id: number; note: string }): Promise<Record<string, unknown>>
         reviewUploadPresent(params: { id: number; remoteMaterialId: string }): Promise<Record<string, unknown>>
         quotaConfig(accountId?: number): Promise<Record<string, unknown>>
+        retryConfig(): Promise<Record<string, unknown>>
+        setRetryConfig(enabled: boolean): Promise<Record<string, unknown>>
         setQuotaConfig(params: { accountId: number; perProductVideos: number; perAccountProducts: number; perAccountVideos: number }): Promise<Record<string, unknown>>
+        postPublishSettings(): Promise<Record<string, unknown>>
+        setPostPublishEnabled(enabled: boolean): Promise<Record<string, unknown>>
+        postPublishRuns(): Promise<Record<string, unknown>>
+        retryPostPublishRun(queueId: number): Promise<Record<string, unknown>>
+        scanViolations(qcId: number): Promise<Record<string, unknown>>
+        prepareViolationDeletion(params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>>
+        violationBatch(batchId: number): Promise<Record<string, unknown>>
+        violationHistory(qcId: number): Promise<Record<string, unknown>>
+        exportViolationManifest(batchId: number): Promise<Record<string, unknown>>
+        executeViolationDeletion(params: { batchId: number; count: number; confirmation: string }): Promise<Record<string, unknown>>
+        onViolationProgress(cb: (event: { batchId: number; completed: number; total: number; status?: string; reason?: string }) => void): () => void
       }
       /** 去水印辅助（动态水印去除的框选模板交互） */
       watermark: {

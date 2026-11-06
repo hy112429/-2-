@@ -42,6 +42,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "selectionMode": "general",
     "categoryMode": "auto",
     "categorySelection": {"level1": [], "level2": [], "level3": []},
+    "excludedCategorySelection": {"level1": [], "level2": [], "level3": []},
     "filters": {"delivery": {}, "product": {}, "features": {}},
     "poolPriority": ["流量扶持", "小二严选", "低价好货", "福袋奖品"],
     "poolFallback": True,

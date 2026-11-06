@@ -2,6 +2,9 @@
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
 
+const props = defineProps<{ productDraft?: { accountId: number; productId: string; title: string; sourceUrl: string } | null }>()
+const emit = defineEmits<{ (event: 'product-draft-consumed'): void }>()
+
 interface QueueAccount {
   id: number
   name: string
@@ -24,10 +27,22 @@ interface QueueRow {
   status: 'awaiting_confirmation' | 'scheduled' | 'cancelled'
   platform_status: 'not_uploaded' | 'uploading' | 'uploaded_waiting_publish' | 'submitting' | 'submitted_review' | 'needs_review' | 'submission_uncertain' | 'published' | 'isolated'
   platform_error: string
+  screenshot_path: string
+  execution_started_at: string | null
   platform_updated_at: string | null
   published_at: string | null
   created_at: string
   updated_at: string
+}
+
+interface PublishEvent {
+  id: number
+  stage: string
+  outcome: string
+  reason: string
+  screenshot_path: string
+  cleared_at: string | null
+  created_at: string
 }
 
 interface SelectedProductOption {
@@ -59,8 +74,15 @@ const notice = ref('')
 const noticeError = ref(false)
 const activeAccountId = ref(0)
 const autoPublishEnabled = ref(false)
+const manualReviewActive = ref(false)
+const createFormOpen = ref(false)
+const formCardRef = ref<HTMLElement | null>(null)
+const schedulerDetails = ref<HTMLDetailsElement | null>(null)
 const publishProgress = ref<PublishProgressPayload | null>(null)
 const manualRetryNoDraftIds = ref<Record<number, boolean>>({})
+const selectedRetryIds = ref<number[]>([])
+const eventQueueId = ref<number | null>(null)
+const receiptEvents = ref<PublishEvent[]>([])
 const schedulerSettings = reactive({ jitterMinSeconds: 5, jitterMaxSeconds: 15, catchupMaxLateHours: 0 })
 const schedulerSettingsSaving = ref(false)
 let refreshTimer: number | undefined
@@ -108,6 +130,21 @@ const form = computed(() => forms[activeAccountId.value] ?? createForm())
 const accountTabs = computed(() => accounts.value)
 const activeAccount = computed(() => accountTabs.value.find((account) => account.id === activeAccountId.value) ?? null)
 const accountRows = computed(() => rows.value.filter((row) => row.account_id === activeAccountId.value))
+const accountPageSize = 30
+const accountPage = ref(1)
+const accountPageCount = computed(() => Math.max(1, Math.ceil(accountRows.value.length / accountPageSize)))
+const visibleAccountRows = computed(() => {
+  const start = (accountPage.value - 1) * accountPageSize
+  return accountRows.value.slice(start, start + accountPageSize)
+})
+watch(accountRows, () => {
+  if (accountPage.value > accountPageCount.value) accountPage.value = accountPageCount.value
+})
+
+function setAccountPage(page: number): void {
+  accountPage.value = Math.max(1, Math.min(accountPageCount.value, page))
+}
+
 const quarantinedAutoTasks = computed(() => rows.value.filter((row) =>
   Boolean(row.auto_publish) &&
   ['uploading', 'uploaded_waiting_publish', 'needs_review', 'submitting', 'submission_uncertain'].includes(row.platform_status)
@@ -118,6 +155,24 @@ const videoName = computed(() => form.value.videoPath.split(/[\\/]/).filter(Bool
 const accountProducts = computed(() => products.value.filter((product) => product.account_id === activeAccountId.value))
 const selectedProduct = computed(() => accountProducts.value.find((product) => product.product_id === form.value.productId) ?? null)
 
+function applyProductDraft(): void {
+  const draft = props.productDraft
+  if (!draft || !accounts.value.some((account) => account.id === draft.accountId)) return
+  activeAccountId.value = draft.accountId
+  forms[draft.accountId] = {
+    ...createForm(),
+    productId: draft.productId,
+    title: draft.title,
+    description: draft.title
+  }
+  createFormOpen.value = true
+  emit('product-draft-consumed')
+  requestAnimationFrame(() => formCardRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+}
+
+watch(() => props.productDraft, () => applyProductDraft(), { immediate: true })
+watch(() => accounts.value.length, () => applyProductDraft())
+
 function accountPlanCount(accountId: number): number {
   return rows.value.filter((row) => row.account_id === accountId && row.status !== 'cancelled').length
 }
@@ -125,6 +180,40 @@ function accountPlanCount(accountId: number): number {
 function selectAccount(accountId: number): void {
   if (accountTabs.value.some((account) => account.id === accountId)) {
     activeAccountId.value = accountId
+    accountPage.value = 1
+    createFormOpen.value = false
+    selectedRetryIds.value = []
+    eventQueueId.value = null
+  }
+}
+
+function openSchedulerSettings(): void {
+  if (!schedulerDetails.value) return
+  schedulerDetails.value.open = true
+  requestAnimationFrame(() => schedulerDetails.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+}
+
+function openCreateForm(): void {
+  createFormOpen.value = true
+  requestAnimationFrame(() => formCardRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
+}
+
+async function toggleManualReview(): Promise<void> {
+  if (schedulerSettingsSaving.value) return
+  const next = !manualReviewActive.value
+  if (!next && autoPublishEnabled.value && !window.confirm('关闭人工复核后，到期的自动任务可能直接提交最终发布。确认关闭？')) return
+  schedulerSettingsSaving.value = true
+  try {
+    const saved = await runCli(['auto-settings', 'set', '--manual-review-enabled', String(next)])
+    if (saved.ok !== true) throw new Error(String(saved.error ?? '人工复核设置未保存'))
+    manualReviewActive.value = saved.manualReviewEnabled === true
+    noticeError.value = false
+    notice.value = manualReviewActive.value ? '人工复核已开启：自动任务停在最终发布前。' : '人工复核已关闭：自动任务按原计划执行。'
+  } catch (error) {
+    noticeError.value = true
+    notice.value = `人工复核设置失败：${String(error)}`
+  } finally {
+    schedulerSettingsSaving.value = false
   }
 }
 
@@ -180,6 +269,7 @@ async function refresh(): Promise<void> {
     rows.value = (result.rows ?? []) as QueueRow[]
     products.value = (result.products ?? []) as SelectedProductOption[]
     autoPublishEnabled.value = publishSettings.autoPublishEnabled === true
+    manualReviewActive.value = publishSettings.manualReviewEnabled === true
     schedulerSettings.jitterMinSeconds = Number(publishSettings.publishJitterMinSeconds ?? 5)
     schedulerSettings.jitterMaxSeconds = Number(publishSettings.publishJitterMaxSeconds ?? 15)
     schedulerSettings.catchupMaxLateHours = Number(publishSettings.publishCatchupMaxLateHours ?? 0)
@@ -187,7 +277,9 @@ async function refresh(): Promise<void> {
       if (!forms[account.id]) forms[account.id] = createForm()
     }
     if (!accountTabs.value.some((account) => account.id === activeAccountId.value)) {
-      activeAccountId.value = accountTabs.value.find((account) => account.status === 'active')?.id ?? accountTabs.value[0]?.id ?? 0
+      const nextAccountId = accountTabs.value.find((account) => account.status === 'active')?.id ?? accountTabs.value[0]?.id ?? 0
+      if (nextAccountId !== activeAccountId.value) accountPage.value = 1
+      activeAccountId.value = nextAccountId
     }
     for (const account of accounts.value) {
       const accountId = account.id
@@ -195,6 +287,7 @@ async function refresh(): Promise<void> {
       const selected = products.value.find((product) => product.account_id === accountId && product.product_id === accountForm.productId)
       if (selected && !accountForm.description.trim()) accountForm.description = selected.product_name
     }
+    applyProductDraft()
     noticeError.value = false
     if (accountTabs.value.length === 0) notice.value = '尚未添加账号。请先在账号管理中添加并启用账号。'
     else if (!notice.value) notice.value = ''
@@ -242,8 +335,9 @@ async function saveSchedulerSettings(): Promise<void> {
     schedulerSettings.jitterMinSeconds = Number(saved.publishJitterMinSeconds ?? jitterMinSeconds)
     schedulerSettings.jitterMaxSeconds = Number(saved.publishJitterMaxSeconds ?? jitterMaxSeconds)
     schedulerSettings.catchupMaxLateHours = Number(saved.publishCatchupMaxLateHours ?? catchupMaxLateHours)
+    manualReviewActive.value = saved.manualReviewEnabled === true
     noticeError.value = false
-    notice.value = '已保存本机调度设置；0 小时表示所有逾期计划都按顺延规则补发。'
+    notice.value = '已保存本机调度设置。'
   } catch (error) {
     noticeError.value = true
     notice.value = `保存调度设置失败：${String(error)}`
@@ -364,7 +458,7 @@ function canRetryManually(row: QueueRow): boolean {
   ].includes(row.platform_status)
 }
 
-async function retryManually(row: QueueRow): Promise<void> {
+async function retryManually(row: QueueRow, clearFailure = false): Promise<void> {
   if (!canRetryManually(row)) {
     noticeError.value = true
     notice.value = '该任务当前不可手动重发；已发布、审核中、取消或尚未上传的任务不会重复提交。'
@@ -391,12 +485,18 @@ async function retryManually(row: QueueRow): Promise<void> {
     if (needsConfirmNoDraft) {
       confirmation.push('上次未找到可恢复的现有投稿。请确认创作者中心也没有这条作品的草稿；确认后本次才会重新上传视频。')
     }
-    if (row.auto_publish) {
+    if (row.auto_publish && !manualReviewActive.value) {
       confirmation.push('原任务开启了自动发布，本次恢复成功后可能点击最终“发布”。')
     } else {
-      confirmation.push('原任务未开启自动发布，本次会停在发布前，由你手动点击本条“发布”。')
+      confirmation.push('本次会停在最终发布前，由你检查后手动点击本条“发布”。')
     }
+    if (clearFailure) confirmation.push('当前失败提示会清除；原失败原因和截图仍保留在过程日志中。')
     if (!window.confirm(`仅重试“${row.product_name}”（任务 #${row.id}），不启动其他隔离或待核查任务。\n\n${confirmation.join('\n')}\n\n确认继续？`)) return
+
+    if (clearFailure) {
+      const cleared = await runCli(['clear-failure-log', '--id', String(row.id)])
+      if (cleared.ok !== true) throw new Error(String(cleared.error ?? '失败提示未能清除'))
+    }
 
     notice.value = ''
     publishProgress.value = {
@@ -451,6 +551,75 @@ async function retryManually(row: QueueRow): Promise<void> {
   }
 }
 
+async function retrySelected(): Promise<void> {
+  const selected = accountRows.value.filter((row) => selectedRetryIds.value.includes(row.id) && canRetryManually(row))
+  if (!selected.length) return
+  if (busyId.value !== null) return
+  try {
+    const plans: Array<{ row: QueueRow; plan: Record<string, unknown> }> = []
+    for (const row of selected) {
+      const plan = await runCli(['manual-retry-plan', '--id', String(row.id)])
+      if (plan.ok !== true) throw new Error(`#${row.id} 检查点不可恢复：${String(plan.error ?? '')}`)
+      plans.push({ row, plan })
+    }
+    const needSubmissionCheck = plans.filter(({ plan }) => plan.needsConfirmNotSubmitted === true)
+    const summary = plans.map(({ row }) => `#${row.id} ${row.product_name}`).join('\n')
+    const warning = needSubmissionCheck.length
+      ? `其中 ${needSubmissionCheck.map(({ row }) => `#${row.id}`).join('、')} 必须先确认创作者中心没有已提交或审核中的同一作品。\n`
+      : ''
+    const publishWarning = plans.some(({ row }) => row.auto_publish) && !manualReviewActive.value
+      ? '其中自动发布任务在恢复成功后可能点击最终“发布”。\n' : ''
+    if (!window.confirm(`将顺序重试以下 ${plans.length} 条任务；每条优先恢复原投稿，任何一条失败即停止后续。\n${warning}${publishWarning}\n${summary}\n\n确认开始？`)) return
+    let completed = 0
+    for (const { row, plan } of plans) {
+      busyId.value = row.id
+      const result = await window.api.publish.retryManually(row.id, {
+        confirmedNotSubmitted: plan.needsConfirmNotSubmitted === true,
+        confirmedNoDraft: false
+      })
+      if (result.state === 'failed') throw new Error(`#${row.id}：${result.error ?? result.message ?? '重试未完成'}`)
+      completed += 1
+      await refresh()
+    }
+    selectedRetryIds.value = []
+    noticeError.value = false
+    notice.value = `已顺序处理 ${completed} 条；请按各条平台状态核对回执。`
+  } catch (error) {
+    noticeError.value = true
+    notice.value = `批量重试已停止：${String(error)}`
+  } finally {
+    busyId.value = null
+    await refresh()
+  }
+}
+
+async function exportReceipts(): Promise<void> {
+  const result = await window.api.publish.exportReceipts()
+  if (result.cancelled) return
+  noticeError.value = !result.ok
+  notice.value = result.ok ? `已导出 ${result.count ?? 0} 条发布回执：${result.path ?? ''}` : `导出失败：${result.error ?? '未知错误'}`
+}
+
+async function openReceiptScreenshot(row: QueueRow): Promise<void> {
+  const result = await window.api.publish.openScreenshot(row.screenshot_path)
+  if (!result.ok) {
+    noticeError.value = true
+    notice.value = result.error ?? '无法打开截图'
+  }
+}
+
+async function viewReceiptEvents(row: QueueRow): Promise<void> {
+  try {
+    const result = await runCli(['events', '--id', String(row.id)])
+    if (result.ok !== true) throw new Error(String(result.error ?? '读取过程日志失败'))
+    receiptEvents.value = (result.events ?? []) as PublishEvent[]
+    eventQueueId.value = row.id
+  } catch (error) {
+    noticeError.value = true
+    notice.value = `读取任务 #${row.id} 过程日志失败：${String(error)}`
+  }
+}
+
 async function prepareCreatorUpload(row: QueueRow): Promise<void> {
   if (row.status !== 'scheduled') {
     noticeError.value = true
@@ -471,6 +640,7 @@ async function prepareCreatorUpload(row: QueueRow): Promise<void> {
   }
   let uploadStarted = false
   let copiedProductUrl = ''
+  let screenshotPath = ''
   try {
     const profilePath = await getAccountProfilePath(row.account_id)
     publishProgress.value = { ...publishProgress.value, stage: '校验账号专属浏览器', message: '确认使用本账号的登录 profile', updatedAt: new Date().toISOString() }
@@ -494,13 +664,15 @@ async function prepareCreatorUpload(row: QueueRow): Promise<void> {
       videoPath: String(task.videoPath ?? row.video_path),
       description: String(task.description ?? row.description ?? row.product_name)
     })
+    screenshotPath = typeof prepared.screenshotPath === 'string' ? prepared.screenshotPath : ''
     if (
       prepared.isolated === true &&
       prepared.classification === 'PUBLISH_VERIFY_OTHER_ROW_ISOLATED' &&
       String(prepared.productId ?? '') === String(task.productId ?? row.product_id)
     ) {
       const warning = String(prepared.warning ?? prepared.error ?? '百应商品核验重查耗尽，本任务已隔离；未上传视频。')
-      const isolated = await runCli(['upload-isolate', '--id', String(row.id), '--error', warning])
+      const isolated = await runCli(['upload-isolate', '--id', String(row.id), '--error', warning,
+        ...(screenshotPath ? ['--screenshot-path', screenshotPath] : [])])
       if (isolated.ok !== true || isolated.isolated !== true) {
         throw new Error(String(isolated.error ?? '商品核验隔离检查点未能保存'))
       }
@@ -558,6 +730,7 @@ async function prepareCreatorUpload(row: QueueRow): Promise<void> {
           'upload-finish', '--id', String(row.id), '--status', 'needs_review', '--error', message
         ]
         if (copiedProductUrl) finishArgs.push('--product-url', copiedProductUrl)
+        if (screenshotPath) finishArgs.push('--screenshot-path', screenshotPath)
         await runCli(finishArgs)
       } catch {
         // 若本地检查点写入也失败，队列仍保留 uploading；下次启动时提示人工先检查浏览器。
@@ -613,6 +786,7 @@ async function submitPublish(row: QueueRow): Promise<void> {
   }
   let submitLockAcquired = false
   let submissionMayHaveBeenAttempted = false
+  let screenshotPath = ''
   try {
     const profilePath = await getAccountProfilePath(row.account_id)
     const validation = await window.api.browser.validateProfilePath({
@@ -643,6 +817,7 @@ async function submitPublish(row: QueueRow): Promise<void> {
       videoPath: String(task.videoPath ?? row.video_path),
       description: String(task.description ?? row.description)
     })
+    screenshotPath = typeof submitted.screenshotPath === 'string' ? submitted.screenshotPath : ''
     if (
       submitted.isolated === true &&
       submitted.classification === 'CREATOR_COVER_REQUIRED_ISOLATED' &&
@@ -650,7 +825,8 @@ async function submitPublish(row: QueueRow): Promise<void> {
       String(submitted.productId ?? '') === row.product_id
     ) {
       const warning = String(submitted.warning ?? submitted.error ?? '平台要求封面，当前任务已隔离；未记录为发布成功。')
-      const isolated = await runCli(['submit-isolate', '--id', String(row.id), '--error', warning])
+      const isolated = await runCli(['submit-isolate', '--id', String(row.id), '--error', warning,
+        ...(screenshotPath ? ['--screenshot-path', screenshotPath] : [])])
       if (isolated.ok !== true || isolated.isolated !== true) {
         throw new Error(String(isolated.error ?? '平台封面隔离检查点未能保存'))
       }
@@ -674,7 +850,8 @@ async function submitPublish(row: QueueRow): Promise<void> {
       const failedStatus = submissionMayHaveBeenAttempted ? 'submission_uncertain' : 'uploaded_waiting_publish'
       const message = String(submitted.error ?? '抖音未返回发布确认')
       const saved = await runCli([
-        'submit-finish', '--id', String(row.id), '--status', failedStatus, '--error', message
+        'submit-finish', '--id', String(row.id), '--status', failedStatus, '--error', message,
+        ...(screenshotPath ? ['--screenshot-path', screenshotPath] : [])
       ])
       if (saved.ok !== true) throw new Error(`${message}；发布检查点保存失败：${String(saved.error ?? '')}`)
       submitLockAcquired = false
@@ -708,6 +885,7 @@ async function submitPublish(row: QueueRow): Promise<void> {
       'submit-finish', '--id', String(row.id), '--status', platformStatus
     ])
     if (saved.ok !== true) throw new Error(String(saved.error ?? '抖音已处理，但本地无法保存发布结果'))
+    if (platformStatus === 'published') await window.api.publish.notifyPostPublish(row.id, platformStatus)
     submitLockAcquired = false
     const accepted = platformStatus === 'submitted_review'
     publishProgress.value = {
@@ -729,7 +907,8 @@ async function submitPublish(row: QueueRow): Promise<void> {
       const uncertainStatus = submissionMayHaveBeenAttempted ? 'submission_uncertain' : 'uploaded_waiting_publish'
       try {
         const saved = await runCli([
-          'submit-finish', '--id', String(row.id), '--status', uncertainStatus, '--error', message
+          'submit-finish', '--id', String(row.id), '--status', uncertainStatus, '--error', message,
+          ...(screenshotPath ? ['--screenshot-path', screenshotPath] : [])
         ])
         if (saved.ok === true) submitLockAcquired = false
       } catch {
@@ -805,6 +984,7 @@ async function addTask(): Promise<void> {
     targetForm.description = ''
     targetForm.plannedAt = localDateTimeAfter(10)
     await refresh()
+    createFormOpen.value = false
   } catch (error) {
     noticeError.value = true
     notice.value = `添加失败：${String(error)}`
@@ -841,7 +1021,9 @@ async function deleteTask(row: QueueRow): Promise<void> {
 async function updateTask(id: number, action: 'confirm' | 'cancel' | 'delete' | 'mark-published' | 'reset-upload' | 'reset-submission', successMessage: string): Promise<void> {
   busyId.value = id
   try {
-    const result = await runCli([action, '--id', String(id)])
+    const result = action === 'mark-published'
+      ? await window.api.publish.markPublished(id)
+      : await runCli([action, '--id', String(id)])
     if (result.ok !== true) throw new Error(String(result.error ?? '更新失败'))
     noticeError.value = false
     notice.value = successMessage
@@ -888,7 +1070,9 @@ onMounted(() => {
     if (progressEventsReceived === receivedBeforeSnapshot) publishProgress.value = progress
   }).catch(() => undefined)
   void refresh()
-  refreshTimer = window.setInterval(() => { if (!loading.value) void refresh() }, 15_000)
+  refreshTimer = window.setInterval(() => {
+    if (!loading.value && document.visibilityState === 'visible') void refresh()
+  }, 30_000)
 })
 
 onUnmounted(() => {
@@ -903,24 +1087,30 @@ onUnmounted(() => {
     <header class="page-head">
       <div>
         <h1>抖音发布管理</h1>
-        <p>选品生成的视频默认全自动发布；此页面保留人工发布入口，供手动计划和异常核查使用。</p>
+        <p>查看队列、处理异常与回执</p>
       </div>
       <div class="head-actions">
+        <label class="account-picker">账号
+          <select :value="activeAccountId" :disabled="!accountTabs.length" @change="selectAccount(Number(($event.target as HTMLSelectElement).value))">
+            <option v-for="account in accountTabs" :key="account.id" :value="account.id">{{ account.name }} · {{ accountPlanCount(account.id) }} 条</option>
+          </select>
+        </label>
+        <button class="button primary" :disabled="!activeAccount || activeAccount.status !== 'active'" @click="openCreateForm">新建计划</button>
+        <button class="button review-toggle" :class="{ enabled: manualReviewActive }" :disabled="schedulerSettingsSaving" :aria-pressed="manualReviewActive" @click="toggleManualReview">人工复核：{{ manualReviewActive ? '已开' : '已关' }}</button>
+        <button class="button" @click="openSchedulerSettings">调度设置</button>
+        <button class="button" @click="exportReceipts">导出回执</button>
         <button class="button" :disabled="loading" @click="refresh">{{ loading ? '读取中…' : '刷新队列' }}</button>
       </div>
     </header>
 
     <div class="auto-publish-state" :class="{ paused: !autoPublishEnabled }">
       <strong>{{ autoPublishEnabled ? '全自动发布已开启' : '全自动发布当前已暂停' }}</strong>
-      <span v-if="quarantinedAutoTasks.length > 0">
-        待核查任务 {{ quarantinedAutoTasks.length }} 条：{{ quarantinedAutoTasks.map((row) => `#${row.id} ${row.product_name}`).join('、') }}。这些任务不会自动重试或标记成功，已与后续任务隔离。
-      </span>
-      <span v-if="autoPublishEnabled">客户端运行期间，其他符合条件的到期任务会继续按队列执行；单项失败只隔离该任务。</span>
-      <span v-else>全自动发布当前为暂停状态；待核查任务已隔离，恢复自动发布后不会重试这些任务。</span>
+      <span v-if="quarantinedAutoTasks.length > 0">{{ quarantinedAutoTasks.length }} 条待核查任务已隔离</span>
+      <span v-if="manualReviewActive">自动任务停在最终发布前</span>
     </div>
 
-    <details class="scheduler-settings">
-      <summary>定时调度与逾期补发设置</summary>
+    <details ref="schedulerDetails" class="scheduler-settings">
+      <summary>调度细项 · 随机错峰与逾期补发</summary>
       <div class="scheduler-settings-body">
         <label>
           最短随机错峰（秒）
@@ -937,16 +1127,11 @@ onUnmounted(() => {
         <button class="button primary" :disabled="schedulerSettingsSaving" @click="saveSchedulerSettings">
           {{ schedulerSettingsSaving ? '保存中…' : '保存调度设置' }}
         </button>
-        <small>调度器由本机主进程运行：每轮检查约间隔 10 秒，并额外等待设定范围内的随机时间。逾期期限填 0 表示不限；超过期限的计划会标记为已取消并保留原因，不会自动触发平台操作。</small>
+        <small>错峰单位为秒；逾期期限填 0 表示不限。</small>
       </div>
     </details>
 
-    <div class="notice workflow-note">
-      <strong>全自动发布</strong>
-      <span>选品完成后，每个视频完成图转视频并入队即按商品逐个上传、关联商品并提交。客户端关闭期间错过的任务会在下次启动时补查；配额不足时按顺延时间执行；单项异常会隔离并记录，后续合格任务继续执行，待核查任务不会自动重试或标记成功。</span>
-      <strong>人工发布</strong>
-      <span>保存本地计划 → 确认排期 → 上传视频并关联商品（此时还未发布） → 检查后点击“发布”，客户端才会向抖音提交。</span>
-    </div>
+    <details class="workflow-help"><summary>查看发布流程说明</summary><p>自动任务到期后按账号逐个处理，失败任务隔离；人工计划依次确认排期、上传关联商品，再由你点击最终“发布”。</p></details>
 
     <div v-if="notice" class="notice result" :class="{ error: noticeError }">{{ notice }}</div>
     <section v-if="publishProgress && publishProgress.state !== 'idle'" class="publish-progress-card" :class="publishProgress.state">
@@ -965,43 +1150,23 @@ onUnmounted(() => {
       <small v-if="publishProgress.state === 'running' && typeof publishProgress.percent !== 'number'">平台没有提供可验证的上传百分比，当前显示实际处理阶段。</small>
     </section>
 
-    <nav v-if="accountTabs.length" class="account-tabs" role="tablist" aria-label="发布账号">
-      <button
-        v-for="account in accountTabs"
-        :key="account.id"
-        class="account-tab"
-        :class="{ active: activeAccountId === account.id }"
-        role="tab"
-        :aria-selected="activeAccountId === account.id"
-        @click="selectAccount(account.id)"
-      >
-        <span>{{ account.name }}</span>
-        <small>{{ account.status === 'active' ? '已启用' : '已停用' }} · {{ accountPlanCount(account.id) }} 条有效计划</small>
-      </button>
-    </nav>
-
-    <section v-if="activeAccount" class="account-workspace" role="tabpanel">
+    <section v-if="activeAccount" class="account-workspace">
       <header class="account-head">
         <div>
           <h2>{{ activeAccount.name }}</h2>
-          <p>当前工作区只显示本账号商品和发布记录，上传使用本账号专属 Chrome profile。</p>
+          <p>有效计划 {{ activeCount }} · 待确认 {{ pendingCount }} · 共 {{ accountRows.length }} 条记录</p>
         </div>
-        <button class="button primary" :disabled="activeAccount.status !== 'active' || busyId === -activeAccount.id" @click="openCreatorCenter(activeAccount.id)">
-          {{ busyId === -activeAccount.id ? '正在打开…' : '打开此账号创作者中心' }}
-        </button>
+        <div class="account-actions">
+          <button class="button" :disabled="activeAccount.status !== 'active' || busyId === -activeAccount.id" @click="openCreatorCenter(activeAccount.id)">{{ busyId === -activeAccount.id ? '正在打开…' : '打开创作者中心' }}</button>
+          <button v-if="createFormOpen" class="button" @click="createFormOpen = false">收起新建计划</button>
+        </div>
       </header>
       <p v-if="activeAccount.status !== 'active'" class="hint">此账号已停用；队列记录仍可查看，启用后才能创建或处理平台任务。</p>
 
-      <div class="summary">
-        <div><b>{{ activeCount }}</b><span>本账号有效计划</span></div>
-        <div><b>{{ pendingCount }}</b><span>待确认本地计划</span></div>
-        <div class="summary-note">每日配额按本账号设置或通用默认值校验；待确认和已排期任务都会占用该账号的计划日期配额。</div>
-      </div>
-
-      <div class="card form-card">
+      <div v-if="createFormOpen" ref="formCardRef" class="card form-card">
         <div class="card-title">
           <h2>添加 {{ activeAccount.name }} 视频计划</h2>
-          <span>仅使用该账号已加车商品；选择图转视频生成的 MP4 文件</span>
+          <span>选择本账号商品和 MP4 视频</span>
         </div>
         <div class="form-grid">
         <label>
@@ -1053,21 +1218,27 @@ onUnmounted(() => {
         <div class="card-title">
           <h2>{{ activeAccount.name }}发布记录</h2>
           <span>{{ accountRows.length }} 条记录</span>
+          <button class="button" :disabled="busyId !== null || selectedRetryIds.length === 0" @click="retrySelected">批量重试已勾选（{{ selectedRetryIds.length }}）</button>
         </div>
-        <div v-if="accountRows.length === 0" class="empty">{{ activeAccount.name }}还没有本地发布计划。请在上方选择该账号已加车商品和视频。</div>
+        <nav v-if="accountPageCount > 1" class="queue-pagination" aria-label="发布记录分页">
+          <span>第 {{ accountPage }} / {{ accountPageCount }} 页 · 每页 {{ accountPageSize }} 条</span>
+          <button class="button" :disabled="accountPage <= 1" @click="setAccountPage(accountPage - 1)">上一页</button>
+          <button class="button" :disabled="accountPage >= accountPageCount" @click="setAccountPage(accountPage + 1)">下一页</button>
+        </nav>
+        <div v-if="accountRows.length === 0" class="empty">暂无发布记录。点击上方“新建计划”添加。</div>
         <div v-else class="table-wrap">
           <table>
             <thead>
-              <tr><th>计划时间</th><th>商品</th><th>视频备注 / 文件</th><th>本地计划状态</th><th>抖音平台状态</th><th>操作</th></tr>
+              <tr><th>重试</th><th>计划时间</th><th>商品与视频</th><th>状态</th><th>操作</th></tr>
             </thead>
             <tbody>
-              <tr v-for="row in accountRows" :key="row.id" :class="{ cancelled: row.status === 'cancelled' }">
+              <tr v-for="row in visibleAccountRows" :key="row.id" :class="{ cancelled: row.status === 'cancelled' }">
+                <td><input v-if="canRetryManually(row)" v-model="selectedRetryIds" type="checkbox" :value="row.id" :aria-label="`选择重试任务 #${row.id}`"></td>
                 <td class="date-cell">{{ formatSchedule(row.schedule_at) }}</td>
-                <td class="id-cell"><b>{{ row.product_name || '商品名称未保存' }}</b><small>{{ row.product_id }}</small></td>
-                <td class="file-cell" :title="row.video_path"><b>{{ row.title }}</b><small>{{ row.video_path.split(/[\\/]/).pop() }}</small></td>
-                <td><span class="badge" :class="row.status">{{ statusLabel(row.status) }}</span></td>
+                <td class="id-cell" :title="`${row.product_id} · ${row.video_path}`"><b>{{ row.product_name || '商品名称未保存' }}</b><small>{{ row.video_path.split(/[\\/]/).pop() }}</small></td>
                 <td class="platform-cell">
                   <span class="badge" :class="row.platform_status">{{ platformStatusLabel(row.platform_status) }}</span>
+                  <span v-if="row.status !== 'scheduled'" class="badge" :class="row.status">{{ statusLabel(row.status) }}</span>
                   <div v-if="progressForRow(row)" class="row-publish-progress">
                     <small>{{ progressForRow(row)?.stage }}</small>
                     <div v-if="progressForRow(row)?.state === 'running'" class="progress-track" role="progressbar" :aria-valuenow="progressForRow(row)?.percent" :aria-valuemin="0" :aria-valuemax="100">
@@ -1077,15 +1248,12 @@ onUnmounted(() => {
                     <small v-if="typeof progressForRow(row)?.percent === 'number'">当前阶段 {{ progressForRow(row)?.percent }}%</small>
                     <small v-if="progressForRow(row)?.message">{{ progressForRow(row)?.message }}</small>
                   </div>
-                  <small v-if="row.platform_error">{{ row.platform_error }}</small>
-                <small v-else-if="row.platform_status === 'uploaded_waiting_publish'">简介：{{ row.description }}</small>
-                <small v-else-if="row.platform_status === 'submitted_review'">平台已收件，审核结果由抖音创作者中心更新。</small>
+                  <small v-if="row.platform_error" class="error-preview" :title="row.platform_error">{{ row.platform_error }}</small>
                 </td>
                 <td class="actions">
                   <button v-if="row.status === 'awaiting_confirmation'" class="text-button" :disabled="busyId === row.id" @click="confirmSchedule(row)">确认排期</button>
                   <button v-if="row.status === 'scheduled' && row.platform_status === 'not_uploaded' && !row.auto_publish" class="text-button" :disabled="busyId === row.id" @click="prepareCreatorUpload(row)">上传视频并关联商品（之后发布）</button>
                   <div v-else-if="row.status === 'scheduled' && row.platform_status === 'not_uploaded' && row.auto_publish" class="immediate-actions">
-                    <span class="muted">{{ quarantinedAutoTasks.length > 0 ? '待核查任务已隔离' : autoPublishEnabled ? '等待计划时间' : '自动发布暂停中' }}</span>
                     <button
                       class="text-button publish-action"
                       :disabled="busyId === row.id || busyId === -row.account_id || quarantinedAutoTasks.length > 0 || accounts.find((item) => item.id === row.account_id)?.status !== 'active'"
@@ -1093,25 +1261,29 @@ onUnmounted(() => {
                       @click="publishImmediately(row)"
                     >{{ busyId === row.id ? '发布中…' : '马上发布' }}</button>
                   </div>
-                  <button v-if="row.platform_status === 'uploaded_waiting_publish'" class="text-button" :disabled="busyId === -row.account_id" @click="openCreatorCenter(row.account_id)">打开创作者中心</button>
                   <button v-if="row.platform_status === 'uploaded_waiting_publish'" class="text-button publish-action" :disabled="busyId === row.id || busyId === -row.account_id" @click="submitPublish(row)">{{ busyId === row.id ? '提交中…' : '发布' }}</button>
-                  <button v-if="row.platform_status === 'uploaded_waiting_publish'" class="text-button" :disabled="busyId === row.id" @click="markPublished(row)">我已在抖音发布（仅记录）</button>
-                  <button v-if="row.platform_status === 'needs_review' || row.platform_status === 'uploading'" class="text-button" :disabled="busyId === -row.account_id" @click="openCreatorCenter(row.account_id)">检查创作者中心</button>
-                  <button v-if="row.platform_status === 'needs_review' || row.platform_status === 'uploading'" class="text-button danger" :disabled="busyId === row.id" @click="resetUncertainUpload(row)">核实未上传后重试</button>
-                  <button v-if="row.platform_status === 'submission_uncertain' || row.platform_status === 'submitting'" class="text-button" :disabled="busyId === -row.account_id" @click="openCreatorCenter(row.account_id)">检查创作者中心</button>
-                  <button v-if="row.platform_status === 'submission_uncertain' || row.platform_status === 'submitting'" class="text-button" :disabled="busyId === row.id" @click="markPublished(row)">我已确认发布（仅记录）</button>
-                  <button v-if="row.platform_status === 'submission_uncertain' || row.platform_status === 'submitting'" class="text-button danger" :disabled="busyId === row.id" @click="resetUncertainSubmission(row)">核实未发布后重试</button>
-                  <button v-if="canRetryManually(row)" class="text-button publish-action" :disabled="busyId !== null || progressForRow(row)?.state === 'running' || accounts.find((item) => item.id === row.account_id)?.status !== 'active'" title="仅重试本条；先恢复已有投稿，必要时再核实无草稿后重传" @click="retryManually(row)">{{ busyId === row.id ? '重发中…' : '手动重新发布' }}</button>
-                  <button v-if="row.status !== 'cancelled' && (row.platform_status === 'not_uploaded' || row.platform_status === 'isolated')" class="text-button danger" :disabled="busyId === row.id" @click="cancelTask(row)">取消</button>
-                  <button v-if="row.platform_status === 'not_uploaded' && ['awaiting_confirmation', 'scheduled', 'cancelled'].includes(row.status)" class="text-button danger" :disabled="busyId === row.id || progressForRow(row)?.state === 'running'" @click="deleteTask(row)">删除计划</button>
-                  <span v-if="row.status !== 'cancelled' && row.platform_status === 'uploaded_waiting_publish'" class="muted">视频已上传，点击“发布”才会提交</span>
-                  <span v-if="row.status !== 'cancelled' && row.platform_status === 'submitting'" class="muted">发布命令已启动，请勿重复操作</span>
-                  <span v-if="row.status !== 'cancelled' && row.platform_status === 'published'" class="muted">已收到抖音发布成功回执</span>
-                  <span v-if="row.status !== 'cancelled' && row.platform_status === 'submitted_review'" class="muted">抖音已接收，等待平台审核</span>
-                  <span v-if="row.status !== 'cancelled' && row.platform_status === 'submission_uncertain'" class="muted">请核对创作者中心后再处理</span>
-                    <span v-if="row.status !== 'cancelled' && row.platform_status === 'isolated'" class="muted">本项已隔离，未记录为发布成功；查看错误说明后再处理。</span>
-                  <span v-if="row.status !== 'cancelled' && (row.platform_status === 'needs_review' || row.platform_status === 'uploading')" class="muted">上传状态需要人工核对</span>
-                  <span v-if="row.status === 'cancelled'" class="muted">—</span>
+                  <button v-if="canRetryManually(row) && row.platform_status !== 'uploaded_waiting_publish'" class="text-button publish-action" :disabled="busyId !== null || progressForRow(row)?.state === 'running' || accounts.find((item) => item.id === row.account_id)?.status !== 'active'" @click="retryManually(row)">{{ busyId === row.id ? '重试中…' : '检查并重试' }}</button>
+                  <details class="row-more-actions">
+                    <summary>详情与更多</summary>
+                    <div class="row-more-content">
+                      <small>任务 #{{ row.id }} · 商品 ID {{ row.product_id }}</small>
+                      <small>视频备注：{{ row.title }} · 文件：{{ row.video_path }}</small>
+                      <small v-if="row.execution_started_at">实际开始：{{ formatSchedule(row.execution_started_at) }}</small>
+                      <small v-if="row.description">简介：{{ row.description }}</small>
+                      <small v-if="row.platform_error">原因：{{ row.platform_error }}</small>
+                      <button v-if="row.status === 'scheduled'" class="text-button" :disabled="busyId === -row.account_id" @click="openCreatorCenter(row.account_id)">打开创作者中心</button>
+                      <button v-if="row.platform_status === 'uploaded_waiting_publish'" class="text-button" :disabled="busyId === row.id" @click="markPublished(row)">我已在抖音发布（仅记录）</button>
+                      <button v-if="row.platform_status === 'needs_review' || row.platform_status === 'uploading'" class="text-button danger" :disabled="busyId === row.id" @click="resetUncertainUpload(row)">核实未上传后重置</button>
+                      <button v-if="row.platform_status === 'submission_uncertain' || row.platform_status === 'submitting'" class="text-button" :disabled="busyId === row.id" @click="markPublished(row)">我已确认发布（仅记录）</button>
+                      <button v-if="row.platform_status === 'submission_uncertain' || row.platform_status === 'submitting'" class="text-button danger" :disabled="busyId === row.id" @click="resetUncertainSubmission(row)">核实未发布后重置</button>
+                      <button v-if="row.platform_status === 'uploaded_waiting_publish' && canRetryManually(row)" class="text-button" :disabled="busyId !== null" @click="retryManually(row)">恢复原投稿</button>
+                      <button v-if="canRetryManually(row) && row.platform_error" class="text-button" :disabled="busyId !== null" @click="retryManually(row, true)">清除失败提示并重试</button>
+                      <button v-if="row.screenshot_path" class="text-button" @click="openReceiptScreenshot(row)">查看失败截图</button>
+                      <button class="text-button" @click="viewReceiptEvents(row)">过程日志</button>
+                      <button v-if="row.status !== 'cancelled' && (row.platform_status === 'not_uploaded' || row.platform_status === 'isolated')" class="text-button danger" :disabled="busyId === row.id" @click="cancelTask(row)">取消计划</button>
+                      <button v-if="row.platform_status === 'not_uploaded' && ['awaiting_confirmation', 'scheduled', 'cancelled'].includes(row.status)" class="text-button danger" :disabled="busyId === row.id || progressForRow(row)?.state === 'running'" @click="deleteTask(row)">删除计划</button>
+                    </div>
+                  </details>
                 </td>
               </tr>
             </tbody>
@@ -1121,20 +1293,44 @@ onUnmounted(() => {
     </section>
 
     <div v-else class="empty account-empty">当前没有账号记录。请先在账号管理中添加并启用账号。</div>
+    <Teleport to="body">
+      <section v-if="eventQueueId !== null" class="receipt-events-mask" @click.self="eventQueueId = null" @keydown.esc.window="eventQueueId = null">
+        <div class="receipt-events" role="dialog" aria-modal="true" :aria-label="`任务 #${eventQueueId} 过程日志`">
+          <div class="card-title"><h3>任务 #{{ eventQueueId }} 过程日志</h3><button class="button" @click="eventQueueId = null">关闭</button></div>
+          <p v-if="!receiptEvents.length">暂无上传或发布事件。</p>
+          <div v-for="event in receiptEvents" :key="event.id" class="receipt-event">
+            <b>{{ event.stage }} · {{ event.outcome }}</b><span>{{ formatSchedule(event.created_at) }}</span>
+            <small v-if="event.reason">{{ event.reason }}{{ event.cleared_at ? '（失败提示已清除，历史留存）' : '' }}</small>
+            <small v-if="event.screenshot_path">截图：{{ event.screenshot_path }}</small>
+          </div>
+        </div>
+      </section>
+    </Teleport>
   </section>
 </template>
 
 <style scoped>
-.publish-page { flex: 1; min-width: 0; min-height: 0; overflow: auto; padding: 2px 3px 14px; color: var(--text); }
-.page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
-.head-actions { display: flex; align-items: center; gap: 10px; }
+.publish-page { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior-y: contain; overflow-anchor: none; scrollbar-gutter: stable; padding: 2px 3px 14px; color: var(--text); }
+.page-head { position: sticky; top: 0; z-index: 12; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; padding: 8px 4px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
+.head-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.account-picker { display: flex; flex-direction: row; align-items: center; gap: 5px; white-space: nowrap; }
+.account-picker select { width: auto; min-width: 130px; max-width: 180px; }
+.review-toggle.enabled { border-color: #86efac; background: #f0fdf4; color: #166534; }
 .auto-publish-state { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; margin-bottom: 9px; padding: 9px 12px; border: 1px solid #86efac; border-radius: var(--radius); background: #f0fdf4; color: #166534; font-size: 12px; line-height: 1.5; }
 .auto-publish-state.paused { border-color: #fcd34d; background: #fffbeb; color: #92400e; }
 .auto-publish-state span { overflow-wrap: anywhere; }
-.scheduler-settings { margin: 0 0 9px; padding: 9px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); font-size: 12px; }
+.scheduler-settings { margin: 0 0 7px; padding: 7px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); font-size: 12px; scroll-margin-top: 70px; }
 .scheduler-settings summary { cursor: pointer; color: var(--text); font-weight: 600; }
 .scheduler-settings-body { display: grid; grid-template-columns: repeat(3, minmax(130px, 1fr)) auto; align-items: end; gap: 10px; margin-top: 10px; }
 .scheduler-settings-body small { grid-column: 1 / -1; color: var(--text-muted); line-height: 1.5; }
+.workflow-help { margin: 0 0 7px; color: var(--text-muted); font-size: 12px; }
+.workflow-help summary { width: fit-content; cursor: pointer; }
+.workflow-help p { margin: 6px 0 0; }
+.receipt-events-mask { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 20px; background: rgb(15 23 42 / 46%); }
+.receipt-events { width: min(760px, 95vw); max-height: 80vh; overflow: auto; padding: 16px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-panel); box-shadow: 0 18px 56px rgb(15 23 42 / 22%); }
+.receipt-events .card-title { align-items: center; justify-content: space-between; }
+.receipt-event { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 7px 0; border-top: 1px solid var(--border); font-size: 12px; }
+.receipt-event small { flex-basis: 100%; color: var(--text-muted); overflow-wrap: anywhere; }
 .page-head h1 { margin: 0; font-size: 21px; }
 .page-head p, .card-title span, .summary-note, .form-actions > span { color: var(--text-muted); font-size: 12px; }
 .page-head p { margin: 5px 0 0; }
@@ -1156,23 +1352,21 @@ onUnmounted(() => {
 .row-publish-progress { display: grid; gap: 4px; min-width: 120px; margin-top: 6px; }
 .row-publish-progress small { color: var(--text-muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
 @keyframes publish-progress-slide { from { left: -38%; } to { left: 105%; } }
-.account-tabs { display: flex; gap: 8px; margin-top: 12px; padding: 0 0 8px; border-bottom: 1px solid var(--border); }
-.account-tab { display: flex; flex-direction: column; gap: 4px; min-width: 190px; padding: 9px 13px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-panel); color: var(--text); text-align: left; cursor: pointer; }
-.account-tab.active { border-color: var(--brand); box-shadow: inset 0 -2px 0 var(--brand); color: var(--brand); }
-.account-tab span { font-size: 13px; font-weight: 600; }
-.account-tab small { color: var(--text-muted); font-size: 11px; }
 .account-workspace { min-width: 0; }
-.account-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 12px; padding: 13px 15px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.account-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 12px; padding: 13px 15px; border: 1px solid var(--border); border-radius: var(--radius); background: linear-gradient(110deg, #f6f9ff, #ffffff); box-shadow: var(--shadow-card); }
 .account-head h2 { margin: 0; font-size: 16px; }
 .account-head p { margin: 5px 0 0; color: var(--text-muted); font-size: 12px; }
+.account-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .account-empty { margin-top: 14px; border: 1px dashed var(--border); border-radius: var(--radius); }
 .summary { display: grid; grid-template-columns: 130px 150px 1fr; align-items: center; gap: 14px; margin: 10px 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
 .summary > div:not(.summary-note) { display: flex; align-items: baseline; gap: 8px; }
 .summary b { color: var(--brand); font-size: 21px; }
 .summary span { color: var(--text-muted); font-size: 12px; }
-.card { margin-top: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.card { margin-top: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
+.form-card { scroll-margin-top: 90px; }
 .card-title { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
 .card-title h2 { margin: 0; font-size: 16px; }
+.queue-pagination { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; margin: 0 0 9px; color: var(--text-muted); font-size: 12px; }
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
 label { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 12px; }
 label.wide { grid-column: 1 / -1; }
@@ -1191,14 +1385,15 @@ textarea { min-height: 66px; padding: 8px 9px; resize: vertical; font: inherit; 
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th, td { padding: 9px 8px; border-top: 1px solid var(--border); text-align: left; vertical-align: middle; }
 th { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
-.date-cell, .id-cell { white-space: nowrap; }
+.date-cell { white-space: nowrap; }
+.id-cell { min-width: 190px; max-width: 340px; }
 .id-cell b, .id-cell small, .platform-cell small { display: block; }
-.id-cell small, .platform-cell small { margin-top: 3px; color: var(--text-muted); white-space: normal; }
-.platform-cell { min-width: 150px; max-width: 260px; }
+.id-cell b, .id-cell small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.id-cell small, .platform-cell small { margin-top: 3px; color: var(--text-muted); }
+.platform-cell { min-width: 170px; max-width: 280px; }
 .platform-cell small { max-width: 260px; overflow-wrap: anywhere; }
-.file-cell { min-width: 230px; max-width: 420px; }
-.file-cell b, .file-cell small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-cell small { margin-top: 3px; color: var(--text-muted); }
+.platform-cell .badge + .badge { margin-left: 5px; }
+.error-preview { display: -webkit-box !important; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .badge { display: inline-block; padding: 3px 7px; border-radius: 10px; background: var(--brand-soft); color: var(--brand); white-space: nowrap; }
 .badge.awaiting_confirmation { background: #fff7ed; color: #c2410c; }
 .badge.cancelled { background: #f3f4f6; color: var(--text-muted); }
@@ -1209,12 +1404,16 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
 .badge.published { background: #ecfdf5; color: #047857; }
 .publish-action { color: #1d4ed8; font-weight: 700; }
 .immediate-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 5px; }
-.actions { display: flex; min-width: 220px; flex-wrap: wrap; align-items: center; gap: 3px 5px; white-space: normal; }
+.actions { min-width: 150px; white-space: normal; }
+.row-more-actions { margin-top: 5px; font-size: 11px; }
+.row-more-actions summary { width: fit-content; min-height: 26px; color: var(--brand); cursor: pointer; }
+.row-more-content { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; max-width: 360px; padding: 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-panel); }
+.row-more-content small { max-width: 100%; overflow-wrap: anywhere; color: var(--text-muted); }
 .text-button { padding: 3px 5px; border: 0; background: transparent; color: var(--brand); cursor: pointer; }
 .text-button:disabled { opacity: .5; cursor: default; }
 .text-button.danger { color: #dc2626; }
 .muted { color: var(--text-muted); }
 tr.cancelled { color: var(--text-muted); }
-@media (max-width: 900px) { .summary { grid-template-columns: 120px 130px; } .summary-note { grid-column: 1 / -1; } .account-head { align-items: flex-start; flex-direction: column; } }
-@media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } label.wide { grid-column: auto; } .form-actions { align-items: flex-start; flex-direction: column; } .workflow-note { grid-template-columns: 1fr; } .scheduler-settings-body { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .page-head { align-items: flex-start; flex-direction: column; } .account-head { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } label.wide { grid-column: auto; } .form-actions { align-items: flex-start; flex-direction: column; } .scheduler-settings-body { grid-template-columns: 1fr; } }
 </style>

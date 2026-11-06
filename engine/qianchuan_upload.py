@@ -32,6 +32,7 @@ DEFAULT_LIMITS = {
 }
 OCCUPIED_STATUSES = ("queued", "uploading", "needs_review", "succeeded")
 MAX_DEFER_DAYS = 366
+AUTO_RETRY_DELAYS_MINUTES = (5, 15, 60)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS qianchuan_quota_groups (
@@ -56,6 +57,11 @@ CREATE TABLE IF NOT EXISTS qianchuan_quota_settings (
     max_step_delay_ms INTEGER NOT NULL DEFAULT 2000,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS qianchuan_upload_preferences (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    auto_retry_enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS qianchuan_upload_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     asset_id INTEGER NOT NULL,
@@ -73,6 +79,8 @@ CREATE TABLE IF NOT EXISTS qianchuan_upload_jobs (
     failure_stage TEXT NOT NULL DEFAULT '',
     screenshot_path TEXT NOT NULL DEFAULT '',
     submit_attempted INTEGER NOT NULL DEFAULT 0,
+    auto_retry_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
     created_at TEXT NOT NULL,
     started_at TEXT,
     completed_at TEXT,
@@ -117,6 +125,17 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     ):
         if column not in settings_columns:
             connection.execute(f"ALTER TABLE qianchuan_quota_settings ADD COLUMN {column} {ddl}")
+    job_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(qianchuan_upload_jobs)")}
+    for column, ddl in (
+        ("auto_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_retry_at", "TEXT"),
+    ):
+        if column not in job_columns:
+            connection.execute(f"ALTER TABLE qianchuan_upload_jobs ADD COLUMN {column} {ddl}")
+    connection.execute(
+        "INSERT OR IGNORE INTO qianchuan_upload_preferences (id, auto_retry_enabled, updated_at) "
+        "VALUES (1, 1, ?)", (now_text(),),
+    )
     connection.execute(
         "INSERT OR IGNORE INTO qianchuan_quota_settings "
         "(account_id, per_product_videos, per_account_products, per_account_videos, "
@@ -126,6 +145,41 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         (*DEFAULT_LIMITS.values(), now_text()),
     )
     connection.commit()
+
+
+def retry_config(connection: sqlite3.Connection, enabled: Optional[bool] = None) -> Dict[str, Any]:
+    if enabled is not None:
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            timestamp = now_text()
+            connection.execute(
+                "UPDATE qianchuan_upload_preferences SET auto_retry_enabled = ?, updated_at = ? WHERE id = 1",
+                (1 if enabled else 0, timestamp),
+            )
+            if not enabled:
+                waiting = connection.execute(
+                    "SELECT id FROM qianchuan_upload_jobs "
+                    "WHERE status = 'queued' AND next_retry_at IS NOT NULL"
+                ).fetchall()
+                for row in waiting:
+                    job_id = int(row["id"])
+                    connection.execute(
+                        "UPDATE qianchuan_upload_jobs SET status = 'failed', next_retry_at = NULL, "
+                        "error_code = 'AUTO_RETRY_DISABLED', completed_at = ?, updated_at = ? WHERE id = ?",
+                        (timestamp, timestamp, job_id),
+                    )
+                    _event(connection, job_id, "auto_retry", "disabled", "自动重试已关闭，等待人工处理",
+                           details={"quotaHeld": False})
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    row = connection.execute(
+        "SELECT auto_retry_enabled FROM qianchuan_upload_preferences WHERE id = 1"
+    ).fetchone()
+    return {"ok": True, "autoRetryEnabled": bool(row[0]) if row else True,
+            "retryDelaysMinutes": list(AUTO_RETRY_DELAYS_MINUTES)}
 
 
 def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
@@ -263,7 +317,7 @@ def _group_for_account(connection: sqlite3.Connection, account_id: int) -> int:
 
 def list_targets(connection: sqlite3.Connection) -> Dict[str, Any]:
     rows = connection.execute(
-        "SELECT a.id AS account_id, a.name AS account_name, a.status AS account_status, "
+        "SELECT a.id AS account_id, a.name AS account_name, a.douyin_id AS douyin_id, a.status AS account_status, "
         "q.id AS qianchuan_account_id, q.qc_name, q.qc_id, q.login_state, "
         "m.group_id AS quota_group_id "
         "FROM accounts a LEFT JOIN account_qianchuan aq ON aq.account_row_id = a.id "
@@ -272,6 +326,51 @@ def list_targets(connection: sqlite3.Connection) -> Dict[str, Any]:
         "ORDER BY a.id, q.id"
     ).fetchall()
     return {"ok": True, "rows": [dict(row) for row in rows], "quotaScope": "local_sqlite"}
+
+
+def product_quota_remaining(
+    connection: sqlite3.Connection, account_id: int, product_id: str,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """只读计算 Step17 当日可为该商品预占的素材条数。"""
+    product_id = str(product_id or "").strip()
+    if account_id < 1 or not product_id:
+        raise ValueError("抖音账号 ID 与商品 ID 必填")
+    if not connection.execute("SELECT 1 FROM accounts WHERE id = ?", (account_id,)).fetchone():
+        raise ValueError(f"账号不存在：{account_id}")
+    today = today or date.today()
+    limits = _limits(connection, account_id)
+    group_row = connection.execute(
+        "SELECT group_id FROM qianchuan_quota_group_members WHERE account_id = ?", (account_id,)
+    ).fetchone()
+    group_id = int(group_row["group_id"]) if group_row else 0
+    if group_id:
+        members = connection.execute(
+            "SELECT account_id FROM qianchuan_quota_group_members WHERE group_id = ?", (group_id,)
+        ).fetchall()
+        group_limits = [_limits(connection, int(member["account_id"])) for member in members]
+    else:
+        # 尚未分组时，enqueue 会为该账号创建新组；新组目前仅含此账号。
+        group_limits = [limits]
+    group_product_cap = min(item["perGroupProducts"] for item in group_limits)
+    group_video_cap = min(item["perGroupVideos"] for item in group_limits)
+    usage = _quota_usage(connection, account_id, group_id, product_id, today.isoformat())
+    product_remaining = max(0, limits["perProductVideos"] - usage["productVideos"])
+    account_remaining = max(0, limits["perAccountVideos"] - usage["accountVideos"])
+    group_remaining = max(0, group_video_cap - usage["groupVideos"])
+    if usage["newAccountProduct"] and usage["accountProducts"] >= limits["perAccountProducts"]:
+        account_remaining = 0
+    if usage["newGroupProduct"] and usage["groupProducts"] >= group_product_cap:
+        group_remaining = 0
+    remaining = min(product_remaining, account_remaining, group_remaining)
+    return {
+        "ok": True, "accountId": account_id, "productId": product_id,
+        "date": today.isoformat(), "remaining": remaining,
+        "limits": limits,
+        "usage": usage,
+        "quotaGroupId": group_id or None,
+        "quotaScope": "local_sqlite",
+    }
 
 
 def eligible_assets(connection: sqlite3.Connection, account_id: int, limit: int = 200) -> Dict[str, Any]:
@@ -511,12 +610,16 @@ def _job_payload(row: sqlite3.Row) -> Dict[str, Any]:
         "reason": row["error_message"], "stage": row["failure_stage"],
         "screenshotPath": row["screenshot_path"],
         "submitAttempted": bool(row["submit_attempted"]),
+        "autoRetryCount": int(row["auto_retry_count"]),
+        "nextRetryAt": row["next_retry_at"],
         "createdAt": row["created_at"], "updatedAt": row["updated_at"],
     }
 
 
-def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = None) -> Dict[str, Any]:
-    today = today or date.today()
+def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = None,
+          now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or datetime.now()
+    today = today or now.date()
     connection.commit()
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -525,6 +628,8 @@ def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = N
             raise ValueError(f"任务状态为 {row['status']}，不可再次领取")
         if row["scheduled_date"] > today.isoformat():
             raise ValueError(f"该素材配额已顺延至 {row['scheduled_date']}")
+        if row["next_retry_at"] and row["next_retry_at"] > now.isoformat(timespec="seconds"):
+            raise ValueError(f"任务等待自动重试，预计 {row['next_retry_at']}")
         running = int(connection.execute(
             "SELECT COUNT(*) FROM qianchuan_upload_jobs WHERE status = 'uploading'"
         ).fetchone()[0])
@@ -551,7 +656,8 @@ def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = N
         if not Path(row["file_path"]).is_file():
             raise ValueError("任务素材文件已不存在，停止上传")
         connection.execute(
-            "UPDATE qianchuan_upload_jobs SET status = 'uploading', started_at = ?, updated_at = ? "
+            "UPDATE qianchuan_upload_jobs SET status = 'uploading', next_retry_at = NULL, "
+            "started_at = ?, updated_at = ? "
             "WHERE id = ? AND status = 'queued'", (now_text(), now_text(), job_id),
         )
         _event(connection, job_id, "upload_claim", "started")
@@ -576,7 +682,7 @@ def complete(connection: sqlite3.Connection, job_id: int, remote_material_id: st
         timestamp = now_text()
         connection.execute(
             "UPDATE qianchuan_upload_jobs SET status = 'succeeded', remote_material_id = ?, "
-            "error_code = '', error_message = '', failure_stage = '', completed_at = ?, "
+            "error_code = '', error_message = '', failure_stage = '', next_retry_at = NULL, completed_at = ?, "
             "updated_at = ? WHERE id = ?",
             (remote_material_id, timestamp, timestamp, job_id),
         )
@@ -606,10 +712,12 @@ def complete(connection: sqlite3.Connection, job_id: int, remote_material_id: st
 def fail(
     connection: sqlite3.Connection, job_id: int, reason: str, stage: str,
     screenshot_path: str = "", submit_attempted: bool = False,
-    uncertain: bool = False,
+    uncertain: bool = False, manual_action_required: bool = False,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     if not reason.strip() or not stage.strip():
         raise ValueError("失败原因和阶段不能为空")
+    now = now or datetime.now()
     connection.commit()
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -618,21 +726,48 @@ def fail(
             raise ValueError(f"任务状态为 {row['status']}，不能重复登记失败")
         needs_review = bool(submit_attempted or uncertain)
         status = "needs_review" if needs_review else "failed"
-        timestamp = now_text()
+        timestamp = now.isoformat(timespec="seconds")
+        retry_count = int(row["auto_retry_count"])
         connection.execute(
             "UPDATE qianchuan_upload_jobs SET status = ?, error_code = ?, error_message = ?, "
             "failure_stage = ?, screenshot_path = ?, submit_attempted = ?, "
-            "completed_at = ?, updated_at = ? WHERE id = ?",
-            (status, "SUBMISSION_UNCERTAIN" if needs_review else "UPLOAD_FAILED",
+            "next_retry_at = NULL, completed_at = ?, updated_at = ? WHERE id = ?",
+            (status, "SUBMISSION_UNCERTAIN" if needs_review else
+             "MANUAL_ACTION_REQUIRED" if manual_action_required else "UPLOAD_FAILED",
              reason.strip()[:2000], stage.strip(), screenshot_path.strip(),
              1 if submit_attempted else 0, timestamp, timestamp, job_id),
         )
         _event(connection, job_id, stage.strip(), status, reason.strip(), screenshot_path.strip(), {
             "submitAttempted": bool(submit_attempted), "uncertain": bool(uncertain),
+            "manualActionRequired": bool(manual_action_required), "retryCount": retry_count,
             "quotaHeld": needs_review,
         })
+        enabled = retry_config(connection)["autoRetryEnabled"]
+        if not needs_review and not manual_action_required and enabled and retry_count < len(AUTO_RETRY_DELAYS_MINUTES):
+            delay = AUTO_RETRY_DELAYS_MINUTES[retry_count]
+            try:
+                scheduled = _reserve_date(connection, int(row["account_id"]),
+                                          int(row["quota_group_id"]), str(row["product_id"]), now.date())
+            except ValueError as error:
+                _event(connection, job_id, "auto_retry", "failed", str(error), details={
+                    "retryCount": retry_count, "quotaHeld": False,
+                })
+            else:
+                retry_at = (now + timedelta(minutes=delay)).isoformat(timespec="seconds")
+                connection.execute(
+                    "UPDATE qianchuan_upload_jobs SET status = 'queued', scheduled_date = ?, "
+                    "auto_retry_count = ?, next_retry_at = ?, completed_at = NULL, "
+                    "error_code = 'AUTO_RETRY_PENDING', updated_at = ? WHERE id = ?",
+                    (scheduled.isoformat(), retry_count + 1, retry_at, timestamp, job_id),
+                )
+                _event(connection, job_id, "auto_retry", "queued", details={
+                    "retryCount": retry_count + 1, "retryAt": retry_at,
+                    "scheduledDate": scheduled.isoformat(), "quotaHeld": True,
+                })
         connection.commit()
-        return {"ok": True, "job": _job_payload(_job(connection, job_id)), "quotaHeld": needs_review}
+        final_job = _job_payload(_job(connection, job_id))
+        return {"ok": True, "job": final_job,
+                "quotaHeld": final_job["status"] in ("needs_review", "queued")}
     except Exception:
         connection.rollback()
         raise
@@ -692,7 +827,8 @@ def retry_safe(
         connection.execute(
             "UPDATE qianchuan_upload_jobs SET status = 'queued', scheduled_date = ?, "
             "error_code = '', error_message = '', failure_stage = '', screenshot_path = '', "
-            "started_at = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
+            "auto_retry_count = 0, next_retry_at = NULL, started_at = NULL, "
+            "completed_at = NULL, updated_at = ? WHERE id = ?",
             (scheduled.isoformat(), now_text(), job_id),
         )
         _event(connection, job_id, "manual_retry", "queued", details={
@@ -730,7 +866,8 @@ def resolve_review_absent(
         connection.execute(
             "UPDATE qianchuan_upload_jobs SET status = 'queued', scheduled_date = ?, "
             "error_code = '', error_message = '', failure_stage = '', screenshot_path = '', "
-            "submit_attempted = 0, started_at = NULL, completed_at = NULL, updated_at = ? "
+            "submit_attempted = 0, auto_retry_count = 0, next_retry_at = NULL, "
+            "started_at = NULL, completed_at = NULL, updated_at = ? "
             "WHERE id = ?",
             (scheduled.isoformat(), timestamp, job_id),
         )
@@ -788,6 +925,9 @@ def build_parser() -> argparse.ArgumentParser:
     assets = commands.add_parser("eligible-assets", help="列出本账号网页下载素材及资格原因")
     assets.add_argument("--account-id", type=int, required=True)
     assets.add_argument("--limit", type=int, default=200)
+    remaining = commands.add_parser("product-quota-remaining", help="只读计算指定商品今日可用 Step17 条数")
+    remaining.add_argument("--account-id", type=int, required=True)
+    remaining.add_argument("--product-id", required=True)
     add = commands.add_parser("enqueue", help="批量预占配额并登记上传任务")
     add.add_argument("--account-id", type=int, required=True)
     add.add_argument("--asset-ids", required=True, help="逗号分隔的素材 ID")
@@ -806,6 +946,7 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("--screenshot-path", default="")
     failure.add_argument("--submit-attempted", action="store_true")
     failure.add_argument("--uncertain", action="store_true")
+    failure.add_argument("--manual-action-required", action="store_true")
     interrupted = commands.add_parser("recover-interrupted", help="显式隔离超时的上传中任务，保留配额待人工核查")
     interrupted.add_argument("--older-than-minutes", type=int, default=30)
     retry = commands.add_parser("retry-safe", help="人工重排明确未触及远端写入的失败任务")
@@ -835,6 +976,8 @@ def build_parser() -> argparse.ArgumentParser:
     quota.add_argument("--max-concurrent-uploads", type=int)
     quota.add_argument("--min-step-delay-ms", type=int)
     quota.add_argument("--max-step-delay-ms", type=int)
+    retry_settings = commands.add_parser("retry-config", help="读取或设置提交前失败自动重试开关")
+    retry_settings.add_argument("--enabled", type=int, choices=(0, 1))
     return parser
 
 
@@ -847,6 +990,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 result = list_targets(connection)
             elif args.command == "eligible-assets":
                 result = eligible_assets(connection, args.account_id, args.limit)
+            elif args.command == "product-quota-remaining":
+                result = product_quota_remaining(connection, args.account_id, args.product_id)
             elif args.command == "enqueue":
                 ids = [int(value.strip()) for value in args.asset_ids.split(",") if value.strip()]
                 result = enqueue(connection, args.account_id, ids, args.qianchuan_account_id)
@@ -858,7 +1003,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 result = complete(connection, args.id, args.remote_material_id)
             elif args.command == "fail":
                 result = fail(connection, args.id, args.reason, args.stage,
-                              args.screenshot_path, args.submit_attempted, args.uncertain)
+                              args.screenshot_path, args.submit_attempted, args.uncertain,
+                              args.manual_action_required)
             elif args.command == "recover-interrupted":
                 result = recover_interrupted(connection, args.older_than_minutes)
             elif args.command == "retry-safe":
@@ -886,6 +1032,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 updates = {key: getattr(args, attr) for attr, key in keys.items()
                            if getattr(args, attr) is not None}
                 result = quota_config(connection, args.account_id, updates or None)
+            elif args.command == "retry-config":
+                result = retry_config(connection, None if args.enabled is None else bool(args.enabled))
             else:
                 return emit({"ok": False, "error": "未知命令"}, 2)
         # 次日额度重排是可观测的排队结论，供主进程继续显示 scheduledDate。

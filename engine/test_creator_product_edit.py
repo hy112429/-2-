@@ -14,6 +14,10 @@ PRODUCT_ID = "3771360143091040606"
 PRODUCT_URL = f"https://haohuo.jinritemai.com/views/product/item2?id={PRODUCT_ID}"
 
 
+def expected_short_title():
+    return browser_cdp._creator_product_short_title(PRODUCT_NAME, "", 10)
+
+
 class CreatorProductEditDomTests(unittest.TestCase):
     """平台会在点击“添加链接”后先要求填写短标题，再显示关联商品。"""
 
@@ -126,7 +130,7 @@ class CreatorProductEditDomTests(unittest.TestCase):
 
         actual_short_title = browser_cdp._fill_creator_product_short_title(self.page, PRODUCT_NAME)
 
-        self.assertEqual(actual_short_title, PRODUCT_NAME[:10])
+        self.assertEqual(actual_short_title, expected_short_title())
         self.assertFalse(self.page.locator("#edit-modal").is_visible())
         self.assertEqual(self.page.evaluate("window.events"), [
             "add-link", "fill-short-title", "complete-edit"
@@ -141,7 +145,7 @@ class CreatorProductEditDomTests(unittest.TestCase):
 
         actual_short_title = browser_cdp._fill_creator_product_short_title(self.page, PRODUCT_NAME)
 
-        self.assertEqual(actual_short_title, PRODUCT_NAME[:10])
+        self.assertEqual(actual_short_title, expected_short_title())
         self.assertFalse(self.page.locator("#edit-modal").is_visible())
         self.assertEqual(self.page.evaluate("window.events"), [
             "edit-card", "fill-short-title", "complete-edit"
@@ -151,7 +155,7 @@ class CreatorProductEditDomTests(unittest.TestCase):
         field = self._load(card_present=True)
         self.page.locator(".product-short").evaluate(
             "(el, title) => el.textContent = '短标题：' + title + ' 每单赚17'",
-            PRODUCT_NAME[:10],
+            expected_short_title(),
         )
         card, card_text = browser_cdp._creator_product_card(self.page, PRODUCT_NAME)
         short_title = browser_cdp._creator_resume_linked_short_title(
@@ -160,14 +164,14 @@ class CreatorProductEditDomTests(unittest.TestCase):
             PRODUCT_ID,
             PRODUCT_NAME,
         )
-        self.assertEqual(short_title, PRODUCT_NAME[:10])
+        self.assertEqual(short_title, expected_short_title())
         self.assertEqual(self.page.evaluate("window.events"), [])
 
     def test_resume_refuses_same_title_with_another_product_id(self):
         field = self._load(card_present=True)
         self.page.locator(".product-short").evaluate(
             "(el, title) => el.textContent = '短标题：' + title + ' 每单赚17'",
-            PRODUCT_NAME[:10],
+            expected_short_title(),
         )
         other_url = PRODUCT_URL.replace(PRODUCT_ID, "9999999999999999999")
         self.page.locator("#product-card a").evaluate("(el, url) => el.href = url", other_url)
@@ -204,7 +208,7 @@ class CreatorProductEditDomTests(unittest.TestCase):
 
         actual_short_title = browser_cdp._fill_creator_product_short_title(self.page, PRODUCT_NAME)
 
-        self.assertEqual(actual_short_title, PRODUCT_NAME[:10])
+        self.assertEqual(actual_short_title, expected_short_title())
         self.assertEqual(self.page.evaluate("window.events"), [
             "add-link-request", "add-link", "fill-short-title", "complete-edit"
         ])

@@ -1,0 +1,4 @@
+[发布后千川素材] 队列 #43 编排已返回：skipped_no_video
+[发布后千川素材] 队列 #48 编排已返回：skipped_no_video
+post-publish Qianchuan isolation: PASS (blocked_auth, blocked_binding, skipped_quota, skipped_no_video, failed_download, idempotence, published-only hook, mark-published trigger, account/product attribution, detail_generated excluded)
+EXIT=0

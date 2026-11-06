@@ -376,8 +376,9 @@ h1,h2,p { margin:0; }
 .load-error { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 13px; border:1px solid #f0c8c5; border-radius:6px; background:#fff4f3; color:#ad3f3a; font-size:12px; }
 .load-error button,.clear-filters { border:0; background:none; color:#397af5; font:inherit; cursor:pointer; }
 .metric-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:11px; }
-.metric-card,.workflow-card,.task-card { border:1px solid #e2e7ef; border-radius:8px; background:#fff; box-shadow:0 2px 6px rgba(29,46,77,.025); }
-.metric-card { min-height:112px; padding:13px 15px 12px; }
+.metric-card,.workflow-card,.task-card { border:1px solid var(--border); border-radius:var(--radius); background:#fff; box-shadow:var(--shadow-card); }
+.metric-card { min-height:112px; padding:13px 15px 12px; border-top:3px solid #a9c4f7; }
+.metric-card:nth-child(2) { border-top-color:#e9c181; }.metric-card:nth-child(3) { border-top-color:#8ac8d6; }.metric-card:nth-child(4) { border-top-color:#e6a29e; }.metric-card:nth-child(5) { border-top-color:#8fc9ae; }
 .metric-top { display:flex; justify-content:space-between; align-items:center; }
 .metric-label { color:#68738a; font-size:12px; font-weight:600; }
 .metric-mark { display:grid; place-items:center; width:25px; height:25px; border-radius:7px; font-size:11px; font-weight:700; }
@@ -430,7 +431,9 @@ tbody tr:hover { background:#fafcff; }
 .queue-pill { padding:3px 7px; border-radius:4px; background:#f0f3f8; color:#67738a; }.queue-pending { background:#fff5e7; color:#bb7c25; }.queue-cancelled { color:#98a0ad; background:#f3f4f6; }
 .platform-pill { color:#778198; }.platform-pill i { width:6px; height:6px; border-radius:50%; background:#a9b1be; }.platform-pill.danger { color:#c84944; }.platform-pill.danger i { background:#dc5a55; }.platform-pill.success { color:#27825f; }.platform-pill.success i { background:#45a67c; }.platform-pill.info { color:#3574dc; }.platform-pill.info i { background:#4788ed; }.platform-pill.warning { color:#be7b22; }.platform-pill.warning i { background:#d59a42; }
 .time-cell { color:#778198; font-size:10px; white-space:nowrap; font-variant-numeric:tabular-nums; }
-.action-column { text-align:right; }
+.action-column { position:sticky; right:0; z-index:2; text-align:right; background:#fff; box-shadow:-5px 0 8px -8px #63718a; }
+thead .action-column { z-index:3; background:#f6f8fb; }
+tbody tr:hover .action-column { background:#fafcff; }
 .row-action { border:1px solid #dce6f8; border-radius:4px; background:#fff; color:#397af5; padding:4px 8px; font-size:10px; white-space:nowrap; }.row-action:hover { background:#f2f6ff; }
 .empty-state { height:172px; text-align:center; color:#8b95a7; }.empty-state>* { display:block; margin:4px auto; }.empty-state b { color:#49556d; font-size:12px; }.empty-state>span:not(.empty-icon) { font-size:10px; }.empty-state .button { display:flex; width:max-content; margin-top:10px; }
 .empty-icon { color:#b9c3d2; font-size:24px; }
@@ -441,6 +444,6 @@ tbody tr:hover { background:#fafcff; }
 .page-total { margin-left:-5px; }
 .table-footer .refresh-list { min-height:26px; margin-left:7px; padding:0 9px; font-size:10px; }
 .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
-@media (max-width:1180px) { .metric-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }.filters { gap:7px; }.search-field { flex:1 1 220px; } }
+@media (max-width:1450px) { .metric-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }.filters { gap:7px; }.search-field { flex:1 1 220px; }.dashboard-heading { gap:10px; }.heading-actions { flex-wrap:wrap; justify-content:flex-end; } }
 @media (max-width:760px) { .dashboard-heading { align-items:flex-start; flex-direction:column; }.heading-actions { width:100%; }.metric-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }.workflow-steps { grid-template-columns:1fr; }.workflow-step+.workflow-step { border-left:0; border-top:1px solid #e9edf3; }.section-heading,.task-heading { align-items:flex-start; }.account-scope { display:none; } }
 </style>

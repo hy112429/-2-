@@ -14,6 +14,7 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "audit:ui": "node scripts/audit_ui_interactions.mjs",
     "pack": "npm run build && npm run verify:python-staging && electron-builder --win",
     "verify:python-staging": "node scripts/verify_python_staging.mjs"
   },

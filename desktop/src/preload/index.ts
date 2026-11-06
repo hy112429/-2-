@@ -1,6 +1,20 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+interface SelectionScheduleDuePayload {
+  date: string
+  time: string
+  triggeredAt: number
+}
+
+interface SelectionScheduleSnapshotPayload {
+  enabled: boolean
+  time: string
+  launchAtLogin: boolean
+  canLaunchAtLogin: boolean
+  pendingDue: SelectionScheduleDuePayload | null
+}
+
 /**
  * 预加载脚本：渲染进程（网页）与主进程（Node）之间唯一的合法通道。
  *
@@ -62,6 +76,8 @@ const browser = {
     downloadPath: string
     selectedIndexes?: number[]
     candidateSnapshot?: unknown[]
+    allowCandidateFallback?: boolean
+    recoverExistingCart?: boolean
     refreshCandidatesById?: boolean
     analyzeBeforeCart?: boolean
     maxSelectedProducts?: number
@@ -225,6 +241,22 @@ const selectionCooldown = {
     subscribe('selection-cooldown:expired', cb)
 }
 
+/** 每日选品计划仅负责按本地时间通知 renderer；实际选品仍走现有账号与登录预检。 */
+const selectionSchedule = {
+  get: (): Promise<SelectionScheduleSnapshotPayload> => ipcRenderer.invoke('selection-schedule:get'),
+  save: (params: { enabled: boolean; time: string; launchAtLogin: boolean }): Promise<{
+    ok: boolean
+    schedule?: SelectionScheduleSnapshotPayload
+    error?: string
+  }> => ipcRenderer.invoke('selection-schedule:save', toPlainIpcPayload(params)),
+  acknowledge: (date: string, outcome?: string): Promise<{ ok: boolean; matched: boolean }> =>
+    ipcRenderer.invoke('selection-schedule:ack', date, outcome),
+  trace: (params: { date: string; stage: string; attempt?: number; delayMs?: number }): Promise<{ ok: boolean }> =>
+    ipcRenderer.invoke('selection-schedule:trace', toPlainIpcPayload(params)),
+  onDue: (cb: (event: SelectionScheduleDuePayload) => void): (() => void) =>
+    subscribe('selection-schedule:due', cb)
+}
+
 /** 当前运行版本的数据目录（安装版与开发态隔离）。 */
 const appPaths = {
   get: (): Promise<{
@@ -254,9 +286,14 @@ const assets = {
 
 /** 百应批量抓取：按商品ID列表驱动登录视图逐页抓取缓存 */
 const baiying = {
+  /** 返回启用账号及每个账号已保存的专属百应 Chrome profile 路径。 */
+  batchAccounts: (): Promise<{ ok?: boolean; accounts?: Array<{ id: number; name: string; profilePath?: string }>; error?: string }> =>
+    ipcRenderer.invoke('baiying:batchAccounts'),
+
   /** 启动批量抓取，立刻返回 {taskId}；进度与终态走 onBatchEvent */
   batchStart: (params: {
     productIds: string[]
+    accountId: number
     intervalMs?: number
   }): Promise<BaiyingBatchStartReply> => ipcRenderer.invoke('baiying:batchStart', params),
 
@@ -340,6 +377,13 @@ const account = {
 
 /** 千川账户登录态：独立分区（persist:qc-{id}），与抖音账号分区互不共用（A-12 多开隔离） */
 const qianchuan = {
+  apiStatus: (): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number }> => ipcRenderer.invoke('qianchuan:api:status'),
+  apiConfigure: (params: { appId: string; secret: string }): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:api:configure', toPlainIpcPayload(params)),
+  apiAuthorize: (url: string): Promise<{ ok: boolean; callback: string; profilePath: string }> => ipcRenderer.invoke('qianchuan:api:authorize', url),
+  apiVideos: (params: { advertiserId: string; productId: string; awemeId: string; cursor?: string }): Promise<{ videos: Array<{ videoId: string; awemeItemId: string; title: string; url: string; duration: number | null }>; hasMore: boolean; cursor: string; totalReturned: number }> => ipcRenderer.invoke('qianchuan:api:videos', toPlainIpcPayload(params)),
+  apiAccounts: (): Promise<{ accounts: Array<{ id: string; name: string; source: string }>; identities: Array<{ id: string; type: string; name: string }>; warnings: string[]; requiresQianchuanAuthorization: boolean }> => ipcRenderer.invoke('qianchuan:api:accounts'),
+  apiAwemes: (advertiserId: string): Promise<Array<{ id: string; name: string }>> => ipcRenderer.invoke('qianchuan:api:awemes', advertiserId),
+  apiVerifyVideo: (path: string): Promise<{ ok: boolean; path: string; bytes?: number; reason?: string }> => ipcRenderer.invoke('qianchuan:api:verifyVideo', path),
   /** 在该千川账户专属托管 Chrome profile 打开登录页 */
   openLogin: (qcId: number): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }> =>
     ipcRenderer.invoke('qianchuan:openLogin', qcId),
@@ -369,8 +413,26 @@ const qianchuan = {
     ipcRenderer.invoke('qianchuan:upload:reviewPresent', params),
   quotaConfig: (accountId?: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:upload:quotaConfig', accountId),
+  retryConfig: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:retryConfig'),
+  setRetryConfig: (enabled: boolean): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:setRetryConfig', enabled),
   setQuotaConfig: (params: { accountId: number; perProductVideos: number; perAccountProducts: number; perAccountVideos: number }): Promise<Record<string, unknown>> =>
-    ipcRenderer.invoke('qianchuan:upload:setQuotaConfig', params)
+    ipcRenderer.invoke('qianchuan:upload:setQuotaConfig', params),
+  postPublishSettings: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:postPublish:settings'),
+  setPostPublishEnabled: (enabled: boolean): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:postPublish:setEnabled', enabled),
+  postPublishRuns: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:postPublish:runs'),
+  retryPostPublishRun: (queueId: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:postPublish:retry', queueId),
+  scanViolations: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:scan', qcId),
+  prepareViolationDeletion: (params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:violations:prepare', toPlainIpcPayload(params)),
+  violationBatch: (batchId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:batch', batchId),
+  violationHistory: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:history', qcId),
+  exportViolationManifest: (batchId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:export', batchId),
+  executeViolationDeletion: (params: { batchId: number; count: number; confirmation: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:violations:execute', toPlainIpcPayload(params)),
+  onViolationProgress: (cb: (event: { batchId: number; completed: number; total: number; status?: string; reason?: string }) => void): (() => void) =>
+    subscribe('qianchuan:violations:progress', cb)
 }
 
 /** 去水印辅助：抽视频帧 + 暂存用户框选的水印模板 */
@@ -418,14 +480,38 @@ const api = {
   appPaths,
   browser,
   selectionCooldown,
+  selectionSchedule,
   publish: {
     getProgress: (): Promise<PublishProgressPayload> => ipcRenderer.invoke('publish:autoProgress:get'),
     runNow: (queueId: number): Promise<PublishProgressPayload> => ipcRenderer.invoke('publish:autoRun', queueId),
     runImmediately: (queueId: number): Promise<PublishProgressPayload> => ipcRenderer.invoke('publish:runImmediately', queueId),
     retryManually: (queueId: number, options: { confirmedNotSubmitted?: boolean; confirmedNoDraft?: boolean } = {}): Promise<PublishProgressPayload> =>
       ipcRenderer.invoke('publish:retryManually', queueId, toPlainIpcPayload(options)),
+    markPublished: (queueId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('publish:markPublished', queueId),
+    notifyPostPublish: (queueId: number, platformStatus: string): Promise<Record<string, unknown>> =>
+      ipcRenderer.invoke('publish:postPublish:notify', { queueId, platformStatus }),
+    exportReceipts: (): Promise<{ ok: boolean; cancelled?: boolean; path?: string; count?: number; error?: string }> =>
+      ipcRenderer.invoke('publish:exportReceipts'),
+    openScreenshot: (path: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('publish:openScreenshot', path),
     onProgress: (cb: (progress: PublishProgressPayload) => void): (() => void) =>
       subscribe('publish:autoProgress', cb)
+  },
+  productList: {
+    list: (params: { accountId?: number | null; status?: string; query?: string; limit?: number; offset?: number }): Promise<{
+      ok: boolean
+      rows: Array<{ accountId: number; accountName: string; productId: string; title: string; commodityId: string; sourceUrl: string; coverUrl: string; sku: string; categoryLabels: string[]; status: string; failureReason: string; batchId: string; candidateSnapshot: Record<string, unknown>; selectedAt: string; updatedAt: string }>
+      total: number
+      limit: number
+      offset: number
+      accounts: Array<{ id: number; name: string }>
+    }> => ipcRenderer.invoke('product-list:list', toPlainIpcPayload(params)),
+    update: (params: { accountId: number; productId: string; title: string; sku?: string; categoryLabels?: string[] }): Promise<{ ok: boolean }> =>
+      ipcRenderer.invoke('product-list:update', toPlainIpcPayload(params)),
+    delete: (params: { accountId: number; productId: string }): Promise<{ ok: boolean }> =>
+      ipcRenderer.invoke('product-list:delete', toPlainIpcPayload(params)),
+    cartOutcome: (params: { accountId: number; productId: string; status: 'cart_added' | 'selection_failed' | 'needs_review'; reason?: string }): Promise<{ ok: boolean; status?: string }> =>
+      ipcRenderer.invoke('product-list:cartOutcome', toPlainIpcPayload(params))
   },
   login,
   engine,

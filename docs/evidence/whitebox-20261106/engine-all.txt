@@ -1,0 +1,334 @@
+Building prefix dict from the default dictionary ...
+Loading model from cache C:\Users\9\AppData\Local\Temp\jieba.cache
+Loading model cost 0.461 seconds.
+Prefix dict has been built successfully.
+{"type": "stage", "stage": "扫描中 1/1", "percent": 100}
+{"type": "stage", "stage": "扫描中 1/1", "percent": 100}
+{"type": "task", "status": "running", "tid": "qc-test", "percent": 100, "attempts": 0, "message": "下载中 100%"}
+======================================================================
+ERROR: test_filter_application_uses_last_response_after_intermediate_lists (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_filter_application_uses_last_response_after_intermediate_lists)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7641, in _collect_priority_source_ids
+    product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key)
+                                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 6975, in _read_priority_source_product_ids
+    source_page = page.context.new_page()
+                  ^^^^^^^^^^^^
+AttributeError: 'FakePage' object has no attribute 'context'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2721, in test_filter_application_uses_last_response_after_intermediate_lists
+    result = browser_cdp.apply_settings_and_collect_candidates(fake_page, settings, force_refresh=True)
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 9838, in apply_settings_and_collect_candidates
+    source_membership, source_warnings, source_results, _source_candidates = _collect_priority_source_ids(page, settings, progress)
+                                                                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7672, in _collect_priority_source_ids
+    raise RuntimeError(f"读取{label}来源时遇到账号/风控/连接异常，已暂停当前账号：{error}") from error
+RuntimeError: 读取热点趋势来源时遇到账号/风控/连接异常，已暂停当前账号：'FakePage' object has no attribute 'context'
+
+======================================================================
+ERROR: test_multi_category_candidate_results_are_merged_deduped_and_ranked (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_multi_category_candidate_results_are_merged_deduped_and_ranked)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7641, in _collect_priority_source_ids
+    product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key)
+                                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 6981, in _read_priority_source_product_ids
+    parsed = urlparse(source_page.url)
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\urllib\parse.py", line 397, in urlparse
+    splitresult = urlsplit(url, scheme, allow_fragments)
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\urllib\parse.py", line 506, in urlsplit
+    if i > 0 and url[0].isascii() and url[0].isalpha():
+       ^^^^^
+TypeError: '>' not supported between instances of 'MagicMock' and 'int'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 1986, in test_multi_category_candidate_results_are_merged_deduped_and_ranked
+    merged = apply_settings_and_collect_candidates(MagicMock(), settings)
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 9838, in apply_settings_and_collect_candidates
+    source_membership, source_warnings, source_results, _source_candidates = _collect_priority_source_ids(page, settings, progress)
+                                                                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7672, in _collect_priority_source_ids
+    raise RuntimeError(f"读取{label}来源时遇到账号/风控/连接异常，已暂停当前账号：{error}") from error
+RuntimeError: 读取热点趋势来源时遇到账号/风控/连接异常，已暂停当前账号：'>' not supported between instances of 'MagicMock' and 'int'
+
+======================================================================
+ERROR: test_unreadable_optional_priority_source_is_skipped_and_next_source_continues (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_unreadable_optional_priority_source_is_skipped_and_next_source_continues)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7641, in _collect_priority_source_ids
+    product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: not enough values to unpack (expected 3, got 1)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 370, in test_unreadable_optional_priority_source_is_skipped_and_next_source_continues
+    membership, warnings, results = _collect_priority_source_ids(page, settings)
+                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7672, in _collect_priority_source_ids
+    raise RuntimeError(f"读取{label}来源时遇到账号/风控/连接异常，已暂停当前账号：{error}") from error
+RuntimeError: 读取热点趋势来源时遇到账号/风控/连接异常，已暂停当前账号：not enough values to unpack (expected 3, got 1)
+
+======================================================================
+ERROR: test_fallback_uses_top_a67_score_not_priority_source_order (test_selection_recommendations.VisibleSourceRecommendationTests.test_fallback_uses_top_a67_score_not_priority_source_order)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_selection_recommendations.py", line 60, in test_fallback_uses_top_a67_score_not_priority_source_order
+    result = self.build_result([
+        candidate("lower-hotspot", "cat-low", 35, "hotSpot", 1),
+        candidate("higher-alliance", "cat-high", 55, "allianceRank", 2),
+    ], target_count=1)
+  File "D:\抖音电商\投广管理客户端\engine\test_selection_recommendations.py", line 37, in build_result
+    return browser_cdp._visible_source_candidate_result(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        source_candidates,
+        ^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        {"candidateLimit": target_count, "_candidatePoolLimit": 30},
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: _visible_source_candidate_result() missing 3 required positional arguments: 'selection_square_result', 'warnings', and 'settings'
+
+======================================================================
+ERROR: test_high_score_category_count_precedes_average_score (test_selection_recommendations.VisibleSourceRecommendationTests.test_high_score_category_count_precedes_average_score)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_selection_recommendations.py", line 46, in test_high_score_category_count_precedes_average_score
+    result = self.build_result([
+        candidate("x-1", "cat-x", 88, "hotSpot", 1),
+    ...<2 lines>...
+        candidate("z-1", "cat-z", 59, "hotSpot", 4),
+    ])
+  File "D:\抖音电商\投广管理客户端\engine\test_selection_recommendations.py", line 37, in build_result
+    return browser_cdp._visible_source_candidate_result(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        source_candidates,
+        ^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        {"candidateLimit": target_count, "_candidatePoolLimit": 30},
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+TypeError: _visible_source_candidate_result() missing 3 required positional arguments: 'selection_square_result', 'warnings', and 'settings'
+
+======================================================================
+FAIL: test_ambiguous_duplicate_title_fails_closed_before_add_cart (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_ambiguous_duplicate_title_fails_closed_before_add_cart)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2791, in test_ambiguous_duplicate_title_fails_closed_before_add_cart
+    _locate_candidate_card(page, {
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+        "title": "同名商品", "productId": "product-b", "commodityId": "promotion-b"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    })
+    ^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12706, in _locate_candidate_card
+    card_locator = page.locator(row_selector)
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 226, in locator
+    assert selector == '[class*="__card___"]'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+======================================================================
+FAIL: test_candidate_card_locator_reads_react_product_ids (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_candidate_card_locator_reads_react_product_ids)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2671, in test_candidate_card_locator_reads_react_product_ids
+    _title, card = _locate_candidate_card(page, {
+                   ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+        "title": "商品标题", "productId": "product-b", "commodityId": "promotion-b"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    })
+    ^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12706, in _locate_candidate_card
+    card_locator = page.locator(row_selector)
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 226, in locator
+    assert selector == '[class*="__card___"]'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+======================================================================
+FAIL: test_cart_recovery_requeries_candidate_source_category_by_product_id (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_cart_recovery_requeries_candidate_source_category_by_product_id)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2078, in test_cart_recovery_requeries_candidate_source_category_by_product_id
+    self.assertIn("未点击加车", result[0]["status"])
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: '未点击加车' not found in '来源类目复核后当前商品不再可安全加入，已跳过并继续其他商品（商品 ID product-a 未出现在刷新后的来源类目结果中；已跳过（刷新后的原始 material_list 响应不含该商品 ID；商品可能已离开当前类目结果或列表发生变化））'
+
+======================================================================
+FAIL: test_duplicate_title_is_disambiguated_by_product_id (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_duplicate_title_is_disambiguated_by_product_id)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2780, in test_duplicate_title_is_disambiguated_by_product_id
+    _title, card = _locate_candidate_card(page, {
+                   ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+        "title": "同名商品", "productId": "product-b", "commodityId": "promotion-b"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    })
+    ^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12706, in _locate_candidate_card
+    card_locator = page.locator(row_selector)
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 226, in locator
+    assert selector == '[class*="__card___"]'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+======================================================================
+FAIL: test_filter_application_falls_back_to_search_when_no_response_is_captured (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_filter_application_falls_back_to_search_when_no_response_is_captured)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2693, in test_filter_application_falls_back_to_search_when_no_response_is_captured
+    apply.assert_called_once_with(fake_page, settings)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\unittest\mock.py", line 991, in assert_called_once_with
+    return self.assert_called_with(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\unittest\mock.py", line 979, in assert_called_with
+    raise AssertionError(_error_message()) from cause
+AssertionError: expected call not found.
+Expected: apply_filter_settings(<test_browser_cdp_recovery.FakePage object at 0x0000027A67F78050>, {'candidateLimit': 1})
+  Actual: apply_filter_settings(<test_browser_cdp_recovery.FakePage object at 0x0000027A67F78050>, {'candidateLimit': 1, '_sourceMembership': {}})
+
+======================================================================
+FAIL: test_filter_option_uses_forced_browser_click (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_filter_option_uses_forced_browser_click)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 1581, in test_filter_option_uses_forced_browser_click
+    option.click.assert_called_once_with(force=True, timeout=3_000, no_wait_after=True)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\unittest\mock.py", line 991, in assert_called_once_with
+    return self.assert_called_with(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\unittest\mock.py", line 979, in assert_called_with
+    raise AssertionError(_error_message()) from cause
+AssertionError: expected call not found.
+Expected: click(force=True, timeout=3000, no_wait_after=True)
+  Actual: click(force=True, timeout=1500, no_wait_after=True)
+
+======================================================================
+FAIL: test_multi_category_failure_reports_query_index_and_cached_progress (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_multi_category_failure_reports_query_index_and_cached_progress)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 7641, in _collect_priority_source_ids
+    product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key)
+                                          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 6981, in _read_priority_source_product_ids
+    parsed = urlparse(source_page.url)
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\urllib\parse.py", line 397, in urlparse
+    splitresult = urlsplit(url, scheme, allow_fragments)
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\urllib\parse.py", line 506, in urlsplit
+    if i > 0 and url[0].isascii() and url[0].isalpha():
+       ^^^^^
+TypeError: '>' not supported between instances of 'MagicMock' and 'int'
+
+The above exception was the direct cause of the following exception:
+
+RuntimeError: 读取热点趋势来源时遇到账号/风控/连接异常，已暂停当前账号：'>' not supported between instances of 'MagicMock' and 'int'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2048, in test_multi_category_failure_reports_query_index_and_cached_progress
+    with self.assertRaisesRegex(
+         ~~~~~~~~~~~~~~~~~~~~~~^
+        RuntimeError, "第 2/2 项.*leaf-b.*前 1 项成功结果仅在当前桥接进程内缓存 15 分钟.*平台限流"
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ):
+    ^
+AssertionError: "第 2/2 项.*leaf-b.*前 1 项成功结果仅在当前桥接进程内缓存 15 分钟.*平台限流" does not match "读取热点趋势来源时遇到账号/风控/连接异常，已暂停当前账号：'>' not supported between instances of 'MagicMock' and 'int'"
+
+======================================================================
+FAIL: test_previous_uncertain_cart_attempt_requires_explicit_add_button_before_retry (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_previous_uncertain_cart_attempt_requires_explicit_add_button_before_retry)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 1511, in test_previous_uncertain_cart_attempt_requires_explicit_add_button_before_retry
+    self.assertEqual(result[0]["cartStatus"], "状态待人工核验")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: '状态待核验（本商品已跳过）' != '状态待人工核验'
+- 状态待核验（本商品已跳过）
++ 状态待人工核验
+
+
+======================================================================
+FAIL: test_recovery_refreshes_cart_state_even_when_old_card_is_still_visible (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_recovery_refreshes_cart_state_even_when_old_card_is_still_visible)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2847, in test_recovery_refreshes_cart_state_even_when_old_card_is_still_visible
+    result = run_selection_command(fake_page, object(), command)
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 13233, in run_selection_command
+    cards_ready = source_paths_available or (len(original_ids) == len(set(selected)) and all(
+                                                                                         ~~~^
+        _candidate_card_is_available(page, candidate) for candidate in selected_candidates
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ))
+    ^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 13234, in <genexpr>
+    _candidate_card_is_available(page, candidate) for candidate in selected_candidates
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12927, in _candidate_card_is_available
+    _locate_candidate_card(page, candidate)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12706, in _locate_candidate_card
+    card_locator = page.locator(row_selector)
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 226, in locator
+    assert selector == '[class*="__card___"]'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+======================================================================
+FAIL: test_run_command_stops_if_original_product_disappeared (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_run_command_stops_if_original_product_disappeared)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2878, in test_run_command_stops_if_original_product_disappeared
+    run_selection_command(fake_page, object(), command)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 13233, in run_selection_command
+    cards_ready = source_paths_available or (len(original_ids) == len(set(selected)) and all(
+                                                                                         ~~~^
+        _candidate_card_is_available(page, candidate) for candidate in selected_candidates
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ))
+    ^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 13234, in <genexpr>
+    _candidate_card_is_available(page, candidate) for candidate in selected_candidates
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12927, in _candidate_card_is_available
+    _locate_candidate_card(page, candidate)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "D:\抖音电商\投广管理客户端\engine\browser_cdp.py", line 12706, in _locate_candidate_card
+    card_locator = page.locator(row_selector)
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 226, in locator
+    assert selector == '[class*="__card___"]'
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+
+======================================================================
+FAIL: test_a67_candidate_score_uses_relative_metrics_and_penalizes_missing_coverage (test_selection_recommendations.VisibleSourceRecommendationTests.test_a67_candidate_score_uses_relative_metrics_and_penalizes_missing_coverage)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_selection_recommendations.py", line 78, in test_a67_candidate_score_uses_relative_metrics_and_penalizes_missing_coverage
+    self.assertEqual([row["analysisScore"] for row in candidates], [20.0, 10.0, 0.0])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [16.7, 8.3, 0.0] != [20.0, 10.0, 0.0]
+
+First differing element 0:
+16.7
+20.0
+
+- [16.7, 8.3, 0.0]
++ [20.0, 10.0, 0.0]
+
+----------------------------------------------------------------------
+Ran 310 tests in 18.464s
+
+FAILED (failures=11, errors=5)
+EXIT=1

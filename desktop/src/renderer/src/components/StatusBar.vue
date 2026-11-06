@@ -36,6 +36,7 @@ defineProps<{
   border-top: 1px solid var(--border);
   color: var(--text-muted);
   font-size: 12px;
+  box-shadow: 0 -2px 10px rgba(28, 50, 89, .035);
   /* 路径可能要选中复制，这里放开文本选择 */
   user-select: text;
 }
@@ -67,7 +68,11 @@ defineProps<{
 
 .state {
   margin-left: auto;
-  color: var(--brand);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #24825e;
   white-space: nowrap;
 }
+.state::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3aaf7b; }
 </style>

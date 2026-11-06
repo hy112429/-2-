@@ -339,6 +339,7 @@ onBeforeUnmount(() => {
   padding: 12px;
   gap: 8px;
   overflow-y: auto;
+  background: linear-gradient(180deg, #ffffff, #fbfcff);
 }
 
 .head {
@@ -368,7 +369,9 @@ onBeforeUnmount(() => {
 .btn:hover:not(:disabled) {
   border-color: var(--brand);
   color: var(--brand);
+  background: var(--brand-soft);
 }
+.btn.primary:hover:not(:disabled) { background: #265dc7; color: #fff; }
 
 .btn:disabled {
   opacity: 0.5;
@@ -428,6 +431,8 @@ onBeforeUnmount(() => {
   font-size: 13px;
   font-family: inherit;
   resize: vertical;
+  min-height: 78px;
+  line-height: 1.5;
 }
 
 .row {

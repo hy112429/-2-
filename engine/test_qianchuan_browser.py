@@ -39,6 +39,18 @@ class QianchuanBrowserTests(unittest.TestCase):
         self.assertTrue(qc.is_qianchuan_page("https://qianchuan.jinritemai.com/dashboard"))
         self.assertFalse(qc.is_qianchuan_page("http://qianchuan.jinritemai.com/dashboard"))
 
+    def test_account_permission_gate_requires_manual_action(self):
+        page = types.SimpleNamespace(
+            url="https://qianchuan.jinritemai.com/dashboard",
+            get_by_role=lambda *_args: types.SimpleNamespace(count=lambda: 0),
+            locator=lambda *_args: object(),
+        )
+        with patch.object(qc, "_page_text", return_value="当前账号权限不足"), \
+             patch.object(qc, "_visible_count", return_value=0), \
+             self.assertRaises(qc.UploadStopped) as error:
+            qc._check_page_gate(page, "navigate")
+        self.assertTrue(error.exception.manual)
+
     def test_only_successful_create_response_with_material_id_counts(self):
         responses = [
             FakeResponse("https://qianchuan.jinritemai.com/api/material/upload", {"code": 0, "data": {"materialId": "123456789"}}),

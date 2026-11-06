@@ -390,7 +390,7 @@ onBeforeUnmount(() => {
 
       <div v-else-if="viewMode === 'all'" class="grid">
         <div v-for="a in assets" :key="a.id" class="card" :class="{ selected: selected.has(a.id) }">
-          <div class="cover" @click="toggleRow(a.id)">
+          <div class="cover" role="button" tabindex="0" :aria-label="`${selected.has(a.id) ? '取消选择' : '选择'}素材 ${a.file_name}`" @click="toggleRow(a.id)" @keydown.enter.prevent="toggleRow(a.id)" @keydown.space.prevent="toggleRow(a.id)">
             <img v-if="thumbMap[a.id]" :src="thumbMap[a.id]" alt="" />
             <div v-else class="cover-ph">{{ a.file_name.slice(-3) }}</div>
           </div>
@@ -410,9 +410,9 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="ops">
-            <input type="checkbox" :checked="selected.has(a.id)" @change="toggleRow(a.id)" />
-            <button class="btn small" title="打开所在文件夹" @click="openFolder(a)">📁</button>
-            <button class="btn small" title="设置标签" @click="editTags(a)">🏷</button>
+            <input type="checkbox" :aria-label="`选择素材 ${a.file_name}`" :checked="selected.has(a.id)" @change="toggleRow(a.id)" />
+            <button class="btn small" title="打开所在文件夹" aria-label="打开所在文件夹" @click="openFolder(a)">📁</button>
+            <button class="btn small" title="设置标签" aria-label="设置标签" @click="editTags(a)">🏷</button>
           </div>
         </div>
       </div>
@@ -425,7 +425,7 @@ onBeforeUnmount(() => {
           </header>
           <div class="grid">
             <div v-for="a in group.rows" :key="a.id" class="card" :class="{ selected: selected.has(a.id) }">
-              <div class="cover" @click="toggleRow(a.id)">
+              <div class="cover" role="button" tabindex="0" :aria-label="`${selected.has(a.id) ? '取消选择' : '选择'}素材 ${a.file_name}`" @click="toggleRow(a.id)" @keydown.enter.prevent="toggleRow(a.id)" @keydown.space.prevent="toggleRow(a.id)">
                 <img v-if="thumbMap[a.id]" :src="thumbMap[a.id]" alt="" />
                 <div v-else class="cover-ph">{{ a.file_name.slice(-3) }}</div>
               </div>
@@ -443,9 +443,9 @@ onBeforeUnmount(() => {
                 <div class="line muted">{{ fmtSize(a.file_size) }} · {{ a.status }}</div>
               </div>
               <div class="ops">
-                <input type="checkbox" :checked="selected.has(a.id)" @change="toggleRow(a.id)" />
-                <button class="btn small" title="打开所在文件夹" @click="openFolder(a)">📁</button>
-                <button class="btn small" title="设置标签" @click="editTags(a)">🏷</button>
+                <input type="checkbox" :aria-label="`选择素材 ${a.file_name}`" :checked="selected.has(a.id)" @change="toggleRow(a.id)" />
+                <button class="btn small" title="打开所在文件夹" aria-label="打开所在文件夹" @click="openFolder(a)">📁</button>
+                <button class="btn small" title="设置标签" aria-label="设置标签" @click="editTags(a)">🏷</button>
               </div>
             </div>
           </div>
@@ -468,14 +468,17 @@ onBeforeUnmount(() => {
   border-radius: var(--radius);
   padding: 12px;
   overflow: hidden;
+  box-shadow: var(--shadow-card);
 }
 
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   flex-wrap: wrap;
   flex-shrink: 0;
+  padding-bottom: 11px;
+  border-bottom: 1px solid var(--border);
 }
 
 .fld {
@@ -527,6 +530,7 @@ onBeforeUnmount(() => {
 .btn:hover:not(:disabled) {
   border-color: var(--brand);
   color: var(--brand);
+  background: var(--brand-soft);
 }
 
 .btn:disabled {
@@ -655,7 +659,11 @@ onBeforeUnmount(() => {
   background: var(--bg-panel);
   display: flex;
   flex-direction: column;
+  box-shadow: 0 2px 8px rgba(32, 55, 94, .035);
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
+
+.card:hover { border-color: #b4c8eb; box-shadow: 0 5px 15px rgba(32, 55, 94, .10); }
 
 .card.selected {
   border-color: var(--brand);
@@ -664,12 +672,13 @@ onBeforeUnmount(() => {
 
 .cover {
   aspect-ratio: 16 / 9;
-  background: var(--bg-placeholder);
+  background: linear-gradient(145deg, #e9f0fb, #f6f8fd);
   cursor: pointer;
   display: grid;
   place-items: center;
   overflow: hidden;
 }
+.cover:focus-visible { outline: 2px solid var(--brand); outline-offset: -3px; }
 
 .cover img {
   width: 100%;
@@ -684,7 +693,7 @@ onBeforeUnmount(() => {
 }
 
 .meta {
-  padding: 6px 8px;
+  padding: 9px 10px;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -740,8 +749,9 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px 6px;
+  padding: 6px 10px;
   border-top: 1px solid var(--border);
+  background: #fbfcff;
 }
 
 .mono {

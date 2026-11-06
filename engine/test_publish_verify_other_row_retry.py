@@ -116,15 +116,14 @@ class PublishVerifyOtherRowRetryTests(unittest.TestCase):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
-        connection.execute(
-            "CREATE TABLE publish_queue (id INTEGER PRIMARY KEY, account_id INTEGER, product_id TEXT, product_name TEXT, "
-            "status TEXT, platform_status TEXT, platform_error TEXT, isolated_from_status TEXT, platform_updated_at TEXT, updated_at TEXT, "
-            "cancelled_at TEXT)"
-        )
         connection.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT, status TEXT)")
+        publish_queue.ensure_schema(connection)
         connection.execute("INSERT INTO accounts VALUES (1, '主号A', 'active')")
         connection.execute(
-            "INSERT INTO publish_queue VALUES (1, 1, 'target-1', '目标商品', 'scheduled', 'uploading', '', '', '', '', '')"
+            "INSERT INTO publish_queue (id, account_id, product_id, product_name, video_path, video_key, title, "
+            "schedule_at, mode, status, platform_status, created_at, updated_at) "
+            "VALUES (1, 1, 'target-1', '目标商品', 'test.mp4', 'test.mp4', '目标商品', "
+            "'2026-11-06 10:00:00', 'scheduled', 'scheduled', 'uploading', '2026-11-06 10:00:00', '2026-11-06 10:00:00')"
         )
         result = publish_queue.isolate_upload_task(connection, 1, "错行重查耗尽")
         self.assertTrue(result["isolated"])

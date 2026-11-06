@@ -151,9 +151,12 @@ def reserve(
     account_key: str,
     request_id: str,
     items: list[dict[str, Any]],
+    max_reserved: Optional[int] = None,
 ) -> dict[str, Any]:
     if not account_key.strip() or not request_id.strip():
         raise ValueError("本机账号标识或请求标识为空。")
+    if max_reserved is not None and max_reserved < 0:
+        raise ValueError("本机选品预留数量上限不能小于 0。")
     connection.execute("BEGIN IMMEDIATE")
     try:
         migrate_legacy_categories(connection)
@@ -162,6 +165,8 @@ def reserve(
         rejected: list[dict[str, str]] = []
         requested_categories: set[str] = set()
         for item in items:
+            if max_reserved is not None and len(reserved) >= max_reserved:
+                break
             product_id = str(item.get("productId") or "").strip()
             leaf_category_id = str(item.get("leafCategoryId") or "").strip()
             title = str(item.get("title") or "")[:512]
@@ -172,7 +177,7 @@ def reserve(
                 # 通用数据模式下类目可能未知；商品 ID 仍必须纳入全局互斥登记。
                 leaf_category_id = f"__unknown__:{product_id}"
             existing = connection.execute(
-                "SELECT state, account_key, leaf_category_id, reservation_token "
+                "SELECT state, account_key, leaf_category_id, reservation_token, request_id "
                 "FROM selection_local_registry WHERE product_id=?", (product_id,)
             ).fetchone()
             if product_id in old_product_ids:
@@ -183,6 +188,7 @@ def reserve(
                     existing["state"] == "RESERVED"
                     and str(existing["account_key"]) == account_key
                     and str(existing["leaf_category_id"]) == leaf_category_id
+                    and str(existing["request_id"]) == request_id
                 ):
                     if not leaf_category_id.startswith("__unknown__:"):
                         requested_categories.add(leaf_category_id)
@@ -282,6 +288,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     reserve_parser.add_argument("--account-key", required=True)
     reserve_parser.add_argument("--request-id", required=True)
     reserve_parser.add_argument("--items-json", required=True)
+    reserve_parser.add_argument("--max-reserved", type=int)
     begin_parser = commands.add_parser("begin")
     begin_parser.add_argument("--token", required=True)
     finish_parser = commands.add_parser("finish")
@@ -293,7 +300,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.command == "snapshot":
             result = snapshot(connection, args.account_key, parse_json_argument(args.candidates_json, "候选商品"))
         elif args.command == "reserve":
-            result = reserve(connection, args.account_key, args.request_id, parse_json_argument(args.items_json, "预留商品"))
+            result = reserve(
+                connection,
+                args.account_key,
+                args.request_id,
+                parse_json_argument(args.items_json, "预留商品"),
+                max_reserved=args.max_reserved,
+            )
         elif args.command == "begin":
             result = begin(connection, args.token)
         else:

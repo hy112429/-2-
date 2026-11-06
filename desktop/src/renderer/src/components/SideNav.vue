@@ -11,14 +11,14 @@ const emit = defineEmits<{
 const NAV_GROUPS = [
   { title: '工作台', items: [{ label: '投放看板', icon: '▦' }] },
   { title: '选品与素材', items: [{ label: '选品设置', icon: '◇' }, { label: '选品日志', icon: '≡' }, { label: '素材与工具', icon: '▧' }] },
-  { title: '发布管理', items: [{ label: '发布队列', icon: '▷' }, { label: '千川管理', icon: '▤' }] },
+  { title: '发布与计划', items: [{ label: '商品列表', icon: '▤' }, { label: '发布队列', icon: '▷' }, { label: '千川管理', icon: '▤' }] },
   { title: '账户与系统', items: [{ label: '连接与工具', icon: '⌘' }, { label: '账号管理', icon: '♙' }] }
 ]
 
 const expanded = ref<Record<string, boolean>>({
   工作台: true,
   选品与素材: true,
-  发布管理: true,
+  发布与计划: true,
   账户与系统: true
 })
 
@@ -46,6 +46,7 @@ watch(() => props.active, (active) => {
           type="button"
           class="nav-item"
           :class="{ active: item.label === props.active }"
+          :aria-current="item.label === props.active ? 'page' : undefined"
           @click="emit('update:active', item.label)"
         >
           <span class="nav-icon" aria-hidden="true">{{ item.icon }}</span>
@@ -58,70 +59,76 @@ watch(() => props.active, (active) => {
 
 <style scoped>
 .nav {
-  background: var(--bg-nav);
-  padding: 10px 0 14px;
+  background: linear-gradient(180deg, #16243e 0%, #121c32 100%);
+  padding: 15px 0 18px;
   overflow-y: auto;
   /* 极窄的滚动条，避免深色背景下出现一条突兀的白条 */
   scrollbar-width: thin;
 }
 
-.nav-group + .nav-group { margin-top: 8px; }
+.nav-group + .nav-group { margin-top: 11px; }
 
 .group-title {
   width: 100%;
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 14px 6px 17px;
-  color: #8790a1;
+  padding: 8px 15px 6px 17px;
+  color: #899bb7;
   text-align: left;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: .05em;
 }
 
-.group-title:hover { color: var(--text-on-dark); }
+.group-title:hover { color: #e6eeff; }
 .group-chevron { color: #7c8799; font-size: 14px; transition: transform .15s; }
 .group-chevron.collapsed { transform: rotate(-90deg); }
-.group-items { display: flex; flex-direction: column; gap: 2px; }
+.group-items { display: flex; flex-direction: column; gap: 3px; }
 
 .nav-item {
-  width: 100%;
+  width: calc(100% - 16px);
+  margin: 0 8px;
   display: flex;
   align-items: center;
-  gap: 9px;
-  min-height: 36px;
-  padding: 8px 13px;
+  gap: 10px;
+  min-height: 37px;
+  padding: 7px 10px;
+  border-radius: 8px;
   color: var(--text-on-dark);
   text-align: left;
-  border-left: 3px solid transparent;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: background 0.15s, color 0.15s;
 }
 
 .nav-item:hover {
-  background: var(--bg-nav-hover);
+  background: rgba(137, 171, 233, .12);
   color: var(--text-on-dark-strong);
 }
 
 .nav-item.active {
-  background: var(--bg-nav-hover);
+  background: linear-gradient(90deg, rgba(78, 130, 245, .32), rgba(78, 130, 245, .13));
   color: var(--text-on-dark-strong);
-  border-left-color: var(--brand);
+  box-shadow: inset 3px 0 #6fa1ff;
+  font-weight: 600;
 }
 
 .nav-icon {
-  width: 17px;
+  width: 22px;
+  height: 22px;
   display: inline-flex;
   justify-content: center;
   align-items: center;
-  color: #a7b0c0;
-  font-size: 14px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, .055);
+  color: #9fb2d0;
+  font-size: 13px;
   line-height: 1;
   flex-shrink: 0;
 }
 
 .nav-item.active .nav-icon {
-  color: var(--brand);
+  background: rgba(126, 171, 255, .18);
+  color: #b9d2ff;
 }
 
 .label {

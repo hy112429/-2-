@@ -1,0 +1,27 @@
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> touguang-client@0.0.10 audit:ui
+> node scripts/audit_ui_interactions.mjs
+
+AccountManagementView.vue: 58 个按钮，0 个自定义点击区域
+AssetLibraryView.vue: 11 个按钮，2 个自定义点击区域
+BrowserPane.vue: 4 个按钮，0 个自定义点击区域
+DashboardView.vue: 13 个按钮，0 个自定义点击区域
+LinkToolView.vue: 6 个按钮，0 个自定义点击区域
+ProductListView.vue: 15 个按钮，0 个自定义点击区域
+ProductQueryView.vue: 29 个按钮，1 个自定义点击区域（1 个有自动操作替代）
+PublishQueueView.vue: 30 个按钮，0 个自定义点击区域
+QianchuanOverviewView.vue: 14 个按钮，0 个自定义点击区域
+QianchuanVideoQueryPanel.vue: 8 个按钮，0 个自定义点击区域
+QianchuanViolationsView.vue: 8 个按钮，0 个自定义点击区域
+SelectionFilterEditor.vue: 5 个按钮，0 个自定义点击区域
+SelectionLogsView.vue: 6 个按钮，0 个自定义点击区域
+SelectionSettingsView.vue: 60 个按钮，0 个自定义点击区域
+SideNav.vue: 2 个按钮，0 个自定义点击区域
+StatusBar.vue: 0 个按钮，0 个自定义点击区域
+ToastHost.vue: 2 个按钮，0 个自定义点击区域
+TopMenu.vue: 1 个按钮，0 个自定义点击区域
+WorkArea.vue: 0 个按钮，0 个自定义点击区域
+界面静态交互检查：19 页，0 个未绑定按钮，0 个需检查的自定义点击区域
+EXIT=0

@@ -3,6 +3,7 @@
 
 import unittest
 import tempfile
+import re
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -69,8 +70,13 @@ class FakeCard:
     def is_visible(self):
         return self.visible
 
-    def evaluate(self, _script, expected_ids):
-        return any(value in self.html or value in self.react_ids for value in expected_ids)
+    def evaluate(self, _script, *_args):
+        html_ids = re.findall(r'data-(?:product|goods|item)-id=["\']([^"\']+)', self.html)
+        return list(dict.fromkeys([*html_ids, *self.react_ids]))
+
+    def get_by_text(self, _title, exact=True):
+        assert exact is True
+        return FakeCardMatches([self])
 
 
 class FakeCardMatches:
@@ -82,6 +88,10 @@ class FakeCardMatches:
 
     def nth(self, index):
         return self.cards[index]
+
+    @property
+    def first(self):
+        return self.cards[0] if self.cards else None
 
 
 class FakeTitleLocator:
@@ -223,7 +233,11 @@ class FakePage:
             return FakeSearchInputs(self.search_input)
         if selector == browser_cdp.SEARCH_KEYWORD_CLEAR_SELECTOR:
             return FakeSearchClearButtons(self.search_input)
-        assert selector == '[class*="__card___"]'
+        assert selector in {
+            '[class*="__card___"]',
+            browser_cdp.BAIYING_PRIORITY_ROOT_SELECTOR,
+            browser_cdp.BAIYING_PRIORITY_ALLIANCE_ROW_SELECTOR,
+        }
         cards = []
         for matches in self.title_to_cards.values():
             for card in matches:
@@ -363,17 +377,18 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         def read_source(_page, source_key):
             if source_key == "allianceRank":
                 raise RecoverablePrioritySourceReadError("榜单没有可识别的商品列表")
-            return {"123456789"}
+            return {"123456789"}, [{"product_id": "123456789"}], {}
 
         settings = {"sources": {"priority": ["allianceRank", "hotSpot"]}}
         with patch.object(browser_cdp, "_read_priority_source_product_ids", side_effect=read_source) as read:
-            membership, warnings, results = _collect_priority_source_ids(page, settings)
+            membership, warnings, results, source_candidates = _collect_priority_source_ids(page, settings)
 
         self.assertEqual(read.call_count, 2)
         self.assertEqual(membership["allianceRank"], set())
         self.assertEqual(membership["hotSpot"], {"123456789"})
+        self.assertEqual(source_candidates["hotSpot"], [{"product_id": "123456789"}])
         self.assertEqual([result["status"] for result in results], ["skipped", "read"])
-        self.assertTrue(any("继续其他来源和选品广场" in warning for warning in warnings))
+        self.assertTrue(any("继续处理其余来源" in warning for warning in warnings))
 
     def test_playwright_navigation_timeout_still_requires_account_pause(self):
         error = browser_cdp.PlaywrightTimeoutError("Page.goto: Timeout 45000ms exceeded")
@@ -1508,9 +1523,9 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
             result = execute_selected_candidates(page, MagicMock(), [candidate], [0], ".")
 
         self.assertFalse(result[0]["cartAdded"])
-        self.assertEqual(result[0]["cartStatus"], "状态待人工核验")
+        self.assertEqual(result[0]["cartStatus"], "状态待核验（本商品已跳过）")
         self.assertTrue(result[0]["cartAttempted"])
-        self.assertIn("避免重复操作", result[0]["status"])
+        self.assertIn("不重复点击本商品，已跳过并继续下一个候选", result[0]["status"])
         button.click.assert_not_called()
 
     def test_candidate_add_cart_action_text_is_exact_negative_cart_evidence(self):
@@ -1578,7 +1593,7 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
 
         _click_filter_option(option)
 
-        option.click.assert_called_once_with(force=True, timeout=3_000, no_wait_after=True)
+        option.click.assert_called_once_with(force=True, timeout=1_500, no_wait_after=True)
 
     def test_legacy_short_third_category_id_gets_current_parent_path(self):
         self.assertEqual(
@@ -1982,7 +1997,8 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         with patch.object(
             browser_cdp, "_page_applied_filter_signature",
             return_value=browser_cdp._selection_filter_signature(settings),
-        ), patch.object(browser_cdp, "_apply_one_category_and_collect_candidates", side_effect=results) as apply:
+        ), patch.object(browser_cdp, "_collect_priority_source_ids", return_value=({}, [], [], {})), \
+                patch.object(browser_cdp, "_apply_one_category_and_collect_candidates", side_effect=results) as apply:
             merged = apply_settings_and_collect_candidates(MagicMock(), settings)
 
         self.assertEqual(apply.call_count, 2)
@@ -2042,11 +2058,11 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         with patch.object(browser_cdp, "_apply_one_category_and_collect_candidates", side_effect=[
             {"candidates": [], "warnings": []},
             RuntimeError("平台限流 11001"),
-        ]) as apply_one, patch.object(
+        ]) as apply_one, patch.object(browser_cdp, "_collect_priority_source_ids", return_value=({}, [], [], {})), patch.object(
             browser_cdp, "_can_reuse_applied_non_category_filters", return_value=True
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "第 2/2 项.*leaf-b.*前 1 项成功结果仅在当前桥接进程内缓存 15 分钟.*平台限流"
+                RuntimeError, "第 2/2 项.*leaf-b.*平台限流.*已暂停后续平台请求"
             ):
                 browser_cdp.apply_settings_and_collect_candidates(page, settings)
 
@@ -2075,7 +2091,7 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
             result = execute_selected_candidates(MagicMock(), MagicMock(), [candidate], [3], ".", settings)
 
         self.assertEqual(result[0]["cartAdded"], False)
-        self.assertIn("未点击加车", result[0]["status"])
+        self.assertIn("已跳过并继续其他商品", result[0]["status"])
         self.assertEqual(refresh.call_args.args[1]["categorySelection"], candidate["sourceCategorySelection"])
         self.assertTrue(refresh.call_args.kwargs["force_refresh"])
         self.assertEqual(refresh.call_args.kwargs["preserve_product_ids"], ["product-a"])
@@ -2690,8 +2706,8 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
                 fake_page, settings, force_refresh=True, preserve_product_ids=["original-product"]
             )
 
-        apply.assert_called_once_with(fake_page, settings)
-        search.assert_called_once_with(fake_page, settings, ["original-product"])
+        apply.assert_called_once_with(fake_page, {**settings, "_sourceMembership": {}})
+        search.assert_called_once_with(fake_page, {**settings, "_sourceMembership": {}}, ["original-product"])
         self.assertEqual(result["candidates"], expected["candidates"])
         self.assertEqual(result["warnings"], ["筛选已应用"])
 
@@ -2715,7 +2731,8 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
                     callback(response)
             return []
 
-        with patch.object(browser_cdp, "apply_filter_settings", side_effect=apply_and_emit), \
+        with patch.object(browser_cdp, "_collect_priority_source_ids", return_value=({}, [], [], {})), \
+                patch.object(browser_cdp, "apply_filter_settings", side_effect=apply_and_emit), \
                 patch.object(browser_cdp, "search_baiying_candidates") as search, \
                 patch.object(browser_cdp.time, "time", side_effect=tick):
             result = browser_cdp.apply_settings_and_collect_candidates(fake_page, settings, force_refresh=True)
@@ -2787,7 +2804,7 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
             FakeCard("<div class='card'>第一张</div>"),
             FakeCard("<div class='card'>第二张</div>"),
         ]})
-        with self.assertRaisesRegex(RuntimeError, "无法按商品 ID 唯一定位"):
+        with self.assertRaisesRegex(RuntimeError, "无法按精确商品 ID.*唯一定位"):
             _locate_candidate_card(page, {
                 "title": "同名商品", "productId": "product-b", "commodityId": "promotion-b"
             })
@@ -2986,6 +3003,7 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
             "rowKey": "row-1",
             "rowText": "查询前的商品标题",
             "identityHints": ["goodsId=123"],
+            "statusHints": ["无库存"],
         }
         rows = MagicMock()
         rows.count.return_value = 4
@@ -2998,6 +3016,7 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
 
         self.assertIn("tbody tr:行4", snapshot)
         self.assertIn("row-1", snapshot)
+        self.assertIn("无库存", snapshot)
         self.assertIn("查询前的商品标题", snapshot)
         self.assertEqual(row.evaluate.call_count, 1)
 

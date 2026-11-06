@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import BrowserPane from './BrowserPane.vue'
 import LinkToolView from './LinkToolView.vue'
 import ProductQueryView from './ProductQueryView.vue'
@@ -10,6 +10,7 @@ import SelectionLogsView from './SelectionLogsView.vue'
 import PublishQueueView from './PublishQueueView.vue'
 import DashboardView from './DashboardView.vue'
 import QianchuanOverviewView from './QianchuanOverviewView.vue'
+import ProductListView from './ProductListView.vue'
 
 const props = defineProps<{
   top: string
@@ -18,10 +19,59 @@ const props = defineProps<{
 
 const emit = defineEmits<{ (event: 'navigate', value: string): void }>()
 const selectionSettingsOpened = ref(false)
+const scheduledStart = ref<SelectionScheduleDue | null>(null)
+const receivedScheduleDates = new Set<string>()
+const pendingProductDraft = ref<{ accountId: number; productId: string; title: string; sourceUrl: string } | null>(null)
+const accountManagementInitialTab = ref<'账号列表' | '账号分组' | '千川账户'>('账号列表')
+let stopSelectionScheduleDue: (() => void) | undefined
+
+function receiveScheduledStart(due: SelectionScheduleDue): void {
+  if (receivedScheduleDates.has(due.date)) return
+  receivedScheduleDates.add(due.date)
+  scheduledStart.value = due
+  selectionSettingsOpened.value = true
+  // 登录失效时选品页需要显示现有预检对话框，避免无人看见后台暂停。
+  emit('navigate', '选品设置')
+}
+
+async function acknowledgeScheduledStart(date: string, outcome: string): Promise<void> {
+  const result = await window.api.selectionSchedule.acknowledge(date, outcome)
+  if (scheduledStart.value?.date === date) scheduledStart.value = null
+  // 非终态确认不会清除主进程的待处理计划；允许下一次广播重新交给页面处理。
+  receivedScheduleDates.delete(date)
+  if (!result.cleared) return
+}
+
+function createPublishTaskFromProduct(product: { accountId: number; productId: string; title: string; sourceUrl: string }): void {
+  pendingProductDraft.value = product
+  emit('navigate', '发布队列')
+}
+
+function clearPendingProductDraft(): void {
+  pendingProductDraft.value = null
+}
+
+function openQianchuanAccounts(): void {
+  accountManagementInitialTab.value = '千川账户'
+  emit('navigate', '账号管理')
+}
 
 watch(() => props.nav, (nav) => {
   if (nav === '选品设置') selectionSettingsOpened.value = true
 }, { immediate: true })
+
+onMounted(async () => {
+  stopSelectionScheduleDue = window.api.selectionSchedule.onDue(receiveScheduledStart)
+  try {
+    const schedule = await window.api.selectionSchedule.get()
+    if (schedule.enabled || schedule.pendingDue) selectionSettingsOpened.value = true
+    if (schedule.pendingDue) receiveScheduledStart(schedule.pendingDue)
+  } catch {
+    // 定时选品设置暂不可读时不影响普通选品页面。
+  }
+})
+
+onUnmounted(() => stopSelectionScheduleDue?.())
 
 // 顶部菜单切走「百应工作台」时，摘除客户端内置会话视图；系统浏览器窗口不受影响。
 // 内置视图仍供后台探针和自动化流程使用，不承担登录页面展示。
@@ -37,19 +87,27 @@ watch(
 
 <template>
   <main class="work">
-    <div class="crumb">{{ props.top }} / {{ props.nav }}</div>
+    <div class="crumb">{{ props.top === '商品查询' ? '商品查询' : `${props.top} / ${props.nav}` }}</div>
 
-    <!-- 发布计划在两个顶部菜单下都可访问 -->
-    <template v-if="props.nav === '发布队列'">
+    <!-- 顶部菜单优先决定主界面，避免停留在发布队列时点「商品查询」仍看到旧页面。 -->
+    <template v-if="props.top === '商品查询'">
       <div class="query-body">
-        <PublishQueueView />
+        <ProductQueryView />
       </div>
     </template>
 
-    <!-- 顶部菜单「商品查询」：商品查询主界面 -->
-    <template v-else-if="props.top === '商品查询'">
+    <template v-else-if="props.nav === '商品列表'">
       <div class="query-body">
-        <ProductQueryView />
+        <ProductListView
+          @navigate="emit('navigate', $event)"
+          @create-publish-task="createPublishTaskFromProduct"
+        />
+      </div>
+    </template>
+
+    <template v-else-if="props.nav === '发布队列'">
+      <div class="query-body">
+        <PublishQueueView :product-draft="pendingProductDraft" @product-draft-consumed="clearPendingProductDraft" />
       </div>
     </template>
 
@@ -70,13 +128,13 @@ watch(
     <!-- 「账号管理」导航（Step 11）：多账号矩阵 + 分组 + 千川账户 + 账号级登录态 -->
     <template v-else-if="props.nav === '账号管理'">
       <div class="query-body">
-        <AccountManagementView />
+        <AccountManagementView :initial-tab="accountManagementInitialTab" />
       </div>
     </template>
 
     <template v-else-if="props.nav === '千川管理'">
       <div class="query-body">
-        <QianchuanOverviewView @navigate="emit('navigate', $event)" />
+        <QianchuanOverviewView @navigate="emit('navigate', $event)" @open-qianchuan-accounts="openQianchuanAccounts" />
       </div>
     </template>
 
@@ -103,7 +161,12 @@ watch(
 
     <!-- 首次打开选品后保持组件挂载，切换导航时冷却恢复协调器仍可接收主进程到期事件。 -->
     <div v-if="selectionSettingsOpened" v-show="props.nav === '选品设置' && props.top !== '商品查询'" class="query-body">
-      <SelectionSettingsView @navigate="emit('navigate', $event)" />
+      <SelectionSettingsView
+        :active="props.nav === '选品设置' && props.top !== '商品查询'"
+        :scheduled-start="scheduledStart"
+        @navigate="emit('navigate', $event)"
+        @scheduled-start-handled="acknowledgeScheduledStart"
+      />
     </div>
   </main>
 </template>
@@ -114,8 +177,8 @@ watch(
   flex-direction: column;
   min-width: 0;
   min-height: 0;
-  background: var(--bg-app);
-  padding: 12px 16px 16px;
+  background: radial-gradient(circle at 94% -10%, #e8efff 0, transparent 34%), var(--bg-app);
+  padding: 13px 18px 18px;
   /* 这里**不能**是 auto：一旦这个容器能滚动，用户滚动时
      覆盖层（浏览器视图）不会跟着动，位置就会错位。
      所以让内容自适应、不产生滚动。 */
@@ -124,10 +187,15 @@ watch(
 
 .crumb {
   flex-shrink: 0;
-  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 10px;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 600;
 }
+.crumb::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }
 
 .content {
   display: flex;
@@ -146,6 +214,7 @@ watch(
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
+  box-shadow: var(--shadow-card);
 }
 
 .panel.browser {

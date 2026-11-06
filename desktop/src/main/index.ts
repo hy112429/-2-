@@ -13,6 +13,13 @@ import { registerWatermarkIpc, registerFrameProtocol } from './watermark'
 import { getAutoPublisherProgress, runAutoPublisherNow, runImmediatePublishNow, runManualRetryPublishNow, startAutoPublisher, disposeAutoPublisher } from './auto_publisher'
 import { disposeSelectionCooldown, registerSelectionCooldownIpc } from './selection_cooldown'
 import { disposeQianchuanUploadScheduler, registerQianchuanUploadIpc, startQianchuanUploadScheduler } from './qianchuan_upload'
+import { registerQianchuanViolationIpc } from './qianchuan_violations'
+import { registerPublishArtifactsIpc } from './publish_artifacts'
+import { registerProductListIpc } from './product_list'
+import { registerQianchuanApiIpc, disposeQianchuanApi } from './qianchuan_api'
+import { registerPostPublishQianchuanMaterialIpc } from './post_publish_qianchuan_material'
+import { disposeSelectionScheduleScheduler, registerSelectionScheduleIpc, startSelectionScheduleScheduler } from './selection_scheduler'
+import { registerCenterMachineOnStartup } from './center_client_bootstrap'
 
 // 安装版使用全新的本地数据命名空间；开发态只有显式设置测试根目录时才隔离 userData。
 const isolatedTestRoot = getIsolatedTestRoot()
@@ -106,6 +113,7 @@ app.whenReady().then(() => {
   // 必须在 whenReady 之后，因为里面要用到 session 和 safeStorage
   registerLoginIpc()
   registerSelectionCooldownIpc()
+  registerSelectionScheduleIpc()
   ipcMain.handle('app:getVersion', () => app.getVersion())
   ipcMain.handle('publish:autoProgress:get', () => getAutoPublisherProgress())
   ipcMain.handle('publish:autoRun', (_event, queueId: number) => runAutoPublisherNow(queueId))
@@ -116,6 +124,11 @@ app.whenReady().then(() => {
   // 注册 Python 引擎 IPC（子进程拉起 / 进度转发 / 取消）
   registerEngineIpc()
   registerQianchuanUploadIpc()
+  registerQianchuanApiIpc()
+  registerPostPublishQianchuanMaterialIpc()
+  registerQianchuanViolationIpc()
+  registerPublishArtifactsIpc()
+  registerProductListIpc()
 
   // 注册应用本地设置 IPC（下载目录选择与持久化）
   registerAppDirsIpc()
@@ -140,6 +153,7 @@ app.whenReady().then(() => {
   // 全自动发布仅处理用户已启用且到达本地计划时间的新任务。
   if (!isolatedTestRoot) startAutoPublisher()
   if (!isolatedTestRoot) startQianchuanUploadScheduler()
+  if (!isolatedTestRoot) startSelectionScheduleScheduler()
 
   // 开发时保留 F12 开发者工具、Ctrl+R 刷新等快捷键；生产环境自动禁用
   app.on('browser-window-created', (_, window) => {
@@ -147,6 +161,7 @@ app.whenReady().then(() => {
   })
 
   createWindow()
+  void registerCenterMachineOnStartup()
 
   // macOS 习惯：点 Dock 图标且没有窗口时重新创建一个
   app.on('activate', () => {
@@ -158,7 +173,9 @@ app.whenReady().then(() => {
 app.on('before-quit', () => {
   disposeAutoPublisher()
   disposeQianchuanUploadScheduler()
+  disposeQianchuanApi()
   disposeSelectionCooldown()
+  disposeSelectionScheduleScheduler()
   disposeLogin()
   disposeExternalBrowserBridges()
   disposeEngine()

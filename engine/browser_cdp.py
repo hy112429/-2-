@@ -13,6 +13,7 @@ import mimetypes
 import os
 import queue
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -23,6 +24,16 @@ from typing import Any, Callable, Dict, Optional, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from playwright.sync_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+
+try:
+    import jieba.posseg as jieba_posseg
+except ImportError:
+    jieba_posseg = None
+
+try:
+    from selection_settings import DEFAULT_BANNED_WORDS
+except ImportError:  # 支持以 engine.browser_cdp 形式从项目根目录导入
+    from .selection_settings import DEFAULT_BANNED_WORDS
 
 try:
     from image_to_video import build_product_cover, resolve_ffmpeg
@@ -67,6 +78,14 @@ BAIYING_CART_ROW_SELECTORS = (
     '[class*="aurora-table-row"]',
     '[class*="__row___"]',
     '[class*="productRow"]',
+)
+_CREATOR_SHORT_TITLE_STOPWORDS = frozenset({
+    "正宗", "新鲜", "包邮", "现货", "旗舰店", "官方", "厂家", "直销", "爆款", "热卖",
+    "优惠", "特价", "促销", "秒杀", "推荐", "精选", "优选", "商品", "产品",
+    "每单", "售价", "直播", "全国", "发货", "下单", "拍下", "限时", "活动",
+})
+_CREATOR_SHORT_TITLE_ALIAS_GROUPS = (
+    frozenset({"猕猴桃", "奇异果"}),
 )
 BAIYING_ROW_METADATA_SCRIPT = r"""(element, expected) => {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
@@ -116,6 +135,27 @@ BAIYING_ROW_METADATA_SCRIPT = r"""(element, expected) => {
     }
   }
   const rowText = normalize(element.innerText || element.textContent || '');
+  const unavailablePattern = /暂无库存|无库存|库存不足|已售罄|售罄|缺货|已下架|暂不可带货|暂不可带|不可带货|不可加车|暂不可添加/;
+  const statusHints = [];
+  const addStatusHint = (value) => {
+    const text = normalize(value);
+    if (text && unavailablePattern.test(text) && !statusHints.includes(text)) {
+      statusHints.push(text.slice(0, 100));
+    }
+  };
+  for (const node of nodes) {
+    const rect = node.getBoundingClientRect();
+    const style = getComputedStyle(node);
+    if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || style.display === 'none') continue;
+    addStatusHint(node.innerText || node.textContent || '');
+    for (const attribute of ['aria-label', 'aria-description', 'title', 'alt', 'data-tooltip', 'data-status', 'data-state']) {
+      addStatusHint(node.getAttribute?.(attribute));
+    }
+    for (const pseudo of ['::before', '::after']) {
+      const content = getComputedStyle(node, pseudo).content;
+      if (content && content !== 'none' && content !== 'normal') addStatusHint(content.replace(/^['\"]|['\"]$/g, ''));
+    }
+  }
   const compactTitle = title.replace(/\s+/g, '');
   const titlePrefixLength = Math.min(24, Math.max(14, Math.ceil(compactTitle.length * 0.55)));
   const matchesTitleText = (value) => {
@@ -138,6 +178,7 @@ BAIYING_ROW_METADATA_SCRIPT = r"""(element, expected) => {
       matchesTitleText(node.innerText || node.textContent || ''))),
     rowKey: element.getAttribute('data-row-key') || element.getAttribute('data-id') || '',
     rowText: rowText.slice(0, 180),
+    statusHints,
     identityHints,
     domIdentityHints,
     reactIdentityHints,
@@ -261,6 +302,16 @@ def _candidate_unavailable_reason(value: Any) -> str:
     return next((marker for marker in _CANDIDATE_UNAVAILABLE_MARKERS if marker.lower() in compact), "")
 
 
+def _baiying_row_unavailable_reason(row: Dict[str, Any]) -> str:
+    values = [row.get("rowText"), row.get("text"), row.get("accessibleText"), row.get("statusText")]
+    hints = row.get("statusHints")
+    if isinstance(hints, str):
+        values.append(hints)
+    elif isinstance(hints, (list, tuple)):
+        values.extend(hints)
+    return next((reason for value in values if (reason := _candidate_unavailable_reason(value))), "")
+
+
 def _row_identity_product_ids(identity_hints: Any) -> set[str]:
     if not isinstance(identity_hints, (list, tuple)):
         return set()
@@ -283,7 +334,7 @@ def _baiying_row_skip_reason(product_id: str, rows: Sequence[Dict[str, Any]]) ->
         return ""
     id_matches = [row for row in visible_rows if row.get("matchesProductId") is True]
     title_matches = [row for row in visible_rows if row.get("matchesProductTitle") is True]
-    unavailable = [_candidate_unavailable_reason(row.get("rowText") or row.get("text")) for row in visible_rows]
+    unavailable = [_baiying_row_unavailable_reason(row) for row in visible_rows]
     if id_matches:
         if all(unavailable[index] for index, row in enumerate(visible_rows) if row.get("matchesProductId") is True):
             markers = sorted({unavailable[index] for index, row in enumerate(visible_rows) if row.get("matchesProductId") is True})
@@ -309,6 +360,8 @@ def _baiying_row_skip_reason(product_id: str, rows: Sequence[Dict[str, Any]]) ->
     elif row_ids and all(ids and expected not in ids for ids in row_ids):
         other_ids = sorted({value for ids in row_ids for value in ids})
         return "按商品 ID 查询后只看到其他商品行（可见商品 ID：" + "、".join(other_ids[:5]) + "）"
+    if not id_matches and not title_matches and len(visible_rows) == 1 and unavailable[0]:
+        return f"核验行不可识别·唯一可见行明确显示无库存/不可加车：{unavailable[0]}"
     if title_matches:
         title_indexes = [index for index, row in enumerate(visible_rows) if row.get("matchesProductTitle") is True]
         if title_indexes and all(unavailable[index] for index in title_indexes):
@@ -730,6 +783,232 @@ def _creator_text_limit(locator: Any, fallback: int) -> int:
     return fallback
 
 
+def _creator_text_length_units(value: str) -> int:
+    """HTML maxlength 按 UTF-16 code unit 计数；中文 BMP 字符各占一个单位。"""
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in value)
+
+
+def _creator_saved_banned_words(command: Dict[str, Any]) -> list[str]:
+    supplied = command.get("bannedWords")
+    if isinstance(supplied, list):
+        return list(dict.fromkeys(str(word).strip() for word in supplied if str(word).strip()))
+    database_path = str(command.get("selectionSettingsDbPath") or "").strip()
+    if database_path:
+        connection: Optional[sqlite3.Connection] = None
+        try:
+            path = Path(database_path).expanduser().resolve()
+            connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=3)
+            row = connection.execute(
+                "SELECT settings_json FROM selection_settings WHERE scope_key='global'"
+            ).fetchone()
+            if row:
+                settings = json.loads(row[0])
+                words = settings.get("bannedWords") if isinstance(settings, dict) else None
+                if isinstance(words, list):
+                    return list(dict.fromkeys(str(word).strip() for word in words if str(word).strip()))
+        except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        finally:
+            if connection is not None:
+                connection.close()
+    return list(DEFAULT_BANNED_WORDS)
+
+
+def _creator_manual_review_active(command: Dict[str, Any]) -> bool:
+    """最终点击前复查本机开关，防止上传期间切换到人工复核后继续自动发布。"""
+    database_path = str(command.get("selectionSettingsDbPath") or "").strip()
+    if not database_path:
+        return False
+    path = Path(database_path).expanduser().resolve()
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=3)
+        row = connection.execute(
+            "SELECT manual_review_enabled FROM publish_settings WHERE setting_id = 1"
+        ).fetchone()
+    except (OSError, sqlite3.Error) as error:
+        raise RuntimeError(f"人工复核开关无法读取，已停在最终发布前：{error}") from error
+    finally:
+        if connection is not None:
+            connection.close()
+    if row is None:
+        raise RuntimeError("人工复核开关记录不存在，已停在最终发布前")
+    return bool(row[0])
+
+
+def _creator_strip_price_mentions(value: Any) -> str:
+    text = str(value or "")
+    label_price = re.compile(
+        r"(?:每单(?:赚|佣金)?|佣金|售价|价格|原价|现价|到手价|券后价|优惠价|特价|活动价|直播价|"
+        r"会员价|专享价|秒杀价|团购价|低至|仅需|只要)\s*[:：]?\s*"
+        r"(?:人民币|RMB)?\s*[￥¥$]?\s*\d+(?:[,.]\d+)?\s*(?:元|块(?:钱)?|人民币)?",
+        flags=re.IGNORECASE,
+    )
+    text = label_price.sub(" ", text)
+    text = re.sub(r"[￥¥$]\s*\d+(?:[,.]\d+)?\s*(?:元|块(?:钱)?)?", " ", text)
+    text = re.sub(
+        r"(?<![A-Za-z0-9])\d+(?:[,.]\d+)?\s*(?:元|块(?:钱)?)(?![A-Za-z0-9])",
+        " ", text,
+    )
+    text = re.sub(r"(?<![A-Za-z0-9])\d+[.]\d{1,2}(?![A-Za-z0-9])", " ", text)
+    text = re.sub(r"\bRMB\s*\d+(?:[,.]\d+)?\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?:每单赚|每单佣金|佣金|售价|价格|原价|现价|到手价|券后价|优惠价|特价|活动价|直播价|"
+        r"会员价|专享价|秒杀价|团购价|低至|仅需|只要)\s*[:：]?",
+        " ", text, flags=re.IGNORECASE,
+    )
+    return text
+
+
+def _creator_clean_publication_text(value: Any, banned_words: Sequence[str] = ()) -> str:
+    """去掉价格、当前全局屏蔽词和分词器识别的人名，供发布标题及短标题使用。"""
+    text = _creator_strip_price_mentions(value)
+    if jieba_posseg is not None:
+        person_names = {
+            str(getattr(token, "word", "") or "").strip()
+            for token in jieba_posseg.cut(text, HMM=True)
+            if str(getattr(token, "flag", "") or "").lower().startswith("nr")
+        }
+        for name in sorted((name for name in person_names if name), key=len, reverse=True):
+            text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
+    for word in sorted((str(word).strip() for word in banned_words if str(word).strip()), key=len, reverse=True):
+        text = re.sub(re.escape(word), " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\s|｜,，;；:：/\\·•、—–-]+", " ", text)
+    text = re.sub(r"^[\s。.!！?？,，;；:：]+|[\s。.!！?？,，;；:：]+$", "", text)
+    return " ".join(text.split())
+
+
+def _creator_truncate_text_units(value: str, limit: int) -> str:
+    result: list[str] = []
+    used = 0
+    for character in value:
+        units = 2 if ord(character) > 0xFFFF else 1
+        if used + units > max(0, limit):
+            break
+        result.append(character)
+        used += units
+    return "".join(result).rstrip()
+
+
+def _creator_publication_title(product_title: str, limit: int, banned_words: Sequence[str]) -> str:
+    clean = _creator_clean_publication_text(product_title, banned_words)
+    return _creator_truncate_text_units(clean, limit)
+
+
+def _creator_strip_leading_title_tag(value: str) -> str:
+    """移除短括号店铺前缀，让商品本身的词优先；长括号商品标题整体保留。"""
+    text = " ".join(str(value or "").split())
+    for _ in range(3):
+        match = re.match(
+            r"^\s*(?:【[^【】]{1,12}】|\[[^\[\]]{1,12}\]|（[^（）]{1,12}）|\([^()]{1,12}\))\s*",
+            text,
+        )
+        if not match:
+            break
+        text = text[match.end():]
+    return text
+
+
+def _creator_product_short_title(
+    product_title: str,
+    description: str,
+    limit: int = 10,
+    banned_words: Sequence[str] = (),
+) -> str:
+    """从商品标题和作品简介抽取关键词，按来源顺序组合，不再截取标题前缀。"""
+    if jieba_posseg is None:
+        raise RuntimeError("中文关键词组件未安装，无法安全生成商品短标题")
+
+    title_text = _creator_clean_publication_text(_creator_strip_leading_title_tag(product_title), banned_words)
+    description_text = _creator_clean_publication_text(_creator_strip_leading_title_tag(description), banned_words)
+    source_values = ((title_text, 2.0, 0), (description_text, 1.0, 1))
+    terms: Dict[str, Dict[str, Any]] = {}
+    pos_weights = {
+        "n": 1.35, "nr": 1.1, "nt": 1.1, "nz": 1.2, "vn": 1.0,
+        "v": 0.7, "a": 0.75, "eng": 1.0, "x": 0.45,
+    }
+
+    for source_text, source_weight, source_index in source_values:
+        if not source_text:
+            continue
+        position = 0
+        for token in jieba_posseg.cut(source_text, HMM=True):
+            word = str(getattr(token, "word", "") or "").strip()
+            flag = str(getattr(token, "flag", "") or "").lower()
+            if (
+                not word or word.casefold() in _CREATOR_SHORT_TITLE_STOPWORDS or
+                flag == "ns" or flag.startswith("nr") or flag == "m"
+            ):
+                position += len(word)
+                continue
+            pos_weight = pos_weights.get(flag)
+            if pos_weight is None and flag.startswith("n"):
+                pos_weight = 1.1
+            elif pos_weight is None and flag.startswith("v"):
+                pos_weight = 0.7
+            elif pos_weight is None and flag.startswith("a"):
+                pos_weight = 0.75
+            if pos_weight is None:
+                position += len(word)
+                continue
+            if (len(word) < 2 or _creator_text_length_units(word) > limit
+                    or not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", word)):
+                position += len(word)
+                continue
+            key = word.casefold()
+            record = terms.setdefault(key, {
+                "word": word,
+                "score": 0.0,
+                "title_position": None,
+                "description_position": None,
+            })
+            length_bonus = 1.0 + min(len(word), 6) * 0.05
+            generic_term_penalty = 0.55 if key in {"水果", "零食", "日用品"} else 1.0
+            record["score"] += source_weight * pos_weight * length_bonus * generic_term_penalty
+            position_key = "title_position" if source_index == 0 else "description_position"
+            if record[position_key] is None:
+                record[position_key] = position
+            position += len(word)
+
+    ranked = sorted(
+        terms.values(),
+        key=lambda item: (
+            -float(item["score"]),
+            -len(str(item["word"])),
+            item["title_position"] if item["title_position"] is not None else 10**9,
+            item["description_position"] if item["description_position"] is not None else 10**9,
+        ),
+    )
+    selected: list[Dict[str, Any]] = []
+    used_units = 0
+    for candidate in ranked:
+        word = str(candidate["word"])
+        if any(word in str(item["word"]) or str(item["word"]) in word for item in selected):
+            continue
+        if any(
+            word in alias_group and str(item["word"]) in alias_group
+            for item in selected
+            for alias_group in _CREATOR_SHORT_TITLE_ALIAS_GROUPS
+        ):
+            continue
+        units = _creator_text_length_units(word)
+        if used_units + units > limit:
+            continue
+        selected.append(candidate)
+        used_units += units
+        if used_units == limit:
+            break
+
+    selected.sort(key=lambda item: (
+        0 if item["title_position"] is not None else 1,
+        item["title_position"] if item["title_position"] is not None else item["description_position"],
+    ))
+    result = "".join(str(item["word"]) for item in selected)
+    if not result:
+        raise RuntimeError("清理价格、全局屏蔽词和人名后，未能提取可用商品短标题；未点击发布")
+    return result
+
+
 def _creator_product_card(page: Page, product_name: str) -> tuple[Optional[Any], str]:
     """按商品名定位已添加商品卡片及其唯一编辑按钮。"""
     candidates = page.locator("button, [role='button']")
@@ -848,7 +1127,13 @@ def _creator_product_edit_modal(page: Page) -> Optional[Any]:
     return None
 
 
-def _fill_creator_product_short_title(page: Page, product_name: str) -> str:
+def _fill_creator_product_short_title(
+    page: Page,
+    product_name: str,
+    description: str = "",
+    expected_short_title: Optional[str] = None,
+    banned_words: Sequence[str] = (),
+) -> str:
     # 新版页面点击“添加链接”就先弹必填短标题；旧版则先显示卡片，再点“编辑”。
     # 两种入口都先确认当前弹窗的原标题，完成后才允许核验商品关联。
     dialog = _creator_product_edit_modal(page)
@@ -888,12 +1173,21 @@ def _fill_creator_product_short_title(page: Page, product_name: str) -> str:
     field = _creator_product_short_title_field(dialog)
     if field is None:
         raise RuntimeError("商品编辑框中没有唯一识别到“商品短标题”；未点击发布")
-    short_title = product_name.strip()[:_creator_text_limit(field, 10)].rstrip()
+    short_title_limit = _creator_text_limit(field, 10)
+    short_title = expected_short_title or _creator_product_short_title(
+        product_name, description, short_title_limit, banned_words
+    )
+    if _creator_text_length_units(short_title) > short_title_limit:
+        short_title = _creator_product_short_title(product_name, description, short_title_limit, banned_words)
     if not short_title:
         raise RuntimeError("商品名称为空，无法填写商品短标题；未点击发布")
-    field.fill(short_title, timeout=10_000)
-    if _creator_text_value(field).strip() != short_title:
-        raise RuntimeError("商品短标题未能准确填入；未点击发布")
+    _fill_creator_text_with_readback(
+        page,
+        field,
+        short_title,
+        "商品短标题",
+        normalizer=lambda value: str(value or "").strip(),
+    )
 
     done_buttons = dialog.get_by_role("button", name="完成编辑", exact=True)
     if done_buttons.count() != 1 or not _is_visible(done_buttons.first):
@@ -933,8 +1227,62 @@ def _fill_creator_product_short_title(page: Page, product_name: str) -> str:
 
 
 def normalize_creator_description_readback(value: Any) -> str:
-    """移除创作者中心编辑器放在末尾的零宽光标占位符，再核对可见简介。"""
-    return str(value or "").rstrip("\u200b")
+    """统一换行，并移除创作者中心编辑器附加的末尾空行/零宽光标占位符。"""
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n").rstrip("\u200b\n")
+
+
+def _fill_creator_text_with_readback(
+    page: Page,
+    field: Any,
+    expected: str,
+    label: str,
+    *,
+    normalizer: Optional[Callable[[Any], str]] = None,
+    timeout_seconds: float = 3.0,
+) -> str:
+    """填写创作者中心文本并等待框架回写；失效时用键盘输入重试一次，始终按回读值放行。"""
+    normalize = normalizer or normalize_creator_description_readback
+    expected_value = normalize(expected)
+    fill_error = ""
+    try:
+        field.fill(expected, timeout=10_000)
+    except Exception as error:
+        fill_error = type(error).__name__
+
+    def wait_for_expected_value() -> tuple[bool, str]:
+        actual = ""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                actual = _creator_text_value(field)
+                if normalize(actual) == expected_value:
+                    return True, actual
+            except Exception:
+                actual = ""
+            page.wait_for_timeout(100)
+        return False, actual
+
+    matched, actual = wait_for_expected_value()
+    if matched:
+        return actual
+
+    keyboard_error = ""
+    try:
+        field.click(timeout=5_000)
+        field.press("Control+A", timeout=3_000)
+        field.press_sequentially(expected, delay=5, timeout=15_000)
+    except Exception as error:
+        keyboard_error = type(error).__name__
+    matched, actual = wait_for_expected_value()
+    if matched:
+        return actual
+
+    details = f"预期字符数 {len(expected)}，实际回读字符数 {len(actual)}"
+    if fill_error:
+        details += f"；fill={fill_error}"
+    if keyboard_error:
+        details += f"；键盘重试={keyboard_error}"
+    raise RuntimeError(f"{label}未能准确填入；{details}")
 
 
 def _creator_product_link_field(page: Page) -> Optional[Any]:
@@ -1240,7 +1588,9 @@ def _baiying_row_snapshot(page: Page, max_rows: int = 2) -> str:
             row_key = str(metadata.get("rowKey") or "无")[:24]
             hints = metadata.get("identityHints") or []
             hint_text = f";ID线索={hints[:2]}" if hints else ""
-            samples.append(f"#{index + 1} key={row_key} {text}{hint_text}")
+            status_hints = metadata.get("statusHints") or []
+            status_text = f";状态线索={status_hints[:2]}" if status_hints else ""
+            samples.append(f"#{index + 1} key={row_key} {text}{hint_text}{status_text}")
         if visible_count:
             return f"{selector}:行{visible_count};样本={samples}"
     return "未找到可见商品行（所有已知行选择器均为 0）"
@@ -1272,7 +1622,9 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
         if not visible_rows:
             samples = []
             sample_limit = 2 if visible_count and not sampled_visible_rows else 0
-            for index in range(min(rows.count(), sample_limit)):
+            for index in range(rows.count()):
+                if len(samples) >= sample_limit:
+                    break
                 row = rows.nth(index)
                 if not _is_visible(row):
                     continue
@@ -1286,6 +1638,7 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
                         "text": str(sample.get("rowText") or "无文本")[:72],
                         "identityHints": (sample.get("identityHints") or [])[:2],
                         "domIdentityHints": (sample.get("domIdentityHints") or [])[:2],
+                        "statusHints": (sample.get("statusHints") or [])[:4],
                         "matchesProductId": bool(sample.get("matchesProductId")),
                         "matchesProductTitle": bool(sample.get("matchesProductTitle")),
                     })
@@ -1326,14 +1679,14 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
         selected_ids = _row_identity_product_ids(
             selected.get("domIdentityHints") if "domIdentityHints" in selected else selected.get("identityHints")
         )
-        unavailable_reason = _candidate_unavailable_reason(selected.get("rowText"))
-        if unavailable_reason:
-            raise CandidateCartSkip(product_id, f"目标商品行明确显示{unavailable_reason}")
         if selected.get("matchesProductTitle") and not selected.get("matchesProductId") and selected_ids and product_id not in selected_ids:
             raise WrongBaiyingProductRow(
                 product_id,
                 "标题命中行的商品 ID 为 " + "、".join(sorted(selected_ids)[:5]) + "，与目标 ID 不符",
             )
+        unavailable_reason = _baiying_row_unavailable_reason(selected)
+        if unavailable_reason:
+            raise CandidateCartSkip(product_id, f"目标商品行明确显示{unavailable_reason}")
         identity = "商品 ID" if selected.get("matchesProductId") else "商品标题（唯一回退）"
         row_key = str(selected.get("rowKey") or "未提供")[:48]
         return selected["locator"], f"按{identity}命中 1 行；候选行数 {len(visible_rows)}；rowKey={row_key}"
@@ -1848,6 +2201,7 @@ def _creator_cart_context_matches_product(context: Dict[str, Any], product_id: s
 
 def _creator_resume_linked_short_title(
     card_hrefs: list[str], card_text: str, product_id: str, product_name: str,
+    description: str = "", banned_words: Sequence[str] = (),
 ) -> Optional[str]:
     """续跑时只有商品 ID 与短标题都确认一致才复用现有关联，避免重复添加或错挂。"""
     id_matches = any(
@@ -1860,29 +2214,99 @@ def _creator_resume_linked_short_title(
     if not card_text:
         raise RuntimeError("现有投稿已有商品链接，但未能确认对应商品卡片；未重复添加链接或点击发布")
     actual_short_title = _creator_card_short_title(card_text)
-    expected_short_title = product_name.strip()[:10].rstrip()
+    expected_short_title = _creator_product_short_title(product_name, description, 10, banned_words)
     if actual_short_title != expected_short_title:
         raise RuntimeError("现有投稿已关联商品，但短标题未能核对；未重复添加链接或点击发布")
     return actual_short_title
 
 
+def _creator_radio_state(locator: Any) -> Optional[bool]:
+    """读取原生 radio、ARIA radio 或其可见标签的选中状态。"""
+    try:
+        return bool(locator.is_checked())
+    except Exception:
+        pass
+    try:
+        aria_checked = locator.get_attribute("aria-checked")
+        if aria_checked in {"true", "false"}:
+            return aria_checked == "true"
+    except Exception:
+        pass
+    try:
+        state = locator.evaluate(r"""el => {
+            for (let node = el, depth = 0; node && depth < 7; node = node.parentElement, depth++) {
+                const aria = node.getAttribute && node.getAttribute('aria-checked');
+                if (aria === 'true' || aria === 'false') return aria === 'true';
+                const marked = node.getAttribute && node.getAttribute('data-checked');
+                if (marked === 'true' || marked === 'false') return marked === 'true';
+                if (node.matches && node.matches('input[type="radio"], input[type="checkbox"]')) return !!node.checked;
+                if (node.matches && node.matches('label')) {
+                    const input = node.querySelector('input[type="radio"], input[type="checkbox"]');
+                    if (input) return !!input.checked;
+                }
+                const className = typeof node.className === 'string' ? node.className.toLowerCase() : '';
+                if (/\b(?:radio-)?checked\b/.test(className)) return true;
+                if (/\b(?:radio-)?unchecked\b/.test(className)) return false;
+            }
+            return null;
+        }""")
+        return state if isinstance(state, bool) else None
+    except Exception:
+        return None
+
+
+def _creator_scoped_publish_option(page: Page, name: str) -> Optional[Any]:
+    """按发布设置字段分组找可见选项，兼容平台没有稳定 radio accessible name 的 DOM。"""
+    groups = {
+        "允许": ("保存权限", "不允许"),
+        "立即发布": ("发布时间", "定时发布"),
+    }
+    group_label, alternative = groups.get(name, ("", ""))
+    if not group_label:
+        return None
+    for label in _visible_exact_text(page, group_label):
+        container = label
+        for _ in range(8):
+            try:
+                container = container.locator("xpath=..")
+                text = " ".join((container.inner_text(timeout=500) or "").split())
+            except Exception:
+                break
+            if group_label not in text or alternative not in text:
+                continue
+            options = _visible_exact_text(container, name)
+            alternatives = _visible_exact_text(container, alternative)
+            if len(options) == 1 and len(alternatives) == 1:
+                return options[0]
+    return None
+
+
 def _ensure_creator_radio(page: Page, name: str) -> None:
     radios = page.get_by_role("radio", name=name, exact=True)
-    if radios.count() != 1:
-        raise RuntimeError(f"没有唯一识别到“{name}”发布选项；未点击发布")
-    radio = radios.first
-    radio.scroll_into_view_if_needed(timeout=3_000)
+    visible_radios = [radios.nth(index) for index in range(radios.count()) if _is_visible(radios.nth(index))]
+    target = visible_radios[0] if len(visible_radios) == 1 else _creator_scoped_publish_option(page, name)
+    if target is None:
+        raise RuntimeError(f"发布设置中没有找到唯一可见的“{name}”选项；未点击发布")
+
+    target.scroll_into_view_if_needed(timeout=3_000)
+    if _creator_radio_state(target) is True:
+        return
     try:
-        if not radio.is_checked():
-            radio.check(timeout=3_000)
+        target.check(timeout=3_000)
     except Exception:
-        radio.click(timeout=3_000)
-    try:
-        checked = radio.is_checked()
-    except Exception:
-        checked = radio.get_attribute("aria-checked") == "true"
-    if not checked:
-        raise RuntimeError(f"未能确认“{name}”发布选项已选中；未点击发布")
+        # check() 可能已经触发平台更新，先回读再决定是否点击，避免双击把选项取消。
+        if _creator_radio_state(target) is not True:
+            target.click(timeout=3_000)
+    checked = None
+    for _ in range(15):
+        checked = _creator_radio_state(target)
+        if checked is not False:
+            break
+        page.wait_for_timeout(100)
+    if checked is False:
+        raise RuntimeError(f"点击后“{name}”仍未选中；未点击发布")
+    # 某些平台版本只暴露视觉标签，不暴露 checked/aria-checked；唯一字段分组中的选项
+    # 已被显式点击且未报错，按用户确认的默认设置继续提交，避免无障碍树缺失造成假阻断。
 
 
 class PublishSubmissionError(RuntimeError):
@@ -3630,6 +4054,11 @@ def prepare_douyin_publish(
         raise RuntimeError("缺少已选商品、商品链接或作品描述，未执行上传")
     if len(description) > 500:
         raise RuntimeError("视频简介不能超过 500 个字符，未执行上传")
+    banned_words = _creator_saved_banned_words(command)
+    expected_work_title = _creator_publication_title(product_name, 30, banned_words)
+    if not expected_work_title:
+        raise RuntimeError("商品标题清理价格、全局屏蔽词和人名后没有可用内容；请先调整商品标题，未上传视频")
+    expected_product_short_title = _creator_product_short_title(product_name, description, 10, banned_words)
     if not _product_url_matches_product(product_url, product_id):
         raise RuntimeError("商品链接域名或商品 ID 与当前选品记录不匹配，未执行上传")
     auto_publish = command.get("autoPublish") is True
@@ -3740,18 +4169,21 @@ def prepare_douyin_publish(
         raise RuntimeError("视频已提交给创作者中心，但作品标题输入框尚未出现；状态不确定，请检查当前页面后再继续")
 
     try:
-        work_title = product_name[:_creator_text_limit(work_title_field, 30)].rstrip()
+        work_title = _creator_publication_title(
+            product_name, _creator_text_limit(work_title_field, 30), banned_words
+        )
         if not work_title:
             raise RuntimeError("商品名称为空，无法填写作品标题")
-        work_title_field.fill(work_title, timeout=10_000)
-        if normalize_creator_description_readback(_creator_text_value(work_title_field)).strip() != work_title:
-            raise RuntimeError("作品标题回读与商品名称不一致")
-        description_field.fill(description, timeout=10_000)
+        _fill_creator_text_with_readback(
+            page,
+            work_title_field,
+            work_title,
+            "作品标题",
+            normalizer=lambda value: normalize_creator_description_readback(value).strip(),
+        )
+        _fill_creator_text_with_readback(page, description_field, description, "简介")
     except Exception as error:
         raise RuntimeError(f"已提交视频，但作品标题或简介预填失败；请检查当前页面。原因：{error}") from error
-    entered_description = _creator_text_value(description_field)
-    if normalize_creator_description_readback(entered_description) != description:
-        raise RuntimeError("简介未能准确填入；页面已保留供检查，未点击发布")
     _report_operation_progress(progress, "填写作品内容", message="作品标题已按商品名填入，简介已填入并核对")
 
     # 先连续确认视频预览和平台上传完成，再关联商品并提交。
@@ -3795,7 +4227,7 @@ def prepare_douyin_publish(
     existing_card, existing_card_text = _creator_product_card(page, product_name) if resume_after_upload else (None, "")
     existing_card_hrefs = _creator_product_card_hrefs(existing_card, product_name) if resume_after_upload else []
     product_short_title = _creator_resume_linked_short_title(
-        existing_card_hrefs, existing_card_text, product_id, product_name,
+        existing_card_hrefs, existing_card_text, product_id, product_name, description, banned_words,
     ) if resume_after_upload else None
     if product_short_title is not None:
         _report_operation_progress(progress, "核对已有商品关联", message="已确认同一商品及短标题，跳过重复添加链接")
@@ -3814,7 +4246,9 @@ def prepare_douyin_publish(
 
         _report_operation_progress(progress, "填写商品短标题", message="平台要求先完成商品编辑，再确认购物车关联")
         try:
-            product_short_title = _fill_creator_product_short_title(page, product_name)
+            product_short_title = _fill_creator_product_short_title(
+                page, product_name, description, expected_product_short_title, banned_words,
+            )
         except Exception as error:
             raise RuntimeError(f"视频已上传，但商品短标题编辑未完成；已停止，未点击发布。原因：{error}") from error
 
@@ -3837,14 +4271,17 @@ def prepare_douyin_publish(
             hint = "；页面虽提示添加成功，但未核验到当前商品 ID 或完整名称" if saw_success_hint else ""
             raise RuntimeError(f"视频已上传，但页面没有确认当前商品链接已关联{hint}；已停止，未点击发布")
 
-    # 固定发布选项：公开、允许保存、立即发布；封面保持平台默认，本流程不操作封面区。
-    _report_operation_progress(progress, "核对发布选项", message="确认公开、允许保存和立即发布设置")
-    for option in ("公开", "允许", "立即发布"):
+    # 按用户要求沿用平台当前可见范围，不探测或改动“谁可以看”；其余选项仍照常核验。
+    # 封面保持平台默认，本流程不操作封面区。
+    _report_operation_progress(progress, "核对发布选项", message="确认允许保存和立即发布设置；可见范围沿用页面当前选择")
+    for option in ("允许", "立即发布"):
         try:
             _ensure_creator_radio(page, option)
         except Exception as error:
             raise RuntimeError(f"视频和商品链接已填入，但发布选项“{option}”无法确认；已停止，未点击发布。原因：{error}") from error
 
+    if auto_publish and _creator_manual_review_active(command):
+        auto_publish = False
     if auto_publish:
         publish_page_url = page.url
         publish_page_title = page.title()
@@ -3918,6 +4355,10 @@ def submit_douyin_publish(
         raise RuntimeError("发布任务缺少商品或作品描述，未点击发布")
     if not _product_url_matches_product(product_url, product_id):
         raise RuntimeError("队列商品链接与商品 ID 不匹配，未点击发布")
+    banned_words = _creator_saved_banned_words(command)
+    expected_work_title = _creator_publication_title(product_name, 30, banned_words)
+    if not expected_work_title:
+        raise RuntimeError("商品标题清理价格、全局屏蔽词和人名后没有可用内容；未点击发布")
     video_path = Path(str(command.get("videoPath") or "")).expanduser().resolve(strict=True)
     if not video_path.is_file() or video_path.suffix.lower() != ".mp4":
         raise RuntimeError("发布任务对应的本地 MP4 不可用，未点击发布")
@@ -3941,7 +4382,9 @@ def submit_douyin_publish(
     work_title_field = _creator_work_title_field(page)
     if work_title_field is None:
         raise RuntimeError("当前投稿页没有唯一可识别的作品标题；未点击发布")
-    expected_work_title = product_name[:_creator_text_limit(work_title_field, 30)].rstrip()
+    expected_work_title = _creator_publication_title(
+        product_name, _creator_text_limit(work_title_field, 30), banned_words
+    )
     actual_work_title = normalize_creator_description_readback(_creator_text_value(work_title_field)).strip()
     if not expected_work_title or actual_work_title != expected_work_title:
         raise RuntimeError("当前作品标题与商品名称不一致；未点击发布")
@@ -3963,15 +4406,18 @@ def submit_douyin_publish(
     ):
         raise RuntimeError("当前投稿页无法核对已关联的队列商品；未点击发布")
     _, product_card_text = _creator_product_card(page, product_name)
-    expected_short_title = product_name.strip()[:10].rstrip()
+    expected_short_title = _creator_product_short_title(product_name, description, 10, banned_words)
     if not expected_short_title or _creator_card_short_title(product_card_text) != expected_short_title:
         raise RuntimeError("当前关联商品短标题与商品名称不一致；未点击发布")
 
     # 最终提交前不重开或核验封面槽；沿用准备阶段的用户闸门和平台默认状态。
     cover_selection = _creator_skip_product_covers(progress)
 
-    for option in ("公开", "允许", "立即发布"):
+    # 恢复已上传投稿时同样沿用页面当前可见范围，不因“公开”控件无法识别而阻断。
+    for option in ("允许", "立即发布"):
         _ensure_creator_radio(page, option)
+    if command.get("respectManualReview") is True and _creator_manual_review_active(command):
+        raise RuntimeError("人工复核已开启，已停在最终发布前；请在发布队列人工检查后点击发布")
     publish_page_url = page.url
     publish_page_title = page.title()
     return_status, snapshot = _publish_creator_post(page, progress)
@@ -3988,6 +4434,27 @@ def submit_douyin_publish(
         "url": publish_page_url,
         "pageTitle": publish_page_title,
     }
+
+
+def _capture_publish_failure(context: Any, queue_id: Any) -> str:
+    """仅在投稿失败时保存当前账号投稿页截图，绝不点击或重试发布。"""
+    root = os.environ.get("TOUGUANG_DATA_DIR", "").strip()
+    if not root:
+        return ""
+    page = next((item for item in reversed(context.pages)
+                 if not item.is_closed() and "douyin.com" in urlparse(item.url).netloc
+                 and "/post/video" in urlparse(item.url).path), None)
+    if page is None:
+        return ""
+    try:
+        folder = Path(root) / "diagnostics" / "publish"
+        folder.mkdir(parents=True, exist_ok=True)
+        safe_id = str(queue_id) if str(queue_id).isdigit() else "unknown"
+        path = folder / f"queue-{safe_id}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.png"
+        page.screenshot(path=str(path), full_page=False, timeout=5_000)
+        return str(path)
+    except Exception:
+        return ""
 
 
 def run_watch(profile_path: Path) -> int:
@@ -4057,6 +4524,8 @@ def run_watch(profile_path: Path) -> int:
                                     page.goto(url, wait_until="domcontentloaded", timeout=45_000)
                                 else:
                                     page.bring_to_front()
+                                    if page.url != url:
+                                        page.goto(url, wait_until="domcontentloaded", timeout=45_000)
                                 emit({"type": "result", "id": command_id, "ok": True, "url": page.url, "title": page.title()})
                             except Exception as error:
                                 emit({"type": "result", "id": command_id, "ok": False, "error": str(error)})
@@ -4115,11 +4584,13 @@ def run_watch(profile_path: Path) -> int:
                             result = prepare_douyin_publish(context, command, report_progress)
                             emit({"type": "result", "id": command_id, **result})
                         except Exception as error:
+                            screenshot_path = _capture_publish_failure(context, command.get("queueId"))
                             emit({
                                 "type": "result",
                                 "id": command_id,
                                 "ok": False,
                                 "error": str(error),
+                                "screenshotPath": screenshot_path,
                                 **({
                                     "isolated": True,
                                     "classification": error.classification,
@@ -4142,11 +4613,13 @@ def run_watch(profile_path: Path) -> int:
                             result = submit_douyin_publish(context, command, report_progress)
                             emit({"type": "result", "id": command_id, **result})
                         except Exception as error:
+                            screenshot_path = _capture_publish_failure(context, command.get("queueId"))
                             emit({
                                 "type": "result",
                                 "id": command_id,
                                 "ok": False,
                                 "error": str(error),
+                                "screenshotPath": screenshot_path,
                                 **({
                                     "isolated": True,
                                     "classification": error.classification,
@@ -7273,6 +7746,18 @@ def _candidate_matches_manual_categories(candidate: Dict[str, Any], selected_ids
                 selected_aliases.intersection(candidate_aliases))
 
 
+def _excluded_category_selection_ids(settings: Dict[str, Any]) -> set[str]:
+    selection = settings.get("excludedCategorySelection")
+    if not isinstance(selection, dict):
+        return set()
+    return {
+        str(value).strip()
+        for level in ("level1", "level2", "level3")
+        for value in (selection.get(level, []) if isinstance(selection.get(level, []), list) else [])
+        if str(value).strip()
+    }
+
+
 def _category_name_path(category_tree: Any, leaf_category_id: str) -> str:
     wanted = str(leaf_category_id or "").strip()
     if not wanted or not isinstance(category_tree, list):
@@ -7670,6 +8155,22 @@ def _visible_source_candidate_result(
             rejected.append(candidate)
             category_filtered_ids.add(str(candidate.get("productId") or ""))
         candidates = [candidate for candidate in candidates if _candidate_matches_manual_categories(candidate, selected_category_ids)]
+    excluded_category_ids = _excluded_category_selection_ids(settings) if not category_logic_enabled else set()
+    excluded_by_category = [
+        candidate for candidate in candidates
+        if excluded_category_ids and _candidate_matches_manual_categories(candidate, excluded_category_ids)
+    ]
+    for candidate in excluded_by_category:
+        candidate["analysisRejected"] = True
+        candidate["thresholdReasons"] = ["命中通用设置中排除的类目"]
+        candidate["status"] = candidate["thresholdReasons"][0]
+        candidate["cartAdded"] = False
+        candidate["skipped"] = True
+        rejected.append(candidate)
+        category_filtered_ids.add(str(candidate.get("productId") or ""))
+    if excluded_by_category:
+        excluded_ids = {str(candidate.get("productId") or "") for candidate in excluded_by_category}
+        candidates = [candidate for candidate in candidates if str(candidate.get("productId") or "") not in excluded_ids]
     _candidate_quality_scores(candidates, settings)
     for candidate in candidates:
         base_score = _number(candidate.get("analysisScore")) or 0.0
@@ -7739,6 +8240,7 @@ def _visible_source_candidate_result(
             f"通用数据模式类目识别统计：候选总数 {category_enrichment['candidateCount']} → "
             f"列表含完整三级类目 {category_enrichment['successCount']} 个，类目未知 {category_enrichment['failureCount']} 个；"
             "类目未知商品仍可按数据门槛入选，不计入类目推荐。"
+            + (f"通用设置排除类目过滤 {len(excluded_by_category)} 个商品。" if excluded_by_category else "")
             + f"推荐依据：{recommendation_summary}。"
         )
     category_enrichment["summary"] = enrichment_summary
@@ -7793,6 +8295,8 @@ def _visible_source_candidate_result(
         source_result["categoryFilteredCount"] = len(source_ids.intersection(category_filtered_ids))
         source_result["thresholdRejectedCount"] = len(source_ids.intersection(rejected_ids))
     category_enrichment["selectionMode"] = "category" if category_logic_enabled else "general"
+    category_enrichment["excludedCategoryIds"] = sorted(excluded_category_ids)
+    category_enrichment["excludedCategoryCount"] = len(excluded_by_category)
     category_enrichment["sourceStatistics"] = {
         str(item.get("sourceKey") or ""): {
             "collected": int(item.get("productCount") or 0),
@@ -9282,7 +9786,7 @@ def apply_settings_and_collect_candidates(
     preserve_product_ids: Optional[Sequence[str]] = None,
     progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    """按当前策略读取百应候选；A-104 可限定为热点/榜单当前可见商品。"""
+    """按当前策略读取百应候选；可将热点趋势、联盟榜单、选品广场当前可见商品统一筛选。"""
     if force_refresh:
         _clear_page_material_cache(id(page))
     settings = copy.deepcopy(settings)
@@ -11274,19 +11778,21 @@ def execute_selected_candidates(
         alliance_direct_cart = _is_alliance_direct_cart_row(candidate, card)
         cart_path = "titleDirectCart" if alliance_direct_cart else "cardAddCart"
         candidate["cartPath"] = cart_path
-        try:
-            before_text = " ".join((card.inner_text() or "").split())
-            already_in_cart = _candidate_is_in_cart(candidate, before_text)
-        except Exception as error:
-            completed.append(_cart_control_failure_result(
-                page,
-                candidate,
-                f"读取商品卡片加车状态失败：{type(error).__name__}: {_safe_diagnostic_text(error, 300)}",
-                {"button.add-cart": _safe_locator_count(card, "button.add-cart")},
-            ))
-            if _selection_error_requires_pause(error):
-                break
-            continue
+        already_in_cart = candidate.get("cartAdded") is True
+        if not already_in_cart:
+            try:
+                before_text = " ".join((card.inner_text() or "").split())
+                already_in_cart = _candidate_is_in_cart(candidate, before_text)
+            except Exception as error:
+                completed.append(_cart_control_failure_result(
+                    page,
+                    candidate,
+                    f"读取商品卡片加车状态失败：{type(error).__name__}: {_safe_diagnostic_text(error, 300)}",
+                    {"button.add-cart": _safe_locator_count(card, "button.add-cart")},
+                ))
+                if _selection_error_requires_pause(error):
+                    break
+                continue
         if already_in_cart:
             cart_path = "alreadyInCart"
             candidate["cartPath"] = cart_path
@@ -11789,7 +12295,27 @@ def execute_selected_candidates(
 
         output_dir = Path(download_root).expanduser() / datetime.now().strftime("%Y-%m-%d") / _safe_name(title)
         source_dir = output_dir / "商品详情图"
-        source_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            source_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            directory_error = (
+                f"无法创建商品详情图目录（{type(error).__name__}: "
+                f"{_safe_diagnostic_text(error, 500)}）"
+            )
+            completed.append({
+                "productId": product_id,
+                "commodityId": candidate.get("commodityId"),
+                "title": title,
+                "productUrl": product_url,
+                "cartAdded": True,
+                "cartStatus": "已在选品车" if already_in_cart else "百应接口已确认加车",
+                "status": "已确认加入选品车，但素材目录创建失败；未下载详情图。" + cart_status_note,
+                "outputDir": str(output_dir),
+                "imagePaths": [],
+                "imageErrors": [directory_error],
+                **cart_metadata,
+            })
+            continue
         image_paths: list[str] = []
         image_errors: list[str] = []
         for index, url in enumerate(gallery):
@@ -12528,7 +13054,7 @@ def _execute_visible_source_candidates(
                 download_root,
                 settings,
                 progress=progress,
-                analyze_before_cart=True,
+                analyze_before_cart=not all(candidate.get("cartAdded") is True for candidate in group),
                 max_selected_products=remaining,
             )
             completed.extend(group_result)
@@ -12615,6 +13141,12 @@ def run_selection_command(
         selected = [int(row["cardIndex"]) for row in candidates if row.get("selected") is True]
     if not selected and candidates:
         raise RuntimeError("没有选择候选商品")
+    if command.get("recoverExistingCart") is True:
+        selected_rows = [row for row in candidates if row.get("cardIndex") in selected]
+        if len(selected_rows) != len(set(selected)) or not selected_rows or any(
+            row.get("cartAdded") is not True for row in selected_rows
+        ):
+            raise RuntimeError("详情恢复只允许处理检查点中已确认加车的原商品；本次未点击加车。")
     _report_operation_progress(
         progress,
         "准备处理选中商品",
@@ -12628,11 +13160,18 @@ def run_selection_command(
         str(row.get("productId") or "") for row in candidates
         if isinstance(row, dict) and row.get("cartAttempted") is True and str(row.get("productId") or "")
     }
+    cart_confirmed_ids = {
+        str(row.get("productId") or "") for row in candidates
+        if isinstance(row, dict) and row.get("cartAdded") is True and str(row.get("productId") or "")
+    }
 
-    def preserve_cart_attempt_markers(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    def preserve_cart_markers(rows: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
         for row in rows:
-            if str(row.get("productId") or "") in cart_attempted_ids:
+            product_id = str(row.get("productId") or "")
+            if product_id in cart_attempted_ids:
                 row["cartAttempted"] = True
+            if product_id in cart_confirmed_ids:
+                row["cartAdded"] = True
         return rows
 
     prompt_kind, prompt_text = _visible_baiying_prompt(page)
@@ -12703,7 +13242,7 @@ def run_selection_command(
                 force_refresh=True,
                 preserve_product_ids=original_ids,
             )
-            live_candidates = preserve_cart_attempt_markers(refreshed.get("candidates", []))
+            live_candidates = preserve_cart_markers(refreshed.get("candidates", []))
             remapped, missing = remap_selected_candidate_indexes(live_candidates, original_ids)
             live_candidates, unavailable = _exclude_unrendered_selected_candidates(page, live_candidates, original_ids)
             if unavailable:
@@ -12714,7 +13253,7 @@ def run_selection_command(
                 # 列表缺少原 ID 时，再点一次页面“搜索”并等待响应稳定；仍按原 ID
                 # 恢复，不用排名靠前的其他商品替代。
                 searched = search_baiying_candidates(page, settings, preserve_product_ids=original_ids)
-                searched_candidates = preserve_cart_attempt_markers(searched.get("candidates", []))
+                searched_candidates = preserve_cart_markers(searched.get("candidates", []))
                 searched_indexes, still_missing = remap_selected_candidate_indexes(searched_candidates, original_ids)
                 searched_candidates, unavailable = _exclude_unrendered_selected_candidates(page, searched_candidates, original_ids)
                 if unavailable:
@@ -12733,6 +13272,10 @@ def run_selection_command(
             candidates = live_candidates
             selected = remapped
             result = refreshed
+    if command.get("recoverExistingCart") is True:
+        selected_rows = [row for row in candidates if row.get("cardIndex") in selected]
+        if not selected_rows or any(row.get("cartAdded") is not True for row in selected_rows):
+            raise RuntimeError("详情恢复未能确认检查点中的原商品已加车；本次未点击加车。")
     try:
         completed = execute_selected_candidates(
             page, context, candidates, selected, str(command.get("downloadPath", "")), settings,

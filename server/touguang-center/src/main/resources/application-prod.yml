@@ -1,0 +1,18 @@
+spring:
+  datasource:
+    url: "${DB_URL:jdbc:mysql://${DB_HOST:127.0.0.1}:${DB_PORT:3306}/${DB_NAME:touguang_center}?useUnicode=true&characterEncoding=utf8&useSSL=true&serverTimezone=Asia/Shanghai}"
+    username: ${DB_USERNAME:touguang_app}
+    password: ${DB_PASSWORD:}
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      username: ${REDIS_USERNAME:}
+      password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: ${REDIS_SSL:false}
+  flyway:
+    enabled: ${DB_MIGRATION_ENABLED:true}
+
+server:
+  address: ${SERVER_BIND_ADDRESS:0.0.0.0}

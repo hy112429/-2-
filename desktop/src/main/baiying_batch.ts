@@ -1,7 +1,7 @@
-import { ipcMain, BrowserWindow, type WebContents } from 'electron'
+import { ipcMain, type WebContents } from 'electron'
 import { onProductCaptured } from './probe'
 import { runScript } from './engine'
-import { ensureLoginView, attachLoginViewAt, detachLoginView, checkLoginState } from './login'
+import { commandManagedBrowser } from './external_browser'
 
 /**
  * 百应「半自动批量浏览」驱动（T-15）
@@ -10,7 +10,7 @@ import { ensureLoginView, attachLoginViewAt, detachLoginView, checkLoginState } 
  * （合规不逆向）。替代方案是让**已登录的真实浏览器**逐个打开商品详情页——
  * 签名由浏览器天然生成，客户端只做响应解析（探针 probe.ts）并落库。
  *
- * 流程：商品ID列表 → 逐个导航登录视图到该商品的「商品决策页」路由 → 探针捕获
+ * 流程：选择本地账号 → 使用其专属托管 Chrome profile → 逐个打开商品详情页 → 探针捕获
  * pack_detail → 写入 baiying_products 缓存 → 固定间隔 + 随机抖动限速 → 下一个。
  *
  * 关键实测（2026-10-12，7 轮二分）：详情路由必须携带 commodity_id 等上下文参数，
@@ -19,8 +19,7 @@ import { ensureLoginView, attachLoginViewAt, detachLoginView, checkLoginState } 
 
 const DETAIL_ROUTE = 'https://buyin.jinritemai.com/dashboard/merch-picking-library/merch-promoting'
 
-/** 单商品最大等待时间：页面加载 20s + 捕获 25s */
-const LOAD_TIMEOUT_MS = 20_000
+/** 单商品最大等待时间：等待详情接口响应 */
 const CAPTURE_TIMEOUT_MS = 25_000
 /** 单批上限（避免一次性驱动过多页面触发风控） */
 const MAX_BATCH = 500
@@ -31,6 +30,13 @@ const MIN_INTERVAL_MS = 2_000
 interface BatchItemInput {
   productId: string
   commodityId?: string
+}
+
+interface BaiyingCaptureAccount {
+  id: number
+  name: string
+  profilePath?: string
+  status: string
 }
 
 /** 解析输入行 */
@@ -50,8 +56,8 @@ interface BatchRun {
 const RUNNING = new Map<string, BatchRun>()
 let seq = 0
 
-/** 最近一次捕获的时间戳（productId → ts），由探针通知更新 */
-const lastCaptured = new Map<string, number>()
+/** 最近一次详情响应（账号与商品 → 时间及视频条数），由探针通知更新。 */
+const lastCaptured = new Map<string, { time: number; videoCount: number }>()
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -76,37 +82,6 @@ function buildDetailUrl(item: BatchItemInput): string {
   )
 }
 
-/** 导航到详情页，等 did-finish-load / did-fail-load（超时兜底） */
-function loadDetail(wc: WebContents, url: string): Promise<{ ok: boolean; code?: number; desc?: string }> {
-  return new Promise((resolve) => {
-    let settled = false
-    const finish = (r: { ok: boolean; code?: number; desc?: string }): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      wc.removeListener('did-finish-load', onFinish)
-      wc.removeListener('did-fail-load', onFail)
-      resolve(r)
-    }
-    const onFinish = (): void => finish({ ok: true })
-    const onFail = (_e: unknown, code: number, desc: string): void => finish({ ok: false, code, desc })
-    const timer = setTimeout(() => finish({ ok: false, code: -2, desc: '页面加载超时' }), LOAD_TIMEOUT_MS)
-
-    wc.on('did-finish-load', onFinish)
-    wc.on('did-fail-load', onFail)
-
-    // 同一 URL 再次导航不会触发加载，强制 reload
-    const target = new URL(url)
-    const current = wc.getURL()
-    const currentUrl = current ? new URL(current) : null
-    if (currentUrl && currentUrl.origin === target.origin && currentUrl.pathname === target.pathname) {
-      wc.reload()
-    } else {
-      void wc.loadURL(url).catch(() => finish({ ok: false, code: -1, desc: 'loadURL 抛出异常' }))
-    }
-  })
-}
-
 /** 从百应缓存查询 commodity_id（用户只提供 product_id 时自动补全） */
 function resolveCommodity(productId: string): Promise<string | null> {
   return new Promise((resolve) => {
@@ -125,29 +100,31 @@ function resolveCommodity(productId: string): Promise<string | null> {
   })
 }
 
-/** 轮询等待探针捕获到指定商品（before 之后的新捕获），超时返回 false */
+/** 轮询等待探针捕获到指定商品（before 之后的新捕获）；null 表示超时。 */
 function waitCapture(
   productId: string,
+  accountId: number,
   before: number,
   timeoutMs: number,
   flag: { canceled: boolean }
-): Promise<boolean> {
+): Promise<number | null> {
   return new Promise((resolve) => {
     const started = Date.now()
     const timer = setInterval(() => {
       if (flag.canceled) {
         clearInterval(timer)
-        resolve(false)
+        resolve(null)
         return
       }
-      if ((lastCaptured.get(productId) ?? 0) > before) {
+      const captured = lastCaptured.get(`${accountId}:${productId}`)
+      if (captured && captured.time > before) {
         clearInterval(timer)
-        resolve(true)
+        resolve(captured.videoCount)
         return
       }
       if (Date.now() - started > timeoutMs) {
         clearInterval(timer)
-        resolve(false)
+        resolve(null)
       }
     }, 400)
   })
@@ -157,6 +134,7 @@ async function runBatch(
   taskId: string,
   sender: Electron.WebContents,
   items: BatchItemInput[],
+  account: BaiyingCaptureAccount,
   intervalMs: number,
   flag: { canceled: boolean }
 ): Promise<void> {
@@ -164,27 +142,29 @@ async function runBatch(
     if (!sender.isDestroyed()) sender.send('baiying:event', { taskId, ...payload })
   }
 
-  // 前置条件：百应已登录（驱动的是登录视图，未登录打开详情页必然拿不到数据）
-  const login = await checkLoginState()
-  const baiying = login.targets.find((t) => t.id === 'baiying')
-  if (!baiying?.loggedIn) {
-    emit({ type: 'error', message: '百应未登录：请先在「巨量百应」工作台扫码登录后重试' })
+  const browserOptions = { profileKey: `account-${account.id}`, profilePath: account.profilePath }
+  let login: Record<string, unknown>
+  try {
+    login = await commandManagedBrowser('check-account-logins', { accountId: account.id }, browserOptions)
+  } catch (error) {
+    emit({
+      type: 'error',
+      message: `检查账号“${account.name}”的百应登录状态失败：${error instanceof Error ? error.message : String(error)}`
+    })
+    RUNNING.delete(taskId)
+    return
+  }
+  const baiying = login.baiying as { state?: string; message?: string } | undefined
+  if (login.ok !== true || baiying?.state !== 'logged_in') {
+    emit({ type: 'error', message: `账号“${account.name}”的专属百应未确认登录：${baiying?.message ?? '请先打开该账号百应登录页并完成登录'}` })
     RUNNING.delete(taskId)
     return
   }
 
-  const view = ensureLoginView()
-  const wc = view.webContents
-
-  // 挂到窗口给真实视口（0×0 视图会导致详情懒加载不触发、pack_detail 不发请求）
-  const host = BrowserWindow.getAllWindows().find((w) => !w.isDestroyed())
-  if (host) {
-    const [width, height] = host.getContentSize()
-    attachLoginViewAt({ x: 0, y: 0, width, height })
-  }
-
   const offCaptured = onProductCaptured((p) => {
-    lastCaptured.set(p.productId, Date.now())
+    if (p.accountId === account.id) lastCaptured.set(`${account.id}:${p.productId}`, {
+      time: Date.now(), videoCount: p.videoUrls.length
+    })
   })
 
   const total = items.length
@@ -205,7 +185,8 @@ async function runBatch(
         message: `第 ${i + 1}/${total} 个：${pid}`
       })
 
-      const before = lastCaptured.get(pid) ?? 0
+      const captureKey = `${account.id}:${pid}`
+      const before = lastCaptured.get(captureKey)?.time ?? 0
 
       // commodity_id 是触发 pack_detail 的必要参数：优先用户提供，否则从缓存自动补全
       let commodityId: string | null | undefined = item.commodityId
@@ -224,32 +205,33 @@ async function runBatch(
         continue
       }
 
-      const loaded = await loadDetail(wc, buildDetailUrl({ productId: pid, commodityId }))
-      if (flag.canceled) break
-
-      // -3 是主动中断（reload 等）不算失败，仍进入捕获等待
-      if (loaded.ok || loaded.code === -3) {
-        const captured = await waitCapture(pid, before, CAPTURE_TIMEOUT_MS, flag)
+      try {
+        const opened = await commandManagedBrowser('open', {
+          url: buildDetailUrl({ productId: pid, commodityId })
+        }, browserOptions)
+        if (opened.ok !== true) throw new Error(String(opened.error ?? '百应商品详情打开失败'))
         if (flag.canceled) break
-        if (captured) {
+        const captured = await waitCapture(pid, account.id, before, CAPTURE_TIMEOUT_MS, flag)
+        if (flag.canceled) break
+        if (captured !== null && captured > 0) {
           success++
-          emit({ type: 'product', productId: pid, status: 'success', message: '已捕获视频直链' })
+          emit({ type: 'product', productId: pid, status: 'success', message: `已从账号“${account.name}”捕获 ${captured} 条视频直链` })
         } else {
           failed++
           emit({
             type: 'product',
             productId: pid,
             status: 'failed',
-            message: '未捕获到视频直链（详情页可能未正常渲染）'
+            message: captured === 0 ? '百应详情已返回，但该商品没有视频直链' : '未捕获到商品详情响应（详情页可能未正常渲染）'
           })
         }
-      } else {
+      } catch (error) {
         failed++
         emit({
           type: 'product',
           productId: pid,
           status: 'failed',
-          message: `页面加载失败：${loaded.desc ?? loaded.code}`
+          message: `账号“${account.name}”打开商品详情失败：${error instanceof Error ? error.message : String(error)}`
         })
       }
 
@@ -259,7 +241,6 @@ async function runBatch(
     }
   } finally {
     offCaptured()
-    detachLoginView()
     RUNNING.delete(taskId)
   }
 
@@ -272,14 +253,51 @@ async function runBatch(
   })
 }
 
+async function loadBaiyingCaptureAccounts(): Promise<BaiyingCaptureAccount[]> {
+  const listed = await runScript('account_manager.py', { args: ['account-list'], onEvent: () => undefined }).promise
+  if (!listed.ok || !listed.result) throw new Error(listed.error ?? '读取账号列表失败')
+  const rows = (listed.result as { accounts?: Array<Record<string, unknown>> }).accounts ?? []
+  const activeRows = rows.filter((row) => row.status === 'active' && Number.isSafeInteger(Number(row.id)) && Number(row.id) > 0)
+  const accounts: BaiyingCaptureAccount[] = []
+  for (const row of activeRows) {
+    const id = Number(row.id)
+    const settingsReply = await runScript('selection_settings.py', {
+      args: ['get', '--account-id', String(id)],
+      onEvent: () => undefined
+    }).promise
+    if (!settingsReply.ok || !settingsReply.result) {
+      throw new Error(`读取账号“${String(row.name ?? id)}”的百应浏览器路径失败：${settingsReply.error ?? '未知错误'}`)
+    }
+    const settings = (settingsReply.result as {
+      settings?: { account?: { browserProfilePath?: unknown } }
+    }).settings?.account
+    const configuredPath = typeof settings?.browserProfilePath === 'string' ? settings.browserProfilePath.trim() : ''
+    accounts.push({
+      id,
+      name: String(row.name ?? `账号-${id}`),
+      status: String(row.status ?? ''),
+      ...(configuredPath ? { profilePath: configuredPath } : {})
+    })
+  }
+  return accounts
+}
+
 // ---------------------------------------------------------------- IPC 注册
 
 export function registerBaiyingBatchIpc(): void {
+  ipcMain.handle('baiying:batchAccounts', async () => {
+    try {
+      return { ok: true, accounts: await loadBaiyingCaptureAccounts() }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
   ipcMain.handle(
     'baiying:batchStart',
     async (
       event,
-      params: { productIds?: string[]; intervalMs?: number }
+      params: { productIds?: string[]; accountId?: number; intervalMs?: number }
     ): Promise<{ ok: boolean; taskId?: string; error?: string }> => {
       const items: BatchItemInput[] = (Array.isArray(params?.productIds) ? params.productIds : [])
         .map((s) => String(s).trim())
@@ -293,13 +311,22 @@ export function registerBaiyingBatchIpc(): void {
         }
       }
       if (items.length > MAX_BATCH) return { ok: false, error: `单批最多 ${MAX_BATCH} 个商品 ID，请分批` }
+      const accountId = Number(params?.accountId)
+      if (!Number.isSafeInteger(accountId) || accountId < 1) return { ok: false, error: '请先选择百应采集账号' }
+      let account: BaiyingCaptureAccount
+      try {
+        account = (await loadBaiyingCaptureAccounts()).find((item) => item.id === accountId) as BaiyingCaptureAccount
+        if (!account) return { ok: false, error: '所选账号不存在或已停用，请刷新账号列表后重试' }
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      }
 
       const intervalMs = Math.max(MIN_INTERVAL_MS, Math.min(60_000, params?.intervalMs ?? 8_000))
       const taskId = `baiying-batch-${++seq}`
       const flag = { canceled: false }
       RUNNING.set(taskId, { flag })
 
-      void runBatch(taskId, event.sender, items, intervalMs, flag)
+      void runBatch(taskId, event.sender, items, account, intervalMs, flag)
       return { ok: true, taskId }
     }
   )

@@ -1,0 +1,183 @@
+✔ 开发态隔离测试根目录仅允许 D 盘建议安装根目录下的独立子目录 (1.6062ms)
+✔ 打包版忽略开发态隔离测试环境变量 (0.3097ms)
+node:internal/modules/cjs/loader:1456
+  const err = new Error(message);
+              ^
+
+Error: Cannot find module './app-dirs'
+Require stack:
+- D:\抖音电商\投广管理客户端\desktop\scripts\external_browser_retry.test.mjs
+    at Module._resolveFilename (node:internal/modules/cjs/loader:1456:15)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1066:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1071:22)
+    at Module._load (node:internal/modules/cjs/loader:1242:25)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+    at Module.require (node:internal/modules/cjs/loader:1556:12)
+    at require (node:internal/modules/helpers:152:16)
+    at localRequire (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/external_browser_retry.test.mjs:16:10)
+    at eval (eval at <anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/external_browser_retry.test.mjs:18:1), <anonymous>:19:20)
+    at file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/external_browser_retry.test.mjs:18:55 {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [
+    'D:\\抖音电商\\投广管理客户端\\desktop\\scripts\\external_browser_retry.test.mjs'
+  ]
+}
+
+Node.js v24.14.1
+✖ scripts\external_browser_retry.test.mjs (671.8608ms)
+✔ 调度轮询在基础间隔上增加闭区间随机错峰 (1.0564ms)
+✔ 错峰设置读取无效时回到默认范围，非法区间拒绝计算 (1.5714ms)
+✔ 千川 OAuth 校验 state、保留长 ID、刷新 Token 后继续按商品 ID 查询 (68.4098ms)
+✔ 恢复批次只执行选中的未完成账号且不改写其他检查点 (2.9898ms)
+✔ 恢复账号筛选忽略已完成账号和批次外账号 (0.3661ms)
+✔ 验证码、登录和浏览器断连错误停在 failed，不进入限流自动续跑 (1.8695ms)
+✔ 百应 11001 限流错误会保存为可恢复检查点 (0.4112ms)
+✔ 页面已打开但工作台短暂未识别时只复查一次并可继续 (0.831ms)
+✔ 真实登录/验证码/断连和普通 unknown 不触发登录假阴性重试 (0.6458ms)
+✔ 两类中途错误最终失败结束；限流和验证码断连保留原待恢复语义 (0.3884ms)
+✔ 冷却归零后只为仍待恢复的限流批次排入自动续跑 (0.3124ms)
+✔ 冷却意图在 busy 期间保留，busy 解除后自动续选且忽略过渡态标志 (1.0983ms)
+✔ 冷却恢复已启动时防重复，账号检查点失效时明确判过期 (0.6429ms)
+✔ 自动恢复遇设置变化时按当前保存设置直续，手动恢复仍走确认流程 (1.3827ms)
+✔ 恢复上下文差异忽略 Windows 路径大小写和分隔符漂移 (1.1254ms)
+✔ 批次按账号 ID 串行处理启用账号并跳过停用账号 (58.5452ms)
+✔ 账号 A 遇 11001 保留失败原因，后续账号 B 仍立即执行 (0.4759ms)
+✔ 账号 A 遇验证码、登录或断连时保留失败原因，账号 B 仍立即执行 (0.4007ms)
+✔ 冷却恢复先重试限流账号，再按原规则继续其他账号 (0.1105ms)
+✔ 账号 A 部分完成且未显式允许续批时，账号 B 仍执行并保留 A 的说明 (0.1034ms)
+✔ 重复触发批次复用当前任务，不会再次调用执行函数 (0.1059ms)
+✔ 人工勾选只作用于预览所属账号，其他账号使用各自自动精选 (0.0841ms)
+✔ 账号资源路径大小写或分隔符相同会被识别为冲突 (0.2773ms)
+✔ 加车失败检查点恢复时按原候选 ID 重试加车 (0.0942ms)
+✔ 已确认加车的检查点继续后续阶段且不重新加车 (0.0492ms)
+✔ 冲突的完整类目设置可按 cart_pending 已选商品来源收窄到唯一末级路径 (0.6436ms)
+✔ 恢复多个候选时保留每个已选商品的有效来源末级类目 (0.2062ms)
+✔ 缺失、重复或与目录冲突的候选来源路径会阻止恢复查询 (0.1748ms)
+✔ 类目推荐先比较高分商品数量，再比较平均分，并在候选序列中轮转类目 (3.7297ms)
+✔ 无 60 分候选时按 A-67 分数取前 N 个，并用已用较少的类目打破同分 (0.5906ms)
+✖ 登记过滤强制排除全局重复商品、账号历史类目和缺少类目 ID 的候选 (2.8792ms)
+✔ 主进程 deadline 到点后续选；模拟后台漏 tick 和提前唤醒 (1.4106ms)
+✔ deadline 已经过期时立即通知，取消中的定时器不再续选 (0.1988ms)
+✔ 主进程 IPC 只接受有效批次 deadline，并按批次发送到期通知 (1.1211ms)
+✔ 到期 IPC 未确认时重发；恢复入队确认后停止重发并等待真正启动 (2264.4787ms)
+✔ 11001 映射为限流说明并保留倒计时，不泄露 IPC 和 Trace (2.2187ms)
+✔ 11001 冷却结束时提供可继续选品的业务提示 (0.7289ms)
+✔ 选品太多、请求过多和常见频控文案统一识别为百应限流 (1.0212ms)
+✔ 验证码、登录和浏览器断连映射为换号可读文案 (1.0834ms)
+✔ 登录和连接状态分类可与限流分类区分 (0.5319ms)
+✔ 筛选和页面状态按 classification 映射为业务可读文案 (0.3324ms)
+✔ 普通中文业务进度原样显示，未知技术异常隐藏在诊断详情 (1.4905ms)
+✔ 选品通知、进度和结果绑定映射文案，冷却后有恢复入口 (1.3427ms)
+✔ 账号级验证失败写入 failed 后交给串行调度器，候选预览失败可排除单账号 (0.8808ms)
+✖ 配置仅返回密钥状态，回环 HTTP 可用，检查连接会携带认证头 (144.464ms)
+✖ 候选快照会清洗账号 ID、去重本轮商品/末级类目并传递认证密钥 (1.6273ms)
+✖ 缺少稳定账号 ID 时拒绝快照请求，非回环 HTTP 配置会被拦截 (0.1823ms)
+ℹ tests 50
+ℹ suites 0
+ℹ pass 45
+ℹ fail 5
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3024.9782
+
+✖ failing tests:
+
+test at scripts\external_browser_retry.test.mjs:1:1
+✖ scripts\external_browser_retry.test.mjs (671.8608ms)
+  'test failed'
+
+test at scripts\selection_candidates.test.mjs:49:1
+✖ 登记过滤强制排除全局重复商品、账号历史类目和缺少类目 ID 的候选 (2.8792ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+      [
+        'global-used',
+        '商品 ID 已在全账号池登记'
+      ],
+      [
+        'account-category-used',
+  +     '该账号历史或本轮已使用此末级类目'
+  -     '该账号历史已使用此末级类目'
+      ],
+      [
+        'missing-category',
+  +     '品类模式下来源数据缺少三级类目 ID'
+  -     '来源数据缺少商品 ID 或三级类目 ID'
+      ]
+    ]
+  
+      at TestContext.<anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_candidates.test.mjs:63:10)
+      at Test.runInAsyncScope (node:async_hooks:228:14)
+      at Test.run (node:internal/test_runner/test:1118:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:787:18)
+      at Test.postRun (node:internal/test_runner/test:1247:19)
+      at Test.run (node:internal/test_runner/test:1175:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:787:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ [ 'global-used', '商品 ID 已在全账号池登记' ], [ 'account-category-used', '该账号历史或本轮已使用此末级类目' ], [ 'missing-category', '品类模式下来源数据缺少三级类目 ID' ] ],
+    expected: [ [ 'global-used', '商品 ID 已在全账号池登记' ], [ 'account-category-used', '该账号历史已使用此末级类目' ], [ 'missing-category', '来源数据缺少商品 ID 或三级类目 ID' ] ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at scripts\selection_registry_adapter.test.mjs:56:1
+✖ 配置仅返回密钥状态，回环 HTTP 可用，检查连接会携带认证头 (144.464ms)
+  Error: Cannot find module './app-dirs'
+  Require stack:
+  - D:\抖音电商\投广管理客户端\desktop\scripts\selection_registry_adapter.test.mjs
+      at Module._resolveFilename (node:internal/modules/cjs/loader:1456:15)
+      at defaultResolveImpl (node:internal/modules/cjs/loader:1066:19)
+      at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1071:22)
+      at Module._load (node:internal/modules/cjs/loader:1242:25)
+      at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+      at Module.require (node:internal/modules/cjs/loader:1556:12)
+      at require (node:internal/modules/helpers:152:16)
+      at mockedRequire (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:33:68)
+      at eval (eval at <anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:34:3), <anonymous>:11:20)
+      at TestContext.<anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:34:57) {
+    code: 'MODULE_NOT_FOUND',
+    requireStack: [ 'D:\\抖音电商\\投广管理客户端\\desktop\\scripts\\selection_registry_adapter.test.mjs' ]
+  }
+
+test at scripts\selection_registry_adapter.test.mjs:87:1
+✖ 候选快照会清洗账号 ID、去重本轮商品/末级类目并传递认证密钥 (1.6273ms)
+  Error: Cannot find module './app-dirs'
+  Require stack:
+  - D:\抖音电商\投广管理客户端\desktop\scripts\selection_registry_adapter.test.mjs
+      at Module._resolveFilename (node:internal/modules/cjs/loader:1456:15)
+      at defaultResolveImpl (node:internal/modules/cjs/loader:1066:19)
+      at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1071:22)
+      at Module._load (node:internal/modules/cjs/loader:1242:25)
+      at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+      at Module.require (node:internal/modules/cjs/loader:1556:12)
+      at require (node:internal/modules/helpers:152:16)
+      at mockedRequire (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:33:68)
+      at eval (eval at <anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:34:3), <anonymous>:11:20)
+      at TestContext.<anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:34:57) {
+    code: 'MODULE_NOT_FOUND',
+    requireStack: [ 'D:\\抖音电商\\投广管理客户端\\desktop\\scripts\\selection_registry_adapter.test.mjs' ]
+  }
+
+test at scripts\selection_registry_adapter.test.mjs:123:1
+✖ 缺少稳定账号 ID 时拒绝快照请求，非回环 HTTP 配置会被拦截 (0.1823ms)
+  Error: Cannot find module './app-dirs'
+  Require stack:
+  - D:\抖音电商\投广管理客户端\desktop\scripts\selection_registry_adapter.test.mjs
+      at Module._resolveFilename (node:internal/modules/cjs/loader:1456:15)
+      at defaultResolveImpl (node:internal/modules/cjs/loader:1066:19)
+      at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1071:22)
+      at Module._load (node:internal/modules/cjs/loader:1242:25)
+      at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+      at Module.require (node:internal/modules/cjs/loader:1556:12)
+      at require (node:internal/modules/helpers:152:16)
+      at mockedRequire (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:33:68)
+      at eval (eval at <anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:34:3), <anonymous>:11:20)
+      at TestContext.<anonymous> (file:///D:/%E6%8A%96%E9%9F%B3%E7%94%B5%E5%95%86/%E6%8A%95%E5%B9%BF%E7%AE%A1%E7%90%86%E5%AE%A2%E6%88%B7%E7%AB%AF/desktop/scripts/selection_registry_adapter.test.mjs:34:57) {
+    code: 'MODULE_NOT_FOUND',
+    requireStack: [ 'D:\\抖音电商\\投广管理客户端\\desktop\\scripts\\selection_registry_adapter.test.mjs' ]
+  }
+EXIT=1

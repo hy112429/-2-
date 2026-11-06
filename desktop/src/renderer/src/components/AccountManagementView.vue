@@ -75,9 +75,12 @@ interface AccountBrowserPageStatus {
 const DB_PATH = 'D:\\software\\投广客户端\\data\\ad_client.db'
 const TABS = ['账号列表', '账号分组', '千川账户'] as const
 
+const props = defineProps<{ initialTab?: (typeof TABS)[number] }>()
+
 // ---------------------------------------------------------------- 状态
 
-const activeTab = ref<(typeof TABS)[number]>('账号列表')
+const activeTab = ref<(typeof TABS)[number]>(props.initialTab ?? '账号列表')
+watch(() => props.initialTab, (tab) => { if (tab) activeTab.value = tab }, { immediate: true })
 const stats = ref<StatsRow | null>(null)
 const accounts = ref<AccountRow[]>([])
 const groups = ref<GroupRow[]>([])
@@ -85,6 +88,8 @@ const qcs = ref<QcRow[]>([])
 const selected = ref<Set<number>>(new Set())
 const accountPage = ref(1)
 const accountPageSize = ref(20)
+const compactLayout = ref(window.innerWidth <= 2400)
+function updateCompactLayout(): void { compactLayout.value = window.innerWidth <= 2400 }
 const busy = ref(false)
 const notice = ref('')
 const errorMsg = ref('')
@@ -569,7 +574,10 @@ async function openQcLogin(row: QcRow): Promise<void> {
   await withBusy(async () => {
     const r = await window.api.qianchuan.openLogin(row.id)
     if (!r.ok) throw new Error(r.error ?? '打开千川登录失败')
-    setNotice(`已在独立 Chrome profile 打开千川登录页；Playwright CDP 会复用该 profile，客户端 Electron 缓存仍独立。`)
+    const name = row.qc_name || row.qc_id || `档案 #${row.id}`
+    let pageAccount = ''
+    try { pageAccount = new URL(r.url).searchParams.get('aavid') ?? '' } catch { /* 登录跳转页不一定含账户参数 */ }
+    setNotice(`已打开千川档案「${name}」的独立 Chrome 资料目录：${r.profilePath ?? '未返回目录'}。${pageAccount ? `页面当前广告主 ID：${pageAccount}。` : ''}同一档案重开会保留原登录态；切换千川账号请先在这个窗口退出原账号，再登录目标账号。其他档案使用各自的资料目录。`)
   })
 }
 
@@ -676,6 +684,7 @@ async function openMaterialFolder(row: AccountRow): Promise<void> {
 // ---------------------------------------------------------------- 生命周期
 
 onMounted(() => {
+  window.addEventListener('resize', updateCompactLayout)
   void loadAll()
   browserPageScanTimer = window.setInterval(() => { void refreshOpenBrowserPages() }, 10_000)
   const off1 = window.api.account.onStateChanged((s) => (viewState.value = s))
@@ -690,6 +699,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('resize', updateCompactLayout)
   if (browserPageScanTimer !== undefined) window.clearInterval(browserPageScanTimer)
   scrollEl.value?.removeEventListener('scroll', onScroll)
   unsubscribers.forEach((off) => off())
@@ -780,7 +790,7 @@ function toggleSelectBind(id: number): void {
       </div>
 
       <!-- 账号表格 -->
-      <div class="table-wrap">
+      <div v-if="!compactLayout" class="table-wrap account-table-wrap">
         <table class="grid">
           <thead>
             <tr>
@@ -872,6 +882,53 @@ function toggleSelectBind(id: number): void {
         </table>
       </div>
 
+      <!-- 普通窗口宽度下把操作放在账号信息旁，避免横向滚动才能找到按钮。 -->
+      <div v-if="compactLayout" class="compact-list account-card-list">
+        <article v-for="(row, index) in visibleAccounts" :key="row.id" class="compact-card">
+          <div class="compact-head">
+            <label class="compact-identity">
+              <input type="checkbox" :checked="selected.has(row.id)" @change="toggleSelect(row.id)" />
+              <span><strong>{{ (accountPage - 1) * accountPageSize + index + 1 }}. {{ row.name }}</strong><small>{{ row.nickname || row.douyin_id || '未填写抖音号' }} · ID {{ row.id }}</small></span>
+            </label>
+            <span class="tag" :class="row.status === 'active' ? 'ok' : 'muted'">{{ statusText(row) }}</span>
+          </div>
+          <div class="compact-summary">
+            <span>千川 {{ row.qianchuan_id ?? '未绑定' }}</span>
+            <span>成功 {{ row.success_count ?? '—' }}</span>
+            <span>素材 {{ row.material_count }}</span>
+            <span>{{ row.groups.length ? row.groups.join('、') : '未分组' }}</span>
+          </div>
+          <div class="compact-actions">
+            <button type="button" class="btn mini primary" :disabled="busy" @click="openJingxuan(row)">打开百应</button>
+            <button type="button" class="btn mini" :disabled="busy" @click="openCreatorCenter(row)">创作者中心</button>
+            <button type="button" class="btn mini" :disabled="busy" @click="openSelectionSettings(row)">选品设置</button>
+            <button type="button" class="btn mini" :disabled="busy" @click="openEditAccount(row)">编辑</button>
+          </div>
+          <details class="compact-details">
+            <summary>详细信息与更多操作</summary>
+            <div class="compact-fields">
+              <span>抖音号：{{ row.douyin_id ?? '—' }}</span><span>类目：{{ selectionCategoryDisplay(row.selection_category).summary }}</span>
+              <span v-if="row.nickname">粉丝：{{ fmtCount(row.follower_count) }} · 作品：{{ fmtCount(row.aweme_count) }}</span>
+              <span>运营分类：{{ row.category ?? '—' }}</span><span>手机号：{{ row.phone ?? '—' }}</span>
+              <span>计划发布率：{{ metricLabel(row.publish_rate) }}</span><span>卡优率：{{ metricLabel(row.karl_rate) }}</span>
+              <span>广告条数：{{ metricLabel(row.ad_count) }}</span>
+              <span>客户端：{{ loginMap[row.id] ? (loginMap[row.id]!.loggedIn ? '有凭证' : '无凭证') : '未检查' }}</span>
+              <span>浏览器：{{ browserPageStatus[row.id]?.state === 'checked' ? (browserPageStatus[row.id]?.baiyingOpen ? '百应已打开' : browserPageStatus[row.id]?.creatorCenterOpen ? '创作者已打开' : '目标页面未打开') : '未检查' }}</span>
+            </div>
+            <ul v-if="selectionCategoryDisplay(row.selection_category).paths.length" class="compact-category-paths"><li v-for="path in selectionCategoryDisplay(row.selection_category).paths" :key="path">{{ path }}</li></ul>
+            <div class="compact-actions">
+              <button type="button" class="btn mini" :disabled="busy" @click="openBrowser(row)">抖音主站</button>
+              <button type="button" class="btn mini" :disabled="busy" @click="pullInfo(row)">拉取信息</button>
+              <button type="button" class="btn mini" :disabled="busy" @click="openMaterialFolder(row)">素材夹</button>
+              <button type="button" class="btn mini" :disabled="busy" @click="checkAccountLogin(row)">查客户端缓存</button>
+              <button type="button" class="btn mini" :disabled="busy" @click="toggleStatus(row)">{{ row.status === 'active' ? '停用' : '启用' }}</button>
+              <button type="button" class="btn mini danger" :disabled="busy" @click="deleteAccount(row)">删除</button>
+            </div>
+          </details>
+        </article>
+        <p v-if="accounts.length === 0" class="empty">暂无账号，点「新建账号」开始</p>
+      </div>
+
       <div class="pagination-bar">
         <span>共 {{ accounts.length }} 个账号，已选 {{ selected.size }} 个</span>
         <label>每页
@@ -926,7 +983,7 @@ function toggleSelectBind(id: number): void {
       <div class="batch-bar">
         <button type="button" class="btn mini" @click="qcForm.id = 0; qcForm.qc_name = ''; qcForm.qc_id = ''; qcForm.subject = ''; qcForm.remark = ''; showQcForm = true">新增千川账户</button>
       </div>
-      <div class="table-wrap">
+      <div v-if="!compactLayout" class="table-wrap qc-table-wrap">
         <table class="grid">
           <thead>
             <tr>
@@ -961,7 +1018,7 @@ function toggleSelectBind(id: number): void {
               <td class="muted">{{ row.last_check ? new Date(row.last_check).toLocaleString('zh-CN') : '—' }}</td>
               <td>{{ row.remark ?? '—' }}</td>
               <td class="ops">
-                <button type="button" class="btn mini" @click="openQcLogin(row)">登录千川</button>
+                <button type="button" class="btn mini" @click="openQcLogin(row)">打开专属浏览器</button>
                 <button type="button" class="btn mini" @click="checkQcLogin(row)">查客户端缓存</button>
                 <button type="button" class="btn mini" @click="openBindPanel(row)">绑定账号</button>
                 <button type="button" class="btn mini" @click="qcForm.id = row.id; qcForm.qc_name = row.qc_name ?? ''; qcForm.qc_id = row.qc_id ?? ''; qcForm.subject = row.subject ?? ''; qcForm.remark = row.remark ?? ''; showQcForm = true">编辑</button>
@@ -973,6 +1030,22 @@ function toggleSelectBind(id: number): void {
             </tr>
           </tbody>
         </table>
+      </div>
+      <div v-if="compactLayout" class="compact-list qc-card-list">
+        <article v-for="row in qcs" :key="row.id" class="compact-card">
+          <div class="compact-head"><strong>{{ row.qc_name || '未命名千川账户' }}</strong><span class="tag" :class="row.login_state === 'online' ? 'ok' : 'muted'">{{ row.login_state === 'online' ? '在线' : '离线' }}</span></div>
+          <div class="compact-summary"><span>千川 ID：{{ row.qc_id || '—' }}</span><span>绑定 {{ row.bind_count }} 个账号</span><span>{{ row.subject || '未填写主体' }}</span></div>
+          <div class="compact-actions">
+            <button type="button" class="btn mini primary" @click="openQcLogin(row)">打开专属浏览器</button>
+            <button type="button" class="btn mini" @click="openBindPanel(row)">绑定账号</button>
+            <button type="button" class="btn mini" @click="qcForm.id = row.id; qcForm.qc_name = row.qc_name ?? ''; qcForm.qc_id = row.qc_id ?? ''; qcForm.subject = row.subject ?? ''; qcForm.remark = row.remark ?? ''; showQcForm = true">编辑</button>
+          </div>
+          <details class="compact-details"><summary>详细信息与更多操作</summary>
+            <div class="compact-fields"><span>客户端：{{ qcLoginMap[row.id] ? (qcLoginMap[row.id]!.loggedIn ? '有凭证' : '无凭证') : '未检查' }}</span><span>最近校验：{{ row.last_check ? new Date(row.last_check).toLocaleString('zh-CN') : '—' }}</span><span>备注：{{ row.remark || '—' }}</span></div>
+            <div class="compact-actions"><button v-if="row.qc_id" type="button" class="btn mini" @click="copyText(row.qc_id!)">复制 ID</button><button type="button" class="btn mini" @click="checkQcLogin(row)">查客户端缓存</button><button type="button" class="btn mini danger" @click="deleteQc(row)">删除</button></div>
+          </details>
+        </article>
+        <p v-if="qcs.length === 0" class="empty">暂无千川账户，点「新增千川账户」开始</p>
       </div>
     </template>
 
@@ -1090,7 +1163,9 @@ function toggleSelectBind(id: number): void {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 12px 14px;
+  box-shadow: var(--shadow-card);
 }
+.stat-card:first-child { background: linear-gradient(135deg, #ffffff, #edf4ff); border-color: #d4e3fb; }
 
 .stat-card .num {
   font-size: 24px;
@@ -1113,6 +1188,7 @@ function toggleSelectBind(id: number): void {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .tabs {
@@ -1140,11 +1216,13 @@ function toggleSelectBind(id: number): void {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
   flex-shrink: 0;
   background: var(--bg-panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 8px;
+  box-shadow: var(--shadow-card);
 }
 
 .check-all {
@@ -1260,6 +1338,7 @@ function toggleSelectBind(id: number): void {
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
+  flex-wrap: wrap;
   padding: 10px 2px;
   color: var(--text-muted);
   font-size: 12px;
@@ -1287,6 +1366,7 @@ function toggleSelectBind(id: number): void {
 .btn:hover:not(:disabled) {
   border-color: var(--brand);
   color: var(--brand);
+  background: var(--brand-soft);
 }
 
 .btn.primary {
@@ -1294,6 +1374,7 @@ function toggleSelectBind(id: number): void {
   border-color: var(--brand);
   color: #fff;
 }
+.btn.primary:hover:not(:disabled) { background: #265dc7; color: #fff; }
 
 .btn.mini {
   padding: 2px 7px;
@@ -1312,6 +1393,33 @@ function toggleSelectBind(id: number): void {
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.compact-list { display: none; }
+.compact-card { min-width: 0; padding: 13px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
+.compact-card:hover { border-color: #bacced; }
+.compact-head, .compact-identity, .compact-summary, .compact-actions { display: flex; align-items: center; gap: 8px; }
+.compact-head { justify-content: space-between; }
+.compact-head strong { font-size: 14px; color: #203351; }
+.compact-identity { min-width: 0; cursor: pointer; }
+.compact-identity span { display: flex; flex-direction: column; min-width: 0; }
+.compact-identity strong, .compact-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compact-identity small { color: var(--text-muted); font-size: 11px; }
+.compact-summary { flex-wrap: wrap; margin: 8px 0; color: var(--text-muted); font-size: 12px; }
+.compact-summary span + span::before { content: '·'; margin-right: 8px; }
+.compact-actions { flex-wrap: wrap; }
+.compact-details { margin-top: 9px; border-top: 1px solid var(--border); padding-top: 8px; }
+.compact-details summary { color: var(--brand); cursor: pointer; font-size: 12px; }
+.compact-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 12px; margin: 9px 0; color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+.compact-category-paths { max-height: 120px; margin: 0 0 9px; padding-left: 20px; overflow: auto; color: var(--text-muted); font-size: 12px; }
+
+@media (max-width: 2400px) {
+  .account-table-wrap, .qc-table-wrap { display: none; }
+  .compact-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 8px; flex: none; }
+}
+@media (max-width: 1200px) {
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .batch-info { margin-left: 0; }
 }
 
 .error-bar {

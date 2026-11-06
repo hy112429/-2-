@@ -239,6 +239,9 @@ def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float)
                             "attempts": task["attempts"],
                             "message": f"下载中 {percent}%",
                         })
+            # 千川开放平台地址须确实返回可识别的视频，不能把 200 HTML 错误页当 MP4 登记。
+            if task.get("verify_video") and not probe_codec(tmp, "v:0"):
+                raise NoRetryError("接口地址未返回可识别的视频文件（可能是过期直链或 HTML 错误页）")
             tmp.replace(dest)
         finally:
             tmp.unlink(missing_ok=True)

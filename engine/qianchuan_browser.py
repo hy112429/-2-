@@ -167,6 +167,8 @@ def _check_page_gate(page: Any, stage: str) -> None:
     challenge_iframe = _visible_count(page.locator('iframe[src*="captcha"],iframe[src*="verify"]')) > 0
     if challenge_dialog or challenge_iframe or re.search(r"请完成验证|滑动验证|安全验证|人机验证", text):
         raise UploadStopped("千川页面要求人工完成验证", stage=stage, manual=True)
+    if re.search(r"当前账号(?:无权|没有权限)|无访问权限|权限不足|无权限访问", text):
+        raise UploadStopped("千川账户无上传页面权限，请账户管理员核实授权", stage=stage, manual=True)
     if _visible_count(page.locator('input[type="password"]')) > 0 and "登录" in text:
         raise UploadStopped("千川页面显示登录表单，请人工登录", stage=stage, manual=True)
 

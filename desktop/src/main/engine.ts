@@ -44,11 +44,14 @@ const ALLOWED_SCRIPTS = new Set([
   'selection_registry_local.py',
   'publish_queue.py',
   'image_to_video.py',
+  'auto_video_editor.py',
   'remove_watermark.py'
 ])
 
 /** 仅主进程可调用：队列终态与千川页面执行不能由渲染进程任意伪造。 */
-const INTERNAL_SCRIPTS = new Set(['qianchuan_upload.py', 'qianchuan_browser.py'])
+const INTERNAL_SCRIPTS = new Set([
+  'qianchuan_upload.py', 'qianchuan_browser.py', 'qianchuan_violations.py', 'post_publish_material.py'
+])
 
 /** 正在运行的任务表：taskId -> 句柄（含取消标志与强杀入口） */
 interface TaskHandle {

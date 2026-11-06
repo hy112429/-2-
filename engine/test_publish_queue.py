@@ -118,7 +118,7 @@ class PublishQueueTests(unittest.TestCase):
         self.assertEqual(row["description"], "A 测试商品")
         self.assertEqual(row["platform_status"], "not_uploaded")
 
-    def test_generated_video_is_queued_once_for_confirmation(self) -> None:
+    def test_generated_video_is_queued_once_for_automatic_publish(self) -> None:
         first = publish_queue.add_generated_task(
             self.connection, 1, "product-a", str(self.video_a),
         )
@@ -130,7 +130,7 @@ class PublishQueueTests(unittest.TestCase):
             "FROM publish_queue WHERE id = ?",
             (first["id"],),
         ).fetchone()
-        self.assertEqual(first["status"], "awaiting_confirmation")
+        self.assertEqual(first["status"], "scheduled")
         self.assertFalse(first["alreadyExists"])
         self.assertTrue(second["alreadyExists"])
         self.assertEqual(second["id"], first["id"])
@@ -139,9 +139,9 @@ class PublishQueueTests(unittest.TestCase):
         self.assertEqual(row["product_name"], "A 测试商品")
         self.assertEqual(row["title"], "A 测试商品")
         self.assertEqual(row["description"], "A 测试商品")
-        self.assertEqual(row["mode"], "manual")
-        self.assertEqual(row["status"], "awaiting_confirmation")
-        self.assertGreaterEqual(datetime.fromisoformat(row["schedule_at"]), datetime.now())
+        self.assertEqual(row["mode"], "scheduled")
+        self.assertEqual(row["status"], "scheduled")
+        self.assertLessEqual(abs((datetime.fromisoformat(row["schedule_at"]) - datetime.now()).total_seconds()), 60)
         self.assertEqual(
             self.connection.execute("SELECT COUNT(*) FROM publish_queue").fetchone()[0],
             1,
@@ -159,6 +159,7 @@ class PublishQueueTests(unittest.TestCase):
             publish_queue.add_generated_task(self.connection, 1, "product-c", str(self.video_a))
 
     def test_generated_video_cli_command_returns_queue_task(self) -> None:
+        self.connection.commit()
         output = io.StringIO()
         with redirect_stdout(output):
             exit_code = publish_queue.main([
@@ -169,7 +170,7 @@ class PublishQueueTests(unittest.TestCase):
         result = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
         self.assertTrue(result["ok"])
-        self.assertEqual(result["status"], "awaiting_confirmation")
+        self.assertEqual(result["status"], "scheduled")
         self.assertEqual(result["alreadyExists"], False)
 
     def test_upload_transitions_are_single_attempt_and_user_confirmed(self) -> None:

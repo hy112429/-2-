@@ -4,6 +4,7 @@ import { join } from 'path'
 import { getClientPaths } from './app-dirs'
 import { runEngineCommand } from './engine'
 import { existingManagedBrowserConnection } from './external_browser'
+import { releaseQianchuanAccount, reserveQianchuanAccount } from './qianchuan_account_lock'
 
 type Json = Record<string, unknown>
 
@@ -51,6 +52,47 @@ async function queueCommand(command: string, args: string[] = [], allowDeferred 
   return result
 }
 
+/** 发布后编排复用 Step17 的资格、额度与入队命令；不直接驱动千川浏览器上传器。 */
+export async function getPostPublishUploadTargets(): Promise<Json> {
+  return queueCommand('targets')
+}
+
+export async function getPostPublishQuotaRemaining(accountId: number, productId: string): Promise<Json> {
+  return queueCommand('product-quota-remaining', [
+    '--account-id', String(positiveId(accountId, '抖音账号 ID')),
+    '--product-id', String(productId)
+  ])
+}
+
+export async function getPostPublishEligibleAssets(accountId: number): Promise<Json> {
+  return queueCommand('eligible-assets', [
+    '--account-id', String(positiveId(accountId, '抖音账号 ID')),
+    '--limit', '1000'
+  ])
+}
+
+export async function enqueuePostPublishAssets(
+  accountId: number, productId: string, qianchuanAccountId: number, assetIds: number[]
+): Promise<Json> {
+  // 最后一次资格读取必须紧贴 Step17 enqueue；engine enqueue 仍会在事务内再次验证来源、发布态与配额。
+  const eligible = await getPostPublishEligibleAssets(accountId)
+  const rows = Array.isArray(eligible['rows']) ? eligible['rows'] as Json[] : []
+  const requested = new Set(assetIds.map((value) => positiveId(value, '素材 ID')))
+  const allowed = rows.filter((row) => row['eligible'] === true &&
+    row['sourceType'] === 'web_download' && Number(row['accountId']) === accountId &&
+    String(row['productId'] ?? '') === productId && requested.has(Number(row['assetId'])))
+  const allowedIds = [...new Set(allowed.map((row) => positiveId(row['assetId'], '素材 ID')))]
+  if (!allowedIds.length) {
+    return { ok: true, acceptedCount: 0, rejectedCount: assetIds.length,
+      jobs: [], rejected: assetIds.map((assetId) => ({ assetId, reason: '入队前复核时已不满足 Step17 eligible 资格' })) }
+  }
+  return queueCommand('enqueue', [
+    '--account-id', String(positiveId(accountId, '抖音账号 ID')),
+    '--asset-ids', allowedIds.join(','),
+    '--qianchuan-account-id', String(positiveId(qianchuanAccountId, '千川账户 ID'))
+  ])
+}
+
 function jobIdFrom(value: unknown): number {
   return positiveId(value, '上传任务 ID')
 }
@@ -72,10 +114,15 @@ async function runOneUploadCore(rawJobId: unknown): Promise<Json> {
 
   const jobBeforeClaim = await readJob(id)
   if (jobBeforeClaim['status'] !== 'queued') return { ok: false, error: `任务当前状态为 ${String(jobBeforeClaim['status'])}，不能重复上传` }
+  const nextRetryAt = stringValue(jobBeforeClaim['nextRetryAt'])
+  if (nextRetryAt && nextRetryAt > new Date().toLocaleString('sv-SE').replace(' ', 'T')) {
+    return { ok: false, status: 'retry_wait', error: `任务等待自动重试，预计 ${nextRetryAt}`, job: jobBeforeClaim }
+  }
   const qcId = numericField(jobBeforeClaim, 'qianchuanAccountId', 'qianchuan_account_id')
   if (preflightQianchuanAccounts.has(qcId) || activeQianchuanAccounts.has(qcId)) {
     return { ok: false, error: '该千川账户正在上传或预检查中' }
   }
+  if (!reserveQianchuanAccount(qcId)) return { ok: false, error: '该千川账户正在处理素材，请稍后再试' }
   preflightQianchuanAccounts.add(qcId)
   try {
   const accountId = numericField(jobBeforeClaim, 'accountId', 'account_id')
@@ -143,8 +190,10 @@ async function runOneUploadCore(rawJobId: unknown): Promise<Json> {
     const screenshot = stringValue(browser['screenshotPath'])
     if (screenshot) failArgs.push('--screenshot-path', screenshot)
     if (browser['submitAttempted'] === true || browser['status'] === 'needs_review') failArgs.push('--submit-attempted')
+    if (browser['manualActionRequired'] === true) failArgs.push('--manual-action-required')
     const failed = await queueCommand('fail', failArgs)
-    return { ok: false, status: asObject(failed['job'])['status'] ?? browser['status'] ?? 'failed', stage: browser['stage'], error: reason, screenshotPath: screenshot, job: failed['job'] }
+    return { ok: false, status: asObject(failed['job'])['status'] ?? browser['status'] ?? 'failed', stage: browser['stage'],
+      manualActionRequired: browser['manualActionRequired'] === true, error: reason, screenshotPath: screenshot, job: failed['job'] }
   } catch (error) {
     const reason = String(error)
     if (claimed) {
@@ -163,6 +212,7 @@ async function runOneUploadCore(rawJobId: unknown): Promise<Json> {
   }
   } finally {
     preflightQianchuanAccounts.delete(qcId)
+    releaseQianchuanAccount(qcId)
   }
 }
 
@@ -228,6 +278,11 @@ export function registerQianchuanUploadIpc(): void {
   ipcMain.handle('qianchuan:upload:quotaConfig', (_event, accountId?: unknown) => reply(() =>
     queueCommand('quota-config', accountId == null ? [] : ['--account-id', String(positiveId(accountId, '抖音账号 ID'))])
   ))
+  ipcMain.handle('qianchuan:upload:retryConfig', () => reply(() => queueCommand('retry-config')))
+  ipcMain.handle('qianchuan:upload:setRetryConfig', (_event, enabled: unknown) => reply(() => {
+    if (typeof enabled !== 'boolean') throw new Error('自动重试开关无效')
+    return queueCommand('retry-config', ['--enabled', enabled ? '1' : '0'])
+  }))
   ipcMain.handle('qianchuan:upload:setQuotaConfig', (_event, params: {
     accountId: unknown; perProductVideos: unknown; perAccountProducts: unknown; perAccountVideos: unknown;
     perGroupProducts: unknown; perGroupVideos: unknown; maxConcurrentUploads: unknown;
@@ -266,6 +321,8 @@ async function schedulerTick(): Promise<void> {
     const today = new Date().toLocaleDateString('sv-SE')
     for (const job of rows.reverse()) {
       if (stringValue(job['scheduledDate']) > today) continue
+      const retryAt = stringValue(job['nextRetryAt'])
+      if (retryAt && retryAt > new Date().toLocaleString('sv-SE').replace(' ', 'T')) continue
       const qcId = numericField(job, 'qianchuanAccountId', 'qianchuan_account_id')
       if (schedulerBlockedQianchuanAccounts.has(qcId)) continue
       const connection = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
@@ -274,7 +331,8 @@ async function schedulerTick(): Promise<void> {
       if (outcome['ok'] === false && outcome['status'] !== 'deferred') {
         const stage = stringValue(outcome['stage'])
         const error = stringValue(outcome['error'])
-        if (outcome['status'] === 'needs_review' || /登录|验证码|网络|连接|页面|控件/.test(error) || /login|captcha|network|locate/.test(stage)) {
+        if (outcome['status'] === 'needs_review' || outcome['manualActionRequired'] === true ||
+            /登录|验证码|无权限/.test(error) || /login|captcha/.test(stage)) {
           schedulerBlockedQianchuanAccounts.add(qcId)
         }
       }

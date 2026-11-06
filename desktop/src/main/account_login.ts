@@ -503,6 +503,9 @@ export function registerAccountLoginIpc(): void {
 
   // 千川登录页在独立的托管 Chrome profile 打开。
   ipcMain.handle('qianchuan:openLogin', async (_e, qcId: number) => {
+    if (!Number.isSafeInteger(qcId) || qcId < 1) {
+      return { ok: false, external: true, url: QC_LOGIN_URL, error: '请选择有效的千川账户档案后再打开登录页' }
+    }
     return openExternalLogin(QC_LOGIN_URL, `qianchuan-${qcId}`, undefined, qcId)
   })
 

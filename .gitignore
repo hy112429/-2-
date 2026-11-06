@@ -7,6 +7,13 @@ engine/.venv/
 __pycache__/
 *.pyc
 
+# ---- 版本化构建输出与本机 Codex 转交残留 ----
+/desktop/release-*/
+/_p24xfer/
+/_p26xfer/
+/_tmp_codex-prompt-error-ux-11001.md
+/docs/_a105_changed-files.txt
+
 # ---- 敏感数据（凭证/数据库，严禁入库） ----
 *.enc
 *.db

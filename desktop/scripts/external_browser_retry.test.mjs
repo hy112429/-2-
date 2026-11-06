@@ -11,12 +11,25 @@ const compiled = ts.transpileModule(source, {
 }).outputText
 const moduleValue = { exports: {} }
 const localRequire = (specifier) => {
-  if (specifier === './engine') return { getEngineDir: () => '', getPythonPath: () => '' }
+  if (specifier === './engine') return { getEngineDir: () => '', getPythonPath: () => '', getPythonSpawnEnvironment: () => ({}) }
+  if (specifier === './app-dirs') return { getClientPaths: () => ({
+    databasePath: 'D:\\software\\codex\\isolated-test.db',
+    browserProfilesDir: 'D:\\software\\codex\\browser-profiles'
+  }) }
   if (specifier === './probe') return { captureExternalBaiyingResponse: () => undefined }
   return require(specifier)
 }
 new Function('exports', 'require', 'module', compiled)(moduleValue.exports, localRequire, moduleValue)
-const { prepareManagedBrowserRetry, bridgeProcessTreeTermination } = moduleValue.exports
+const { prepareManagedBrowserRetry, bridgeProcessTreeTermination, validateManagedProfilePath } = moduleValue.exports
+
+test('每个千川档案解析到不同的专属 Chrome 资料目录，同一档案稳定复用', () => {
+  const first = validateManagedProfilePath('qianchuan-1')
+  const second = validateManagedProfilePath('qianchuan-2')
+  assert.notEqual(first, second)
+  assert.equal(first, validateManagedProfilePath('qianchuan-1'))
+  assert.ok(first.endsWith('qianchuan-1'))
+  assert.ok(second.endsWith('qianchuan-2'))
+})
 
 test('断线后只自动恢复带完整商品 ID 检查点的选品执行', () => {
   assert.deepEqual(

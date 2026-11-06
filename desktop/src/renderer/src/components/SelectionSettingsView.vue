@@ -35,14 +35,19 @@ import {
 const props = withDefaults(defineProps<{
   initialAccountId?: number | null
   dialogOnly?: boolean
+  active?: boolean
+  scheduledStart?: SelectionScheduleDue | null
 }>(), {
   initialAccountId: null,
-  dialogOnly: false
+  dialogOnly: false,
+  active: true,
+  scheduledStart: null
 })
 const emit = defineEmits<{
   (event: 'close'): void
   (event: 'saved', accountId: number): void
   (event: 'navigate', value: string): void
+  (event: 'scheduled-start-handled', date: string, outcome: string): void
 }>()
 
 interface CategoryNode {
@@ -198,6 +203,8 @@ interface SelectionRecoveryHooks {
 
 interface AccountCandidatePlan {
   candidates: SelectionCandidate[]
+  /** 完成本机/配额/发布锁过滤后的唯一三源候选池；只留在预览缓存，不写入批次 payload。 */
+  candidatePool?: SelectionCandidate[]
   registryExcluded: Array<{ candidate: SelectionCandidate; reason: string }>
   mutualExclusionSkipped: SelectionCandidate[]
   rejectedCandidates: SelectionCandidate[]
@@ -216,6 +223,7 @@ interface FilterField {
 interface SelectionCandidate {
   cardIndex: number
   productId: string
+  cartAdded?: boolean
   publicationLock?: {
     productId: string
     productName?: string
@@ -241,6 +249,7 @@ interface SelectionCandidate {
   analysisScore?: number | null
   unifiedScore?: number | null
   hotOrRankBoost?: number
+  businessPriorityBoost?: number
   analysisRawScore?: number | null
   analysisCoverage?: number
   analysisMetricCount?: number
@@ -292,6 +301,7 @@ const DEFAULTS = {
   selectionMode: 'general' as 'general' | 'category',
   categoryMode: 'auto' as 'auto' | 'manual',
   categorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
+  excludedCategorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
   filters: { delivery: {} as Record<string, unknown>, product: {} as Record<string, unknown>, features: [] as string[] },
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
@@ -307,6 +317,22 @@ const DEFAULTS = {
 const busy = ref(false)
 const error = ref('')
 const notice = ref('')
+const selectionInitialized = ref(false)
+const dailySelectionSchedule = reactive({
+  enabled: false,
+  time: '09:00',
+  launchAtLogin: false,
+  canLaunchAtLogin: false,
+  saving: false
+})
+let savedDailySelectionScheduleEnabled = false
+const handledScheduledStartDates = new Set<string>()
+const scheduledRetryWaiting = ref(false)
+let automaticScheduledStartActive = false
+let activeScheduledStartDate: string | null = null
+let queuedScheduledStart: SelectionScheduleDue | null = null
+const SCHEDULED_RETRY_BASE_DELAY_MS = 30_000
+const SCHEDULED_RETRY_MAX_DELAY_MS = 5 * 60_000
 const runLogWarning = ref('')
 const selectionErrorPresentation = computed(() => toUserSelectionError(error.value))
 const selectionNoticePresentation = computed(() => toUserSelectionError(notice.value))
@@ -318,6 +344,8 @@ const selectionCooldownRemaining = ref(0)
 let selectionCooldownTimer: number | null = null
 let selectionCooldownDeadline: number | null = null
 let selectionAutoResumeTimer: number | null = null
+let selectionProgressFlushTimer: number | null = null
+let pendingSelectionProgressUpdate: (() => void) | null = null
 let selectionViewUnmounted = false
 let stopSelectionCooldownExpired: (() => void) | undefined
 let automaticResumeBatchId: string | null = null
@@ -507,23 +535,45 @@ function armSelectionCooldown(seconds: number, deadlineOverride?: number): void 
     selectionCooldownRemaining.value = 0
     return
   }
-  selectionCooldownTimer = window.setInterval(() => {
-    selectionCooldownRemaining.value = Math.max(0, Math.ceil(((selectionCooldownDeadline ?? Date.now()) - Date.now()) / 1000))
-    if (selectionCooldownRemaining.value === 0 && selectionCooldownTimer !== null) {
-      window.clearInterval(selectionCooldownTimer)
-      selectionCooldownTimer = null
-    }
-  }, 1000)
+  syncSelectionCooldownTicker()
 }
 
 function refreshCooldownFromDeadline(): void {
   if (!selectionCooldownArmed.value || selectionCooldownDeadline === null) return
-  selectionCooldownRemaining.value = Math.max(0, Math.ceil((selectionCooldownDeadline - Date.now()) / 1000))
+  const remaining = Math.max(0, Math.ceil((selectionCooldownDeadline - Date.now()) / 1000))
+  if (selectionCooldownRemaining.value !== remaining) selectionCooldownRemaining.value = remaining
   if (selectionCooldownRemaining.value === 0 && selectionCooldownTimer !== null) {
     window.clearInterval(selectionCooldownTimer)
     selectionCooldownTimer = null
   }
 }
+
+function stopSelectionCooldownTicker(): void {
+  if (selectionCooldownTimer !== null) window.clearInterval(selectionCooldownTimer)
+  selectionCooldownTimer = null
+}
+
+function syncSelectionCooldownTicker(): void {
+  stopSelectionCooldownTicker()
+  refreshCooldownFromDeadline()
+  if (!props.active || document.visibilityState === 'hidden' || !selectionCooldownArmed.value ||
+      selectionCooldownDeadline === null || selectionCooldownRemaining.value <= 0) return
+  // 倒计时只用于展示；主进程负责到期续选。降低无关页面的 Vue 重渲染频率，避免长设置页滚动掉帧。
+  selectionCooldownTimer = window.setInterval(refreshCooldownFromDeadline, 5000)
+}
+
+function handleSelectionViewVisibilityChange(): void {
+  if (document.visibilityState === 'visible' && props.active) {
+    syncSelectionCooldownTicker()
+    flushSelectionProgressUpdate()
+  } else {
+    stopSelectionCooldownTicker()
+    if (selectionProgressFlushTimer !== null) window.clearTimeout(selectionProgressFlushTimer)
+    selectionProgressFlushTimer = null
+  }
+}
+
+watch(() => props.active, handleSelectionViewVisibilityChange)
 
 function traceSelectionCooldown(
   stage: string,
@@ -994,10 +1044,27 @@ function reportSelectionProgress(
     indeterminate: update.indeterminate ?? false
   }
 }
+
+function flushSelectionProgressUpdate(): void {
+  if (selectionProgressFlushTimer !== null) window.clearTimeout(selectionProgressFlushTimer)
+  selectionProgressFlushTimer = null
+  const update = pendingSelectionProgressUpdate
+  pendingSelectionProgressUpdate = null
+  if (update && props.active) update()
+}
+
+function queueSelectionProgressUpdate(update: () => void): void {
+  pendingSelectionProgressUpdate = update
+  if (!props.active || selectionProgressFlushTimer !== null) return
+  // 多个平台进度事件合并为每 250ms 最多一次 UI 更新，减少整页虚拟 DOM 比对。
+  selectionProgressFlushTimer = window.setTimeout(flushSelectionProgressUpdate, 250)
+}
 const candidates = ref<SelectionCandidate[]>([])
 const categoryRecommendations = ref<Array<{ categoryId: string; highScoreCount: number; averageScore: number }>>([])
 const previewAccountId = ref<number | null>(null)
 const candidateSelectionCustomized = ref(false)
+const previewCandidatePool = ref<{ accountId: number; fingerprint: string; plan: AccountCandidatePlan } | null>(null)
+const previewCandidatePoolCount = ref(0)
 const accountId = ref<number | null>(props.initialAccountId)
 const activeTab = ref<'通用设置' | '账号个性化'>(props.initialAccountId === null ? '通用设置' : '账号个性化')
 const categories = ref<CategoryNode[]>([])
@@ -1008,6 +1075,21 @@ const filterCatalogData = ref<Record<string, unknown>>({})
 const filterCatalogUpdatedAt = ref('')
 const defaultDownloadRoot = ref('')
 const browserVisible = ref(false)
+const settingsScrollRef = ref<HTMLElement | null>(null)
+function jumpToSelectionSection(sectionId: string): void {
+  const container = settingsScrollRef.value
+  const target = container?.querySelector<HTMLElement>(`#${sectionId}`)
+  if (!container || !target) return
+  if (target instanceof HTMLDetailsElement) target.open = true
+  if (sectionId === 'account-filters') {
+    const nested = target.querySelector<HTMLDetailsElement>('details.filter-card')
+    if (nested) nested.open = true
+  }
+  container.scrollTo({
+    top: container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 44,
+    behavior: 'smooth'
+  })
+}
 const browserProfileKey = computed(() => accountId.value !== null ? `account-${accountId.value}` : 'general')
 const global = reactive(structuredClone(DEFAULTS))
 const globalFilterSettings = computed<SelectionFilterSettings>({
@@ -1238,6 +1320,7 @@ function normalizeCategorySelection(
 
 function normalizeCurrentCategorySelections(): void {
   global.categorySelection = normalizeCategorySelection(global.categorySelection, categories.value)
+  global.excludedCategorySelection = normalizeCategorySelection(global.excludedCategorySelection, categories.value)
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
 }
 
@@ -1263,10 +1346,12 @@ function pruneCategorySelectionToCatalog(
 
 function pruneCurrentCategorySelections(): number {
   const globalResult = pruneCategorySelectionToCatalog(global.categorySelection, categories.value)
+  const globalExcludedResult = pruneCategorySelectionToCatalog(global.excludedCategorySelection, categories.value)
   const accountResult = pruneCategorySelectionToCatalog(accountDraft.categorySelection, categories.value)
   global.categorySelection = globalResult.selection
+  global.excludedCategorySelection = globalExcludedResult.selection
   accountDraft.categorySelection = accountResult.selection
-  return globalResult.removed + accountResult.removed
+  return globalResult.removed + globalExcludedResult.removed + accountResult.removed
 }
 
 async function loadGlobal(): Promise<void> {
@@ -1278,6 +1363,10 @@ async function loadGlobal(): Promise<void> {
   const cat = (settings.categorySelection ?? {}) as Record<string, string[]>
   global.categorySelection = {
     level1: [...(cat.level1 ?? [])], level2: [...(cat.level2 ?? [])], level3: [...(cat.level3 ?? [])]
+  }
+  const excludedCat = (settings.excludedCategorySelection ?? {}) as Record<string, string[]>
+  global.excludedCategorySelection = {
+    level1: [...(excludedCat.level1 ?? [])], level2: [...(excludedCat.level2 ?? [])], level3: [...(excludedCat.level3 ?? [])]
   }
   const savedProductFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.product ?? {}) }
   delete savedProductFilters['佣金区间']
@@ -1504,6 +1593,8 @@ function hasSelectedPlatformFilters(value: unknown): boolean {
 const level1Options = computed(() => categories.value)
 const level2Options = computed(() => categories.value.filter((item) => global.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const level3Options = computed(() => level2Options.value.filter((item) => global.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
+const excludedLevel2Options = computed(() => categories.value.filter((item) => global.excludedCategorySelection.level1.includes(item.id)).flatMap((item) => item.children))
+const excludedLevel3Options = computed(() => excludedLevel2Options.value.filter((item) => global.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 const accountLevel2Options = computed(() => categories.value.filter((item) => accountDraft.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const accountLevel3Options = computed(() => accountLevel2Options.value.filter((item) => accountDraft.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 function selectedCategoryCount(selection: { level1: string[]; level2: string[]; level3: string[] }): number {
@@ -1545,6 +1636,41 @@ function categoryAction(level: CategoryLevel, scope: 'global' | 'account', actio
   const current = target[level]
   target[level] = action === 'clear' ? [] : action === 'all' ? options.map((item) => item.id) : options.map((item) => item.id).filter((id) => !current.includes(id))
   updateCategory(level, scope)
+}
+
+function updateExcludedCategory(level: CategoryLevel): void {
+  const selected = global.excludedCategorySelection
+  const lv2 = excludedLevel2Options.value
+  const lv3 = excludedLevel3Options.value
+  if (level === 'level1') {
+    const allowed = new Set(lv2.map((item) => item.id))
+    selected.level2 = selected.level2.filter((id) => allowed.has(id))
+  }
+  if (level !== 'level3') {
+    const allowed = new Set(lv3.map((item) => item.id))
+    selected.level3 = selected.level3.filter((id) => allowed.has(id))
+  }
+}
+
+function toggleExcludedCategory(id: string, level: CategoryLevel, checked: boolean): void {
+  const current = global.excludedCategorySelection[level]
+  global.excludedCategorySelection[level] = checked
+    ? current.includes(id) ? current : [...current, id]
+    : current.filter((item) => item !== id)
+  updateExcludedCategory(level)
+}
+
+function excludedCategoryAction(level: CategoryLevel, action: 'all' | 'invert' | 'clear'): void {
+  const options = level === 'level1'
+    ? level1Options.value
+    : level === 'level2' ? excludedLevel2Options.value : excludedLevel3Options.value
+  const current = global.excludedCategorySelection[level]
+  global.excludedCategorySelection[level] = action === 'clear'
+    ? []
+    : action === 'all'
+      ? options.map((item) => item.id)
+      : options.map((item) => item.id).filter((id) => !current.includes(id))
+  updateExcludedCategory(level)
 }
 
 async function saveGlobal(): Promise<void> {
@@ -1844,7 +1970,8 @@ async function prepareBatchCandidatePlans(
   contexts: Map<number, AccountRunContext>,
   reviewedAccountId?: number | null,
   reviewedProducts?: ReadonlySet<string>,
-  accountSwitchFailures?: Map<number, AccountSwitchFailure>
+  accountSwitchFailures?: Map<number, AccountSwitchFailure>,
+  seededPreviewPlans?: ReadonlyMap<number, AccountCandidatePlan>
 ): Promise<Map<number, AccountCandidatePlan>> {
   const poolRows = new Map<number, SelectionCandidate[]>()
   const sourceIdsByAccount = new Map<number, Map<string, Set<string>>>()
@@ -1867,24 +1994,39 @@ async function prepareBatchCandidatePlans(
       _visibleSourcesOnly: true,
       _candidatePoolLimit: 200
     }
+    const seededPlan = seededPreviewPlans?.get(account.id)
+    const seededRows = seededPlan?.candidatePool
     reportSelectionProgress(account.id, '统一采集候选池', {
       accountIndex: targetIndex + 1,
       accountTotal: orderedTargets.length,
       completedAccounts: targetIndex,
-      message: `只读采集三个百应来源并统一筛选（账号 ${account.id}）`
+      message: seededRows?.length
+        ? `复用预览建立的三源候选池，并重新检查已登记商品与配额（账号 ${account.id}）`
+        : `只读采集热点趋势、联盟榜单和选品广场并统一筛选（账号 ${account.id}）`
     })
     let preview: Record<string, unknown>
     let quota: Record<string, unknown>
     try {
+      const previewRequest: Promise<Record<string, unknown>> = seededRows?.length
+        ? Promise.resolve({
+            ok: true,
+            candidates: seededRows,
+            rejectedCandidates: seededPlan?.rejectedCandidates ?? [],
+            warnings: seededPlan?.warnings ?? [],
+            prioritySourceResults: seededPlan?.prioritySourceResults ?? [],
+            recommendedCategories: seededPlan?.recommendedCategories ?? [],
+            categoryEnrichment: seededPlan?.categoryEnrichment
+          })
+        : window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
+            profileKey: context.profileKey,
+            profilePath: context.profilePath,
+            settings,
+            accountId: account.id,
+            downloadPath: context.downloadPath,
+            previewOnly: true
+          }))
       ;[preview, quota] = await Promise.all([
-        window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
-          profileKey: context.profileKey,
-          profilePath: context.profilePath,
-          settings,
-          accountId: account.id,
-          downloadPath: context.downloadPath,
-          previewOnly: true
-        })),
+        previewRequest,
         runEngine('selection_settings.py', [
           '--db', DB_PATH, 'quota', 'get', '--account-id', String(account.id)
         ])
@@ -2002,12 +2144,12 @@ async function prepareBatchCandidatePlans(
   }
   const allocations = allocateExclusiveCandidates([...scoredPools.entries()].map(([accountId, candidates]) => {
     const targetCapacity = capacities.get(accountId) ?? 0
-    // 预览后仍会在主进程原子登记一次；若候选期间被其他任务占用，已拒绝的 ID 会跳过，
-    // 因此多分配一轮同账号备用候选。全局分配器仍保证备用商品不会分给其他账号。
+    // 预览后仍会在主进程原子登记一次；登记时遇到重复 ID/类目冲突需继续从备用候选补位。
+    // 候选池最多为目标的三倍（目标最多 10 个），全局分配器仍保证备用商品不会分给其他账号。
     return {
       accountId,
       accountName: names.get(accountId) ?? `账号 ${accountId}`,
-      capacity: Math.min(candidates.length, targetCapacity * 2),
+      capacity: Math.min(candidates.length, targetCapacity * 3),
       candidates
     }
   }))
@@ -2049,6 +2191,7 @@ async function prepareBatchCandidatePlans(
     }
     plans.set(account.id, {
       candidates: winners,
+      candidatePool: scoredPools.get(account.id) ?? [],
       registryExcluded: registryExcludedByAccount.get(account.id) ?? [],
       mutualExclusionSkipped: mutualSkips,
       rejectedCandidates: rejectedByAccount.get(account.id) ?? [],
@@ -2063,6 +2206,36 @@ async function prepareBatchCandidatePlans(
     })
   }
   return plans
+}
+
+function previewPoolFingerprint(accountId: number, context: AccountRunContext): string {
+  return stableJson({
+    accountId,
+    settings: context.settings,
+    profilePath: context.resolvedProfilePath ?? context.profilePath,
+    downloadPath: context.downloadPath
+  })
+}
+
+function reusablePreviewCandidatePlans(
+  targets: readonly AccountRow[],
+  contexts: ReadonlyMap<number, AccountRunContext>
+): Map<number, AccountCandidatePlan> {
+  const cache = previewCandidatePool.value
+  if (!cache || !targets.some((account) => account.id === cache.accountId)) return new Map()
+  const context = contexts.get(cache.accountId)
+  if (!context || cache.fingerprint !== previewPoolFingerprint(cache.accountId, context)) return new Map()
+  return new Map([[cache.accountId, cache.plan]])
+}
+
+function candidatePlansForBatchPayload(
+  plans: ReadonlyMap<number, AccountCandidatePlan>
+): Record<string, AccountCandidatePlan> {
+  return Object.fromEntries([...plans].map(([accountId, plan]) => {
+    const persistedPlan = { ...plan }
+    delete persistedPlan.candidatePool
+    return [String(accountId), persistedPlan]
+  }))
 }
 
 async function prepareAccountRunContext(
@@ -2278,7 +2451,7 @@ async function executeAccountSelection(
       ? '选品仍只读取百应当前可见商品，并按手动选择的类目范围筛选。'
       : settings.selectionMode === 'category'
         ? '三个百应来源统一筛选；品类模式沿用自动推荐逻辑。'
-        : '选品广场、热点趋势和联盟榜单按同一套数据门槛统一筛选；默认全部类目。'
+        : '选品广场、热点趋势和联盟榜单按同一套数据门槛统一筛选；默认全部类目，并应用通用设置中的排除类目。'
     const cachedFilterOptions = filterCatalogData.value.filters
     if (hasSelectedPlatformFilters(settings.filters) &&
       (!cachedFilterOptions || typeof cachedFilterOptions !== 'object' || Object.keys(cachedFilterOptions as Record<string, unknown>).length === 0)) {
@@ -2297,9 +2470,18 @@ async function executeAccountSelection(
       const previewPlan = previewPlanMap.get(targetAccountId)
       if (!previewPlan) throw new Error('百应候选预览没有生成统一筛选计划。')
       const found = previewPlan.candidates
+      const candidatePool = previewPlan.candidatePool ?? found
+      previewCandidatePoolCount.value = candidatePool.length
+      previewCandidatePool.value = candidatePool.length
+        ? {
+            accountId: targetAccountId,
+            fingerprint: previewPoolFingerprint(targetAccountId, context),
+            plan: previewPlan
+          }
+        : null
       categoryRecommendations.value = previewPlan.recommendedCategories
       if (accountId.value === targetAccountId) {
-        candidates.value = found
+        candidates.value = candidatePool.map((candidate) => ({ ...candidate, selected: true }))
         previewAccountId.value = targetAccountId
         candidateSelectionCustomized.value = false
       }
@@ -2314,10 +2496,19 @@ async function executeAccountSelection(
         warnings.unshift(`本机登记、配额或商品 ID 互斥过滤 ${locallySkipped} 个候选${skippedDetails ? `；示例：${skippedDetails}` : ''}。`)
       }
       const rejected = previewPlan.rejectedCandidates
-      const firstRejectedReason = rejected[0]?.thresholdReasons?.[0]
-      const rejectionSummary = rejected.length
-        ? `；另有 ${rejected.length} 个候选因列表实测数据未达阈值被排除${firstRejectedReason ? `，示例：${firstRejectedReason}` : ''}`
-        : ''
+      const excludedByCategoryCount = rejected.filter((candidate) =>
+        candidate.thresholdReasons?.includes('命中通用设置中排除的类目')
+      ).length
+      const thresholdRejectedCount = Math.max(0, rejected.length - excludedByCategoryCount)
+      const firstThresholdReason = rejected.find((candidate) =>
+        !candidate.thresholdReasons?.includes('命中通用设置中排除的类目')
+      )?.thresholdReasons?.[0]
+      const rejectionSummary = [
+        thresholdRejectedCount
+          ? `另有 ${thresholdRejectedCount} 个候选因列表实测数据未达阈值被排除${firstThresholdReason ? `，示例：${firstThresholdReason}` : ''}`
+          : '',
+        excludedByCategoryCount ? `通用设置排除类目过滤 ${excludedByCategoryCount} 个候选` : ''
+      ].filter(Boolean).map((item) => `；${item}`).join('')
       const previewSourceResults = previewPlan.prioritySourceResults
       const categorySummary = previewPlan.recommendedCategories.length
         ? `重点类目推荐依据：${previewPlan.recommendedCategories.slice(0, 8).map((row) =>
@@ -2650,14 +2841,17 @@ async function executeAccountSelection(
             : '已查询全部已启用来源与选品广场兜底，仍没有符合条件的商品。')
         }
         selectedIndexes = eligible.map((candidate) => candidate.cardIndex)
+        const maxIndexesToSend = hasExplicitPreviewSelection ? candidateLimit * 3 : candidateLimit
         selectedIndexesToExecute = selectedIndexes.slice(0, Math.min(
           selectedIndexes.length,
-          Math.max(candidateLimit, candidateLimit * 2)
+          maxIndexesToSend
         ))
         reportSelectionProgress(targetAccountId, '准备逐个处理选中商品', {
           itemIndex: 0,
           itemTotal: selectedIndexesToExecute.length,
-          message: `候选池 ${selectedIndexesToExecute.length} 个；本轮最多加入 ${maxSelectedProducts} 个`
+          message: hasExplicitPreviewSelection
+            ? `人工勾选候选 ${selectedIndexesToExecute.length} 个；本轮最多加入 ${maxSelectedProducts} 个`
+            : `主候选 ${selectedIndexesToExecute.length} 个；登记冲突时自动从筛选池补位，最多加入 ${maxSelectedProducts} 个`
         })
         await persistStage('cart_pending', {
           candidates: fetched,
@@ -2670,10 +2864,12 @@ async function executeAccountSelection(
       if (selectedIndexesToExecute.length) {
         await recovery?.logEvent({
           stage: '候选池准备', code: 'INFO_CANDIDATE_POOL_READY',
-          message: `已找到 ${selectedIndexesToExecute.length} 个可核验候选（含 ${Math.max(0, selectedIndexesToExecute.length - (maxSelectedProducts ?? 0))} 个备用）；登记冲突按商品 ID 跳过后继续尝试后续候选，最多加入 ${maxSelectedProducts} 个。`,
+          message: hasExplicitPreviewSelection
+            ? `已找到 ${selectedIndexesToExecute.length} 个用户勾选候选（含所选备用项）；登记冲突会跳过并尝试其他勾选项，最多加入 ${maxSelectedProducts} 个。`
+            : `已找到 ${selectedIndexesToExecute.length} 个主候选；遇到已选商品或登记冲突会跳过，并从完整候选池自动补位，单轮最多检查 30 个候选、加入 ${maxSelectedProducts} 个。`,
           detail: hasExplicitPreviewSelection
-            ? '本次只使用人工勾选的候选。'
-            : '候选池按全账号商品 ID 互斥分配；正式预留发现商品已登记时跳过该 ID，并尝试后续备用候选。自动补位候选池最多读取 30 个商品。'
+            ? '本次优先使用人工勾选的候选；本机登记拒绝时仍会尝试其他已选候选。'
+            : '候选池按全账号商品 ID 互斥分配；正式预留遇到已登记商品时跳过，并按候选排序继续从当前完整筛选快照补位，最多保留目标数量 3 倍的执行预留。'
         })
         stage = '加入选品车并取回商品 ID'
         accountStatuses[targetAccountId] = '加入选品车中'
@@ -2694,6 +2890,7 @@ async function executeAccountSelection(
           downloadPath: context.downloadPath,
           selectedIndexes: selectedIndexesToExecute,
           candidateSnapshot: executionCandidates,
+          allowCandidateFallback: !hasExplicitPreviewSelection && !resumeCart,
           refreshCandidatesById: resumeCart,
           analyzeBeforeCart: !resumeAfterCart,
           maxSelectedProducts,
@@ -2708,6 +2905,14 @@ async function executeAccountSelection(
             stage: '本机选品登记', code: 'WARNING_REGISTRY_CONFLICT',
             message: `商品 ${rejected.productId} 未获本机预留，已跳过：${rejected.reason}`,
             detail: rejected.reason, productId: rejected.productId
+          })
+        }
+        const registryReplacementCount = Math.max(0, Number(result.registryReplacementCount) || 0)
+        if (registryReplacementCount) {
+          await recovery?.logEvent({
+            stage: '本机选品登记', code: 'INFO_REGISTRY_CANDIDATE_REPLACED',
+            message: `已自动从后续候选补位 ${registryReplacementCount} 个，继续完成本轮选品。`,
+            detail: '前序候选因本机重复登记或类目冲突未能预留；补位商品仍经过同一筛选和加车核验。'
           })
         }
         const settlementWarnings = Array.isArray(result.registrySettlementWarnings)
@@ -3036,7 +3241,11 @@ async function executeAccountSelection(
             accountKey: `local:${targetAccountId}`,
             downloadPath: context.downloadPath,
             selectedIndexes: [candidate.cardIndex],
-            candidateSnapshot: fetched,
+            candidateSnapshot: fetched.map((row) => row.productId === productId
+              ? { ...row, cartAdded: true }
+              : row),
+            recoverExistingCart: true,
+            refreshCandidatesById: true,
             previewOnly: false
           }))
           if (detail.ok !== true) throw new Error(String(detail.error ?? '百应商品详情采集失败'))
@@ -3232,6 +3441,8 @@ async function previewCandidates(): Promise<void> {
   busy.value = true
   error.value = ''
   notice.value = ''
+  previewCandidatePool.value = null
+  previewCandidatePoolCount.value = 0
   selectionProgress.value = {
     state: 'running', mode: 'preview', accountId: targetAccountId,
     accountName: accounts.value.find((item) => item.id === targetAccountId)?.name ?? `账号 ${targetAccountId}`,
@@ -3249,7 +3460,7 @@ async function previewCandidates(): Promise<void> {
     if (!context) throw new Error('账号资源配置未能解析。')
     const result = await executeAccountSelection(targetAccountId, true, snapshot, undefined, context)
     notice.value = '账号「' + (accounts.value.find((item) => item.id === targetAccountId)?.name ?? targetAccountId) +
-      '」预览完成：已找到 ' + candidates.value.length + ' 个候选商品。详细来源统计和类目依据已收起，可在下方进度详情中查看。'
+      '」预览完成：已建立 ' + previewCandidatePoolCount.value + ' 个去重候选商品池；来源包含选品广场、热点趋势和联盟榜单。账号设置和路径未变化时，正式批次会复用此池并再次排除已登记商品。来源统计可在下方进度详情中查看。'
     selectionProgress.value = {
       ...selectionProgress.value!, state: 'finished', stage: '候选预览完成',
       message: result.message ?? '候选预览完成', itemIndex: null, itemTotal: null, percent: 100
@@ -3389,6 +3600,21 @@ async function validateRecoveryContexts(batch: SelectionRecoveryBatch): Promise<
     errors.set(id, [errors.get(id), ...messages].filter(Boolean).join('；'))
   }
   return { contexts, errors }
+}
+
+async function resolveSavedEffectiveDownloadPath(accountId: number): Promise<string> {
+  const saved = await runEngine('selection_settings.py', [
+    '--db', DB_PATH, 'get', '--account-id', String(accountId)
+  ])
+  const settingsRoot = (saved.settings ?? {}) as { account?: Record<string, unknown> }
+  const configuredPath = String(settingsRoot.account?.downloadPath ?? '').trim()
+  const defaultRoot = (await window.api.dir.getDownloadDir()).replace(/[\\/]+$/, '')
+  const rawPath = configuredPath || `${defaultRoot}\\账号-${accountId}`
+  const result = await window.api.dir.canonicalizePath(rawPath)
+  if (!result.ok || !result.path) {
+    throw new Error(result.error ?? `账号 ${accountId} 的当前下载目录无法解析`)
+  }
+  return result.path
 }
 
 async function loadRecoveryStatus(): Promise<void> {
@@ -3751,6 +3977,7 @@ function loginStateLabel(state: LoginCheckState): string {
 }
 
 function confirmSelectionScope(fingerprint: string, message: string): boolean {
+  if (automaticScheduledStartActive) return true
   const pending = scopeConfirmationToResume
   scopeConfirmationToResume = null
   if (pending && pending.expiresAt > Date.now() && pending.fingerprint === fingerprint) return true
@@ -4056,7 +4283,17 @@ async function runSelectionBatch(): Promise<void> {
       const savedAccountContexts = (batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>
       const displayedContexts = refreshableUpdate?.settingsChanged
         ? refreshableUpdate.freshContexts
-        : savedAccountContexts
+        : { ...savedAccountContexts }
+      const recoveryDownloadPathUpdates: Record<string, string> = {}
+      for (const item of selectedPendingAccounts) {
+        const currentPath = await resolveSavedEffectiveDownloadPath(item.accountId)
+        const savedPath = displayedContexts[String(item.accountId)]?.downloadPath ?? ''
+        if (savedPath && normalizedResourcePath(savedPath) !== normalizedResourcePath(currentPath)) {
+          recoveryDownloadPathUpdates[String(item.accountId)] = currentPath
+          const savedContext = displayedContexts[String(item.accountId)]
+          if (savedContext) displayedContexts[String(item.accountId)] = { ...savedContext, downloadPath: currentPath }
+        }
+      }
       const recoveryPathSummary = selectedPendingAccounts.map((item) => {
         const effectivePath = displayedContexts[String(item.accountId)]?.downloadPath
         return `${currentById.get(item.accountId)?.name ?? item.accountName}：${effectivePath || '沿用检查点中已保存的商品目录'}`
@@ -4065,8 +4302,10 @@ async function runSelectionBatch(): Promise<void> {
         `本次恢复：${selectedSummary}`,
         completedSummary ? `已完成并跳过：${completedSummary}` : '',
         preservedSummary ? `未勾选，保留原检查点：${preservedSummary}` : '',
-        `素材保存路径${refreshableUpdate?.settingsChanged ? '（候选尚未查询，将按当前已保存设置刷新）' : '（沿用本批次快照）'}：\n${recoveryPathSummary}`,
-        '已有素材不会搬迁。'
+        `素材保存路径${Object.keys(recoveryDownloadPathUpdates).length
+          ? '（确认后更新本批次未完成账号）'
+          : refreshableUpdate?.settingsChanged ? '（候选尚未查询，将按当前已保存设置刷新）' : '（当前设置与批次一致）'}：\n${recoveryPathSummary}`,
+        '未完成商品的详情图补采和新生成视频将使用上方目录；已有详情图、已生成视频及其他素材不会搬迁。'
       ].filter(Boolean).join('\n')
       const recoveryScopeFingerprint = stableJson({
         kind: 'recovery',
@@ -4125,7 +4364,21 @@ async function runSelectionBatch(): Promise<void> {
           '）；本次没有恢复或修改批次。'
         )
       }
-      const storedValidation = refreshableUpdate ? null : await validateRecoveryContexts(batch)
+      let validationBatch = batch
+      if (Object.keys(recoveryDownloadPathUpdates).length) {
+        const validationContexts = {
+          ...((batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>)
+        }
+        for (const [accountId, downloadPath] of Object.entries(recoveryDownloadPathUpdates)) {
+          const context = validationContexts[accountId]
+          if (context) validationContexts[accountId] = { ...context, downloadPath }
+        }
+        validationBatch = {
+          ...batch,
+          payload: { ...batch.payload, accountContexts: validationContexts }
+        }
+      }
+      const storedValidation = refreshableUpdate ? null : await validateRecoveryContexts(validationBatch)
       const storedContexts = (batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>
       const preflightTargets = selectedPendingAccounts.map((item) => {
         const currentAccount = currentById.get(item.accountId)
@@ -4144,6 +4397,14 @@ async function runSelectionBatch(): Promise<void> {
         accountSwitchFailures.set(accountId, failure)
       }
       if (loginPreflight.value) return
+      if (Object.keys(recoveryDownloadPathUpdates).length) {
+        const updated = await runRecovery([
+          'batch', 'update-download-paths', '--batch-id', batch.batchId
+        ], { downloadPaths: recoveryDownloadPathUpdates })
+        batch = updated.batch as SelectionRecoveryBatch
+        recoveryBatch.value = batch
+        notice.value = '已将所选待恢复账号的详情图补采和新视频输出目录更新为当前设置；已有素材文件保留原位。'
+      }
       const existingCandidatePlan = batch.payload.candidatePlan as Record<string, AccountCandidatePlan> | undefined
       const candidatePlanAccounts = selectedPendingAccounts.filter((item) => !accountSwitchFailures.has(item.accountId))
       const selectedPlanMissing = candidatePlanAccounts.some((item) =>
@@ -4161,9 +4422,12 @@ async function runSelectionBatch(): Promise<void> {
           return context ? [[account.id, context] as const] : []
         }))
         let candidatePlans: Map<number, AccountCandidatePlan>
+        let reusedPreviewPool = false
         try {
+          const reusablePlans = reusablePreviewCandidatePlans(pendingRows, freshContextMap)
+          reusedPreviewPool = reusablePlans.size > 0
           candidatePlans = await prepareBatchCandidatePlans(
-            pendingRows, freshContextMap, undefined, undefined, accountSwitchFailures
+            pendingRows, freshContextMap, undefined, undefined, accountSwitchFailures, reusablePlans
           )
         } catch (cause) {
           if (toUserSelectionError(cause).classification === 'BAIYING_RATE_LIMIT') {
@@ -4193,13 +4457,17 @@ async function runSelectionBatch(): Promise<void> {
           } : {}),
           candidatePlan: {
             ...(existingCandidatePlan ?? {}),
-            ...Object.fromEntries(candidatePlans)
+            ...candidatePlansForBatchPayload(candidatePlans)
           }
         }
         const refreshed = await runRecovery([
           'batch', 'refresh-candidates', '--batch-id', batch.batchId
         ], payload)
         batch = refreshed.batch as SelectionRecoveryBatch
+        if (reusedPreviewPool) {
+          previewCandidatePool.value = null
+          previewCandidatePoolCount.value = 0
+        }
         notice.value = refreshableUpdate.settingsChanged
           ? '上次失败发生在候选查询，尚未加车；已按当前设置刷新检查点、候选计划和下载路径。'
           : '旧批次尚未保存统一候选计划；已只读采集候选并写入跨账号互斥计划。'
@@ -4301,9 +4569,10 @@ async function runSelectionBatch(): Promise<void> {
       let candidatePlans: Map<number, AccountCandidatePlan>
       const candidatePlanAccounts = enabled.filter((account) => !accountSwitchFailures.has(account.id))
       try {
+        const reusablePlans = reusablePreviewCandidatePlans(candidatePlanAccounts, contexts)
         candidatePlans = candidatePlanAccounts.length
           ? await prepareBatchCandidatePlans(
-            candidatePlanAccounts, contexts, reviewedAccountId, reviewedProducts, accountSwitchFailures
+            candidatePlanAccounts, contexts, reviewedAccountId, reviewedProducts, accountSwitchFailures, reusablePlans
           )
           : new Map()
       } catch (cause) {
@@ -4335,10 +4604,14 @@ async function runSelectionBatch(): Promise<void> {
         }
         throw cause
       }
-      preparedCandidatePlans = Object.fromEntries(candidatePlans)
+      preparedCandidatePlans = candidatePlansForBatchPayload(candidatePlans)
       payload.candidatePlan = preparedCandidatePlans
       const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
       batch = created.batch as SelectionRecoveryBatch
+      if (previewCandidatePool.value && candidatePlanAccounts.some((account) => account.id === previewCandidatePool.value?.accountId)) {
+        previewCandidatePool.value = null
+        previewCandidatePoolCount.value = 0
+      }
       recoveryBatch.value = batch
     }
 
@@ -4661,7 +4934,7 @@ async function runSelectionBatch(): Promise<void> {
 
 const runSelectionBatchOnce = createSingleFlight(runSelectionBatch)
 
-async function startSelection(): Promise<void> {
+async function startSelection(): Promise<boolean> {
   const autoStartBatchId = automaticResumeBatchId
   const autoStartAccountId = automaticResumeAccountId
   const intent = cooldownAutoResumeIntent.value
@@ -4682,11 +4955,11 @@ async function startSelection(): Promise<void> {
   }
   if (busy.value) {
     deferAutomaticResume('busy_before_start_selection')
-    return
+    return false
   }
   if (selectionCooldownRemaining.value > 0 && !automaticResumeIsDue) {
     deferAutomaticResume('cooldown_countdown_not_ready')
-    return
+    return false
   }
   if (automaticResumeIsDue) selectionCooldownRemaining.value = 0
   void window.api.selectionCooldown.cancel().catch(() => undefined)
@@ -4699,14 +4972,292 @@ async function startSelection(): Promise<void> {
   }
   if (selectionCooldownTimer !== null) window.clearInterval(selectionCooldownTimer)
   selectionCooldownTimer = null
-  void runSelectionBatchOnce()
+  const runPromise = runSelectionBatchOnce()
+  // runSelectionBatch 在首个 await 前同步设置 busy。若账号路径未保存等
+  // 前置校验直接返回，不能把“定时已处理”误报成“已启动”。
+  const started = busy.value
+  await runPromise
+  return started
 }
+
+async function loadDailySelectionSchedule(): Promise<void> {
+  const schedule = await window.api.selectionSchedule.get()
+  savedDailySelectionScheduleEnabled = schedule.enabled
+  dailySelectionSchedule.enabled = schedule.enabled
+  dailySelectionSchedule.time = schedule.time
+  dailySelectionSchedule.launchAtLogin = schedule.launchAtLogin
+  dailySelectionSchedule.canLaunchAtLogin = schedule.canLaunchAtLogin
+}
+
+async function saveDailySelectionSchedule(): Promise<void> {
+  if (dailySelectionSchedule.saving) return
+  dailySelectionSchedule.saving = true
+  error.value = ''
+  try {
+    const result = await window.api.selectionSchedule.save({
+      enabled: dailySelectionSchedule.enabled,
+      time: dailySelectionSchedule.time,
+      launchAtLogin: dailySelectionSchedule.enabled && dailySelectionSchedule.launchAtLogin
+    })
+    if (!result.ok || !result.schedule) throw new Error(result.error || '定时选品设置保存失败。')
+    savedDailySelectionScheduleEnabled = result.schedule.enabled
+    dailySelectionSchedule.enabled = result.schedule.enabled
+    dailySelectionSchedule.time = result.schedule.time
+    dailySelectionSchedule.launchAtLogin = result.schedule.launchAtLogin
+    dailySelectionSchedule.canLaunchAtLogin = result.schedule.canLaunchAtLogin
+    notice.value = result.schedule.enabled
+      ? `每日定时选品已启用，每天 ${result.schedule.time} 按当前已保存设置开始。`
+      : '每日定时选品已关闭。'
+  } catch (cause) {
+    error.value = String(cause instanceof Error ? cause.message : cause)
+  } finally {
+    dailySelectionSchedule.saving = false
+  }
+}
+
+function delayScheduledRetry(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
+
+function scheduledLoginBlockReason(): string | null {
+  const preflightAccounts = loginPreflight.value?.accounts ?? []
+  for (const account of preflightAccounts) {
+    const platforms = [
+      { name: '百应', state: account.baiying.state, message: account.baiying.message },
+      { name: '抖音创作者中心', state: account.creatorCenter.state, message: account.creatorCenter.message }
+    ]
+    const blocked = platforms.find((platform) =>
+      platform.state === 'login_required' || platform.state === 'verification_required' ||
+      /(?:需要登录|尚未登录|未登录|登录失效|LOGIN REQUIRED|NOT LOGGED IN|验证码|人工验证|安全验证|CAPTCHA|VERIFICATION REQUIRED)/i.test(platform.message)
+    )
+    if (blocked) return `账号「${account.accountName}」的${blocked.name}需要登录或完成验证。`
+  }
+
+  const pendingErrors = recoveryBatch.value?.accounts
+    .filter((account) => account.state !== 'completed')
+    .map((account) => account.error || '') ?? []
+  const details = [error.value, selectionProgress.value?.stage, selectionProgress.value?.message, ...pendingErrors]
+    .filter(Boolean).join('\n')
+  const classification = toUserSelectionError(details).classification
+  if (classification === 'ACCOUNT_SWITCH_LOGIN' || classification === 'ACCOUNT_SWITCH_CAPTCHA' ||
+      /(?:需要登录|尚未登录|未登录|登录失效|LOGIN REQUIRED|NOT LOGGED IN|验证码|人工验证|安全验证|CAPTCHA|VERIFICATION REQUIRED)/i.test(details)) {
+    return '百应或创作者中心需要登录或完成验证。'
+  }
+  return null
+}
+
+function scheduledRetryDelay(attempt: number): number {
+  const exponent = Math.min(4, Math.max(0, attempt - 1))
+  return Math.min(SCHEDULED_RETRY_MAX_DELAY_MS, SCHEDULED_RETRY_BASE_DELAY_MS * (2 ** exponent))
+}
+
+async function traceScheduledRun(
+  due: SelectionScheduleDue,
+  stage: string,
+  attempt?: number,
+  delayMs?: number
+): Promise<void> {
+  await window.api.selectionSchedule.trace({ date: due.date, stage, attempt, delayMs }).catch(() => undefined)
+}
+
+async function isScheduledSelectionEnabled(): Promise<boolean> {
+  try {
+    return (await window.api.selectionSchedule.get()).enabled
+  } catch {
+    // 读取主进程状态短暂失败时，以最近一次加载的已保存值为准；未保存的开关编辑不影响运行中任务。
+    return savedDailySelectionScheduleEnabled
+  }
+}
+
+async function waitForScheduledRetry(milliseconds: number): Promise<void> {
+  scheduledRetryWaiting.value = true
+  try {
+    const deadline = Date.now() + milliseconds
+    let nextScheduleCheck = 0
+    while (Date.now() < deadline) {
+      if (Date.now() >= nextScheduleCheck) {
+        if (!(await isScheduledSelectionEnabled())) return
+        nextScheduleCheck = Date.now() + 5_000
+      }
+      if (scheduledLoginBlockReason()) return
+      await delayScheduledRetry(Math.min(1_000, Math.max(1, deadline - Date.now())))
+    }
+  } finally {
+    scheduledRetryWaiting.value = false
+  }
+}
+
+async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise<void> {
+  if (!selectionInitialized.value || handledScheduledStartDates.has(due.date)) return
+  if (automaticScheduledStartActive) {
+    if (due.date !== activeScheduledStartDate &&
+        (!queuedScheduledStart || queuedScheduledStart.date < due.date)) {
+      queuedScheduledStart = due
+    }
+    return
+  }
+  handledScheduledStartDates.add(due.date)
+  automaticScheduledStartActive = true
+  activeScheduledStartDate = due.date
+  let outcome: 'completed' | 'login-blocked' | 'disabled' | 'failed' | null = null
+  let attempts = 0
+  let currentRunStarted = false
+  const initialBatch = recoveryBatch.value
+  let currentRunBatchId = initialBatch && ['in_progress', 'needs_retry'].includes(initialBatch.state)
+    ? initialBatch.batchId : null
+  try {
+    while (!outcome) {
+      let attemptCounted = false
+      try {
+        const scheduleEnabled = await isScheduledSelectionEnabled()
+        if (!scheduleEnabled) {
+          outcome = 'disabled'
+          notice.value = '每日定时选品已关闭；停止本次自动运行。'
+          await traceScheduledRun(due, 'schedule_disabled', attempts)
+          break
+        }
+
+        const loginBlock = scheduledLoginBlockReason()
+        if (loginBlock) {
+          outcome = 'login-blocked'
+          notice.value = `每日自动选品已暂停：${loginBlock}完成登录或验证后，可在此页重新检查并继续。`
+          await traceScheduledRun(due, 'login_blocked', attempts)
+          notifyGlobal(notice.value, 'error')
+          break
+        }
+        // unknown / 页面未就绪不是明确的未登录状态；清除旧预检结果并在下一轮重新检查。
+        if (loginPreflight.value) loginPreflight.value = null
+
+        if (currentRunStarted && currentRunBatchId !== null &&
+            recoveryBatch.value?.batchId === currentRunBatchId && recoveryBatch.value.state === 'completed') {
+          outcome = 'completed'
+          notice.value = `每日定时选品已完成（${due.date} ${due.time}）。`
+          await traceScheduledRun(due, 'run_completed', attempts)
+          break
+        }
+
+        if (busy.value) {
+          if (selectionProgress.value?.state === 'running' && selectionProgress.value.mode === 'batch') {
+            currentRunStarted = true
+            currentRunBatchId = recoveryBatch.value?.batchId ?? currentRunBatchId
+            notice.value = `每日计划已到；当前批次正在执行，完成后会自动检查结果并接续未完成项。`
+          } else {
+            notice.value = `每日计划已到；客户端正在处理其他操作，空闲后会自动开始选品。`
+          }
+          await waitForScheduledRetry(1_000)
+          continue
+        }
+
+        if (selectionCooldownRemaining.value > 0) {
+          const remaining = selectionCooldownRemaining.value
+          notice.value = `百应冷却中，约 ${remaining} 秒后自动继续；当前批次检查点会保留。`
+          await waitForScheduledRetry(Math.min(5_000, Math.max(1_000, remaining * 1_000)))
+          continue
+        }
+
+        attempts += 1
+        attemptCounted = true
+        await traceScheduledRun(due, 'attempt_started', attempts)
+        error.value = ''
+        notice.value = `每日计划 ${due.time}：正在运行选品流程（第 ${attempts} 次尝试）。`
+        const started = await startSelection()
+        if (started) {
+          currentRunStarted = true
+          const latestBatch = recoveryBatch.value
+          if (latestBatch && (latestBatch.batchId !== initialBatch?.batchId || currentRunBatchId === latestBatch.batchId)) {
+            currentRunBatchId = latestBatch.batchId
+          }
+        }
+
+        const postRunLoginBlock = scheduledLoginBlockReason()
+        if (postRunLoginBlock) {
+          outcome = 'login-blocked'
+          notice.value = `每日自动选品已暂停：${postRunLoginBlock}完成登录或验证后，可在此页重新检查并继续。`
+          await traceScheduledRun(due, 'login_blocked', attempts)
+          notifyGlobal(notice.value, 'error')
+          break
+        }
+        if (started && currentRunBatchId !== null &&
+            recoveryBatch.value?.batchId === currentRunBatchId && recoveryBatch.value.state === 'completed') {
+          outcome = 'completed'
+          notice.value = `每日定时选品已完成（${due.date} ${due.time}）。`
+          await traceScheduledRun(due, 'run_completed', attempts)
+          break
+        }
+
+        const delayMs = scheduledRetryDelay(attempts)
+        const delaySeconds = Math.ceil(delayMs / 1_000)
+        const reason = error.value || selectionProgress.value?.message || '流程尚未完成，待恢复检查点已保留'
+        const retryMessage = `每日选品第 ${attempts} 次未完成：${reason}。检查点已保留，${delaySeconds} 秒后自动继续。`
+        notice.value = retryMessage
+        if (selectionProgress.value) {
+          selectionProgress.value = {
+            ...selectionProgress.value,
+            state: 'running', stage: '等待定时自动续跑', message: retryMessage, percent: null
+          }
+        }
+        await traceScheduledRun(due, 'retry_scheduled', attempts, delayMs)
+        const retryBatchId = recoveryBatch.value?.batchId
+        if (retryBatchId) {
+          await runRecovery(['log', 'append', '--batch-id', retryBatchId, '--account-id', '0'], {
+            stage: '定时自动续跑', code: 'INFO_SCHEDULED_AUTO_RETRY',
+            message: `本次处理未完成，${delaySeconds} 秒后继续尝试（第 ${attempts} 次）。`,
+            detail: error.value || selectionProgress.value?.message || ''
+          }).catch(() => undefined)
+        }
+        if (attempts === 1 || attempts % 5 === 0) notifyGlobal(retryMessage, 'error')
+        await waitForScheduledRetry(delayMs)
+      } catch (cause) {
+        error.value = `每日定时选品本轮遇到错误：${String(cause instanceof Error ? cause.message : cause)}`
+        const loginBlock = scheduledLoginBlockReason()
+        if (loginBlock) {
+          outcome = 'login-blocked'
+          notice.value = `每日自动选品已暂停：${loginBlock}完成登录或验证后，可在此页重新检查并继续。`
+          await traceScheduledRun(due, 'login_blocked', attempts)
+          notifyGlobal(notice.value, 'error')
+          break
+        }
+        if (!attemptCounted) attempts += 1
+        const delayMs = scheduledRetryDelay(attempts)
+        const retryMessage = `${error.value}；${Math.ceil(delayMs / 1_000)} 秒后自动重试，定时选品保持运行。`
+        notice.value = retryMessage
+        await traceScheduledRun(due, 'attempt_error', attempts, delayMs)
+        await traceScheduledRun(due, 'retry_scheduled', attempts, delayMs)
+        if (attempts === 1 || attempts % 5 === 0) notifyGlobal(retryMessage, 'error')
+        await waitForScheduledRetry(delayMs)
+      }
+    }
+  } finally {
+    scheduledRetryWaiting.value = false
+    automaticScheduledStartActive = false
+    activeScheduledStartDate = null
+    if (outcome === 'completed' || outcome === 'login-blocked' || outcome === 'disabled') {
+      emit('scheduled-start-handled', due.date, outcome)
+    } else {
+      // 非终态不能消耗定时计划；清掉页面去重标记后由主进程再次投递。
+      handledScheduledStartDates.delete(due.date)
+      if (outcome) emit('scheduled-start-handled', due.date, outcome)
+    }
+    const queued = queuedScheduledStart
+    queuedScheduledStart = null
+    if (queued) void handleScheduledSelectionStart(queued)
+  }
+}
+
+watch(() => props.scheduledStart, (due) => {
+  if (due) void handleScheduledSelectionStart(due)
+})
+watch(selectionInitialized, (ready) => {
+  if (ready && props.scheduledStart) void handleScheduledSelectionStart(props.scheduledStart)
+})
 
 watch(accountId, () => {
   candidates.value = []
   categoryRecommendations.value = []
   previewAccountId.value = null
   candidateSelectionCustomized.value = false
+  previewCandidatePool.value = null
+  previewCandidatePoolCount.value = 0
   if (activeTab.value === '账号个性化') void loadAccountSettings()
 })
 watch(activeTab, (tab) => {
@@ -4716,45 +5267,49 @@ watch(activeTab, (tab) => {
 onMounted(async () => {
   selectionViewUnmounted = false
   if (!props.dialogOnly) stopSelectionCooldownExpired = window.api.selectionCooldown.onExpired(onSelectionCooldownExpired)
-  window.addEventListener('focus', refreshCooldownFromDeadline)
-  document.addEventListener('visibilitychange', refreshCooldownFromDeadline)
+  window.addEventListener('focus', handleSelectionViewVisibilityChange)
+  document.addEventListener('visibilitychange', handleSelectionViewVisibilityChange)
   stopSelectionProgress = window.api.browser.onSelectionProgress((event) => {
-    const current = selectionProgress.value
-    if (!current || current.state !== 'running') return
-    if (current.accountId !== null && current.accountId !== event.accountId) return
-    const productProgress = Boolean(event.productId) || event.stage === '核验并处理选中商品' || event.stage === '选中商品处理结果已返回'
-    const itemPercent = productProgress && Number.isInteger(event.index) && Number.isInteger(event.total) && (event.total ?? 0) > 0
-      ? Math.floor(Math.max(0, Math.min(event.total ?? 0, (event.index ?? 0) - 1)) * 100 / (event.total ?? 1))
-      : null
-    reportSelectionProgress(event.accountId, event.stage, {
-      state: 'running',
-      message: event.message ?? '',
-      stepIndex: productProgress ? null : event.index ?? null,
-      stepTotal: productProgress ? null : event.total ?? null,
-      stepUnit: productProgress ? '' : event.unit ?? '',
-      itemIndex: productProgress ? event.index ?? null : null,
-      itemTotal: productProgress ? event.total ?? null : null,
-      percent: event.percent ?? itemPercent,
-      indeterminate: event.indeterminate === true
+    queueSelectionProgressUpdate(() => {
+      const current = selectionProgress.value
+      if (!current || current.state !== 'running') return
+      if (current.accountId !== null && current.accountId !== event.accountId) return
+      const productProgress = Boolean(event.productId) || event.stage === '核验并处理选中商品' || event.stage === '选中商品处理结果已返回'
+      const itemPercent = productProgress && Number.isInteger(event.index) && Number.isInteger(event.total) && (event.total ?? 0) > 0
+        ? Math.floor(Math.max(0, Math.min(event.total ?? 0, (event.index ?? 0) - 1)) * 100 / (event.total ?? 1))
+        : null
+      reportSelectionProgress(event.accountId, event.stage, {
+        state: 'running',
+        message: event.message ?? '',
+        stepIndex: productProgress ? null : event.index ?? null,
+        stepTotal: productProgress ? null : event.total ?? null,
+        stepUnit: productProgress ? '' : event.unit ?? '',
+        itemIndex: productProgress ? event.index ?? null : null,
+        itemTotal: productProgress ? event.total ?? null : null,
+        percent: event.percent ?? itemPercent,
+        indeterminate: event.indeterminate === true
+      })
     })
   })
   stopAutoPublishProgress = window.api.publish.onProgress((event) => {
-    const current = selectionProgress.value
-    if (!current || current.state !== 'running' || current.accountId !== event.accountId ||
-      activeAutoPublishQueueId === null || activeAutoPublishQueueId !== event.queueId) return
-    reportSelectionProgress(event.accountId ?? current.accountId!, event.stage, {
-      state: 'running',
-      message: event.message || event.stage,
-      itemIndex: current.itemIndex,
-      itemTotal: current.itemTotal,
-      percent: typeof event.percent === 'number' ? event.percent : null,
-      indeterminate: event.indeterminate === true
+    queueSelectionProgressUpdate(() => {
+      const current = selectionProgress.value
+      if (!current || current.state !== 'running' || current.accountId !== event.accountId ||
+        activeAutoPublishQueueId === null || activeAutoPublishQueueId !== event.queueId) return
+      reportSelectionProgress(event.accountId ?? current.accountId!, event.stage, {
+        state: 'running',
+        message: event.message || event.stage,
+        itemIndex: current.itemIndex,
+        itemTotal: current.itemTotal,
+        percent: typeof event.percent === 'number' ? event.percent : null,
+        indeterminate: event.indeterminate === true
+      })
     })
   })
   busy.value = true
   try {
     defaultDownloadRoot.value = await window.api.dir.getDownloadDir()
-    await Promise.all([loadGlobal(), loadAccounts()])
+    await Promise.all([loadDailySelectionSchedule(), loadGlobal(), loadAccounts()])
     await loadAccountSettings()
     await Promise.all([reloadCatalog(), loadCachedFilterCatalog()])
     await loadRecoveryStatus()
@@ -4762,6 +5317,7 @@ onMounted(async () => {
     error.value = String(cause instanceof Error ? cause.message : cause)
   } finally {
     busy.value = false
+    selectionInitialized.value = true
   }
 })
 
@@ -4770,10 +5326,12 @@ onUnmounted(() => {
   stopSelectionProgress?.()
   stopAutoPublishProgress?.()
   stopSelectionCooldownExpired?.()
-  window.removeEventListener('focus', refreshCooldownFromDeadline)
-  document.removeEventListener('visibilitychange', refreshCooldownFromDeadline)
-  if (selectionCooldownTimer !== null) window.clearInterval(selectionCooldownTimer)
-  selectionCooldownTimer = null
+  window.removeEventListener('focus', handleSelectionViewVisibilityChange)
+  document.removeEventListener('visibilitychange', handleSelectionViewVisibilityChange)
+  stopSelectionCooldownTicker()
+  if (selectionProgressFlushTimer !== null) window.clearTimeout(selectionProgressFlushTimer)
+  selectionProgressFlushTimer = null
+  pendingSelectionProgressUpdate = null
   clearAutoResumeTimer()
 })
 
@@ -4813,7 +5371,8 @@ onUnmounted(() => {
             <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode" value="general" :disabled="busy"> 通用数据模式</label>
             <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode" value="category" :disabled="busy"> 品类模式</label>
           </div>
-          <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（默认全部类目）' }}。</p>
+          <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目）' }}。</p>
+          <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用通用设置中的 {{ selectedCategoryCount(global.excludedCategorySelection) }} 个排除类目。</p>
           <template v-if="accountDraft.selectionMode === 'category' || (accountDraft.selectionMode === 'inherit' && global.selectionMode === 'category')">
           <div class="category-mode-options" role="group" aria-label="账号品类筛选策略">
             <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode" value="inherit" :disabled="busy"> 沿用通用设置</label>
@@ -4821,7 +5380,7 @@ onUnmounted(() => {
             <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode" value="manual" :disabled="busy"> 手动选择类目</label>
           </div>
           <p v-if="accountDraft.categoryMode === 'inherit'" class="hint">
-            当前沿用通用设置：{{ global.selectionMode !== 'category' ? '自动推荐（通用数据模式未启用品类筛选）' : global.categoryMode === 'manual' ? '手动筛选 ' + selectedCategoryCount(global.categorySelection) + ' 个类目' : '按百应当前可见高分商品自动推荐重点类目' }}。
+            当前沿用通用设置：{{ global.selectionMode !== 'category' ? '通用数据模式，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目' : global.categoryMode === 'manual' ? '手动筛选 ' + selectedCategoryCount(global.categorySelection) + ' 个类目' : '按百应当前可见高分商品自动推荐重点类目' }}。
           </p>
           <p v-else-if="accountDraft.categoryMode === 'auto'" class="hint">系统只分析热点趋势、联盟榜单等当前可见商品，并自动推荐重点类目。</p>
           <template v-else>
@@ -4902,31 +5461,45 @@ onUnmounted(() => {
     <header class="page-head">
       <div>
         <h1>选品设置与自动选品</h1>
-        <p>从百应当前可见热点、联盟来源自动选品，并按高分商品数和平均分推荐重点类目；路径、筛选条件和限额仍可按账号设置。</p>
+        <p>三源候选去重 · 按账号设置路径和限额</p>
       </div>
       <div class="head-actions">
+        <button class="btn" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="activeTab === '通用设置' ? saveGlobal() : saveAccount()">{{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}</button>
         <button class="btn" :disabled="busy" @click="previewCandidates">预览候选</button>
-        <button class="btn primary" :disabled="busy || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelection">
+        <button class="btn primary" :disabled="busy || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelection()">
           {{ selectionCooldownRemaining > 0 ? `冷却中（${selectionCooldownRemaining} 秒）` : recoveryBatch?.state === 'needs_retry' ? '继续选品' : '自动选品一起工作' }}
         </button>
       </div>
     </header>
-    <div v-if="accounts.length" class="account-statuses"><b>账号选品状态</b><span v-for="account in accounts" :key="account.id">{{ account.name }}：{{ accountStatuses[account.id] }}</span></div>
+    <section class="daily-selection-schedule" aria-label="每日定时选品">
+      <div class="daily-selection-copy">
+        <strong>每日定时选品</strong>
+        <span>{{ dailySelectionSchedule.enabled ? `每天 ${dailySelectionSchedule.time} 为所有启用账号启动当前自动流程` : '关闭中；启用后按每天设定时间自动开始' }}</span>
+        <small>到设定时间自动启动；未登录或需人工验证时暂停，其余失败会保留进度并持续重试直至完成。完成后等待下一天计划；客户端需保持运行，安装版可选登录启动。</small>
+      </div>
+      <label class="daily-schedule-toggle">
+        <input v-model="dailySelectionSchedule.enabled" type="checkbox" :disabled="dailySelectionSchedule.saving" @change="!dailySelectionSchedule.enabled && (dailySelectionSchedule.launchAtLogin = false)">
+        启用
+      </label>
+      <label class="daily-schedule-time">开始时间
+        <input v-model="dailySelectionSchedule.time" type="time" :disabled="dailySelectionSchedule.saving || !dailySelectionSchedule.enabled">
+      </label>
+      <label v-if="dailySelectionSchedule.canLaunchAtLogin" class="daily-schedule-toggle">
+        <input v-model="dailySelectionSchedule.launchAtLogin" type="checkbox" :disabled="dailySelectionSchedule.saving || !dailySelectionSchedule.enabled">
+        随 Windows 登录启动
+      </label>
+      <span v-else class="daily-schedule-login-hint" title="在安装版客户端中可启用开机启动">需保持客户端运行；安装版可设置随 Windows 登录启动</span>
+      <button class="btn" :disabled="dailySelectionSchedule.saving" @click="saveDailySelectionSchedule">
+        {{ dailySelectionSchedule.saving ? '保存中…' : '保存定时' }}
+      </button>
+    </section>
+    <details v-if="accounts.length" class="account-statuses"><summary>账号选品状态（{{ accounts.length }}）</summary><span v-for="account in accounts" :key="account.id">{{ account.name }}：{{ accountStatuses[account.id] }}</span></details>
     <section v-if="selectionCooldownArmed" class="selection-cooldown" role="status" aria-live="polite">
       <strong>百应暂时限流</strong>
       <p v-if="selectionCooldownRemaining > 0 && autoResumeAccountId !== null">已暂停后续百应请求，约 {{ selectionCooldownRemaining }} 秒后将从本机保存的检查点自动继续选品。</p>
       <p v-else-if="selectionCooldownRemaining > 0">百应请求暂缓约 {{ selectionCooldownRemaining }} 秒；当前没有可自动恢复的限流检查点。</p>
       <p v-else-if="autoResumeAccountId !== null">冷却已结束，正在从保存的检查点自动继续；也可手动点击“继续选品”。</p>
       <p v-else>冷却已结束；当前没有可自动恢复的限流检查点，可在确认页面后重新选品。</p>
-    </section>
-    <section v-if="!dialogOnly" class="card registry-config-card">
-      <div class="registry-config-summary">
-        <div class="registry-config-heading">
-          <h2>本机选品登记</h2>
-          <span class="registry-online">单机模式</span>
-        </div>
-      </div>
-      <p class="registry-config-note">商品去重和账号已选类目记录保存在这台电脑上，选品时自动使用，无需填写服务器地址或密钥。跨电脑同步暂未启用。</p>
     </section>
     <section v-if="selectionProgress" class="selection-progress-card" :class="selectionProgress.state" aria-live="polite">
       <div class="selection-progress-head">
@@ -4984,7 +5557,23 @@ onUnmounted(() => {
     </div>
 
     <div class="body-layout">
-      <div class="settings-scroll">
+      <div ref="settingsScrollRef" class="settings-scroll">
+        <nav class="settings-jumps" aria-label="快速定位设置">
+          <template v-if="activeTab === '通用设置'">
+            <button class="btn" type="button" @click="jumpToSelectionSection('global-mode')">选品模式</button>
+            <button class="btn" type="button" @click="jumpToSelectionSection('global-path')">下载路径</button>
+            <button class="btn" type="button" @click="jumpToSelectionSection('global-filters')">选品条件</button>
+            <button class="btn" type="button" @click="jumpToSelectionSection('global-quota')">执行与配额</button>
+            <button class="btn" type="button" :disabled="busy" @click="bannedWordsDialogOpen = true">屏蔽词</button>
+          </template>
+          <template v-else>
+            <button class="btn" type="button" @click="jumpToSelectionSection('account-mode')">账号模式</button>
+            <button class="btn" type="button" @click="jumpToSelectionSection('account-quota')">每日配额</button>
+            <button class="btn" type="button" @click="jumpToSelectionSection('account-filters')">账号筛选</button>
+            <button class="btn" type="button" @click="jumpToSelectionSection('account-path')">账号路径</button>
+          </template>
+          <button v-if="candidates.length" class="btn" type="button" @click="jumpToSelectionSection('candidate-pool')">候选池 {{ candidates.length }}</button>
+        </nav>
         <p v-if="notice" class="notice">{{ selectionNoticePresentation.userMessage }}</p>
         <details v-if="notice && selectionNoticePresentation.diagnostic" class="selection-diagnostic">
           <summary>查看诊断详情</summary><pre>{{ selectionNoticePresentation.diagnostic }}</pre>
@@ -5022,9 +5611,9 @@ onUnmounted(() => {
           </div>
           <button class="btn" :disabled="busy" @click="abandonStaleBatch">结束旧批次并保留检查点</button>
         </section>
-        <section v-if="!dialogOnly" class="card failure-log-card">
+        <details v-if="!dialogOnly" class="card failure-log-card">
+          <summary>选品过程日志{{ recoveryBatch ? ` · 最近批次 ${recoveryBatch.batchId}` : '' }}</summary>
           <div class="section-title">
-            <h2>选品过程日志</h2>
             <button class="btn" type="button" @click="emit('navigate', '选品日志')">查看选品日志</button>
           </div>
           <div v-if="recoveryBatch" class="run-log-summary">
@@ -5037,17 +5626,44 @@ onUnmounted(() => {
             <span class="hint">{{ ['in_progress', 'needs_retry'].includes(recoveryBatch.state) ? '批次处理中或待恢复' : '最近批次已结束' }} · 日志保存在本机</span>
           </div>
           <p v-else class="hint">每次选品批次和商品处理记录都会保存在本机，可按账号、状态和日期查看历史详情。</p>
-        </section>
+        </details>
 
         <template v-if="activeTab === '通用设置'">
-          <section class="card">
+          <section id="global-mode" class="card">
             <div class="section-title"><h2>选品模式</h2><button class="btn" @click="browserVisible = !browserVisible">{{ browserVisible ? '隐藏百应登录入口' : '显示百应登录入口' }}</button></div>
-            <p class="hint">默认从选品广场、热点趋势和联盟榜单采集候选，按统一数据门槛筛选。类目可以作为可选筛选条件。</p>
+            <p class="hint">默认从选品广场、热点趋势和联盟榜单采集候选，按统一数据门槛筛选。通用模式可排除指定类目，品类模式可自动推荐或手动限定类目。</p>
             <div class="category-mode-options" role="group" aria-label="通用选品模式">
               <label><input v-model="global.selectionMode" type="radio" name="global-selection-mode" value="general" :disabled="busy"> 通用数据模式（默认全部类目）</label>
               <label><input v-model="global.selectionMode" type="radio" name="global-selection-mode" value="category" :disabled="busy"> 品类模式</label>
             </div>
-            <p v-if="global.selectionMode === 'general'" class="hint">通用数据模式不因类目未识别或类目未匹配而排除商品；同一商品 ID 仍会在所有账号间互斥。</p>
+            <template v-if="global.selectionMode === 'general'">
+              <details class="category-picker">
+                <summary>排除类目（可选）· 已选 {{ selectedCategoryCount(global.excludedCategorySelection) }} 项</summary>
+                <p class="hint">选中上级类目时会排除其下级；类目未知的商品仍按数据门槛处理。</p>
+              <div class="category-grid">
+                <div v-for="(group, index) in [level1Options, excludedLevel2Options, excludedLevel3Options]" :key="index" class="category-level">
+                  <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
+                  <div class="category-options">
+                    <label v-for="item in group" :key="item.id" class="category-option">
+                      <input
+                        type="checkbox"
+                        :checked="global.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
+                        :disabled="busy"
+                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), ($event.target as HTMLInputElement).checked)"
+                      >
+                      <span>{{ item.name }}</span>
+                    </label>
+                    <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                  </div>
+                  <div class="mini-actions">
+                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'all')">全选</button>
+                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'invert')">反选</button>
+                    <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'clear')">清空</button>
+                  </div>
+                </div>
+              </div>
+              </details>
+            </template>
             <template v-if="global.selectionMode === 'category'">
             <div class="category-mode-options" role="group" aria-label="通用类目策略">
               <label><input v-model="global.categoryMode" type="radio" name="global-category-mode" value="auto" :disabled="busy"> 自动推荐（默认）</label>
@@ -5083,7 +5699,7 @@ onUnmounted(() => {
             </template>
           </section>
 
-          <section class="card">
+          <section id="global-path" class="card">
             <div class="section-title">
               <h2>通用下载目录</h2>
               <button class="btn" :disabled="busy" @click="chooseGlobalDownloadPath">选择下载目录</button>
@@ -5091,10 +5707,11 @@ onUnmounted(() => {
             <label class="path-field global-download-path">当前通用根目录
               <input :value="defaultDownloadRoot || '正在读取…'" readonly>
             </label>
-            <p class="hint">选择后立即保存。账号未设置单独路径时，素材保存到此目录下的「账号-ID」子目录，再按日期和商品名称分层；账号个性化中的自定义下载路径优先。已有素材不会移动；未获取候选的检查点可按新设置继续，已开始处理的批次沿用原路径。</p>
+            <details class="compact-help"><summary>路径规则</summary><p class="hint">选择后立即保存。账号独立下载路径优先；未设置时在通用目录下按账号、日期和商品分层。已有素材不会移动。</p></details>
           </section>
 
-          <section class="card">
+          <details id="global-filters" class="card filter-card">
+            <summary>选品条件 · 候选上限 {{ global.candidateLimit }}</summary>
             <SelectionFilterEditor
               v-model="globalFilterSettings"
               title="选品条件"
@@ -5105,16 +5722,11 @@ onUnmounted(() => {
               :syncing="busy"
               @sync="refreshFilterCatalog"
             />
-          </section>
+          </details>
 
-          <div class="banned-words-trigger">
-            <button class="btn" type="button" :disabled="busy" @click="bannedWordsDialogOpen = true">屏蔽词</button>
-          </div>
-
-          <section class="card">
+          <section id="global-quota" class="card">
             <h2>执行设置与每日配额</h2>
             <div class="form-grid">
-              <label>发布方式<select value="全自动发布（单项异常隔离；继续后续任务）" disabled><option>全自动发布（单项异常隔离；继续后续任务）</option></select></label>
               <label>置顶发布时间<input v-model="global.execution.pinTime" type="time"></label>
               <label>随机间隔下限（分钟）<input v-model.number="global.execution.randomIntervalMin" type="number" min="0"></label>
               <label>随机间隔上限（分钟）<input v-model.number="global.execution.randomIntervalMax" type="number" min="0"></label>
@@ -5124,20 +5736,20 @@ onUnmounted(() => {
             </div>
             <p class="hint">账号未单独设置时使用这些默认值。限额只控制客户端选品和发布计划，不代表平台吞吐承诺；待确认和已排期任务会占用计划日期用量。</p>
           </section>
-          <div class="save-row"><button class="btn primary" :disabled="busy" @click="saveGlobal">保存通用设置</button></div>
         </template>
 
         <template v-else>
-          <section class="card">
+          <section id="account-mode" class="card">
             <div class="section-title"><h2>账号与品类</h2><select v-model.number="accountId" class="account-select" :disabled="busy"><option v-for="account in selectionScopeAccounts" :key="account.id" :value="account.id">{{ account.name }}（{{ account.status }}）</option></select></div>
             <p v-if="!accounts.length" class="hint">请先在账号管理中添加账号。</p>
-            <p class="hint">账号可继承通用数据/品类模式，也可单独切换；通用数据模式默认覆盖全部类目。</p>
+          <p class="hint">账号可继承通用数据/品类模式，也可单独切换；通用数据模式默认覆盖全部类目，并应用通用设置中的排除类目。</p>
             <div class="category-mode-options" role="group" aria-label="账号选品模式">
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="inherit" :disabled="busy"> 沿用通用模式</label>
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="general" :disabled="busy"> 通用数据模式</label>
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="category" :disabled="busy"> 品类模式</label>
             </div>
-            <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目）' }}。</p>
+            <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目）' }}。</p>
+            <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用通用设置中的 {{ selectedCategoryCount(global.excludedCategorySelection) }} 个排除类目。</p>
             <template v-if="accountDraft.selectionMode === 'category' || (accountDraft.selectionMode === 'inherit' && global.selectionMode === 'category')">
             <div class="category-mode-options" role="group" aria-label="账号品类筛选策略">
               <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode-settings" value="inherit" :disabled="busy"> 沿用通用设置</label>
@@ -5145,7 +5757,7 @@ onUnmounted(() => {
               <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode-settings" value="manual" :disabled="busy"> 手动选择类目</label>
             </div>
             <p v-if="accountDraft.categoryMode === 'inherit'" class="hint">
-              当前沿用通用设置：{{ global.selectionMode !== 'category' ? '自动推荐（通用数据模式未启用品类筛选）' : global.categoryMode === 'manual' ? '手动筛选 ' + selectedCategoryCount(global.categorySelection) + ' 个类目' : '按百应当前可见高分商品自动推荐重点类目' }}。
+              当前沿用通用设置：{{ global.selectionMode !== 'category' ? '通用数据模式，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目' : global.categoryMode === 'manual' ? '手动筛选 ' + selectedCategoryCount(global.categorySelection) + ' 个类目' : '按百应当前可见高分商品自动推荐重点类目' }}。
             </p>
             <p v-else-if="accountDraft.categoryMode === 'auto'" class="hint">此账号会按百应当前可见高分商品自动推荐重点类目。</p>
             <template v-else>
@@ -5170,7 +5782,7 @@ onUnmounted(() => {
             </template>
             </template>
           </section>
-          <section class="card">
+          <section id="account-quota" class="card">
             <h2>本账号每日配额</h2>
             <label class="check-row account-filter-toggle">
               <input v-model="accountDraft.dailyQuotaOverride.enabled" type="checkbox" :disabled="busy">
@@ -5182,39 +5794,40 @@ onUnmounted(() => {
             </div>
             <p class="hint">关闭时继承通用默认值（{{ global.quota.perAccountProducts }} 个商品 / {{ global.quota.perAccountVideos }} 条视频）。只影响后续选品和新建计划；已有计划仍计入对应日期用量。限额是客户端调度设置，不代表平台承诺的处理能力。</p>
           </section>
-          <section class="card">
+          <section id="account-filters" class="card">
             <label class="check-row account-filter-toggle">
               <input type="checkbox" :checked="accountFilterOverridesEnabled" :disabled="busy" @change="setAccountFilterOverrides(($event.target as HTMLInputElement).checked)">
               为此账号单独配置选品筛选条件
             </label>
             <p class="hint">关闭时继承通用筛选条件。屏蔽词始终全局生效，执行设置保持通用。</p>
-            <SelectionFilterEditor
-              v-if="accountFilterOverridesEnabled"
-              v-model="accountFilterDraft"
-              title="账号选品条件"
-              :filter-groups="filterGroups"
-              :feature-options="featureOptions"
-              :filter-catalog-updated-at="filterCatalogUpdatedAt"
-              :disabled="busy"
-              :show-sync="true"
-              :syncing="busy"
-              @sync="refreshFilterCatalog"
-            />
+            <details v-if="accountFilterOverridesEnabled" class="filter-card account-filter-details">
+              <summary>编辑账号选品条件</summary>
+              <SelectionFilterEditor
+                v-model="accountFilterDraft"
+                title="账号选品条件"
+                :filter-groups="filterGroups"
+                :feature-options="featureOptions"
+                :filter-catalog-updated-at="filterCatalogUpdatedAt"
+                :disabled="busy"
+                :show-sync="true"
+                :syncing="busy"
+                @sync="refreshFilterCatalog"
+              />
+            </details>
             <p v-else class="account-inherit-state">当前账号继承通用筛选设置。</p>
           </section>
-          <section class="card">
-            <h2>账号路径</h2>
+          <section id="account-path" class="card">
+            <div class="section-title"><h2>账号路径</h2><button class="btn" :disabled="busy" @click="resetAccountPaths">恢复两个路径默认值</button></div>
             <label class="path-field">托管 Chrome profile 路径（目录须包含 Default）<div><input v-model="accountDraft.browserProfilePath" placeholder="留空使用客户端专用账号 profile"><button class="btn" @click="chooseProfilePath">选择文件夹</button><button class="btn" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
             <label class="path-field">账号下载路径<div><input v-model="accountDraft.downloadPath" placeholder="留空使用账号独立默认目录"><button class="btn" @click="chooseDownloadPath">选择文件夹</button><button class="btn" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
             <p v-if="accountPathsHaveUnsavedChanges" class="hint warning">路径有未保存修改；新批次仍会使用上次保存的目录。点击“保存账号设置”后才生效；已有素材不会移动，已开始处理的恢复批次沿用原路径。</p>
-            <p class="hint warning">留空时客户端会在 D 盘创建独立 profile，首次使用需在新开的 Chrome 中登录。Chrome 136+ 不允许对默认用户资料目录开放 CDP；若选择已有 profile，请确保它不是 Chrome 默认目录且没有被其他 Chrome 窗口占用。</p>
+            <details class="compact-help"><summary>浏览器路径说明</summary><p class="hint warning">留空时使用客户端独立 profile。已有 Chrome 默认目录或正在使用的目录不能作为托管 profile。</p></details>
           </section>
-          <div class="save-row"><button class="btn primary" :disabled="busy || accountId === null" @click="saveAccount">保存账号设置</button><button class="btn" :disabled="busy" @click="resetAccountPaths">恢复两个路径默认值</button></div>
         </template>
 
-        <section v-if="candidates.length" class="card candidate-card">
-          <h2>百应候选商品（{{ candidates.length }}）</h2>
-          <p class="hint">候选来自百应热点趋势、联盟榜单等当前可见列表。系统按数据分自动排重点类目并自动加车；此处仅展示候选和原因，不需要手动勾选商品。</p>
+        <section v-if="candidates.length" id="candidate-pool" class="card candidate-card">
+          <h2>三源候选池（{{ candidates.length }}）</h2>
+          <p class="hint">候选来自选品广场、热点趋势和联盟榜单的当前可见列表，统一按数据门槛筛选并按商品 ID 去重；已在本机登记或受配额、发布任务占用的商品会排除。正式批次会复用匹配的预览池，并在执行前再次检查登记状态。</p>
           <div v-if="categoryRecommendations.length" class="category-recommendations">
             <strong>系统重点类目推荐</strong>
             <span v-for="item in categoryRecommendations.slice(0, 3)" :key="item.categoryId" class="category-recommendation">
@@ -5229,7 +5842,7 @@ onUnmounted(() => {
           </div>
           <label v-for="candidate in candidates" :key="candidate.productId" class="candidate-row">
             <input type="checkbox" :checked="candidate.selected" disabled>
-            <span class="candidate-main"><b>{{ candidate.title }}</b><small>商品 ID：{{ candidate.productId }} · 月销：{{ candidate.monthSales ?? '平台未提供' }} · 佣金：{{ candidate.commissionRate ?? '平台未提供' }}% · 体验分：{{ candidate.dataMetrics?.experienceScore ?? candidate.shopScore ?? '平台未提供' }} · {{ candidate.trendRising ? '走势上升' : '走势未确认上升' }}</small><small v-if="candidate.detailCapturedAt || candidate.analysisScore !== undefined || candidate.unifiedScore !== undefined">统一分：{{ candidate.unifiedScore ?? candidate.analysisScore ?? '暂无可评分实测数据' }}/100<span v-if="candidate.hotOrRankBoost">（热点/榜单加权 +{{ candidate.hotOrRankBoost }}）</span> · 数据覆盖 {{ candidate.analysisCoverage ?? 0 }}/{{ candidate.analysisMetricCount ?? 0 }} 项 · {{ candidate.analysisStatus ?? '已分析' }}<span v-if="candidate.status"> · {{ candidate.status }}</span></small><details v-if="candidate.analysisReasons?.length" class="candidate-analysis" @click.stop><summary>查看数据分析依据</summary><small>{{ candidate.analysisReasons.join('；') }}</small></details><small v-if="candidate.sources?.length" class="source-badges">来源命中：{{ candidateSourceLabels(candidate) }}</small><small v-if="candidate.categoryStatus === '类目未知'" class="warning">类目未知；通用数据模式可按数据门槛参与，品类推荐不计入</small><small v-if="candidate.publicationLock" class="warning">{{ productPublishLockLabel(candidate.publicationLock) }}</small></span>
+            <span class="candidate-main"><b>{{ candidate.title }}</b><small>商品 ID：{{ candidate.productId }} · 月销：{{ candidate.monthSales ?? '平台未提供' }} · 佣金：{{ candidate.commissionRate ?? '平台未提供' }}% · 体验分：{{ candidate.dataMetrics?.experienceScore ?? candidate.shopScore ?? '平台未提供' }} · {{ candidate.trendRising ? '走势上升' : '走势未确认上升' }}</small><small v-if="candidate.detailCapturedAt || candidate.analysisScore !== undefined || candidate.unifiedScore !== undefined">统一分：{{ candidate.unifiedScore ?? candidate.analysisScore ?? '暂无可评分实测数据' }}/100<span v-if="candidate.hotOrRankBoost">（热点/榜单加权 +{{ candidate.hotOrRankBoost }}）</span><span v-if="candidate.businessPriorityBoost">（经营推荐加权 +{{ candidate.businessPriorityBoost }}）</span> · 数据覆盖 {{ candidate.analysisCoverage ?? 0 }}/{{ candidate.analysisMetricCount ?? 0 }} 项 · {{ candidate.analysisStatus ?? '已分析' }}<span v-if="candidate.status"> · {{ candidate.status }}</span></small><details v-if="candidate.analysisReasons?.length" class="candidate-analysis" @click.stop><summary>查看数据分析依据</summary><small>{{ candidate.analysisReasons.join('；') }}</small></details><small v-if="candidate.sources?.length" class="source-badges">来源命中：{{ candidateSourceLabels(candidate) }}</small><small v-if="candidate.categoryStatus === '类目未知'" class="warning">类目未知；通用数据模式可按数据门槛参与，品类推荐不计入</small><small v-if="candidate.publicationLock" class="warning">{{ productPublishLockLabel(candidate.publicationLock) }}</small></span>
           </label>
         </section>
       </div>
@@ -5366,15 +5979,23 @@ onUnmounted(() => {
 .account-settings-dialog .path-field input { flex: 1; min-width: 120px; }
 .account-settings-dialog .path-field button { white-space: nowrap; }
 .selection-page { display: flex; flex-direction: column; width: 100%; min-width: 0; min-height: 0; gap: 10px; color: var(--text); }
-.page-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.page-head { position: relative; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 0; background: var(--bg-app); }
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.daily-selection-schedule { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 11px 14px; border: 1px solid #cfdef8; border-radius: var(--radius); background: linear-gradient(110deg, #f5f9ff, #ffffff); font-size: 12px; box-shadow: var(--shadow-card); }
+.daily-selection-copy { display: flex; flex-direction: column; gap: 3px; min-width: 190px; margin-right: auto; }
+.daily-selection-copy span, .daily-schedule-login-hint { color: var(--text-muted); }
+.daily-schedule-toggle, .daily-schedule-time { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.daily-schedule-time input { min-height: 30px; border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; color: var(--text); background: var(--bg-panel); }
+.daily-schedule-login-hint { max-width: 210px; }
 .page-head h1 { margin: 0; font-size: 20px; }
 .page-head p, .hint { margin: 5px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
 .tabs { display: flex; gap: 6px; border-bottom: 1px solid var(--border); }
 .tabs button { padding: 8px 12px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-muted); }
 .tabs button.active { border-bottom-color: var(--brand); color: var(--brand); }
 .tabs .account-state { margin-left: auto; cursor: default; }
-.account-statuses { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; color: var(--text-muted); font-size: 12px; }
+.account-statuses { color: var(--text-muted); font-size: 12px; }
+.account-statuses summary { width: fit-content; cursor: pointer; }
+.account-statuses span { display: inline-flex; margin: 7px 14px 0 0; }
 .global-download-path { margin-top: 10px; }
 .selection-progress-card { padding: 11px 13px; border: 1px solid #93c5fd; border-radius: var(--radius); background: #eff6ff; color: #1e3a8a; }
 .selection-progress-card.finished { border-color: #86efac; background: #f0fdf4; color: #166534; }
@@ -5412,12 +6033,20 @@ onUnmounted(() => {
 .selection-progress-details[open] > summary { margin-bottom: 4px; }
 @keyframes selection-progress-slide { from { transform: translateX(-20%); } to { transform: translateX(210%); } }
 .body-layout { display: flex; flex: 1; min-height: 0; gap: 10px; }
-.settings-scroll { flex: 1; min-width: 0; overflow: auto; padding: 1px 4px 12px 1px; }
+.settings-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior-y: contain; overflow-anchor: none; scrollbar-gutter: stable; padding: 1px 4px 12px 1px; scroll-padding-top: 48px; }
+.settings-jumps { position: sticky; top: 0; z-index: 2; display: flex; gap: 6px; overflow-x: auto; padding: 7px 2px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
+.settings-jumps .btn { flex: 0 0 auto; min-height: 28px; padding: 0 10px; white-space: nowrap; font-size: 12px; }
 .browser-panel { width: 43%; min-width: 420px; min-height: 0; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
-.card { margin-bottom: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.card { margin-bottom: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
 .card h2 { margin: 0 0 10px; font-size: 15px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .category-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.category-picker { margin-top: 12px; padding: 9px 10px; border: 1px solid var(--border); border-radius: var(--radius); }
+.category-picker summary, .compact-help summary { cursor: pointer; color: var(--text); font-size: 12px; font-weight: 600; }
+.filter-card > summary { cursor: pointer; color: var(--text); font-size: 15px; font-weight: 600; }
+.filter-card[open] > summary { margin-bottom: 12px; }
+.account-filter-details { margin-top: 9px; }
+.compact-help { margin-top: 8px; }
 .category-mode-options { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; }
 .category-mode-options label { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; cursor: pointer; }
 .category-mode-options input { margin: 0; accent-color: var(--brand); }
@@ -5432,7 +6061,7 @@ onUnmounted(() => {
 .category-plan ol { max-height: 220px; margin: 6px 0 0; padding-left: 24px; overflow: auto; line-height: 1.55; }
 .category-level > label, .form-grid label, .path-field { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 12px; }
 .category-options { width: 100%; height: 132px; box-sizing: border-box; overflow: auto; padding: 5px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-app); }
-.category-option { display: flex !important; flex-direction: row !important; align-items: center; gap: 7px !important; min-height: 24px; padding: 2px 4px; border-radius: 4px; color: var(--text) !important; cursor: pointer; }
+.category-option { display: flex !important; flex-direction: row !important; align-items: center; gap: 7px !important; min-height: 24px; padding: 2px 4px; border-radius: 4px; color: var(--text) !important; cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto 28px; }
 .category-option:hover { background: var(--brand-soft); }
 .category-option input { margin: 0; }
 .category-empty { padding: 8px 4px; color: var(--text-muted); font-size: 12px; }
@@ -5462,7 +6091,7 @@ onUnmounted(() => {
 .platform-filter-multi .check-row { margin: 0; font-size: 12px; }
 .filter-chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 16px; color: var(--text); cursor: pointer; }
 .filter-chip:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); }
-.candidate-row { display: flex; align-items: flex-start; gap: 9px; padding: 9px 2px; border-top: 1px solid var(--border); cursor: pointer; }
+.candidate-row { display: flex; align-items: flex-start; gap: 9px; padding: 9px 2px; border-top: 1px solid var(--border); cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto 120px; }
 .candidate-row > input { margin-top: 3px; }
 .candidate-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .candidate-main b { overflow-wrap: anywhere; color: var(--text); font-size: 13px; }
@@ -5528,6 +6157,8 @@ onUnmounted(() => {
 .recovery-account-completed { color: var(--text-muted); }
 .recovery-account-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
 .failure-log-card { margin-bottom: 10px; }
+.failure-log-card > summary { cursor: pointer; font-size: 12px; font-weight: 600; }
+.failure-log-card .section-title { margin-top: 10px; }
 .run-log-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin: 4px 0 8px; color: var(--text-muted); font-size: 12px; }
 .run-log-summary strong { color: var(--text); }
 .log-count-success { color: #087443; }

@@ -62,7 +62,7 @@ test('登记过滤强制排除全局重复商品、账号历史类目和缺少�
   assert.deepEqual(result.eligible.map((row) => row.productId), ['available'])
   assert.deepEqual(result.excluded.map(({ candidate: row, reason }) => [row.productId, reason]), [
     ['global-used', '商品 ID 已在全账号池登记'],
-    ['account-category-used', '该账号历史已使用此末级类目'],
-    ['missing-category', '来源数据缺少商品 ID 或三级类目 ID']
+    ['account-category-used', '该账号历史或本轮已使用此末级类目'],
+    ['missing-category', '品类模式下来源数据缺少三级类目 ID']
   ])
 })

@@ -1,0 +1,30 @@
+======================================================================
+FAIL: test_filter_application_falls_back_to_search_when_no_response_is_captured (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_filter_application_falls_back_to_search_when_no_response_is_captured)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 2710, in test_filter_application_falls_back_to_search_when_no_response_is_captured
+    search.assert_called_once_with(fake_page, settings, ["original-product"])
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\unittest\mock.py", line 991, in assert_called_once_with
+    return self.assert_called_with(*args, **kwargs)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\9\AppData\Local\Programs\Python\Python313\Lib\unittest\mock.py", line 979, in assert_called_with
+    raise AssertionError(_error_message()) from cause
+AssertionError: expected call not found.
+Expected: search_baiying_candidates(<test_browser_cdp_recovery.FakePage object at 0x0000019307CFF650>, {'candidateLimit': 1}, ['original-product'])
+  Actual: search_baiying_candidates(<test_browser_cdp_recovery.FakePage object at 0x0000019307CFF650>, {'candidateLimit': 1, '_sourceMembership': {}}, ['original-product'])
+
+======================================================================
+FAIL: test_previous_uncertain_cart_attempt_requires_explicit_add_button_before_retry (test_browser_cdp_recovery.BrowserCdpRecoveryTests.test_previous_uncertain_cart_attempt_requires_explicit_add_button_before_retry)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\抖音电商\投广管理客户端\engine\test_browser_cdp_recovery.py", line 1528, in test_previous_uncertain_cart_attempt_requires_explicit_add_button_before_retry
+    self.assertIn("避免重复操作", result[0]["status"])
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: '避免重复操作' not found in '上次已尝试加车但没有得到确定回执；不重复点击本商品，已跳过并继续下一个候选。'
+
+----------------------------------------------------------------------
+Ran 134 tests in 6.253s
+
+FAILED (failures=2)
+EXIT=1

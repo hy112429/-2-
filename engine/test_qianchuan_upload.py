@@ -122,6 +122,7 @@ class QianchuanUploadTests(unittest.TestCase):
         self.assertEqual(result["qianchuanAccountId"], self.qc_id)
 
     def test_daily_quotas_defer_and_failed_pre_submit_releases_slot(self) -> None:
+        qc.retry_config(self.connection, False)
         qc.quota_config(self.connection, self.account_id, {
             "perAccountProducts": 1, "perAccountVideos": 1, "perProductVideos": 1,
         })
@@ -143,6 +144,25 @@ class QianchuanUploadTests(unittest.TestCase):
         retried = qc.retry_safe(self.connection, job, today=TODAY)
         self.assertEqual(retried["job"]["status"], "queued")
         self.assertEqual(retried["job"]["scheduledDate"], (TODAY + timedelta(days=2)).isoformat())
+
+    def test_product_quota_remaining_matches_step17_daily_reservation(self) -> None:
+        qc.quota_config(self.connection, self.account_id, {
+            "perProductVideos": 2, "perAccountVideos": 2, "perAccountProducts": 1,
+        })
+        first = self.add_asset("p-quota")
+        initial = qc.product_quota_remaining(self.connection, self.account_id, "p-quota", TODAY)
+        self.assertEqual(initial["remaining"], 2)
+        self.assertIsNone(initial["quotaGroupId"])
+
+        first_job = qc.enqueue(self.connection, self.account_id, [first], today=TODAY)["jobs"][0]
+        self.assertEqual(first_job["scheduledDate"], TODAY.isoformat())
+        after_one = qc.product_quota_remaining(self.connection, self.account_id, "p-quota", TODAY)
+        self.assertEqual(after_one["remaining"], 1)
+
+        second = self.add_asset("p-quota")
+        qc.enqueue(self.connection, self.account_id, [second], today=TODAY)
+        after_two = qc.product_quota_remaining(self.connection, self.account_id, "p-quota", TODAY)
+        self.assertEqual(after_two["remaining"], 0)
 
     def test_submit_uncertain_holds_quota_and_prevents_blind_retry(self) -> None:
         qc.quota_config(self.connection, self.account_id, {"perAccountVideos": 1})
@@ -228,6 +248,7 @@ class QianchuanUploadTests(unittest.TestCase):
         self.assertEqual(claimed["job"]["status"], "uploading")
 
     def test_claim_concurrency_limit_and_next_day_claim(self) -> None:
+        qc.retry_config(self.connection, False)
         one = self.add_asset("p-a")
         two = self.add_asset("p-b")
         jobs = qc.enqueue(self.connection, self.account_id, [one, two], today=TODAY)["jobs"]
@@ -237,6 +258,65 @@ class QianchuanUploadTests(unittest.TestCase):
         qc.fail(self.connection, jobs[0]["id"], "明确未选文件", "preflight")
         claimed = qc.claim(self.connection, jobs[1]["id"], today=TODAY)
         self.assertEqual(claimed["job"]["status"], "uploading")
+
+    def test_pre_submit_auto_retry_waits_and_stops_after_three_attempts(self) -> None:
+        self.assertTrue(qc.retry_config(self.connection)["autoRetryEnabled"])
+        asset = self.add_asset("p-auto-retry")
+        job = qc.enqueue(self.connection, self.account_id, [asset], today=TODAY)["jobs"][0]["id"]
+        start = datetime(2026, 11, 1, 10, 0)
+        qc.claim(self.connection, job, today=TODAY, now=start)
+        for attempt, delay in enumerate((5, 15, 60), 1):
+            failed = qc.fail(self.connection, job, "提交前网络断开", "navigate", now=start)
+            self.assertEqual(failed["job"]["id"], job)
+            self.assertEqual(failed["job"]["status"], "queued")
+            self.assertEqual(failed["job"]["autoRetryCount"], attempt)
+            retry_at = start + timedelta(minutes=delay)
+            self.assertEqual(failed["job"]["nextRetryAt"], retry_at.isoformat(timespec="seconds"))
+            with self.assertRaisesRegex(ValueError, "等待自动重试"):
+                qc.claim(self.connection, job, today=TODAY, now=retry_at - timedelta(seconds=1))
+            qc.claim(self.connection, job, today=TODAY, now=retry_at)
+            start = retry_at
+        exhausted = qc.fail(self.connection, job, "提交前网络仍异常", "navigate", now=start)
+        self.assertEqual(exhausted["job"]["status"], "failed")
+        self.assertEqual(exhausted["job"]["autoRetryCount"], 3)
+        self.assertIsNone(exhausted["job"]["nextRetryAt"])
+        self.assertEqual([row["stage"] for row in qc.list_events(self.connection, job)["rows"]].count("auto_retry"), 3)
+
+    def test_manual_gate_and_uncertain_submit_never_auto_retry(self) -> None:
+        first = self.add_asset("p-login")
+        second = self.add_asset("p-uncertain")
+        jobs = qc.enqueue(self.connection, self.account_id, [first, second], today=TODAY)["jobs"]
+        qc.claim(self.connection, jobs[0]["id"], today=TODAY)
+        manual = qc.fail(self.connection, jobs[0]["id"], "请登录", "connect", manual_action_required=True)
+        self.assertEqual(manual["job"]["status"], "failed")
+        self.assertEqual(manual["job"]["autoRetryCount"], 0)
+        qc.claim(self.connection, jobs[1]["id"], today=TODAY)
+        uncertain = qc.fail(self.connection, jobs[1]["id"], "回执未知", "verify", submit_attempted=True)
+        self.assertEqual(uncertain["job"]["status"], "needs_review")
+        self.assertEqual(uncertain["job"]["autoRetryCount"], 0)
+
+    def test_disabling_retry_cancels_waiting_without_touching_regular_queue(self) -> None:
+        first = self.add_asset("p-retry-off")
+        second = self.add_asset("p-regular")
+        jobs = qc.enqueue(self.connection, self.account_id, [first, second], today=TODAY)["jobs"]
+        retry_id, regular_id = [row["id"] for row in jobs]
+        qc.claim(self.connection, retry_id, today=TODAY)
+        self.assertEqual(qc.fail(self.connection, retry_id, "提交前断网", "navigate")["job"]["status"], "queued")
+        self.assertFalse(qc.retry_config(self.connection, False)["autoRetryEnabled"])
+        self.assertEqual(qc._job_payload(qc._job(self.connection, retry_id))["status"], "failed")
+        self.assertEqual(qc._job_payload(qc._job(self.connection, regular_id))["status"], "queued")
+        self.assertEqual(qc.list_events(self.connection, retry_id)["rows"][-1]["outcome"], "disabled")
+
+    def test_existing_upload_table_adds_retry_columns_without_replacing_jobs(self) -> None:
+        asset = self.add_asset("p-migrate")
+        job = qc.enqueue(self.connection, self.account_id, [asset], today=TODAY)["jobs"][0]["id"]
+        # 旧版数据库没有新增字段时，迁移只补字段；这里用独立连接重建旧表形态。
+        self.connection.execute("ALTER TABLE qianchuan_upload_jobs DROP COLUMN auto_retry_count")
+        self.connection.execute("ALTER TABLE qianchuan_upload_jobs DROP COLUMN next_retry_at")
+        self.connection.commit()
+        qc.ensure_schema(self.connection)
+        self.assertEqual(qc._job_payload(qc._job(self.connection, job))["id"], job)
+        self.assertEqual(qc._job_payload(qc._job(self.connection, job))["autoRetryCount"], 0)
 
     def test_interrupted_job_is_isolated_and_quota_held(self) -> None:
         first = self.add_asset("p-interrupted")

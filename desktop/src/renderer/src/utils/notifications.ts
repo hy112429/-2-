@@ -44,8 +44,10 @@ export function notifyGlobal(message: string, level?: NotificationLevel): void {
   const text = message.trim()
   if (!text) return
 
-  const id = nextId++
   const resolvedLevel = level ?? inferLevel(text)
+  if (appNotifications.value.some((item) => item.message === text && item.level === resolvedLevel)) return
+  while (appNotifications.value.length >= 4) dismissNotification(appNotifications.value[0].id)
+  const id = nextId++
   appNotifications.value = [...appNotifications.value, { id, message: text, level: resolvedLevel }]
 
   if (resolvedLevel !== 'error') {
@@ -61,4 +63,8 @@ export function dismissNotification(id: number): void {
     timers.delete(id)
   }
   appNotifications.value = appNotifications.value.filter((item) => item.id !== id)
+}
+
+export function dismissAllNotifications(): void {
+  for (const item of [...appNotifications.value]) dismissNotification(item.id)
 }

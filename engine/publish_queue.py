@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sqlite3
@@ -40,6 +41,8 @@ CREATE TABLE IF NOT EXISTS publish_queue (
     auto_publish INTEGER NOT NULL DEFAULT 0,
     platform_status TEXT NOT NULL DEFAULT 'not_uploaded',
     platform_error TEXT NOT NULL DEFAULT '',
+    screenshot_path TEXT NOT NULL DEFAULT '',
+    execution_started_at TEXT,
     isolated_from_status TEXT NOT NULL DEFAULT '',
     platform_updated_at TEXT,
     published_at TEXT,
@@ -64,8 +67,23 @@ CREATE TABLE IF NOT EXISTS publish_settings (
     publish_jitter_min_seconds INTEGER NOT NULL DEFAULT 5,
     publish_jitter_max_seconds INTEGER NOT NULL DEFAULT 15,
     publish_catchup_max_late_hours INTEGER NOT NULL DEFAULT 0,
+    manual_review_enabled INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
+"""
+
+PUBLISH_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS publish_queue_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES publish_queue(id),
+    stage TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    screenshot_path TEXT NOT NULL DEFAULT '',
+    cleared_at TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_publish_events_task ON publish_queue_events(task_id, id);
 """
 
 
@@ -73,6 +91,10 @@ def ensure_schema(connection: sqlite3.Connection, *, initialize_auto_publish_def
     """只增量新增/扩展发布队列表，不改写既有业务表或队列记录。"""
     connection.executescript(PUBLISH_QUEUE_SCHEMA)
     connection.executescript(PUBLISH_SETTINGS_SCHEMA)
+    connection.executescript(PUBLISH_EVENTS_SCHEMA)
+    event_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(publish_queue_events)")}
+    if "cleared_at" not in event_columns:
+        connection.execute("ALTER TABLE publish_queue_events ADD COLUMN cleared_at TEXT")
     settings_columns = {
         str(row["name"])
         for row in connection.execute("PRAGMA table_info(publish_settings)").fetchall()
@@ -84,6 +106,7 @@ def ensure_schema(connection: sqlite3.Connection, *, initialize_auto_publish_def
         "publish_jitter_min_seconds": "INTEGER NOT NULL DEFAULT 5",
         "publish_jitter_max_seconds": "INTEGER NOT NULL DEFAULT 15",
         "publish_catchup_max_late_hours": "INTEGER NOT NULL DEFAULT 0",
+        "manual_review_enabled": "INTEGER NOT NULL DEFAULT 0",
     }
     if initialize_auto_publish_default:
         settings_migrations["auto_publish_ui_default_applied"] = "INTEGER NOT NULL DEFAULT 0"
@@ -128,6 +151,8 @@ def ensure_schema(connection: sqlite3.Connection, *, initialize_auto_publish_def
         "description": "TEXT NOT NULL DEFAULT ''",
         "platform_status": "TEXT NOT NULL DEFAULT 'not_uploaded'",
         "platform_error": "TEXT NOT NULL DEFAULT ''",
+        "screenshot_path": "TEXT NOT NULL DEFAULT ''",
+        "execution_started_at": "TEXT",
         "isolated_from_status": "TEXT NOT NULL DEFAULT ''",
         "platform_updated_at": "TEXT",
         "published_at": "TEXT",
@@ -385,12 +410,54 @@ def fits_daily_quota(usage: Dict[str, int], quota: Dict[str, int]) -> bool:
     )
 
 
+def record_publish_event(
+    connection: sqlite3.Connection, task_id: int, stage: str, outcome: str,
+    reason: str = "", screenshot_path: str = "",
+) -> None:
+    """发布/上传阶段的追加式过程日志；与队列检查点在同一事务提交。"""
+    connection.execute(
+        "INSERT INTO publish_queue_events(task_id, stage, outcome, reason, screenshot_path, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (task_id, stage, outcome, reason[:2000], screenshot_path, now_text()),
+    )
+
+
+def publish_events(connection: sqlite3.Connection, task_id: int) -> Dict[str, Any]:
+    if not connection.execute("SELECT 1 FROM publish_queue WHERE id = ?", (task_id,)).fetchone():
+        raise ValueError("队列任务不存在")
+    rows = connection.execute(
+        "SELECT id, stage, outcome, reason, screenshot_path, cleared_at, created_at "
+        "FROM publish_queue_events WHERE task_id = ? ORDER BY id", (task_id,),
+    ).fetchall()
+    return {"ok": True, "id": task_id, "events": [dict(row) for row in rows]}
+
+
+def clear_failure_log(connection: sqlite3.Connection, task_id: int) -> Dict[str, Any]:
+    """人工确认重试前清除当前失败提示，保留追加式审计轨迹。"""
+    row = _manual_retry_row(connection, task_id)
+    if not str(row["platform_error"] or "").strip():
+        raise ValueError("当前任务没有可清除的失败提示")
+    timestamp = now_text()
+    connection.execute(
+        "UPDATE publish_queue_events SET cleared_at = ? WHERE id = ("
+        "SELECT id FROM publish_queue_events WHERE task_id = ? AND reason <> '' AND cleared_at IS NULL "
+        "ORDER BY id DESC LIMIT 1)", (timestamp, task_id),
+    )
+    connection.execute(
+        "UPDATE publish_queue SET platform_error = '', updated_at = ? WHERE id = ?",
+        (timestamp, task_id),
+    )
+    record_publish_event(connection, task_id, "失败日志", "cleared_for_retry")
+    return {"ok": True, "id": task_id, "clearedAt": timestamp}
+
+
 def queue_list(connection: sqlite3.Connection, limit: int = 300) -> Dict[str, Any]:
     rows = connection.execute(
         "SELECT q.id, q.account_id, a.name AS account_name, q.product_id, q.product_name, q.product_url, "
         "q.video_path, q.title, q.description, q.schedule_at, q.mode, q.status, "
         "q.auto_publish, "
-        "q.platform_status, q.platform_error, q.isolated_from_status, q.platform_updated_at, q.published_at, "
+        "q.platform_status, q.platform_error, q.screenshot_path, q.execution_started_at, "
+        "q.isolated_from_status, q.platform_updated_at, q.published_at, "
         "q.created_at, q.updated_at "
         "FROM publish_queue q JOIN accounts a ON a.id = q.account_id "
         "ORDER BY q.schedule_at, q.id LIMIT ?",
@@ -403,6 +470,32 @@ def queue_list(connection: sqlite3.Connection, limit: int = 300) -> Dict[str, An
         "accounts": list_accounts(connection),
         "products": selected_product_options(connection),
     }
+
+
+def export_receipts(connection: sqlite3.Connection, output: str) -> Dict[str, Any]:
+    """导出全部本机发布回执；CSV 单元格避免被表格软件解释成公式。"""
+    columns = (
+        "id", "account_name", "product_id", "product_name", "video_path",
+        "schedule_at", "execution_started_at", "platform_status", "platform_error",
+        "screenshot_path", "platform_updated_at", "published_at",
+    )
+    target = Path(output).expanduser().resolve()
+    if target.suffix.lower() != ".csv":
+        raise ValueError("回执文件必须为 CSV")
+    rows = connection.execute(
+        "SELECT q.id, a.name AS account_name, q.product_id, q.product_name, q.video_path, "
+        "q.schedule_at, q.execution_started_at, q.platform_status, q.platform_error, "
+        "q.screenshot_path, q.platform_updated_at, q.published_at "
+        "FROM publish_queue q JOIN accounts a ON a.id=q.account_id ORDER BY q.id",
+    ).fetchall()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow(("'" + str(row[name]) if str(row[name] or "").startswith(("=", "+", "-", "@"))
+                             else str(row[name] or "")) for name in columns)
+    return {"ok": True, "path": str(target), "count": len(rows)}
 
 
 def add_task(
@@ -595,7 +688,7 @@ def get_auto_publish_enabled(connection: sqlite3.Connection) -> bool:
 def auto_publish_settings(connection: sqlite3.Connection) -> Dict[str, Any]:
     row = connection.execute(
         "SELECT auto_publish_enabled, auto_publish_activated_at, updated_at, "
-        "publish_jitter_min_seconds, publish_jitter_max_seconds, publish_catchup_max_late_hours "
+        "publish_jitter_min_seconds, publish_jitter_max_seconds, publish_catchup_max_late_hours, manual_review_enabled "
         "FROM publish_settings WHERE setting_id = 1"
     ).fetchone()
     return {
@@ -605,6 +698,7 @@ def auto_publish_settings(connection: sqlite3.Connection) -> Dict[str, Any]:
         "publishJitterMinSeconds": int(row["publish_jitter_min_seconds"] or 0) if row else 5,
         "publishJitterMaxSeconds": int(row["publish_jitter_max_seconds"] or 0) if row else 15,
         "publishCatchupMaxLateHours": int(row["publish_catchup_max_late_hours"] or 0) if row else 0,
+        "manualReviewEnabled": bool(row and int(row["manual_review_enabled"])),
         "updatedAt": str(row["updated_at"] or "") if row else "",
     }
 
@@ -620,9 +714,10 @@ def set_publish_scheduler_settings(
     jitter_min_seconds: Optional[int] = None,
     jitter_max_seconds: Optional[int] = None,
     catchup_max_late_hours: Optional[int] = None,
+    manual_review_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """保存本机发布调度策略；0 小时表示逾期计划不自动过期。"""
-    if all(value is None for value in (enabled, jitter_min_seconds, jitter_max_seconds, catchup_max_late_hours)):
+    if all(value is None for value in (enabled, jitter_min_seconds, jitter_max_seconds, catchup_max_late_hours, manual_review_enabled)):
         raise ValueError("未提供要保存的调度设置")
     current = auto_publish_settings(connection)
     minimum = current["publishJitterMinSeconds"] if jitter_min_seconds is None else jitter_min_seconds
@@ -645,6 +740,8 @@ def set_publish_scheduler_settings(
     }
     if enabled is not None:
         values["auto_publish_enabled"] = int(enabled)
+    if manual_review_enabled is not None:
+        values["manual_review_enabled"] = int(manual_review_enabled)
     assignments = ", ".join(f"{column} = ?" for column in values)
     connection.execute(
         f"UPDATE publish_settings SET {assignments} WHERE setting_id = 1",
@@ -826,7 +923,7 @@ def hold_auto_publish_task(connection: sqlite3.Connection, task_id: int, error: 
     return {"ok": True, "id": task_id, "held": cursor.rowcount == 1}
 
 
-def isolate_upload_task(connection: sqlite3.Connection, task_id: int, reason: str) -> Dict[str, Any]:
+def isolate_upload_task(connection: sqlite3.Connection, task_id: int, reason: str, screenshot_path: str = "") -> Dict[str, Any]:
     """隔离仍处于上传准备锁定态的单项任务，避免继续重试并阻塞后续队列。"""
     row = connection.execute(
         "SELECT id, status, platform_status FROM publish_queue WHERE id = ?",
@@ -839,13 +936,15 @@ def isolate_upload_task(connection: sqlite3.Connection, task_id: int, reason: st
     timestamp = now_text()
     cursor = connection.execute(
         "UPDATE publish_queue SET platform_status = 'isolated', platform_error = ?, "
+        "screenshot_path = COALESCE(NULLIF(?, ''), screenshot_path), "
         "isolated_from_status = 'uploading', "
         "platform_updated_at = ?, updated_at = ? "
         "WHERE id = ? AND status = 'scheduled' AND platform_status = 'uploading'",
-        (str(reason or "当前发布任务已隔离")[:1000], timestamp, timestamp, task_id),
+        (str(reason or "当前发布任务已隔离")[:1000], screenshot_path, timestamp, timestamp, task_id),
     )
     if cursor.rowcount != 1:
         raise ValueError("任务状态已变化，未能保存隔离检查点")
+    record_publish_event(connection, task_id, "抖音上传", "isolated", reason, screenshot_path)
     return {"ok": True, "id": task_id, "isolated": True, "platformStatus": "isolated"}
 
 
@@ -930,9 +1029,11 @@ def start_upload(connection: sqlite3.Connection, task_id: int) -> Dict[str, Any]
         timestamp = now_text()
         connection.execute(
             "UPDATE publish_queue SET product_name = ?, product_url = ?, description = ?, platform_status = 'uploading', "
-            "platform_error = '', platform_updated_at = ?, updated_at = ? WHERE id = ?",
-            (product_name, product_url, description, timestamp, timestamp, task_id),
+            "platform_error = '', execution_started_at = COALESCE(execution_started_at, ?), "
+            "platform_updated_at = ?, updated_at = ? WHERE id = ?",
+            (product_name, product_url, description, timestamp, timestamp, timestamp, task_id),
         )
+        record_publish_event(connection, task_id, "抖音上传", "started")
         if outer_transaction:
             connection.execute("RELEASE SAVEPOINT publish_queue_upload")
         else:
@@ -963,6 +1064,7 @@ def finish_upload(
     status: str,
     error: str = "",
     product_url: str = "",
+    screenshot_path: str = "",
 ) -> Dict[str, Any]:
     if status not in {"uploaded_waiting_publish", "submitted_review", "published", "needs_review", "submission_uncertain"}:
         raise ValueError("创作者中心上传状态无效")
@@ -980,10 +1082,11 @@ def finish_upload(
     timestamp = now_text()
     connection.execute(
         "UPDATE publish_queue SET platform_status = ?, product_url = COALESCE(?, product_url), "
-        "platform_error = ?, platform_updated_at = ?, "
+        "platform_error = ?, screenshot_path = COALESCE(NULLIF(?, ''), screenshot_path), platform_updated_at = ?, "
         "published_at = COALESCE(?, published_at), updated_at = ? WHERE id = ?",
-        (status, product_url or None, error[:1000], timestamp, timestamp if status == "published" else None, timestamp, task_id),
+        (status, product_url or None, error[:1000], screenshot_path, timestamp, timestamp if status == "published" else None, timestamp, task_id),
     )
+    record_publish_event(connection, task_id, "抖音上传", status, error, screenshot_path)
     result = {"ok": True, "id": task_id, "platformStatus": status}
     if product_url:
         result["productUrl"] = product_url
@@ -1015,12 +1118,14 @@ def start_publish(connection: sqlite3.Connection, task_id: int) -> Dict[str, Any
         timestamp = now_text()
         cursor = connection.execute(
             "UPDATE publish_queue SET platform_status = 'submitting', platform_error = '', "
+            "execution_started_at = COALESCE(execution_started_at, ?), "
             "platform_updated_at = ?, updated_at = ? "
             "WHERE id = ? AND status = 'scheduled' AND platform_status = 'uploaded_waiting_publish'",
-            (timestamp, timestamp, task_id),
+            (timestamp, timestamp, timestamp, task_id),
         )
         if cursor.rowcount != 1:
             raise ValueError("任务状态已变化，请刷新队列后重试")
+        record_publish_event(connection, task_id, "抖音发布", "started")
         connection.commit()
         return {
             "ok": True,
@@ -1043,6 +1148,7 @@ def finish_publish(
     task_id: int,
     status: str,
     error: str = "",
+    screenshot_path: str = "",
 ) -> Dict[str, Any]:
     if status not in {"uploaded_waiting_publish", "submitted_review", "submission_uncertain", "published"}:
         raise ValueError("抖音发布结果状态无效")
@@ -1057,13 +1163,15 @@ def finish_publish(
     timestamp = now_text()
     connection.execute(
         "UPDATE publish_queue SET platform_status = ?, platform_error = ?, "
+        "screenshot_path = COALESCE(NULLIF(?, ''), screenshot_path), "
         "platform_updated_at = ?, published_at = COALESCE(?, published_at), updated_at = ? WHERE id = ?",
-        (status, error[:1000], timestamp, timestamp if status == "published" else None, timestamp, task_id),
+        (status, error[:1000], screenshot_path, timestamp, timestamp if status == "published" else None, timestamp, task_id),
     )
+    record_publish_event(connection, task_id, "抖音发布", status, error, screenshot_path)
     return {"ok": True, "id": task_id, "platformStatus": status}
 
 
-def isolate_publish_task(connection: sqlite3.Connection, task_id: int, reason: str) -> Dict[str, Any]:
+def isolate_publish_task(connection: sqlite3.Connection, task_id: int, reason: str, screenshot_path: str = "") -> Dict[str, Any]:
     """隔离平台已明确因缺封面拒绝提交的任务，禁止伪装成功或自动重试。"""
     row = connection.execute(
         "SELECT id, status, platform_status FROM publish_queue WHERE id = ?",
@@ -1076,13 +1184,15 @@ def isolate_publish_task(connection: sqlite3.Connection, task_id: int, reason: s
     timestamp = now_text()
     cursor = connection.execute(
         "UPDATE publish_queue SET platform_status = 'isolated', platform_error = ?, "
+        "screenshot_path = COALESCE(NULLIF(?, ''), screenshot_path), "
         "isolated_from_status = 'submitting', "
         "platform_updated_at = ?, updated_at = ? "
         "WHERE id = ? AND status = 'scheduled' AND platform_status = 'submitting'",
-        (str(reason or "平台要求封面，当前任务已隔离")[:1000], timestamp, timestamp, task_id),
+        (str(reason or "平台要求封面，当前任务已隔离")[:1000], screenshot_path, timestamp, timestamp, task_id),
     )
     if cursor.rowcount != 1:
         raise ValueError("任务状态已变化，未能保存隔离检查点")
+    record_publish_event(connection, task_id, "抖音发布", "isolated", reason, screenshot_path)
     return {"ok": True, "id": task_id, "isolated": True, "platformStatus": "isolated"}
 
 
@@ -1287,7 +1397,8 @@ def start_manual_retry(
             route = "upload_new"
             new_status = "uploading"
         elif previous == "uploaded_waiting_publish" or submission_stage:
-            route = "submit" if task["autoPublish"] else "ready_manual"
+            review_mode = auto_publish_settings(connection)["manualReviewEnabled"]
+            route = "submit" if task["autoPublish"] and not review_mode else "ready_manual"
             new_status = "submitting" if route == "submit" else "uploaded_waiting_publish"
         else:
             route = "upload_new" if confirmed_no_draft else "resume_upload"
@@ -1296,15 +1407,17 @@ def start_manual_retry(
         cursor = connection.execute(
             "UPDATE publish_queue SET product_name = ?, product_url = ?, description = ?, "
             "platform_status = ?, platform_error = '', isolated_from_status = '', "
+            "execution_started_at = COALESCE(execution_started_at, ?), "
             "platform_updated_at = ?, updated_at = ? "
             "WHERE id = ? AND status = 'scheduled' AND platform_status = ?",
             (
                 task["productName"], task["productUrl"], task["description"],
-                new_status, timestamp, timestamp, task_id, previous,
+                new_status, timestamp, timestamp, timestamp, task_id, previous,
             ),
         )
         if cursor.rowcount != 1:
             raise ValueError("任务状态已变化，请刷新队列后再重试")
+        record_publish_event(connection, task_id, "失败重试", route, f"前状态：{previous}")
         if outer_transaction:
             connection.execute("RELEASE SAVEPOINT publish_queue_manual_retry")
         else:
@@ -1459,15 +1572,18 @@ def build_parser() -> argparse.ArgumentParser:
     upload_finish.add_argument("--status", choices=("uploaded_waiting_publish", "submitted_review", "published", "needs_review", "submission_uncertain"), required=True)
     upload_finish.add_argument("--error", default="")
     upload_finish.add_argument("--product-url", default="")
+    upload_finish.add_argument("--screenshot-path", default="")
     publish_start = commands.add_parser("submit-start", help="锁定已上传投稿并开始最终发布提交")
     publish_start.add_argument("--id", type=int, required=True)
     publish_finish = commands.add_parser("submit-finish", help="保存抖音最终发布提交结果")
     publish_finish.add_argument("--id", type=int, required=True)
     publish_finish.add_argument("--status", choices=("uploaded_waiting_publish", "submitted_review", "submission_uncertain", "published"), required=True)
     publish_finish.add_argument("--error", default="")
+    publish_finish.add_argument("--screenshot-path", default="")
     publish_isolate = commands.add_parser("submit-isolate", help="隔离被平台明确拦截的单项提交任务")
     publish_isolate.add_argument("--id", type=int, required=True)
     publish_isolate.add_argument("--error", required=True)
+    publish_isolate.add_argument("--screenshot-path", default="")
     reset_submission_parser = commands.add_parser("reset-submission", help="用户核实未发布后恢复最终提交")
     reset_submission_parser.add_argument("--id", type=int, required=True)
     published = commands.add_parser("mark-published", help="用户确认已在创作者中心完成发布")
@@ -1483,12 +1599,19 @@ def build_parser() -> argparse.ArgumentParser:
     manual_start.add_argument("--expected-status", required=True)
     manual_start.add_argument("--confirmed-not-submitted", action="store_true")
     manual_start.add_argument("--confirmed-no-draft", action="store_true")
+    receipt_export = commands.add_parser("receipt-export", help="将本机发布回执导出为 CSV")
+    receipt_export.add_argument("--output", required=True)
+    event_list = commands.add_parser("events", help="查看发布任务上传/发布/重试的过程日志")
+    event_list.add_argument("--id", type=int, required=True)
+    clear_failure = commands.add_parser("clear-failure-log", help="清除单条失败提示以触发人工确认重试；审计事件保留")
+    clear_failure.add_argument("--id", type=int, required=True)
     auto_settings = commands.add_parser("auto-settings", help="读取全自动发布状态或初始化默认模式")
     auto_settings.add_argument("action", choices=("get", "set", "initialize-default"))
     auto_settings.add_argument("--enabled", choices=("true", "false"))
     auto_settings.add_argument("--jitter-min-seconds", type=int)
     auto_settings.add_argument("--jitter-max-seconds", type=int)
     auto_settings.add_argument("--catchup-max-late-hours", type=int)
+    auto_settings.add_argument("--manual-review-enabled", choices=("true", "false"))
     auto_next = commands.add_parser("auto-next", help="读取一条到期且可自动发布的任务")
     auto_next.add_argument("--id", type=int, help="立即执行指定的新队列任务")
     publish_now = commands.add_parser("publish-now", help="校验并立即启动一条全自动发布计划")
@@ -1499,6 +1622,7 @@ def build_parser() -> argparse.ArgumentParser:
     upload_isolate = commands.add_parser("upload-isolate", help="隔离仍处于上传准备锁定态的单项发布任务")
     upload_isolate.add_argument("--id", type=int, required=True)
     upload_isolate.add_argument("--error", required=True)
+    upload_isolate.add_argument("--screenshot-path", default="")
     return parser
 
 
@@ -1534,15 +1658,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             elif args.command == "upload-start":
                 result = start_upload(connection, args.id)
             elif args.command == "upload-isolate":
-                result = isolate_upload_task(connection, args.id, args.error)
+                result = isolate_upload_task(connection, args.id, args.error, args.screenshot_path)
             elif args.command == "upload-finish":
-                result = finish_upload(connection, args.id, args.status, args.error, args.product_url)
+                result = finish_upload(connection, args.id, args.status, args.error, args.product_url, args.screenshot_path)
             elif args.command == "submit-start":
                 result = start_publish(connection, args.id)
             elif args.command == "submit-finish":
-                result = finish_publish(connection, args.id, args.status, args.error)
+                result = finish_publish(connection, args.id, args.status, args.error, args.screenshot_path)
             elif args.command == "submit-isolate":
-                result = isolate_publish_task(connection, args.id, args.error)
+                result = isolate_publish_task(connection, args.id, args.error, args.screenshot_path)
             elif args.command == "reset-submission":
                 result = reset_submission(connection, args.id)
             elif args.command == "mark-published":
@@ -1559,6 +1683,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     confirmed_not_submitted=args.confirmed_not_submitted,
                     confirmed_no_draft=args.confirmed_no_draft,
                 )
+            elif args.command == "receipt-export":
+                result = export_receipts(connection, args.output)
+            elif args.command == "events":
+                result = publish_events(connection, args.id)
+            elif args.command == "clear-failure-log":
+                result = clear_failure_log(connection, args.id)
             elif args.command == "auto-settings":
                 if args.action == "get":
                     result = auto_publish_settings(connection)
@@ -1574,6 +1704,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         jitter_min_seconds=args.jitter_min_seconds,
                         jitter_max_seconds=args.jitter_max_seconds,
                         catchup_max_late_hours=args.catchup_max_late_hours,
+                        manual_review_enabled=None if args.manual_review_enabled is None else args.manual_review_enabled == "true",
                     )
             elif args.command == "auto-next":
                 result = next_auto_publish_task(connection, args.id)

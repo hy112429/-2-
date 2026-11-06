@@ -661,6 +661,8 @@ export function registerLoginIpc(): void {
     downloadPath: string
     selectedIndexes?: number[]
     candidateSnapshot?: unknown[]
+    allowCandidateFallback?: boolean
+    recoverExistingCart?: boolean
     refreshCandidatesById?: boolean
     analyzeBeforeCart?: boolean
     maxSelectedProducts?: number
@@ -687,35 +689,115 @@ export function registerLoginIpc(): void {
     const snapshot = Array.isArray(params.candidateSnapshot) ? params.candidateSnapshot as Array<Record<string, unknown>> : []
     const selected = Array.isArray(params.selectedIndexes) ? params.selectedIndexes : []
     if (!snapshot.length || !selected.length) throw new Error('本次加车缺少候选快照；本机登记前已停止平台操作。')
-    const selectedRows = snapshot.filter((candidate) => selected.includes(candidate.cardIndex as number))
-    if (selectedRows.length !== selected.length) throw new Error('候选索引与商品快照无法一一对应；本机登记前已停止平台操作。')
+    const rowByIndex = new Map<number, Record<string, unknown>>()
+    for (const candidate of snapshot) {
+      const cardIndex = Number(candidate.cardIndex)
+      if (Number.isInteger(cardIndex) && !rowByIndex.has(cardIndex)) rowByIndex.set(cardIndex, candidate)
+    }
+    const selectedRows = selected.map((cardIndex) => rowByIndex.get(cardIndex)).filter(
+      (candidate): candidate is Record<string, unknown> => Boolean(candidate)
+    )
+    if (selectedRows.length !== selected.length || new Set(selected).size !== selected.length) {
+      throw new Error('候选索引与商品快照无法一一对应；本机登记前已停止平台操作。')
+    }
+    if (params.recoverExistingCart === true) {
+      if (selectedRows.length !== 1 || selectedRows.some((candidate) => candidate.cartAdded !== true)) {
+        throw new Error('详情恢复只允许读取一个已确认加车的原商品；本次未执行加车。')
+      }
+      // 商品已在前序阶段确认加车；这里只恢复详情素材，不重新占用登记或发起第二次加车。
+      return commandManagedBrowser('run-selection', params, browserOptions, onProgress)
+    }
     const maxSelected = Number(params.maxSelectedProducts)
+    const fallbackRows = params.allowCandidateFallback === true
+      ? snapshot.filter((candidate) =>
+        !selected.includes(candidate.cardIndex as number) &&
+        candidate.cartAttempted !== true && candidate.cartAdded !== true &&
+        candidate.skipped !== true && candidate.analysisRejected !== true
+      )
+      : []
+    const orderedRows = [...selectedRows, ...fallbackRows].slice(0, 30)
     const reservationLimit = Number.isFinite(maxSelected) && maxSelected > 0
-      ? Math.min(selectedRows.length, Math.max(1, Math.ceil(maxSelected * 2)))
-      : selectedRows.length
-    const rowsToReserve = selectedRows.slice(0, reservationLimit)
-    const items: RegistryCandidate[] = rowsToReserve.map((candidate) => {
+      ? Math.min(orderedRows.length, Math.max(1, Math.ceil(maxSelected * 3)))
+      : Math.min(orderedRows.length, selectedRows.length)
+    const categoryModeRequiresId = params.settings.selectionMode === 'category'
+    const candidatesToReserve: Array<{ candidate: Record<string, unknown>; item: RegistryCandidate }> = []
+    const rejected: Array<{ productId: string; reason: string }> = []
+    const seenProductIds = new Set<string>()
+    const selectedProductIds = new Set(selectedRows.map((candidate) => String(candidate.productId ?? '').trim()))
+    for (const candidate of orderedRows) {
+      const productId = String(candidate.productId ?? '').trim()
+      if (!productId) {
+        rejected.push({ productId: '', reason: '候选缺少商品 ID，已跳过并尝试其他候选' })
+        continue
+      }
+      if (seenProductIds.has(productId)) {
+        rejected.push({ productId, reason: '本轮候选池中商品 ID 重复，已跳过重复项' })
+        continue
+      }
+      seenProductIds.add(productId)
       const path = Array.isArray(candidate.categoryIds) ? candidate.categoryIds.map(String).filter(Boolean) : []
-      const leafCategoryId = params.settings.selectionMode === 'category'
+      const leafCategoryId = categoryModeRequiresId
         ? String(candidate.leafCategoryId ?? path.at(-1) ?? '').trim()
         : ''
-      return {
-        productId: String(candidate.productId ?? '').trim(),
+      if (categoryModeRequiresId && !leafCategoryId) {
+        rejected.push({ productId, reason: '候选缺少百应末级类目 ID，已跳过并尝试其他候选' })
+        continue
+      }
+      candidatesToReserve.push({ candidate, item: {
+        productId,
         leafCategoryId,
         title: String(candidate.title ?? '').slice(0, 512)
-      }
-    })
-    const categoryModeRequiresId = params.settings.selectionMode === 'category'
-    if (items.some((item) => !item.productId || (categoryModeRequiresId && !item.leafCategoryId))) {
-      throw new Error('至少一个候选缺少商品 ID' + (categoryModeRequiresId ? ' 或百应末级类目 ID' : '') + '；本机登记前已停止加车。')
+      } })
     }
-    const requestId = randomUUID()
-    const reservationResult = await reserveRegistryCandidates(accountKey, requestId, items)
-    const tokenByProduct = new Map(reservationResult.reserved.map((item) => [item.productId, item.token]))
-    const reservedRows = rowsToReserve.filter((candidate) => tokenByProduct.has(String(candidate.productId ?? '')))
+    const reservationRequestId = randomUUID()
+    const registryResult = candidatesToReserve.length
+      ? await reserveRegistryCandidates(
+        accountKey,
+        reservationRequestId,
+        candidatesToReserve.map(({ item }) => item),
+        reservationLimit
+      )
+      : { reserved: [], rejected: [], mode: 'local' as const }
+    rejected.push(...registryResult.rejected)
+    const tokenByProduct = new Map(registryResult.reserved.map((item) => [item.productId, item.token]))
+    const reservedRows = candidatesToReserve
+      .map(({ candidate }) => candidate)
+      .filter((candidate) => tokenByProduct.has(String(candidate.productId ?? '').trim()))
+    const reservationResult = { ...registryResult, rejected, mode: 'local' as const }
+    const skippedRegistryRows = (completed: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> => {
+      const completedIds = new Set(completed.map((item) => String(item.productId ?? '').trim()).filter(Boolean))
+      return reservationResult.rejected.flatMap((item) => {
+        const productId = String(item.productId ?? '').trim()
+        if (productId && completedIds.has(productId)) return []
+        const candidate = snapshot.find((row) => String(row.productId ?? '').trim() === productId)
+        return [{
+          ...(candidate ?? {}),
+          productId: productId || String(candidate?.productId ?? ''),
+          cartAdded: false,
+          cartAttempted: false,
+          skipped: true,
+          registryExcluded: true,
+          status: `本机登记未通过，已跳过并继续后续候选：${item.reason}`
+        }]
+      })
+    }
     if (!reservedRows.length) {
-      const reasons = reservationResult.rejected.map((item) => `${item.productId}（${item.reason}）`).join('、')
-      throw new Error(`本机登记没有预留到可加车商品，已停止加车。${reasons}`)
+      if (!reservationResult.rejected.length) {
+        throw new Error('本机登记没有返回可执行候选，也没有提供跳过原因；本次未向百应发送加车命令。')
+      }
+      // 全部候选都因重复登记、类目互斥或缺少 ID 被拒绝时，这是可解释的跳过结果，
+      // 不应把账号留在待恢复状态；renderer 会记录这些跳过项并继续批次中的后续账号。
+      const completed = skippedRegistryRows()
+      return {
+        ok: true,
+        completed,
+        analysisAttemptedCount: 0,
+        completionCount: completed.length,
+        registryRejected: reservationResult.rejected.map((item) => ({ ...item })),
+        registryReplacementCount: 0,
+        registrySettlementWarnings: [],
+        registryReleaseEvents: []
+      }
     }
     const reservedIndexes = reservedRows.map((candidate) => candidate.cardIndex as number)
     try {
@@ -758,11 +840,9 @@ export function registerLoginIpc(): void {
         const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' && item.cartAttempted !== true
         const outcome = item?.cartAdded === true
           ? 'ADDED'
-          : controlFailure
+          : controlFailure || item?.cartAttempted !== true
             ? 'NOT_ADDED'
-            : item?.cartAttempted === true || !item
-            ? 'UNKNOWN'
-            : 'NOT_ADDED'
+            : 'UNKNOWN'
         const releaseEvent = controlFailure ? {
           productId,
           outcome: 'NOT_ADDED' as const,
@@ -782,7 +862,11 @@ export function registerLoginIpc(): void {
       const rejected = reservationResult.rejected.map((item) => ({ ...item }))
       return {
         ...result,
+        completed: [...completed, ...skippedRegistryRows(completed)],
         registryRejected: rejected,
+        registryReplacementCount: reservedRows.filter((candidate) =>
+          !selectedProductIds.has(String(candidate.productId ?? '').trim())
+        ).length,
         registrySettlementWarnings: settlementWarnings,
         registryReleaseEvents
       }
@@ -836,6 +920,7 @@ export function registerLoginIpc(): void {
       productUrl: params.productUrl,
       videoPath: params.videoPath,
       description: params.description,
+      selectionSettingsDbPath: getClientPaths().databasePath,
       autoPublish: params.autoPublish === true
     }, {
       profileKey: `account-${params.accountId}`,
@@ -884,7 +969,8 @@ export function registerLoginIpc(): void {
       productName: params.productName,
       productUrl: params.productUrl,
       videoPath: params.videoPath,
-      description: params.description
+      description: params.description,
+      selectionSettingsDbPath: getClientPaths().databasePath
     }, {
       profileKey: `account-${params.accountId}`,
       profilePath: params.profilePath

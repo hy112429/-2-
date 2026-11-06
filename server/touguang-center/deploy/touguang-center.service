@@ -1,0 +1,21 @@
+[Unit]
+Description=Touguang Center API
+Wants=network-online.target mysql.service redis-server.service
+After=network-online.target mysql.service redis-server.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=touguang
+Group=touguang
+WorkingDirectory=/opt/touguang-center
+EnvironmentFile=/etc/touguang-center/center.env
+ExecStart=/usr/bin/java -jar /opt/touguang-center/app.jar
+Restart=on-failure
+RestartSec=15
+SuccessExitStatus=143
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

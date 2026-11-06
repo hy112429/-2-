@@ -11,6 +11,7 @@ baiying_cache.py —— 百应商品数据缓存（T-15 探针方案的落库端
 表结构
     baiying_products
         product_id  业务商品 ID（19 位数字），主键
+        account_id  捕获来源的本地抖音账号 ID；无法确认时为 NULL
         title       商品标题
         cover_url   封面图
         cos_ratio   佣金率（%）
@@ -58,11 +59,13 @@ except ImportError:
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS baiying_products (
     product_id  TEXT    PRIMARY KEY,             -- 业务商品 ID（19 位数字）
+    account_id  INTEGER,                          -- 捕获来源的本地抖音账号 ID；无法确定时为 NULL
     commodity_id TEXT,                           -- 推广 ID（pack_detail 触发所必需，探针可从选品列表接口补全）
     title       TEXT,
     cover_url   TEXT,
     cos_ratio   REAL,                            -- 佣金率（%），如 5.0 = 5%
     video_url   TEXT,                            -- 商品素材视频直链
+    video_urls_json TEXT,                        -- 商品全部视频直链 JSON 数组
     gallery_json TEXT,                           -- 百应商品详情图 URL 列表
     captured_at TEXT    NOT NULL                 -- 抓取时间（本地 ISO8601）
 );
@@ -70,7 +73,9 @@ CREATE TABLE IF NOT EXISTS baiying_products (
 
 # 老库迁移：补充 commodity_id 列（列已存在时忽略）
 MIGRATION_ALTERS = [
+    "ALTER TABLE baiying_products ADD COLUMN account_id INTEGER",
     "ALTER TABLE baiying_products ADD COLUMN commodity_id TEXT",
+    "ALTER TABLE baiying_products ADD COLUMN video_urls_json TEXT",
     "ALTER TABLE baiying_products ADD COLUMN gallery_json TEXT",
 ]
 
@@ -110,7 +115,20 @@ def connect(db_path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
-    return dict(row) if row is not None else None
+    if row is None:
+        return None
+    result = dict(row)
+    try:
+        videos = json.loads(result.get("video_urls_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        videos = []
+    if not isinstance(videos, list):
+        videos = []
+    videos = [str(url) for url in videos if isinstance(url, str) and url.startswith(("http://", "https://"))]
+    if not videos and result.get("video_url"):
+        videos = [str(result["video_url"])]
+    result["video_urls"] = videos
+    return result
 
 
 def global_banned_words(connection: sqlite3.Connection) -> list[str]:
@@ -154,27 +172,56 @@ def upsert_product(
     video_url: Optional[str] = None,
     commodity_id: Optional[str] = None,
     gallery: Optional[Sequence[str]] = None,
+    video_urls: Optional[Sequence[str]] = None,
+    account_id: Optional[int] = None,
 ) -> Dict[str, Any]:
+    if type(account_id) is not int or account_id < 1:
+        account_id = None
+    normalized_video_urls = list(dict.fromkeys(
+        str(url).strip() for url in (video_urls or [])
+        if isinstance(url, str) and str(url).strip().startswith(("http://", "https://"))
+    ))
+    if not normalized_video_urls and video_url and video_url.startswith(("http://", "https://")):
+        normalized_video_urls = [video_url]
     with connect(db_path) as connection:
         existing = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
         ).fetchone()
+        old_video_urls: list[str] = []
+        if existing is not None:
+            try:
+                old_video_urls = json.loads(existing["video_urls_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                old_video_urls = []
+            if not isinstance(old_video_urls, list):
+                old_video_urls = []
+            old_video_urls = [
+                str(url) for url in old_video_urls
+                if isinstance(url, str) and url.startswith(("http://", "https://"))
+            ]
+            if not old_video_urls and existing["video_url"]:
+                old_video_urls = [str(existing["video_url"])]
+        normalized_video_urls = list(dict.fromkeys(normalized_video_urls + old_video_urls))
+        primary_video_url = normalized_video_urls[0] if normalized_video_urls else video_url
         connection.execute(
-            "INSERT INTO baiying_products (product_id, commodity_id, title, cover_url, cos_ratio, video_url, gallery_json, captured_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO baiying_products (product_id, account_id, commodity_id, title, cover_url, cos_ratio, video_url, video_urls_json, gallery_json, captured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(product_id) DO UPDATE SET "
+            "account_id = COALESCE(excluded.account_id, baiying_products.account_id), "
             "commodity_id = COALESCE(excluded.commodity_id, baiying_products.commodity_id), "
             "title = excluded.title, cover_url = excluded.cover_url, "
             "cos_ratio = excluded.cos_ratio, video_url = COALESCE(excluded.video_url, baiying_products.video_url), "
+            "video_urls_json = COALESCE(excluded.video_urls_json, baiying_products.video_urls_json), "
             "gallery_json = COALESCE(excluded.gallery_json, baiying_products.gallery_json), "
             "captured_at = excluded.captured_at",
-            (product_id, commodity_id, title, cover_url, cos_ratio, video_url,
+            (product_id, account_id, commodity_id, title, cover_url, cos_ratio, primary_video_url,
+             json.dumps(normalized_video_urls, ensure_ascii=False) if normalized_video_urls else None,
              json.dumps(list(gallery), ensure_ascii=False) if gallery else None, now_text()),
         )
         row = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
         ).fetchone()
-    return {"ok": True, "created": existing is None, "product": dict(row)}
+    return {"ok": True, "created": existing is None, "product": row_to_dict(row)}
 
 
 def set_commodity(db_path: Path, product_id: str, commodity_id: str) -> Dict[str, Any]:
@@ -224,7 +271,7 @@ def list_products(db_path: Path, limit: int) -> Dict[str, Any]:
             (max(limit * 5, limit),),
         ).fetchall()
         words = global_banned_words(connection)
-    products = [dict(row) for row in rows if not ban_match(row["title"], words)][:limit]
+    products = [row_to_dict(row) for row in rows if not ban_match(row["title"], words)][:limit]
     return {"ok": True, "count": len(products), "products": products}
 
 
@@ -251,7 +298,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_upsert.add_argument("--cover", default=None)
     p_upsert.add_argument("--cos-ratio", type=float, default=None)
     p_upsert.add_argument("--video-url", default=None)
+    p_upsert.add_argument("--account-id", type=int, default=None, help="捕获来源的本地抖音账号 ID")
     p_upsert.add_argument("--gallery-stdin", action="store_true", help="从 stdin 读取商品详情图 URL JSON 列表")
+    p_upsert.add_argument("--detail-stdin", action="store_true", help="从 stdin 读取 {gallery, videoUrls} 商品详情数据")
 
     p_commodity = sub.add_parser("set-commodity", help="补全 product_id 的 commodity_id（推广ID）")
     p_commodity.add_argument("--product-id", required=True)
@@ -273,10 +322,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             payload = init_db(db_path)
         elif args.command == "upsert":
             gallery = None
-            if args.gallery_stdin:
+            video_urls = None
+            account_id = args.account_id
+            if args.gallery_stdin or args.detail_stdin:
                 raw_gallery = sys.stdin.readline()
                 gallery_value = json.loads(raw_gallery) if raw_gallery else []
-                gallery = gallery_value if isinstance(gallery_value, list) else []
+                if isinstance(gallery_value, dict):
+                    gallery = gallery_value.get("gallery") if isinstance(gallery_value.get("gallery"), list) else []
+                    video_urls = gallery_value.get("videoUrls") if isinstance(gallery_value.get("videoUrls"), list) else []
+                    if account_id is None:
+                        raw_account_id = gallery_value.get("accountId")
+                        account_id = raw_account_id if type(raw_account_id) is int and raw_account_id > 0 else None
+                else:
+                    gallery = gallery_value if isinstance(gallery_value, list) else []
             payload = upsert_product(
                 db_path,
                 args.product_id,
@@ -286,6 +344,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.video_url,
                 args.commodity_id,
                 gallery,
+                video_urls,
+                account_id,
             )
         elif args.command == "set-commodity":
             payload = set_commodity(db_path, args.product_id, args.commodity_id)

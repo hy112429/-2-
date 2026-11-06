@@ -162,7 +162,7 @@ onBeforeUnmount(() => {
     <TopMenu v-model:active="activeTop" />
 
     <div class="body">
-      <SideNav :active="activeNav" @update:active="activateNav" />
+      <SideNav :active="activeTop === '商品查询' ? '' : activeNav" @update:active="activateNav" />
       <div v-if="startupError" class="startup-state error">本地数据初始化失败：{{ startupError }}</div>
       <div v-else-if="!startupReady" class="startup-state">正在准备本机数据目录…</div>
       <WorkArea v-else :top="activeTop" :nav="activeNav" @navigate="activateNav" />

@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from engine import asset_library, download_queue
+if __package__:
+    from engine import asset_library, download_queue
+else:
+    import asset_library
+    import download_queue
 
 
 class AssetLibraryStep17Tests(unittest.TestCase):

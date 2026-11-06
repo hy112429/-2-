@@ -1,0 +1,51 @@
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> touguang-client@0.0.10 build
+> npm run typecheck && electron-vite build
+
+npm warn Unknown env config "electron-builder-binaries-mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown env config "electron-mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> touguang-client@0.0.10 typecheck
+> npm run typecheck:node && npm run typecheck:web
+
+npm warn Unknown env config "electron-builder-binaries-mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown env config "electron-mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> touguang-client@0.0.10 typecheck:node
+> tsc --noEmit -p tsconfig.node.json --composite false
+
+npm warn Unknown env config "electron-builder-binaries-mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown env config "electron-mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+npm warn Unknown project config "electron_builder_binaries_mirror". This will stop working in the next major version of npm. See `npm help npmrc` for supported config options.
+
+> touguang-client@0.0.10 typecheck:web
+> vue-tsc --noEmit -p tsconfig.web.json --composite false
+
+vite v7.3.7 building ssr environment for production...
+transforming...
+✓ 24 modules transformed.
+rendering chunks...
+out/main/index.js  241.48 kB
+✓ built in 311ms
+vite v7.3.7 building ssr environment for production...
+transforming...
+✓ 1 modules transformed.
+rendering chunks...
+out/preload/index.js  16.40 kB
+✓ built in 16ms
+vite v7.3.7 building client environment for production...
+transforming...
+✓ 74 modules transformed.
+rendering chunks...
+../../out/renderer/index.html                     0.67 kB
+../../out/renderer/assets/index-uZVdIg8N.css    136.30 kB
+../../out/renderer/assets/index-BH4geyPN.js   1,180.42 kB
+✓ built in 2.06s
+EXIT=0

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { appNotifications, dismissNotification } from '../utils/notifications'
+import { appNotifications, dismissAllNotifications, dismissNotification } from '../utils/notifications'
 </script>
 
 <template>
   <TransitionGroup class="toast-host" name="toast" tag="section" aria-label="操作通知" aria-live="polite">
+    <button v-if="appNotifications.length > 1" key="clear-all" type="button" class="clear-all" @click="dismissAllNotifications">清除全部通知</button>
     <article
       v-for="item in appNotifications"
       :key="item.id"
@@ -29,11 +30,13 @@ import { appNotifications, dismissNotification } from '../utils/notifications'
   display: flex;
   flex-direction: column;
   gap: 8px;
-  width: min(440px, calc(100vw - 36px));
-  max-height: calc(100vh - var(--h-top, 48px) - 30px);
+  width: min(380px, calc(100vw - 36px));
+  max-height: min(58vh, calc(100vh - var(--h-top, 48px) - 30px));
   overflow: auto;
   pointer-events: none;
 }
+.clear-all { align-self: flex-end; padding: 3px 9px; border: 1px solid var(--border); border-radius: 999px; background: #fff; color: var(--text-muted); font-size: 11px; box-shadow: var(--shadow-card); pointer-events: auto; }
+.clear-all:hover { color: var(--brand); border-color: var(--brand); }
 
 .toast {
   display: grid;
@@ -43,9 +46,9 @@ import { appNotifications, dismissNotification } from '../utils/notifications'
   padding: 12px;
   border: 1px solid #d7deea;
   border-left: 4px solid #64748b;
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: #fff;
-  box-shadow: 0 8px 24px rgba(20, 31, 51, 0.18);
+  box-shadow: var(--shadow-float);
   color: #344054;
   pointer-events: auto;
 }

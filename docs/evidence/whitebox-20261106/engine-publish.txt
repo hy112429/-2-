@@ -1,0 +1,10 @@
+Building prefix dict from the default dictionary ...
+Loading model from cache C:\Users\9\AppData\Local\Temp\jieba.cache
+Loading model cost 0.407 seconds.
+Prefix dict has been built successfully.
+{"type": "task", "status": "running", "tid": "qc-test", "percent": 100, "attempts": 0, "message": "下载中 100%"}
+----------------------------------------------------------------------
+Ran 110 tests in 16.594s
+
+OK
+EXIT=0

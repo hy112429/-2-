@@ -12,6 +12,13 @@ const requiredFiles = [
   join(sitePackages, 'playwright', 'sync_api', '__init__.py'),
   join(sitePackages, 'playwright', 'driver', 'node.exe'),
   join(sitePackages, 'requests', '__init__.py'),
+  join(sitePackages, 'jieba', '__init__.py'),
+  join(sitePackages, 'faster_whisper', '__init__.py'),
+  join(sitePackages, 'ctranslate2', '__init__.py'),
+  join(sitePackages, 'av', '__init__.py'),
+  join(sitePackages, 'huggingface_hub', '__init__.py'),
+  join(sitePackages, 'tokenizers', '__init__.py'),
+  join(sitePackages, 'onnxruntime', '__init__.py'),
   join(sitePackages, 'numpy', '__init__.py'),
   join(sitePackages, 'cv2', '__init__.py'),
   join(stagingEngine, 'bin', 'ffmpeg.exe'),
@@ -31,7 +38,7 @@ const env = {
 }
 const probe = spawnSync(python, [
   '-c',
-  'from playwright.sync_api import sync_playwright; import cv2, numpy, requests; print("Python package imports OK")'
+  'from playwright.sync_api import sync_playwright; import av, cv2, ctranslate2, faster_whisper, huggingface_hub, jieba, numpy, onnxruntime, requests, tokenizers; print("Python package imports OK")'
 ], { env, encoding: 'utf8', windowsHide: true })
 
 if (probe.status !== 0) {

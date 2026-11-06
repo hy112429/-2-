@@ -1,0 +1,12 @@
+✔ 调度轮询在基础间隔上增加闭区间随机错峰 (0.7893ms)
+✔ 错峰设置读取无效时回到默认范围，非法区间拒绝计算 (0.4211ms)
+✔ 千川 OAuth 校验 state、保留长 ID、刷新 Token 后继续按商品 ID 查询 (87.8396ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 670.952
+EXIT=0

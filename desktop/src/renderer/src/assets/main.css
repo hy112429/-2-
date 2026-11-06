@@ -5,33 +5,38 @@
 
 :root {
   /* --- 颜色 --- */
-  --bg-app: #f4f5f7;          /* 应用底色 */
+  --bg-app: #f3f6fb;          /* 应用底色 */
   --bg-panel: #ffffff;        /* 内容面板 */
-  --bg-top: #2b3145;          /* 顶部菜单栏 */
-  --bg-nav: #1f2430;          /* 左侧导航 */
-  --bg-nav-hover: #2b3242;
-  --bg-status: #fafbfc;       /* 底部状态栏 */
-  --bg-placeholder: #eef1f5;  /* 占位区块 */
+  --bg-top: #18243c;          /* 顶部菜单栏 */
+  --bg-nav: #15213a;          /* 左侧导航 */
+  --bg-nav-hover: #243654;
+  --bg-status: #ffffff;       /* 底部状态栏 */
+  --bg-placeholder: #f1f5fb; /* 占位区块 */
 
-  --border: #e3e6eb;
-  --border-dark: #343b4d;
+  --border: #dfe7f1;
+  --border-dark: #32425c;
 
-  --text: #1f2430;
-  --text-muted: #6b7280;
-  --text-on-dark: #c9ced8;
+  --text: #25334b;
+  --text-muted: #69788f;
+  --text-on-dark: #b7c5dc;
   --text-on-dark-strong: #ffffff;
 
-  --brand: #3b82f6;
-  --brand-soft: rgba(59, 130, 246, 0.12);
+  --brand: #356fe4;
+  --brand-soft: #eaf1ff;
+  --surface: #ffffff;
+  --surface-muted: #f4f7fc;
+  --muted: var(--text-muted);
+  --shadow-card: 0 3px 14px rgba(28, 50, 89, .055);
+  --shadow-float: 0 18px 48px rgba(16, 32, 61, .18);
 
   /* --- 尺寸 --- */
-  --h-top: 52px;      /* 顶部菜单高度 */
-  --h-status: 30px;   /* 底部状态栏高度 */
-  --w-nav: 184px;     /* 左侧导航宽度 */
+  --h-top: 56px;      /* 顶部菜单高度 */
+  --h-status: 32px;   /* 底部状态栏高度 */
+  --w-nav: 176px;     /* 左侧导航宽度 */
 
-  --radius: 6px;
+  --radius: 9px;
 
-  font-family: 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'Segoe UI Variable', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
   font-size: 14px;
   line-height: 1.5;
   color: var(--text);
@@ -68,4 +73,20 @@ button {
   border: none;
   background: none;
   color: inherit;
+}
+
+button:not(:disabled), summary, select, input[type='checkbox'], input[type='radio'] { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+input, select, textarea { font: inherit; }
+input[type='checkbox'], input[type='radio'] { accent-color: var(--brand); }
+input::placeholder, textarea::placeholder { color: #97a4b8; }
+::selection { background: #d7e6ff; color: #173967; }
+
+* { scrollbar-width: thin; scrollbar-color: #c4d0df transparent; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }

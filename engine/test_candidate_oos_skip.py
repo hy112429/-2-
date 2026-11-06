@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import browser_cdp
 from browser_cdp import (
     CandidateCartSkip,
+    WrongBaiyingProductRow,
     _baiying_row_skip_reason,
     _classify_baiying_prompt,
     _copy_baiying_product_link,
@@ -71,6 +72,107 @@ class CandidateOutOfStockSkipTests(unittest.TestCase):
         self.assertIn("target-1", str(raised.exception))
         self.assertIn("other-2", str(raised.exception))
 
+    def test_single_unmatched_row_with_empty_columns_and_oos_badge_skips(self):
+        row = MagicMock()
+        row.evaluate.return_value = {
+            "matchesProductId": False,
+            "matchesProductTitle": False,
+            "rowKey": "oos-row",
+            "rowText": "",
+            "statusHints": ["无库存"],
+            "identityHints": [],
+            "domIdentityHints": [],
+        }
+        visible_rows = MagicMock()
+        visible_rows.count.return_value = 1
+        visible_rows.nth.return_value = row
+        empty_rows = MagicMock()
+        empty_rows.count.return_value = 0
+        page = MagicMock()
+        page.locator.side_effect = lambda selector: visible_rows if selector == "tbody tr" else empty_rows
+
+        with patch.object(browser_cdp, "BAIYING_CART_ROW_SELECTORS", ("tbody tr",)), \
+                patch.object(browser_cdp, "_is_visible", return_value=True):
+            with self.assertRaises(CandidateCartSkip) as raised:
+                _locate_baiying_product_row(page, "3832406783184470433", "实机无库存商品标题")
+
+        self.assertIn("3832406783184470433", str(raised.exception))
+        self.assertIn("核验行不可识别", str(raised.exception))
+        self.assertIn("无库存", str(raised.exception))
+        self.assertIn("aria-label", browser_cdp.BAIYING_ROW_METADATA_SCRIPT)
+        self.assertIn("statusHints", browser_cdp.BAIYING_ROW_METADATA_SCRIPT)
+        self.assertIn("node.innerText || node.textContent", browser_cdp.BAIYING_ROW_METADATA_SCRIPT)
+        self.assertIn("getComputedStyle(node, pseudo)", browser_cdp.BAIYING_ROW_METADATA_SCRIPT)
+
+    def test_multiple_unmatched_rows_with_one_oos_badge_remain_ambiguous(self):
+        reason = _baiying_row_skip_reason("target-1", [
+            {"matchesProductId": False, "matchesProductTitle": False, "statusHints": ["无库存"]},
+            {"matchesProductId": False, "matchesProductTitle": False, "statusHints": []},
+        ])
+        self.assertEqual(reason, "")
+
+    def test_single_visible_oos_row_after_hidden_dom_rows_skips(self):
+        hidden_rows = [MagicMock(), MagicMock()]
+        visible_row = MagicMock()
+        visible_row.evaluate.return_value = {
+            "matchesProductId": False,
+            "matchesProductTitle": False,
+            "rowText": "",
+            "statusHints": ["无库存"],
+            "identityHints": [],
+            "domIdentityHints": [],
+        }
+        rows = MagicMock()
+        rows.count.return_value = 3
+        rows.nth.side_effect = [*hidden_rows, visible_row, *hidden_rows, visible_row]
+        page = MagicMock()
+        page.locator.return_value = rows
+        with (
+            patch.object(browser_cdp, "BAIYING_CART_ROW_SELECTORS", ("tbody tr",)),
+            patch.object(browser_cdp, "_is_visible", side_effect=lambda row: row is visible_row),
+        ):
+            with self.assertRaises(CandidateCartSkip) as raised:
+                _locate_baiying_product_row(page, "target-1", "目标商品")
+        self.assertIn("无库存", str(raised.exception))
+
+    def test_matched_target_row_with_oos_only_in_badge_skips(self):
+        row = MagicMock()
+        row.evaluate.return_value = {
+            "matchesProductId": True,
+            "matchesProductTitle": False,
+            "rowText": "目标商品",
+            "statusHints": ["无库存"],
+            "identityHints": ["goodsId=target-1"],
+        }
+        rows = MagicMock()
+        rows.count.return_value = 1
+        rows.nth.return_value = row
+        page = MagicMock()
+        page.locator.return_value = rows
+        with patch.object(browser_cdp, "_is_visible", return_value=True):
+            with self.assertRaises(CandidateCartSkip) as raised:
+                _locate_baiying_product_row(page, "target-1", "目标商品")
+        self.assertIn("无库存", str(raised.exception))
+
+    def test_same_title_wrong_id_with_oos_badge_remains_wrong_row(self):
+        row = MagicMock()
+        row.evaluate.return_value = {
+            "matchesProductId": False,
+            "matchesProductTitle": True,
+            "rowText": "同标题商品",
+            "statusHints": ["无库存"],
+            "domIdentityHints": ["goodsId=other-2"],
+        }
+        rows = MagicMock()
+        rows.count.return_value = 1
+        rows.nth.return_value = row
+        page = MagicMock()
+        page.locator.return_value = rows
+        with patch.object(browser_cdp, "_is_visible", return_value=True):
+            with self.assertRaises(WrongBaiyingProductRow) as raised:
+                _locate_baiying_product_row(page, "target-1", "同标题商品")
+        self.assertIn("other-2", str(raised.exception))
+
     def test_identity_ambiguity_without_oos_or_wrong_item_evidence_still_pauses(self):
         reason = _baiying_row_skip_reason("target-1", [{
             "matchesProductId": False,
@@ -129,11 +231,19 @@ class CandidateOutOfStockSkipTests(unittest.TestCase):
         self.assertIn("无库存", str(raised.exception))
 
     def test_batch_skips_confirmed_bad_candidate_and_processes_next(self):
-        first = {"cardIndex": 0, "productId": "oos-1", "title": "无库存商品"}
+        first = {
+            "cardIndex": 0,
+            "productId": "3832406783184470433",
+            "title": "【玉米天下】内蒙古沙土地黄糯玉米8支*240g（试吃2支）26年头茬玉米",
+        }
         second = {"cardIndex": 1, "productId": "ready-2", "title": "已在车商品"}
         second_card = MagicMock()
         second_card.inner_text.return_value = "已加入选品车"
-        skip = CandidateCartSkip("oos-1", "目标商品行明确显示无库存")
+        skip = CandidateCartSkip(
+            "3832406783184470433",
+            "核验行不可识别·唯一可见行明确显示无库存/不可加车：无库存",
+        )
+        progress_events = []
         with (
             patch.object(browser_cdp, "_visible_baiying_prompt", return_value=("", "")),
             patch.object(
@@ -143,15 +253,25 @@ class CandidateOutOfStockSkipTests(unittest.TestCase):
             ) as locate,
         ):
             results = execute_selected_candidates(
-                MagicMock(), MagicMock(), [first, second], [0, 1], ".", stop_after_cart=True
+                MagicMock(), MagicMock(), [first, second], [0, 1], ".",
+                stop_after_cart=True, progress=progress_events.append,
             )
 
         self.assertEqual(locate.call_count, 2)
-        self.assertEqual([item["productId"] for item in results], ["oos-1", "ready-2"])
+        self.assertEqual([item["productId"] for item in results], ["3832406783184470433", "ready-2"])
         self.assertTrue(results[0]["skipped"])
         self.assertFalse(results[0]["cartAdded"])
-        self.assertIn("oos-1", results[0]["status"])
+        self.assertEqual(results[0]["title"], first["title"])
+        self.assertIn("3832406783184470433", results[0]["status"])
         self.assertIn("无库存", results[0]["status"])
+        self.assertIn("继续下一候选", results[0]["status"])
+        self.assertTrue(any(
+            event.get("productId") == first["productId"]
+            and event.get("productTitle") == first["title"]
+            and "无库存" in event.get("message", "")
+            and "继续下一候选" in event.get("message", "")
+            for event in progress_events
+        ))
         self.assertTrue(results[1]["cartAdded"])
 
     def test_stale_oos_toast_does_not_block_next_candidate(self):

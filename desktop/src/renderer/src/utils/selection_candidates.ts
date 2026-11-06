@@ -122,6 +122,7 @@ export interface UnifiedCandidateScoreInput extends SelectionCandidateRankInput 
   trendKnown?: boolean
   trendStatus?: string
   hotOrRankBoost?: number
+  businessPriorityBoost?: number
 }
 
 const UNIFIED_METRIC_WEIGHTS: Record<string, number> = {
@@ -155,6 +156,8 @@ export function scoreUnifiedCandidatePools<T extends UnifiedCandidateScoreInput>
       const preferred = coverage(candidate) > coverage(previous) ? candidate : previous
       const secondary = preferred === candidate ? previous : candidate
       const mergedMetrics = { ...(secondary.dataMetrics ?? {}), ...(preferred.dataMetrics ?? {}) }
+      const poolRanks = [finiteMetric(previous.poolRank), finiteMetric(candidate.poolRank)]
+        .filter((value): value is number => value !== null)
       for (const [key, value] of Object.entries(secondary.dataMetrics ?? {})) {
         if (finiteMetric(mergedMetrics[key]) === null && finiteMetric(value) !== null) mergedMetrics[key] = value
       }
@@ -162,6 +165,7 @@ export function scoreUnifiedCandidatePools<T extends UnifiedCandidateScoreInput>
         ...secondary,
         ...preferred,
         dataMetrics: mergedMetrics,
+        poolRank: poolRanks.length ? Math.min(...poolRanks) : preferred.poolRank,
         sources: [...new Set([...(previous.sources ?? []), ...(candidate.sources ?? [])])],
         trendKnown: previous.trendKnown === true || candidate.trendKnown === true,
         trendStatus: previous.trendKnown === true ? previous.trendStatus : candidate.trendStatus
@@ -207,20 +211,37 @@ export function scoreUnifiedCandidatePools<T extends UnifiedCandidateScoreInput>
       const raw = weightUsed ? weighted / weightUsed : 0
       const sourceSet = new Set(canonical.sources ?? [])
       const boost = Math.min(10, (sourceSet.has('hotSpot') ? 5 : 0) + (sourceSet.has('allianceRank') ? 5 : 0))
-      const unifiedScore = Number(Math.min(100, raw * coverage + boost).toFixed(1))
+      const poolRank = finiteMetric(canonical.poolRank)
+      const poolPriorityIndex = poolRank === null ? null : Math.max(0, Math.trunc(poolRank))
+      const poolPriorityBoost = poolPriorityIndex === null ? 0 : Math.max(0, 8 - poolPriorityIndex * 2)
+      const commissionRate = finiteMetric(canonical.dataMetrics?.commissionRate)
+      const commissionBoost = commissionRate !== null && commissionRate >= 20 ? 4 : 0
+      const experienceScore = finiteMetric(canonical.dataMetrics?.experienceScore)
+      const experienceBoost = experienceScore !== null && experienceScore >= 4.6 ? 3 : 0
+      const businessPriorityBoost = Number((poolPriorityBoost + commissionBoost + experienceBoost).toFixed(1))
+      const unifiedScore = Number(Math.min(100, raw * coverage + boost + businessPriorityBoost).toFixed(1))
       const previousReasons = Array.isArray((candidate as T & { analysisReasons?: string[] }).analysisReasons)
         ? (candidate as T & { analysisReasons: string[] }).analysisReasons
-          .filter((reason) => !reason.startsWith('候选内综合评分') && reason !== '热点/榜单来源优先')
+          .filter((reason) =>
+            !reason.startsWith('候选内综合评分') &&
+            !reason.startsWith('跨账号统一评分') &&
+            !reason.startsWith('经营建议加权：') &&
+            reason !== '热点/榜单来源优先'
+          )
         : []
       const unifiedReasons = [
         `跨账号统一评分 ${unifiedScore}/100（统一候选池相对分 ${raw.toFixed(1)}，覆盖 ${metricCount}/${Object.keys(UNIFIED_METRIC_WEIGHTS).length} 项）`,
         ...(boost ? [`热点/联盟参考加权 +${boost}`] : []),
+        ...(poolPriorityBoost ? [`经营建议加权：选品池优先级第 ${poolPriorityIndex! + 1} 位 +${poolPriorityBoost}`] : []),
+        ...(commissionBoost ? [`经营建议加权：佣金率 ${commissionRate}% 达到推荐线 20%，+${commissionBoost}`] : []),
+        ...(experienceBoost ? [`经营建议加权：商家体验分 ${experienceScore} 达到推荐线 4.6，+${experienceBoost}`] : []),
         ...previousReasons
       ]
       return {
         ...candidate,
         sources: [...sourceSet] as T['sources'],
         hotOrRankBoost: boost,
+        businessPriorityBoost,
         unifiedScore,
         analysisReasons: unifiedReasons
       }

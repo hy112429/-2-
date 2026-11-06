@@ -149,9 +149,9 @@ onBeforeUnmount(() => {
   <section class="pane">
     <!-- ---------- 工具栏 ---------- -->
     <div class="toolbar">
-      <span class="label">登录账号</span>
+      <label class="label" for="browser-login-target">登录账号</label>
 
-      <select v-model="targetId" class="select" :disabled="busy">
+      <select id="browser-login-target" v-model="targetId" class="select" :disabled="busy">
         <option v-for="t in targets" :key="t.id" :value="t.id">{{ t.name }}</option>
       </select>
 
@@ -221,6 +221,8 @@ onBeforeUnmount(() => {
   gap: 8px;
   min-height: 0;
   height: 100%;
+  overflow: auto;
+  padding: 12px;
 }
 
 .session-note,
@@ -323,6 +325,7 @@ onBeforeUnmount(() => {
   font-size: 12px;
   color: var(--text-muted);
   flex-shrink: 0;
+  box-shadow: var(--shadow-card);
 }
 
 .badge {

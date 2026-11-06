@@ -71,19 +71,24 @@ export async function getRegistrySnapshot(accountKey: string, _candidates: Regis
 export async function reserveRegistryCandidates(
   accountKey: string,
   requestId: string,
-  items: RegistryCandidate[]
+  items: RegistryCandidate[],
+  maxReserved?: number
 ): Promise<{ reserved: RegistryReservation[]; rejected: Array<{ productId: string; reason: string }>; mode: 'local' }> {
   const localAccountKey = normalizeLocalAccountKey(accountKey)
   if (!requestId.trim()) throw new Error('本机登记请求标识为空；本次未执行加车。')
   if (!items.length) throw new Error('没有完整商品 ID 和末级类目的候选，本次未执行加车。')
-  const result = await runLocalRegistry<RegistryPayload & {
-    reserved?: RegistryReservation[]
-    rejected?: Array<{ productId: string; reason: string }>
-  }>([
+  const args = [
     'reserve', '--account-key', localAccountKey,
     '--request-id', requestId,
     '--items-json', JSON.stringify(items)
-  ])
+  ]
+  if (Number.isInteger(maxReserved) && Number(maxReserved) >= 0) {
+    args.push('--max-reserved', String(maxReserved))
+  }
+  const result = await runLocalRegistry<RegistryPayload & {
+    reserved?: RegistryReservation[]
+    rejected?: Array<{ productId: string; reason: string }>
+  }>(args)
   return {
     reserved: Array.isArray(result.reserved) ? result.reserved : [],
     rejected: Array.isArray(result.rejected) ? result.rejected : [],

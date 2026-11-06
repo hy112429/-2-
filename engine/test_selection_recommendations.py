@@ -33,11 +33,15 @@ class VisibleSourceRecommendationTests(TestCase):
         ]
         parser_rows = [dict(row) for row in candidates]
         with patch.object(browser_cdp, "_candidate_rows", return_value=(parser_rows, [], [])), \
-                patch.object(browser_cdp, "_candidate_quality_scores"):
+                patch.object(browser_cdp, "_candidate_quality_scores"), \
+                patch.object(browser_cdp, "_save_category_enrichment_report", return_value="isolated-report"):
             return browser_cdp._visible_source_candidate_result(
+                None,
                 source_candidates,
                 source_membership,
                 source_results,
+                [],
+                {},
                 [],
                 {"candidateLimit": target_count, "_candidatePoolLimit": 30},
             )
@@ -50,11 +54,11 @@ class VisibleSourceRecommendationTests(TestCase):
             candidate("z-1", "cat-z", 59, "hotSpot", 4),
         ])
 
-        self.assertEqual(result["recommendedCategories"], [
-            {"categoryId": "cat-x", "highScoreCount": 2, "averageScore": 80.0},
-            {"categoryId": "cat-y", "highScoreCount": 1, "averageScore": 95.0},
-        ])
-        self.assertEqual([row["productId"] for row in result["candidates"]], ["x-1", "x-2", "y-1", "z-1"])
+        self.assertEqual([
+            (row["categoryId"], row["highScoreCount"], row["averageScore"])
+            for row in result["recommendedCategories"]
+        ], [("cat-x", 2, 85.0), ("cat-y", 1, 100.0), ("cat-z", 1, 64.0)])
+        self.assertEqual([row["productId"] for row in result["candidates"]], ["y-1", "x-1", "x-2", "z-1"])
 
     def test_fallback_uses_top_a67_score_not_priority_source_order(self):
         result = self.build_result([
@@ -62,9 +66,10 @@ class VisibleSourceRecommendationTests(TestCase):
             candidate("higher-alliance", "cat-high", 55, "allianceRank", 2),
         ], target_count=1)
 
-        self.assertEqual(result["recommendedCategories"], [
-            {"categoryId": "cat-high", "highScoreCount": 1, "averageScore": 55.0},
-        ])
+        self.assertEqual([
+            (row["categoryId"], row["highScoreCount"], row["averageScore"])
+            for row in result["recommendedCategories"]
+        ], [("cat-high", 1, 60.0)])
 
     def test_a67_candidate_score_uses_relative_metrics_and_penalizes_missing_coverage(self):
         candidates = [
@@ -75,7 +80,7 @@ class VisibleSourceRecommendationTests(TestCase):
 
         browser_cdp._candidate_quality_scores(candidates, {})
 
-        self.assertEqual([row["analysisScore"] for row in candidates], [20.0, 10.0, 0.0])
+        self.assertEqual([row["analysisScore"] for row in candidates], [16.7, 8.3, 0.0])
         self.assertEqual([row["analysisRawScore"] for row in candidates], [100.0, 50.0, 0.0])
         self.assertEqual([row["analysisCoverage"] for row in candidates], [1, 1, 1])
 

@@ -14,9 +14,18 @@ const CHROME_CANDIDATES = [
   join(process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'), 'Google', 'Chrome', 'Application', 'chrome.exe')
 ].filter((value): value is string => Boolean(value))
 
+const EDGE_CANDIDATES = [
+  process.env['TOUGUANG_EDGE_PATH'],
+  join(process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  join(process.env['ProgramFiles'] ?? 'C:\\Program Files', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  join(process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local'), 'Microsoft', 'Edge', 'Application', 'msedge.exe')
+].filter((value): value is string => Boolean(value))
+
 const CDP_START_TIMEOUT_MS = 30_000
 const bridgeSessions = new Map<string, BridgeSession>()
 const creatingSessions = new Map<string, Promise<BridgeSession>>()
+// 自定义 profile 路径不能反推出业务账号，通过明确的 account-{id} profileKey 关联采集来源。
+const baiyingAccountByProfilePath = new Map<string, number | null>()
 let bridgeSequence = 0
 
 interface BridgeSession {
@@ -65,6 +74,12 @@ function findChrome(): string {
   return executable
 }
 
+function findEdge(): string {
+  const executable = EDGE_CANDIDATES.find((candidate) => existsSync(candidate))
+  if (!executable) throw new Error('找不到 Microsoft Edge。请安装 Edge，或设置 TOUGUANG_EDGE_PATH 指向 msedge.exe。')
+  return executable
+}
+
 function safeProfileKey(value: string): string {
   const key = value.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-')
   return key || 'general'
@@ -72,6 +87,16 @@ function safeProfileKey(value: string): string {
 
 function canonicalProfilePath(value: string): string {
   return resolve(value).replace(/[\\/]+$/, '').toLowerCase()
+}
+
+function registerBaiyingAccount(options: OpenManagedBrowserOptions, profilePath: string): void {
+  const match = /^account-(\d+)$/i.exec(options.profileKey.trim())
+  const parsedId = match ? Number(match[1]) : Number.NaN
+  const accountId = Number.isSafeInteger(parsedId) && parsedId > 0 ? parsedId : null
+  const key = canonicalProfilePath(profilePath)
+  const previous = baiyingAccountByProfilePath.get(key)
+  // 若一个 profile 被不同业务账号复用，归属不再唯一，按未知处理，避免错记。
+  baiyingAccountByProfilePath.set(key, previous === undefined || previous === accountId ? accountId : null)
 }
 
 function rejectDefaultChromeProfile(profilePath: string): void {
@@ -226,7 +251,7 @@ function parseBridgeLine(line: string, session: BridgeSession, readyResolve: (va
     const url = payload['url']
     const body = payload['body']
     if (typeof url === 'string' && typeof body === 'string') {
-      captureExternalBaiyingResponse(url, body)
+      captureExternalBaiyingResponse(url, body, baiyingAccountByProfilePath.get(canonicalProfilePath(session.profilePath)) ?? null)
     }
     return
   }
@@ -513,12 +538,13 @@ function sendBridgeCommand(
 
 /** 向指定托管 Chrome profile 发送白名单百应页面命令。 */
 export async function commandManagedBrowser(
-  action: 'inspect-selection' | 'run-selection' | 'check-account-logins' | 'prepare-douyin-publish' | 'submit-douyin-publish' | 'open-douyin-creator',
+  action: 'open' | 'inspect-selection' | 'run-selection' | 'check-account-logins' | 'prepare-douyin-publish' | 'submit-douyin-publish' | 'open-douyin-creator',
   data: Record<string, unknown>,
   options: OpenManagedBrowserOptions,
   onProgress?: (progress: ManagedBrowserProgress) => void
 ): Promise<Record<string, unknown>> {
   const profilePath = resolveProfilePath(options)
+  registerBaiyingAccount(options, profilePath)
   const { result } = await sendManagedCommand(profilePath, action, data, onProgress)
   return result
 }
@@ -529,6 +555,7 @@ export async function openManagedBrowser(
 ): Promise<{ ok: boolean; url: string; external: true; profilePath?: string; port?: number; title?: string; error?: string }> {
   try {
     const profilePath = resolveProfilePath(options)
+    registerBaiyingAccount(options, profilePath)
     const { session, result } = await sendManagedCommand(profilePath, 'open', { url })
     return {
       ok: true,
@@ -541,6 +568,29 @@ export async function openManagedBrowser(
   } catch (error) {
     return { ok: false, external: true, url, error: error instanceof Error ? error.message : String(error) }
   }
+}
+
+/** 在 Microsoft Edge 默认用户资料中打开 OAuth 页面，复用用户现有登录态。 */
+export function openEdgeUrlInDefaultProfile(url: string): Promise<{ ok: boolean; url: string; profilePath: string }> {
+  const parsed = new URL(url)
+  if (parsed.protocol !== 'https:' || !['open.oceanengine.com', 'ad.oceanengine.com', 'qianchuan.jinritemai.com'].includes(parsed.hostname)) {
+    throw new Error('只允许在 Microsoft Edge 中打开巨量引擎或千川开放平台 HTTPS 页面。')
+  }
+  const edge = findEdge()
+  const localAppData = process.env['LOCALAPPDATA'] ?? join(homedir(), 'AppData', 'Local')
+  const profilePath = join(localAppData, 'Microsoft', 'Edge', 'User Data')
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(edge, [`--user-data-dir=${profilePath}`, url], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false
+    })
+    child.once('error', rejectPromise)
+    child.once('spawn', () => {
+      child.unref()
+      resolvePromise({ ok: true, url, profilePath })
+    })
+  })
 }
 
 /** 应用退出时仅关闭 Playwright 连接；外部 Chrome 与其登录 profile 保持打开。 */

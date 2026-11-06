@@ -31,10 +31,11 @@ const CATEGORY_API_RE = /(category|cate_info|cate_list|cate_tree|cat_list)/i
 const CATEGORY_CONTAINER_RE = /(categories|category_list|category_tree|category_nodes|cate_info|cate_list|cate_tree|cat_list|first_level_categories|first_category_list)/i
 let lastCategorySignature = ''
 
-/** 捕获通知（批量浏览驱动靠它感知某个商品已抓到视频直链） */
+/** 捕获通知（包含零视频详情，便于查询立即区分“无视频”和“未响应”） */
 export interface ProductCaptured {
   productId: string
-  videoUrl: string
+  videoUrls: string[]
+  accountId: number | null
 }
 const capturedListeners = new Set<(p: ProductCaptured) => void>()
 
@@ -46,10 +47,10 @@ export function onProductCaptured(cb: (p: ProductCaptured) => void): () => void 
   }
 }
 
-function notifyCaptured(productId: string, videoUrl: string): void {
+function notifyCaptured(productId: string, videoUrls: string[], accountId: number | null = null): void {
   for (const cb of capturedListeners) {
     try {
-      cb({ productId, videoUrl })
+      cb({ productId, videoUrls, accountId })
     } catch {
       /* 单个订阅者出错不影响其余 */
     }
@@ -87,6 +88,7 @@ interface PackDetail {
   cover: string
   cosRatio: number | null
   videoUrl: string | null
+  videoUrls: string[]
   images: string[]
 }
 
@@ -107,9 +109,24 @@ function parsePackDetail(body: string): PackDetail | null {
     const media = base?.media
     const cos = product?.product_cos?.cos_label?.cos?.cos_ratio
     const productId = data?.product_id
-    const rawVideoUrl = media?.video_url
     if (typeof productId !== 'string') {
       return null
+    }
+    const collectVideoUrls = (value: unknown, inVideoField = false): string[] => {
+      if (typeof value === 'string') return inVideoField && /^https?:\/\//i.test(value) ? [value] : []
+      if (Array.isArray(value)) return value.flatMap((item) => collectVideoUrls(item, inVideoField))
+      if (!value || typeof value !== 'object') return []
+      const urls: string[] = []
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        if (/(cover|poster|thumb|image|audio|subtitle)/i.test(key)) continue
+        const videoContext = inVideoField || /(video|play|movie)/i.test(key)
+        if (videoContext && /^(url|origin_url|video_url|play_url|download_url|src)$/i.test(key) && typeof child === 'string') {
+          if (/^https?:\/\//i.test(child)) urls.push(child)
+        } else {
+          urls.push(...collectVideoUrls(child, videoContext))
+        }
+      }
+      return urls
     }
     const collectUrls = (value: unknown): string[] => {
       if (!Array.isArray(value)) return []
@@ -122,7 +139,8 @@ function parsePackDetail(body: string): PackDetail | null {
       })
     }
     const images = [...new Set([...collectUrls(base?.big_imgs), ...collectUrls(base?.images), ...collectUrls(base?.white_background)])].slice(0, 25)
-    const videoUrl = typeof rawVideoUrl === 'string' && rawVideoUrl ? rawVideoUrl : null
+    const videoUrls = [...new Set(collectVideoUrls(media))]
+    const videoUrl = videoUrls[0] ?? null
     const cover = typeof media?.cover_url === 'string' ? media.cover_url
       : typeof base?.cover === 'string' ? base.cover : ''
     if (!videoUrl && !images.length) return null
@@ -132,6 +150,7 @@ function parsePackDetail(body: string): PackDetail | null {
       cover,
       cosRatio: typeof cos === 'number' ? cos : null,
       videoUrl,
+      videoUrls,
       images
     }
   } catch {
@@ -140,26 +159,27 @@ function parsePackDetail(body: string): PackDetail | null {
 }
 
 /** 经引擎白名单脚本落库（fire-and-forget，失败只记日志） */
-function upsertProduct(p: PackDetail): void {
+function upsertProduct(p: PackDetail, accountId: number | null = null): void {
   const now = Date.now()
-  if (now - (lastUpsert.get(p.productId) ?? 0) < DEBOUNCE_MS) return
-  lastUpsert.set(p.productId, now)
+  const captureKey = `${accountId ?? 'unknown'}:${p.productId}`
+  if (now - (lastUpsert.get(captureKey) ?? 0) < DEBOUNCE_MS) return
+  lastUpsert.set(captureKey, now)
 
-  const args = [
-    'upsert',
-    '--product-id', p.productId,
-    '--title', p.title,
-    '--cover', p.cover,
-  ]
-  if (p.videoUrl) args.push('--video-url', p.videoUrl)
-  if (p.images.length) args.push('--gallery-stdin')
+  const args = ['upsert', '--product-id', p.productId, '--detail-stdin']
+  if (p.title) args.push('--title', p.title)
+  if (p.cover) args.push('--cover', p.cover)
   if (p.cosRatio !== null) args.push('--cos-ratio', String(p.cosRatio))
 
-  const handle = runScript('baiying_cache.py', { args, stdinJson: p.images.length ? p.images : undefined, onEvent: () => undefined })
+  const handle = runScript('baiying_cache.py', {
+    args,
+    stdinJson: { gallery: p.images, videoUrls: p.videoUrls, accountId },
+    onEvent: () => undefined
+  })
   void handle.promise.then((outcome) => {
-    logCompact({
+      logCompact({
       action: 'upsert',
       productId: p.productId,
+        accountId,
       title: p.title.slice(0, 40),
       ok: outcome.ok,
       error: outcome.error ?? undefined
@@ -317,15 +337,15 @@ function captureCategoryCatalog(body: string, url: string): void {
 }
 
 /** 处理来自 Electron 探针或外部托管 Chrome CDP 桥接的百应响应。 */
-export function captureExternalBaiyingResponse(url: string, body: string): void {
+export function captureExternalBaiyingResponse(url: string, body: string, accountId: number | null = null): void {
   if (!url.includes('buyin')) return
 
   if (url.includes('pack_detail')) {
     const parsed = parsePackDetail(body)
     if (parsed) {
-      logCompact({ action: 'capture', productId: parsed.productId, path: new URL(url).pathname, hasVideo: Boolean(parsed.videoUrl), imageCount: parsed.images.length, source: 'cdp' })
-      if (parsed.videoUrl) notifyCaptured(parsed.productId, parsed.videoUrl)
-      upsertProduct(parsed)
+      logCompact({ action: 'capture', productId: parsed.productId, accountId, path: new URL(url).pathname, videoCount: parsed.videoUrls.length, imageCount: parsed.images.length, source: 'cdp' })
+      notifyCaptured(parsed.productId, parsed.videoUrls, accountId)
+      upsertProduct(parsed, accountId)
     }
     return
   }
