@@ -1,0 +1,2687 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>投广管理客户端 · 高保真原型 v1.46</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#f4f6f9; --panel:#fff; --panel-2:#fafbfd;
+    --side:#171c2b; --side-hover:#232a3d; --side-text:#a9b1c4;
+    --line:#e8ebf1; --line-2:#f2f4f8;
+    --text:#1b1f2a; --muted:#858d9e; --faint:#aab1c0;
+    --brand:#2f6bff; --brand-hover:#1f57e0; --brand-soft:#eaf1ff; --brand-line:#c7d9ff;
+    --ok:#12a05c; --ok-soft:#e6f7ee;
+    --warn:#e08b00; --warn-soft:#fff5e3;
+    --danger:#e5484d; --danger-soft:#fdecec;
+    --r:6px; --r-lg:8px;
+    --sd:0 1px 2px rgba(16,24,40,.04);
+  }
+  body{
+    font-family:"PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;
+    font-size:13px;color:var(--text);background:var(--bg);height:100vh;overflow:hidden;
+    -webkit-font-smoothing:antialiased;
+  }
+  svg.ic{width:15px;height:15px;vertical-align:-2px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:0 0 auto}
+  svg.ic.sm{width:13px;height:13px}
+  svg.ic.lg{width:18px;height:18px}
+
+  /* ---------- 顶部 ---------- */
+  .topbar{height:54px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 16px;gap:18px;box-shadow:var(--sd);z-index:5}
+  .logo{font-weight:600;font-size:15px;display:flex;align-items:center;gap:9px;white-space:nowrap}
+  .logo .mark{width:22px;height:22px;border-radius:6px;background:linear-gradient(135deg,#2f6bff,#6c8cff);display:flex;align-items:center;justify-content:center;color:#fff}
+  .seg{display:flex;background:#f1f3f7;border-radius:var(--r);padding:2px}
+  .seg button{border:0;background:transparent;padding:5px 13px;border-radius:4px;font-size:13px;color:#5a6172;cursor:pointer;font-family:inherit}
+  .seg button.active{background:var(--panel);color:var(--brand);font-weight:600;box-shadow:var(--sd)}
+  .top-right{margin-left:auto;display:flex;align-items:center;gap:16px;color:var(--muted)}
+  .top-right .ti{cursor:pointer;display:flex;align-items:center;gap:5px}
+  .top-right .ti:hover{color:var(--brand)}
+  .avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,#c3cde0,#a9b6cd);border:2px solid #fff;box-shadow:0 0 0 1px var(--line)}
+
+  /* ---------- 布局 ---------- */
+  .app{display:flex;height:calc(100vh - 54px - 30px)}
+  .sidebar{width:190px;background:var(--side);padding:8px 0 20px;overflow-y:auto;flex:0 0 190px}
+  .sidebar::-webkit-scrollbar{width:6px}
+  .sidebar::-webkit-scrollbar-thumb{background:#2c3446;border-radius:3px}
+  .sidebar .gt{font-size:11px;color:#5d6579;padding:12px 18px 5px;letter-spacing:.4px;display:flex;align-items:center;gap:6px}
+  .sidebar button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;border:0;background:transparent;color:var(--side-text);padding:8px 18px;font-size:13px;cursor:pointer;font-family:inherit;position:relative}
+  .sidebar button:hover{background:var(--side-hover);color:#e8ecf5}
+  .sidebar button.active{background:linear-gradient(90deg,rgba(47,107,255,.22),rgba(47,107,255,.06));color:#fff;font-weight:500}
+  .sidebar button.active::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--brand)}
+
+  .main{flex:1;overflow-y:auto;padding:16px 18px 24px}
+  .main::-webkit-scrollbar{width:8px}
+  .main::-webkit-scrollbar-thumb{background:#d3d8e3;border-radius:4px}
+  .ph{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+  .ph h2{font-size:16px;font-weight:600;letter-spacing:.2px}
+  .ph .sub{color:var(--muted);font-size:12px}
+  .ph .sp{margin-left:auto;display:flex;gap:8px}
+
+  .tag{font-size:11px;padding:2px 8px;border-radius:20px;background:var(--brand-soft);color:var(--brand);font-weight:500}
+  .tag.new{background:var(--warn-soft);color:var(--warn)}
+  .tag.m3{background:#eef0f4;color:#6b7385}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:14px 16px;margin-bottom:14px;box-shadow:var(--sd)}
+  .card-t{font-size:13px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:7px}
+  .card-t .r{margin-left:auto;font-weight:400;font-size:12px;color:var(--muted)}
+  .card-t .bar{width:3px;height:13px;background:var(--brand);border-radius:2px}
+
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .row+.row{margin-top:10px}
+  .field{display:flex;align-items:center;gap:6px}
+  .field>label{color:var(--muted);white-space:nowrap;font-size:12.5px}
+
+  input[type=text],select{height:30px;padding:0 9px;border:1px solid var(--line);border-radius:var(--r);font-size:12.5px;font-family:inherit;background:#fff;color:var(--text);outline:none;transition:border-color .12s}
+  input[type=text]:hover,select:hover{border-color:#d3d8e3}
+  input[type=text]:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(47,107,255,.1)}
+  input[type=checkbox]{width:14px;height:14px;accent-color:var(--brand);cursor:pointer}
+
+  .btn{height:30px;padding:0 13px;border:1px solid var(--line);background:#fff;border-radius:var(--r);font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--text);display:inline-flex;align-items:center;gap:6px;transition:all .12s}
+  .btn:hover{border-color:#c9d0dd;background:#fcfdff}
+  .btn:active{transform:translateY(.5px)}
+  .btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+  .btn.primary:hover{background:var(--brand-hover);border-color:var(--brand-hover)}
+  .btn.danger{color:var(--danger);border-color:#f5c6c8}
+  .btn.danger:hover{background:var(--danger-soft)}
+  .btn.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+  .btn.ghost:hover{background:#f1f3f7;color:var(--text)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line-2);white-space:nowrap}
+  th{color:var(--muted);font-weight:500;background:var(--panel-2);font-size:12px;position:sticky;top:0}
+  tbody tr:hover{background:#fafbfe}
+  tbody tr.sel{background:var(--brand-soft)}
+  .thumb{width:42px;height:54px;border-radius:4px;background:linear-gradient(135deg,#e6ebf5,#ccd6e8);position:relative;overflow:hidden}
+  .thumb::after{content:"";position:absolute;inset:0;background:linear-gradient(180deg,transparent 55%,rgba(0,0,0,.12))}
+  .lnk{color:var(--brand);cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+  .lnk:hover{text-decoration:underline}
+  .lnk+.lnk{margin-left:12px}
+
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);padding:13px 15px;box-shadow:var(--sd);position:relative;overflow:hidden}
+  .stat .k{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
+  .stat .v{font-size:22px;font-weight:600;margin-top:5px;font-variant-numeric:tabular-nums}
+  .stat .d{font-size:11px;color:var(--ok);margin-top:3px}
+  .stat .glow{position:absolute;right:-14px;top:-14px;width:52px;height:52px;border-radius:50%;background:var(--brand-soft);opacity:.7}
+
+  .pill{font-size:11px;padding:2px 8px;border-radius:20px;display:inline-block;line-height:16px}
+  .pill.ok{background:var(--ok-soft);color:var(--ok)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .pill.info{background:var(--brand-soft);color:var(--brand)}
+  .pill.gray{background:#f0f2f6;color:#6b7385}
+  .pill.danger{background:var(--danger-soft);color:var(--danger)}
+
+  .chips{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .chip{background:var(--brand-soft);color:var(--brand);border:1px solid var(--brand-line);border-radius:20px;padding:3px 6px 3px 10px;font-size:12px;display:inline-flex;align-items:center;gap:6px}
+  .chip .x{cursor:pointer;opacity:.6;display:flex}
+  .chip .x:hover{opacity:1}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:12px}
+  .media{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden;transition:all .15s;cursor:pointer}
+  .media:hover{border-color:var(--brand-line);box-shadow:0 4px 14px rgba(16,24,40,.08);transform:translateY(-2px)}
+  .media .cover{height:100px;background:linear-gradient(135deg,#e6ebf5,#ccd6e8);position:relative}
+  .media .cover .play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;opacity:.9}
+  .media .cover .badge{position:absolute;left:6px;top:6px}
+  .media .meta{padding:9px 10px}
+  .media .meta .t{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .media .meta .s{color:var(--muted);margin-top:4px;font-size:11px;display:flex;justify-content:space-between}
+
+  .statusbar{height:30px;background:var(--panel);border-top:1px solid var(--line);display:flex;align-items:center;gap:22px;padding:0 18px;font-size:12px;color:var(--muted);z-index:5}
+  .statusbar .live{display:flex;align-items:center;gap:6px;color:var(--ok)}
+  .dotlive{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+
+  .page{display:none}
+  .page.active{display:block;animation:fade .18s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+
+  .hint{font-size:11.5px;color:var(--muted);margin-top:8px;display:flex;align-items:center;gap:6px}
+  .category-pick-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}
+  .category-pick-group{min-width:0;max-height:210px;overflow:auto}
+  .category-pick-group>b{display:block;margin-bottom:5px;color:var(--muted);font-size:11px}
+  .category-pick-option{display:flex;align-items:flex-start;gap:6px;padding:3px 2px;font-size:11.5px;line-height:1.4;cursor:pointer}
+  .category-pick-option input{width:auto!important;flex:0 0 auto;margin:2px 0 0}
+  .category-pick-option span{min-width:0;overflow-wrap:anywhere}
+  .category-pick-count{grid-column:1/-1;color:var(--brand);font-size:11px}
+  .divider{height:1px;background:var(--line-2);margin:12px 0}
+  .two-col{display:flex;gap:14px;align-items:flex-start}
+  .two-col>.card{flex:1}
+
+  /* 进度条 */
+  .task{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line-2);font-size:12.5px}
+  .task:last-child{border-bottom:0}
+  .task .nm{width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bar{flex:1;height:6px;background:#eef1f6;border-radius:4px;overflow:hidden}
+  .bar>i{display:block;height:100%;background:linear-gradient(90deg,#2f6bff,#6c8cff);border-radius:4px;transition:width .3s}
+  .task .pc{width:42px;text-align:right;font-variant-numeric:tabular-nums;color:var(--muted)}
+  .task .st{width:58px;text-align:right}
+
+  /* 弹窗 */
+  .mask{position:fixed;inset:0;background:rgba(16,24,40,.42);display:none;align-items:center;justify-content:center;z-index:100}
+  .mask.show{display:flex;animation:fade .15s}
+  .modal{background:#fff;border-radius:10px;width:420px;box-shadow:0 20px 48px rgba(16,24,40,.22);overflow:hidden}
+  .modal .mh{padding:16px 18px 0;font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .modal .mb{padding:12px 18px 4px;color:#4a5162;line-height:1.9;font-size:13px}
+  .modal .mf{padding:16px 18px;display:flex;justify-content:flex-end;gap:8px;background:var(--panel-2);border-top:1px solid var(--line-2)}
+
+  /* Toast */
+  .toast-wrap{position:fixed;top:66px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center}
+  .toast{background:#22283a;color:#fff;padding:9px 16px;border-radius:var(--r);font-size:12.5px;box-shadow:0 8px 24px rgba(16,24,40,.24);display:flex;align-items:center;gap:8px;animation:fade .2s}
+  .toast.ok{background:#10592f}
+  .toast.err{background:#7a1f22}
+
+  /* 骨架屏 */
+  .sk{height:12px;border-radius:6px;background:linear-gradient(90deg,#eef1f6 25%,#f6f8fb 37%,#eef1f6 63%);background-size:400% 100%;animation:sh 1.2s infinite}
+  @keyframes sh{0%{background-position:100% 50%}100%{background-position:0 50%}}
+
+  .filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px 20px}
+  .fr{display:flex;align-items:center;gap:10px;padding:6px 0}
+  .fr>label{width:66px;color:var(--muted);font-size:12.5px;flex:0 0 66px}
+  .fr select{flex:1}
+  .swt{display:inline-flex;align-items:center;gap:7px;cursor:pointer;font-size:12.5px}
+  .swt input{display:none}
+  .swt .sw{width:32px;height:18px;border-radius:10px;background:#d8dde8;position:relative;transition:.15s}
+  .swt .sw::after{content:"";position:absolute;width:14px;height:14px;border-radius:50%;background:#fff;top:2px;left:2px;transition:.15s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+  .swt input:checked+.sw{background:var(--brand)}
+  .swt input:checked+.sw::after{left:16px}
+
+  /* ================= v1.0 新增：双端切换 / 角色 / 管理端 / 组件 ================= */
+  .appsw{display:flex;background:#f1f3f7;border-radius:var(--r);padding:2px;margin-right:2px}
+  .appsw button{border:0;background:transparent;padding:5px 13px;border-radius:4px;font-size:13px;color:#5a6172;cursor:pointer;font-family:inherit}
+  .appsw button.active{background:var(--brand);color:#fff;font-weight:600;box-shadow:var(--sd)}
+  body:not(.mode-admin) #roleSel{display:none}
+  body.mode-admin .app[data-app="client"]{display:none}
+  .app[data-app="admin"]{display:none}
+  body.mode-admin .app[data-app="admin"]{display:flex}
+  .app[data-app="admin"] .sidebar{background:#101527}
+  .app[data-app="admin"] .sidebar button.active{background:linear-gradient(90deg,rgba(245,158,11,.22),rgba(245,158,11,.05))}
+  .app[data-app="admin"] .sidebar button.active::before{background:#f59e0b}
+  .app[data-app="admin"] .card-t .bar{background:#f59e0b}
+  .app[data-app="admin"] .btn.primary{background:#b45309;border-color:#b45309}
+  .app[data-app="admin"] .btn.primary:hover{background:#92400e;border-color:#92400e}
+  .pmode{display:none;color:#b45309;font-weight:600}
+  body.mode-admin .pmode{display:inline}
+  body.role-readonly .need-write{opacity:.45;pointer-events:none;filter:grayscale(.35)}
+  .steps{display:flex;gap:8px;margin-bottom:14px}
+  .steps .step{flex:1;display:flex;align-items:center;gap:8px;padding:9px 10px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);color:var(--muted);font-size:12px}
+  .steps .step .n{width:20px;height:20px;border-radius:50%;background:#eef1f6;display:flex;align-items:center;justify-content:center;font-size:11px;flex:0 0 20px}
+  .steps .step.done .n{background:var(--ok);color:#fff}
+  .steps .step.cur{border-color:var(--brand-line);background:var(--brand-soft);color:var(--text);font-weight:600}
+  .steps .step.cur .n{background:var(--brand);color:#fff}
+  .kv{display:grid;grid-template-columns:118px 1fr;gap:9px 14px;font-size:12.5px}
+  .kv .k{color:var(--muted)}
+  .perm th:not(:first-child),.perm td:not(:first-child){text-align:center}
+  .num{font-variant-numeric:tabular-nums}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px}
+  .dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+  .dot.off{background:#c3c9d6}
+  /* 分页 */
+  .pager{display:flex;align-items:center;gap:12px;padding:12px 2px 2px;flex-wrap:wrap}
+  .pager .pg-total{color:var(--muted);font-size:12.5px}
+  .pager .pg-size{color:var(--muted);font-size:12.5px;display:inline-flex;align-items:center;gap:6px}
+  .pager .pg-btns{margin-left:auto;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  button.pg{height:28px;min-width:28px;padding:0 9px;border:1px solid var(--line);background:#fff;border-radius:var(--r);font-size:12.5px;cursor:pointer;font-family:inherit;color:var(--text)}
+  button.pg:hover{border-color:#c9d0dd;background:#fcfdff}
+  button.pg.on{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+  .pg-dots{color:var(--faint);padding:0 2px}
+</style>
+</head>
+<body>
+
+<!-- 图标精灵 -->
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></symbol>
+  <symbol id="i-dl" viewBox="0 0 24 24"><path d="M12 4v11m0 0l-4-4m4 4l4-4"/><path d="M5 19h14"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v5h-5"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 19a6 6 0 0 1 12 0"/><path d="M16 6.5a3 3 0 0 1 0 5.8M18 19a6 6 0 0 0-2.2-4.6"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5l10 6.5-10 6.5z"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="12" rx="2"/><path d="M15 10.5l6-3.5v10l-6-3.5"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16v-5M12 16V8M16 16v-8"/></symbol>
+  <symbol id="i-set" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7 7 0 0 0-2-1.2L14 3h-4l-.6 2.7a7 7 0 0 0-2 1.2l-2.3-1-2 3.4 2 1.5A7 7 0 0 0 5 12a7 7 0 0 0 .1 1.2l-2 1.5 2 3.4 2.3-1a7 7 0 0 0 2 1.2L10 21h4l.6-2.7a7 7 0 0 0 2-1.2l2.3 1 2-3.4-2-1.5A7 7 0 0 0 19 12z"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 6h16M7 12h10M10 18h4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-3-6z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4.5l3 1.5"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path d="M9.5 14.5l5-5"/><path d="M8 12l-1.8 1.8a3.5 3.5 0 0 0 5 5L13 17"/><path d="M16 12l1.8-1.8a3.5 3.5 0 0 0-5-5L11 7"/></symbol>
+  <symbol id="i-cart" viewBox="0 0 24 24"><path d="M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h8.2a2 2 0 0 0 2-1.6L21 8H6"/><circle cx="10" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/></symbol>
+</svg>
+
+<!-- 顶部 -->
+<div class="topbar">
+  <div class="logo"><span class="mark"><svg class="ic sm"><use href="#i-layers"/></svg></span>投广管理客户端</div>
+  <div class="appsw">
+    <button class="active" data-app="client">客户端</button>
+    <button data-app="admin">管理端</button>
+  </div>
+  <div class="seg" id="quickSeg">
+    <button class="active" data-top="accounts">百应工作台</button>
+    <button data-top="product">商品查询</button>
+    <button data-top="selection">选品设置</button>
+  </div>
+  <div class="top-right">
+    <span class="ti" title="演示权限分级（K3）"><svg class="ic"><use href="#i-user"/></svg></span>
+    <select id="roleSel" style="height:28px">
+      <option value="admin">管理员</option>
+      <option value="ops">运营</option>
+      <option value="readonly">只读（演示受限）</option>
+    </select>
+    <span class="ti"><svg class="ic"><use href="#i-refresh"/></svg>同步</span>
+    <span class="avatar"></span>
+  </div>
+</div>
+
+<div class="app" data-app="client">
+<aside class="sidebar" data-app="client">
+    <div class="gt">百应工作台</div>
+    <button data-page="product"><svg class="ic"><use href="#i-search"/></svg>商品查询</button>
+
+    <div class="gt">投放</div>
+    <button data-page="dashboard"><svg class="ic"><use href="#i-chart"/></svg>投放看板</button>
+
+    <div class="gt">素材与工具</div>
+    <button data-page="media"><svg class="ic"><use href="#i-folder"/></svg>素材库管理</button>
+    <button data-page="imgvideo"><svg class="ic"><use href="#i-video"/></svg>图片转视频</button>
+    <button data-page="record"><svg class="ic"><use href="#i-play"/></svg>商品详情录屏</button>
+
+    <div class="gt">账号管理</div>
+    <button class="active" data-page="accounts"><svg class="ic"><use href="#i-users"/></svg>账号列表</button>
+    <button data-page="groups"><svg class="ic"><use href="#i-layers"/></svg>账号分组</button>
+
+    <div class="gt">发布与计划</div>
+    <button data-page="plist"><svg class="ic"><use href="#i-folder"/></svg>商品列表</button>
+    <button data-page="plandouyin"><svg class="ic"><use href="#i-send"/></svg>抖音发布（图转视频）</button>
+    <button data-page="planqianchuan"><svg class="ic"><use href="#i-dl"/></svg>千川发布（素材视频）</button>
+    <button data-page="queue"><svg class="ic"><use href="#i-clock"/></svg>待发布 / 等待执行</button>
+    <button data-page="tasks"><svg class="ic"><use href="#i-clock"/></svg>任务中心</button>
+
+    <div class="gt">千川管理</div>
+    <button data-page="qianchuan"><svg class="ic"><use href="#i-user"/></svg>千川账户</button>
+    <button data-page="qcupload"><svg class="ic"><use href="#i-dl"/></svg>千川素材上传</button>
+    <button data-page="ads"><svg class="ic"><use href="#i-chart"/></svg>广告列表</button>
+    <button data-page="abnormal"><svg class="ic"><use href="#i-warn"/></svg>异常素材</button>
+    <button data-page="cleanup"><svg class="ic"><use href="#i-folder"/></svg>素材清理</button>
+    <button data-page="violation"><svg class="ic"><use href="#i-warn"/></svg>违规管理</button>
+    <button data-page="append"><svg class="ic"><use href="#i-refresh"/></svg>自动追加素材</button>
+
+    <div class="gt">投放计划</div>
+    <button data-page="plancreate"><svg class="ic"><use href="#i-plus"/></svg>计划创建</button>
+    <button data-page="planmanage"><svg class="ic"><use href="#i-set"/></svg>计划管理</button>
+
+    <div class="gt">罗盘管理</div>
+    <button data-page="luopan"><svg class="ic"><use href="#i-user"/></svg>新增罗盘</button>
+    <button data-page="lpxuanpin"><svg class="ic"><use href="#i-filter"/></svg>罗盘选品</button>
+    <button data-page="lplist"><svg class="ic"><use href="#i-chart"/></svg>罗盘列表</button>
+
+    <div class="gt">选品与设置</div>
+    <button data-page="selection"><svg class="ic"><use href="#i-filter"/></svg>百应选品设置</button>
+    <button data-page="settings"><svg class="ic"><use href="#i-set"/></svg>设置</button>
+    <button data-page="logs"><svg class="ic"><use href="#i-chart"/></svg>日志与异常</button>
+  </aside>
+
+  <main class="main">
+
+    <!-- ========== 商品查询 ========== -->
+    <section class="page" id="page-product">
+      <div class="ph">
+        <h2>商品查询</h2><span class="tag">核心</span>
+        <span class="sub">筛选条件经百应接口透传，结果与百应一致</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button></span>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>商品ID</label><input type="text" id="pid" style="width:210px" value="3829712309664743478"></div>
+          <div class="field"><label>视频链接</label><input type="text" style="width:250px" placeholder="短链 / 视频页链接 / 口令文本 均可"></div>
+          <button class="btn primary" id="btnSearch"><svg class="ic"><use href="#i-search"/></svg>搜索</button>
+          <button class="btn" id="btnLink"><svg class="ic"><use href="#i-link"/></svg>解析任意链接</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>支持 `v.douyin.com/xxx` 短链、`douyin.com/video/{id}` 视频页链接、含链接的口令文本；自动识别并归一化</div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>筛选条件<span class="r">选项动态取自百应接口</span></div>
+        <div class="filter-grid">
+          <div class="fr"><label>商品类目</label><select><option>全部</option><option selected>钟表配饰</option><option>个护家清</option><option>智能家居</option><option>图书教育</option></select></div>
+          <div class="fr"><label>二级类目</label><select><option selected>时尚饰品-DIY配件</option><option>手表</option><option>眼镜</option></select></div>
+          <div class="fr"><label>时间范围</label><select><option>近 1 天</option><option>近 7 天</option><option selected>近 30 天</option><option>自定义区间</option></select></div>
+          <div class="fr"><label>佣金区间</label><select><option>全部</option><option selected>20% 以上</option><option>10%–20%</option></select></div>
+          <div class="fr"><label>价格区间</label><select><option>全部</option><option>0–50 元</option><option>50–200 元</option></select></div>
+          <div class="fr"><label>体验分</label><select><option>全部</option><option selected>85 分以上</option></select></div>
+          <div class="fr"><label>带货情况</label><select><option>全部</option><option>月销 100+</option><option>月销 1000+</option></select></div>
+          <div class="fr"><label>特色货盘</label><select><option>全部</option><option>高转化率</option><option>品牌</option><option>新品</option><option>低价好货</option></select></div>
+          <div class="fr"><label>流量激励</label><select><option>全部</option><option>商家自播千川</option><option>自然派千川</option></select></div>
+          <div class="fr"><label>优质</label><span class="swt"><input type="checkbox" checked><span class="sw"></span>仅看优质</span></div>
+        </div>
+        <div class="divider"></div>
+        <div class="chips">
+          <span style="color:var(--muted);font-size:12px">已选：</span>
+          <span class="chip">商品类目：钟表配饰<span class="x" onclick="this.parentNode.remove()"><svg class="ic sm"><use href="#i-plus"/></svg></span></span>
+          <span class="chip">体验分：85分以上<span class="x" onclick="this.parentNode.remove()"><svg class="ic sm"><use href="#i-plus"/></svg></span></span>
+          <span class="chip">佣金：20%以上<span class="x" onclick="this.parentNode.remove()"><svg class="ic sm"><use href="#i-plus"/></svg></span></span>
+          <button class="btn ghost" id="btnResetFilter">重置筛选</button>
+        </div>
+      </div>
+
+      <div class="card" id="productInfo" style="display:none">
+        <div class="row" style="gap:22px">
+          <span>商品名称：<b>拼豆钥匙扣配打孔五金工具套装（彩色开口圈DIY手工材料包）</b></span>
+          <span>类目：钟表配饰 &gt; 时尚饰品-DIY配件</span>
+          <span>商品ID：3829712309664743478</span>
+          <span>佣金率：<b style="color:var(--danger)">21.00%</b></span>
+          <span class="pill info">已授权</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>查询结果<span class="r" id="resCount">共 0 条</span></div>
+        <table>
+          <thead><tr>
+            <th style="width:34px"><input type="checkbox" id="ckAll"></th>
+            <th style="width:40px">序号</th><th style="width:56px">封面</th><th>视频标题</th><th>作者</th><th>发布时间</th>
+            <th>用户支付金额</th><th>商品点击率</th><th>成交件数</th><th>授权</th><th>视频地址</th><th>操作</th>
+          </tr></thead>
+          <tbody id="resBody">
+            <tr><td colspan="12" style="text-align:center;color:var(--muted);padding:28px 0">请输入商品 ID 或链接后点击「搜索」</td></tr>
+          </tbody>
+        </table>
+        <div class="divider"></div>
+        <div class="row">
+          <button class="btn" data-act="download" disabled><svg class="ic"><use href="#i-dl"/></svg>视频下载</button>
+          <button class="btn" disabled>备用下载</button>
+          <button class="btn"><svg class="ic"><use href="#i-folder"/></svg>设置下载目录</button>
+          <button class="btn primary" id="btnDownloadAll" disabled>下载全部</button>
+          <span style="margin-left:auto;color:var(--muted)">已选 <b id="selCount" style="color:var(--text)">0</b> 个</span>
+          <button class="btn">视频预览</button>
+          <button class="btn">一键转码</button>
+          <button class="btn ghost">清空预览</button>
+        </div>
+      </div>
+
+      <div class="card" id="taskCard" style="display:none">
+        <div class="card-t"><span class="bar"></span>下载任务<span class="r" id="taskSummary"></span></div>
+        <div id="taskList"></div>
+      </div>
+    </section>
+
+    <!-- ========== 商品列表 ========== -->
+    <section class="page" id="page-plist">
+      <div class="ph">
+        <h2>商品列表</h2><span class="tag new">参考软件新增</span>
+        <span class="sub">选好品先更新进列表（状态＝待选品）；批量加入选品车后流转；发布失败为后续状态</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button></span>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <span class="sub">状态：待选品 / 已加入选品车 / 选品失败 / 发布失败 / 已上传</span>
+          <span style="margin-left:auto"></span>
+          <button class="btn primary" id="btnPlistAutoCart"><svg class="ic"><use href="#i-cart"/></svg>一键加入选品车（全部待选品）</button>
+          <button class="btn" id="btnPlistAddCart" disabled><svg class="ic"><use href="#i-cart"/></svg>批量加入选品车（勾选）</button>
+          <button class="btn"><svg class="ic"><use href="#i-plus"/></svg>新增商品</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>「一键加入选品车」＝软件<b>自动</b>将列表中全部「待选品」商品逐个跳转百应检索并加入选品车（无人值守）；勾选后「批量加入选品车」手动处理勾选行；选品完成后<b>全自动触发</b>（A-34 / FR-I5-01）；加入失败标记「选品失败」；「发布失败」为发布阶段回传的后续状态</div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>商品列表<span class="r" id="plistCount">共 8 条</span></div>
+        <table>
+          <thead><tr>
+            <th style="width:34px"><input type="checkbox" id="plistAll"></th>
+            <th>商品信息</th>
+            <th style="width:112px">状态</th>
+            <th style="width:90px">编码</th>
+            <th style="width:158px">日期时间</th>
+            <th style="width:210px">操作</th>
+          </tr></thead>
+          <tbody id="plistBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 罗盘管理（R30 新增） ========== -->
+    <section class="page" id="page-luopan">
+      <div class="ph"><h2>新增罗盘</h2><span class="tag new">R30 新增</span><span class="sub">进入抖音罗盘登录新罗盘账号（罗盘数据洞察的数据源）</span>
+        <span class="sp"><button class="btn primary" id="btnNewLuopan"><svg class="ic"><use href="#i-plus"/></svg>新增罗盘账号</button></span></div>
+      <div class="stats">
+        <div class="stat"><div class="k">罗盘账号</div><div class="v num">3</div><div class="d">已登录 3 个</div></div>
+        <div class="stat"><div class="k">数据同步</div><div class="v num">今日</div><div class="d">最近 09:12 成功</div></div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>罗盘账号<span class="r">罗盘选品数据源</span></div>
+        <table>
+          <thead><tr><th>账号名称</th><th>抖音号</th><th>状态</th><th>登录时间</th><th>操作</th></tr></thead>
+          <tbody id="lpAccBody">
+            <tr><td>群益百货</td><td>7574…3821</td><td><span class="pill ok">已登录</span></td><td>2026-10-16 09:12:33</td><td><span class="lnk">刷新登录态</span><span class="lnk">退出</span></td></tr>
+            <tr><td>星禾优品馆</td><td>7574…3983</td><td><span class="pill ok">已登录</span></td><td>2026-10-16 08:40:12</td><td><span class="lnk">刷新登录态</span><span class="lnk">退出</span></td></tr>
+            <tr><td>辰萌贴纸</td><td>7574…1155</td><td><span class="pill warn">待重登</span></td><td>2026-10-14 20:03:51</td><td><span class="lnk">重新登录</span><span class="lnk">退出</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>「新增罗盘账号」＝跳转抖音罗盘（电商罗盘）登录新账号，登录后回读并保存登录态；罗盘账号作为「罗盘选品」的数据源（R30 / A-41）</div>
+      </div>
+    </section>
+
+    <section class="page" id="page-lpxuanpin">
+      <div class="ph"><h2>罗盘选品</h2><span class="tag new">R30 新增</span><span class="sub">基于罗盘数据筛选推荐商品（销量 / 佣金 / 转化 / 退款）</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>同步罗盘数据</button></span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>罗盘账号</label><select id="lpxAcct"><option>全部</option><option>群益百货</option><option>星禾优品馆</option><option>辰萌贴纸</option></select></div>
+          <div class="field"><label>类目</label><select><option>全部</option><option>家居专用</option><option>五金工具</option><option>宠物用品</option></select></div>
+          <div class="field"><label>时间</label><select><option>近 7 天</option><option selected>近 30 天</option><option>自定义</option></select></div>
+          <div class="field"><label>销量 ≥</label><input type="text" style="width:70px" value="100"></div>
+          <div class="field"><label>佣金率 ≥</label><input type="text" style="width:70px" value="20%"></div>
+          <div class="field"><label>退款率 ≤</label><input type="text" style="width:70px" value="5%"></div>
+          <button class="btn primary" id="btnLpxFilter"><svg class="ic"><use href="#i-search"/></svg>开始筛选</button>
+          <button class="btn" id="btnLpxSave"><svg class="ic"><use href="#i-check"/></svg>保存为罗盘方案</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>推荐口径＝基于罗盘经营数据（销量 / 佣金率 / 转化率 / 退款率）综合评分，输出「推荐理由」；选中商品可<b>加入商品列表</b>（状态＝待选品）并串联后续全流程（加车 / 下载 / 图转视频 / 发布，R30 / A-41）</div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>推荐商品<span class="r" id="lpxCount">共 0 条</span></div>
+        <table>
+          <thead><tr><th style="width:34px"><input type="checkbox"></th><th>商品信息</th><th>类目</th><th>近30天销量</th><th>佣金率</th><th>转化率</th><th>退款率</th><th>推荐理由</th><th>操作</th></tr></thead>
+          <tbody id="lpxBody">
+            <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:28px 0">点击「开始筛选」按罗盘数据推荐商品</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="page" id="page-lplist">
+      <div class="ph"><h2>罗盘列表</h2><span class="tag new">R30 新增</span><span class="sub">已保存的罗盘选品方案管理</span>
+        <span class="sp"><button class="btn primary" id="btnLpNewPlan"><svg class="ic"><use href="#i-plus"/></svg>新建方案</button></span></div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>罗盘方案<span class="r" id="lpPlanCount">共 2 条</span></div>
+        <table>
+          <thead><tr><th>方案名称</th><th>罗盘账号</th><th>筛选条件</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+          <tbody id="lpPlanBody">
+            <tr><td>家居好物-高佣低退</td><td>群益百货</td><td>家居专用 · 销量≥100 · 佣金≥20% · 退款≤5%</td><td><span class="pill ok">已启用</span></td><td>2026-10-15 14:22:09</td><td><span class="lnk lp-run">运行</span><span class="lnk">编辑</span><span class="lnk lp-del">删除</span></td></tr>
+            <tr><td>五金工具-冲量</td><td>星禾优品馆</td><td>五金工具 · 销量≥200 · 佣金≥15% · 退款≤8%</td><td><span class="pill warn">已暂停</span></td><td>2026-10-14 09:40:55</td><td><span class="lnk lp-run">运行</span><span class="lnk">编辑</span><span class="lnk lp-del">删除</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>「运行」＝按方案条件在「罗盘选品」执行筛选并可选加入商品列表；「新建方案」＝前往「罗盘选品」配置并保存</div>
+      </div>
+    </section>
+
+    <!-- ========== 账号列表 ========== -->
+    <section class="page active" id="page-accounts">
+      <div class="ph">
+        <h2>账号列表</h2><span class="tag new">参考软件新增</span>
+        <span class="sub">多账号矩阵统一管理</span>
+        <span class="sp">
+          <button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+          <button class="btn primary" id="btnNewAcc"><svg class="ic"><use href="#i-plus"/></svg>新建账号</button>
+        </span>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <span class="sub">矩阵控制（R27 · 参考真实软件）</span>
+          <button class="btn" id="btnRunLog">运行日志</button>
+          <button class="btn primary" id="btnSaveNow"><svg class="ic"><use href="#i-dl"/></svg>即时保存到服务端</button>
+          <span style="margin-left:auto"></span>
+          <button class="btn" id="btnDouyinSet">抖音设置</button>
+          <button class="btn" id="btnCommonSet">通用设置</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>全局控制入口；<b>ADSL 拨号 / 代理不纳入本阶段需求范围（R27）</b></div>
+        <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg><b>数据保全与监督（R35 甲方确认）</b>：① 每日 <b>24h 定时</b>保存客户端数据到服务端（佣金计算用）；② 「<b>即时保存</b>」＝立即将本客户端数据保存到服务端（**监督下游**，甲方可随时拉取）；③ <b>账号注销实时检测</b>——回读失败（登录态失效 / 账号不存在）即实时标记「已注销 / 失联」并停止回读上报；④ 已上报数据<b>不删除</b>，佣金按留存数据结算；管理端可查看「已注销 / 失联」账号</div>
+      </div>
+
+      <div class="stats">
+        <div class="stat"><div class="glow"></div><div class="k"><svg class="ic sm"><use href="#i-users"/></svg>账号数量</div><div class="v">18</div><div class="d">已就绪 12 个</div></div>
+        <div class="stat"><div class="k"><svg class="ic sm"><use href="#i-layers"/></svg>已分组</div><div class="v">15</div><div class="d">4 个分组</div></div>
+        <div class="stat"><div class="k"><svg class="ic sm"><use href="#i-video"/></svg>素材总数</div><div class="v">362</div><div class="d">近 7 天 +48</div></div>
+        <div class="stat"><div class="k"><svg class="ic sm"><use href="#i-send"/></svg>待发布</div><div class="v">6</div><div class="d">今日计划 3</div></div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <button class="btn">自动分组</button>
+          <button class="btn">设置分组</button>
+          <button class="btn">全部设置</button>
+          <button class="btn">启用应用</button>
+          <button class="btn primary" id="btnExec">确认执行</button>
+          <button class="btn ghost">重置设置</button>
+          <span style="margin-left:auto;color:var(--muted)">已选 <b id="accSel" style="color:var(--text)">0</b> 个账号</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>分配账号</div>
+        <table>
+          <thead><tr>
+            <th style="width:34px"><input type="checkbox" id="accAll"></th>
+            <th style="width:40px">序号</th><th>账号名称</th><th>抖音号</th><th>千川ID</th><th>类目</th><th>成功数</th><th>运营分类</th>
+            <th>绑定手机号</th><th>素材数量</th><th>计划发布率</th><th>广告条数</th><th>状态</th><th>操作</th>
+          </tr></thead>
+          <tbody id="accBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 投放看板 ========== -->
+    <section class="page" id="page-dashboard">
+      <div class="ph"><h2>投放看板</h2><span class="tag new">R33 改造 / R34 数据链路</span><span class="sub">按参考软件广告列表形态精细化（指标卡 + 筛选 + 明细表）</span>
+        <span class="sp"><button class="btn" id="btnDashSync"><svg class="ic"><use href="#i-refresh"/></svg>同步数据</button><button class="btn">操作日历</button></span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>时间范围</label><input type="text" style="width:150px" value="2026-10-01 至 2026-10-16"></div>
+          <div class="field"><label>账号</label><select><option>全部账号</option><option>东哥好物</option><option>群益百货</option><option>星禾优品馆</option></select></div>
+          <div class="field"><label>千川账号</label><select><option>全部千川账号</option><option>星禾优品 · 千川A</option><option>辰萌贴纸 · 千川B</option></select></div>
+          <div class="field"><label>计划状态</label><select><option>全部计划状态</option><option>投放中</option><option>已暂停</option><option>已结束</option></select></div>
+          <button class="btn primary"><svg class="ic"><use href="#i-search"/></svg>查询</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg><b>数据链路（R34 甲方确认）</b>：客户端每日回读千川明细（消耗 / 订单数 / 销售额 / 退款销售额 / ROI / 有效佣金 / 盈亏），<b>24 小时一次</b>上报服务端（<b>用于佣金计算</b>）；本地指标（素材数 / 首发率 / 优质率）<b>不上报</b>；<b>看板仅展示本客户端本地数据</b>（客户端可遍布多地，各自独立）</div>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="k">广告数量</div><div class="v num">202 条</div><div class="d">2026-10-01 至 2026-10-16</div></div>
+        <div class="stat"><div class="k">消耗</div><div class="v num">￥12,579.37</div><div class="d">实际投放花费</div></div>
+        <div class="stat"><div class="k">订单数</div><div class="v num">2,117 单</div><div class="d">当前筛选成交订单</div></div>
+        <div class="stat"><div class="k">有效佣金</div><div class="v num">￥16,315.59</div><div class="d">销售额 − 退款销售额</div></div>
+        <div class="stat"><div class="glow"></div><div class="k">盈亏</div><div class="v num" style="color:var(--ok)">￥3,736.22</div><div class="d">有效佣金 − 消耗</div></div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>数据维度<span class="r">
+          <span class="seg" id="dashViewSeg">
+            <button class="active" data-v="detail">广告明细</button>
+            <button data-v="upload">批量上传任务</button>
+          </span>
+        </span></div>
+        <div id="dashDetail">
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>口径：<b>有效佣金＝(销售额 − 退款销售额) × 佣金率 × 90%</b>；<b>盈亏＝有效佣金 − 消耗</b>（R33 甲方确认纳入）</div>
+          <table>
+            <thead><tr>
+              <th style="width:30px"><input type="checkbox"></th>
+              <th>千川账号</th><th>商品 / 广告计划</th><th>投放状态</th><th>投放设置</th>
+              <th>消耗</th><th>订单数</th><th>销售额</th><th>退款销售额</th><th>成交ROI</th>
+              <th>素材数</th><th>首发率</th><th>优质率</th><th>有效佣金</th><th>盈亏</th><th>操作</th>
+            </tr></thead>
+            <tbody id="dashBody"></tbody>
+          </table>
+          <div class="divider"></div>
+          <div class="row">
+            <button class="btn">批量开启投放</button><button class="btn">批量暂停</button><button class="btn">批量删除</button><button class="btn">批量修改ROI</button>
+            <span style="margin-left:auto;color:var(--muted)">已选 <b id="dashSel">0</b> 条</span>
+          </div>
+        </div>
+        <div id="dashUpload" style="display:none">
+          <table>
+            <thead><tr><th>上传任务</th><th>千川账号</th><th>商品</th><th>状态</th><th>进度</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr><td>批量上传任务 #20261017-01</td><td>星禾优品 · 千川A</td><td>陶瓷保鲜盒三件套</td><td><span class="pill info">上传中</span></td><td><div class="task"><span class="nm">72%</span><span class="bar"><i style="width:72%"></i></span></div></td><td><span class="lnk">详情</span></td></tr>
+              <tr><td>批量上传任务 #20261017-01</td><td>星禾优品 · 千川A</td><td>免打孔增压花洒</td><td><span class="pill ok">已上传</span></td><td><div class="task"><span class="nm">100%</span><span class="bar"><i style="width:100%"></i></span></div></td><td><span class="lnk">复制素材ID</span></td></tr>
+              <tr><td>批量上传任务 #20261017-01</td><td>辰萌贴纸 · 千川B</td><td>宠物自动喂食器</td><td><span class="pill danger">失败</span></td><td><div class="task"><span class="nm">0%</span><span class="bar"><i style="width:0%"></i></span></div></td><td><span class="lnk">重试</span><span class="lnk">截图</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 素材库 ========== -->
+    <section class="page" id="page-media">
+      <div class="ph"><h2>素材库管理</h2><span class="sub">本地素材归档与检索 · 按账号分类管理</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>重新扫描目录</button></span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>账号</label><select id="mediaAcct"><option>全部</option><option>群益百货</option><option>星禾优品馆</option><option>辰萌贴纸</option><option>小蒙家居</option><option>辰呈产品</option><option>梅妈妈铺</option></select></div>
+          <div class="field"><label>关键词</label><input type="text" style="width:210px" placeholder="商品ID / 标题 / 标签"></div>
+          <div class="field"><label>标签</label><select><option>全部</option><option>待发布</option><option>已发布</option><option>已裂变</option></select></div>
+          <div class="field"><label>日期</label><select><option>全部</option><option>近 7 天</option><option>近 30 天</option></select></div>
+          <div class="field"><label>状态</label><select><option>全部</option><option>无水印</option><option>已裁剪</option></select></div>
+          <div class="field"><label>首发 / 优质（A-31）</label><select><option>全部</option><option>仅首发</option><option>仅优质</option><option>待判定</option></select></div>
+          <button class="btn primary"><svg class="ic"><use href="#i-search"/></svg>检索</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>素材<span class="r">
+          <span class="seg" id="mediaViewSeg">
+            <button class="active" data-v="grid">全部素材</button>
+            <button data-v="group">按账号分组</button>
+          </span>
+        </span></div>
+        <div class="grid" id="mediaGrid"></div>
+      </div>
+    </section>
+
+    <!-- ========== 图片转视频 ========== -->
+    <section class="page" id="page-imgvideo">
+      <div class="ph"><h2>图片转视频</h2><span class="tag">M2</span></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>参数</div>
+          <div class="fr"><label>模板</label><select><option>竖版 9:16 卡点</option><option>方版 1:1</option></select></div>
+          <div class="fr"><label>单图时长</label><select><option>2 秒</option><option>3 秒</option></select></div>
+          <div class="fr"><label>视频总时长</label><select><option>≈ 10 秒</option><option>8 秒</option><option>12 秒</option></select></div>
+          <div class="fr"><label>转场</label><select><option>淡入淡出</option><option>无</option></select></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>用图张数按「总时长 ÷ 单图时长」自动确定；不添加背景音乐 / 字幕 / 贴纸 / 封面帧；输出对齐 A-04（1080p / H.264 / AAC）</div>
+          <div class="divider"></div>
+          <div class="row"><button class="btn primary">生成预览</button><button class="btn">批量生成</button></div>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>素材来源</div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(110px,1fr))">
+            <div class="media"><div class="cover" style="height:80px"></div><div class="meta"><div class="t">主图1.jpg</div></div></div>
+            <div class="media"><div class="cover" style="height:80px"></div><div class="meta"><div class="t">主图2.jpg</div></div></div>
+            <div class="media"><div class="cover" style="height:80px"></div><div class="meta"><div class="t">详情图.jpg</div></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 账号分组 ========== -->
+    <section class="page" id="page-groups">
+      <div class="ph"><h2>账号分组</h2><span class="sub">按运营分类组织账号矩阵</span></div>
+      <div class="card">
+        <div class="row"><input type="text" placeholder="新建分组名称" style="width:220px"><button class="btn primary"><svg class="ic"><use href="#i-plus"/></svg>新建分组</button><button class="btn">自动分组</button></div>
+      </div>
+      <div class="card">
+        <div class="grid">
+          <div class="media"><div class="cover" style="height:64px"></div><div class="meta"><div class="t">分组 · 数码</div><div class="s"><span>5 个账号</span><span>76 素材</span></div></div></div>
+          <div class="media"><div class="cover" style="height:64px"></div><div class="meta"><div class="t">分组 · 居家</div><div class="s"><span>4 个账号</span><span>52 素材</span></div></div></div>
+          <div class="media"><div class="cover" style="height:64px"></div><div class="meta"><div class="t">分组 · 百货</div><div class="s"><span>3 个账号</span><span>98 素材</span></div></div></div>
+          <div class="media"><div class="cover" style="height:64px"></div><div class="meta"><div class="t">分组 · 服饰</div><div class="s"><span>3 个账号</span><span>41 素材</span></div></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 抖音发布（图转视频）· A-29/A-25 ========== -->
+    <section class="page" id="page-plandouyin">
+      <div class="ph"><h2>抖音发布（图转视频）</h2><span class="tag new">A-29 · 先于千川</span><span class="sub">发布内容＝商品详情图转视频 / 录屏产物 · 浏览器自动化</span></div>
+
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>发布设置</div>
+          <div class="fr"><label>发布模式</label><span class="tag ok">全自动发布默认开启 · 异常时暂停</span></div>
+          <div class="fr"><label>调度方式</label><select><option>客户端本地调度（需保持运行）</option></select></div>
+          <div class="fr"><label>发布方式</label><select><option>定时发布</option><option>立即发布</option></select></div>
+          <div class="fr"><label>置顶时间</label><select><option>每日 18:00</option><option>每日 12:00</option><option>自定义</option></select></div>
+          <div class="fr"><label>发布间隔</label><select><option>串行执行，至少间隔 30 秒</option></select></div>
+          <div class="fr"><label>单日上限</label><select><option>5 条 / 账号</option><option>20 条 / 账号</option><option>50 条 / 账号</option></select></div>
+          <div class="fr"><label>发布账号</label><select><option>分组 · 数码（5 个）</option><option>全部账号</option></select></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>素材来源＝商品详情图片抓取 / 录屏 → 图片转视频（FR-J6-01 / FR-B2-01），仅用于抖音发布，与千川素材互不交叉（A-29）</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>抖音无开放发布 API，自动发布走浏览器自动化脚本；随机间隔与单日上限用于降低风控（R-10）</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>A-52 / A-66 / A-68：全自动发布为默认模式，升级只初始化一次并保留旧任务边界；只处理边界之后新建的任务。每个商品图转视频入队后立即按队列 ID 启动发布，发布阶段逐商品串行，不再固定等 10 分钟；配额不足仍按计划顺延。</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>A-63：发现待核查任务、发布失败或结果不确定时暂停后续发布；旧队列不追溯，不自动重试。</div>
+          <div class="divider"></div>
+          <div class="row">
+            <button class="btn primary" id="btnSavePlan"><svg class="ic"><use href="#i-check"/></svg>保存</button>
+            <button class="btn" id="btnRunNow"><svg class="ic"><use href="#i-send"/></svg>立即执行一次</button>
+            <button class="btn ghost">取消</button>
+          </div>
+          <div class="hint" style="margin-top:8px;color:var(--warn)"><svg class="ic sm"><use href="#i-warn"/></svg><b>A-63 / A-68</b>：待核查任务会暂停后续自动发布；暂停期间新选品仍登记为自动任务，核查清空后自动恢复。人工计划、队列和发布按钮保留；真实平台发布验收仍待合适账号。</div>
+        </div>
+
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>待发布队列<span class="r">3 条</span></div>
+          <table>
+            <thead><tr><th>序号</th><th>发布账号</th><th>素材</th><th>计划时间</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>星禾优品馆</td><td>拼豆钥匙扣_图转视频.mp4</td><td>今日 18:00</td><td><span class="pill warn">等待执行</span></td><td><span class="lnk">马上发布</span> · <span class="lnk">删除计划</span></td></tr>
+              <tr><td>2</td><td>群益百货</td><td>无痕粘钩_图转视频.mp4</td><td>今日 18:03</td><td><span class="pill warn">等待执行</span></td><td><span class="lnk">马上发布</span> · <span class="lnk">删除计划</span></td></tr>
+              <tr><td>3</td><td>小蒙家居</td><td>收纳盒_图转视频.mp4</td><td>今日 17:58</td><td><span class="pill ok">已发布</span></td><td><span class="muted">不可删除</span></td></tr>
+            </tbody>
+          </table>
+          <div class="hint">A-69：仅未上传的待确认、已排期或已取消计划可删除；删除只移除队列记录，不删除视频文件。已进入平台上传或核查流程的记录不可删除。</div>
+          <div class="hint">A-71：「马上发布」仅适用于已排期的全自动任务；用户确认后单次跳过计划等待和全局自动开关，不修改全局设置。提交前复核账号、A-66 新任务边界、A-63 待核查任务、A-64 商品锁和当天配额；未通过时不会触发抖音操作。</div><div class="divider"></div>
+          <div class="row"><button class="btn">暂停队列</button><button class="btn">清空已完成</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>发布回执<span class="r">失败可重试 · 截图留证</span></div>
+        <table>
+          <thead><tr><th>时间</th><th>账号</th><th>素材</th><th>结果</th><th>失败原因</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr><td>10-10 17:58</td><td>小蒙家居</td><td>收纳盒_图转视频.mp4</td><td><span class="pill ok">成功</span></td><td>—</td><td><span class="lnk">查看截图</span></td></tr>
+            <tr><td>10-10 17:41</td><td>梅妈妈铺</td><td>手作串珠_图转视频.mp4</td><td><span class="pill danger">失败</span></td><td>出现验证码，未通过</td><td><span class="lnk">查看截图</span><span class="lnk">重试</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 千川发布（素材视频）· A-29/A-09 ========== -->
+    <section class="page" id="page-planqianchuan">
+      <div class="ph"><h2>千川发布（素材视频）</h2><span class="tag new">A-29 · 后于抖音</span><span class="sub">发布内容＝网页下载素材 · 上传巨量千川</span></div>
+
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>发布设置</div>
+          <div class="fr"><label>自动发布</label><span class="swt"><input type="checkbox" checked id="swAutoQc"><span class="sw"></span>启用自动发布脚本</span></div>
+          <div class="fr"><label>调度方式</label><select><option>客户端常驻调度</option><option>服务端调度 + 客户端代理</option></select></div>
+          <div class="fr"><label>发布方式</label><select><option>定时发布</option><option>立即发布</option></select></div>
+          <div class="fr"><label>发布间隔</label><select><option>随机 5–15 秒</option><option>随机 15–30 秒</option><option>固定 10 秒</option></select></div>
+          <div class="fr"><label>单日上限</label><select><option>50 条 / 账号</option><option>20 条 / 账号</option></select></div>
+          <div class="fr"><label>发布账号</label><select><option>分组 · 数码（5 个）</option><option>全部账号</option></select></div>
+          <div class="fr"><label>千川账户</label><select><option>星禾优品 · 千川A</option><option>辰萌贴纸 · 千川B</option></select></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>素材来源＝抓取 → 去水印 → 转码（网页下载素材），仅用于千川发布，与抖音图转视频互不交叉（A-29）</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>实现方式按 A-09：优先千川开放平台 API；无凭证时用浏览器自动化复用千川登录态（商家凭证，非 API 凭证）</div>
+          <div class="divider"></div>
+          <div class="row">
+            <button class="btn primary" id="btnSavePlanQc"><svg class="ic"><use href="#i-check"/></svg>保存</button>
+            <button class="btn" id="btnRunNowQc"><svg class="ic"><use href="#i-send"/></svg>立即执行一次</button>
+            <button class="btn ghost">取消</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>待发布队列<span class="r">5 条</span></div>
+          <table>
+            <thead><tr><th>序号</th><th>发布账号</th><th>素材</th><th>千川账户</th><th>计划时间</th><th>状态</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>辰呈产品</td><td>拼豆钥匙扣_v3.mp4</td><td>星禾优品 · 千川A</td><td>今日 18:30</td><td><span class="pill warn">等待执行</span></td></tr>
+              <tr><td>2</td><td>群益百货</td><td>无痕粘钩_v2.mp4</td><td>星禾优品 · 千川A</td><td>今日 18:33</td><td><span class="pill warn">等待执行</span></td></tr>
+              <tr><td>3</td><td>小蒙家居</td><td>收纳盒_原版.mp4</td><td>辰萌贴纸 · 千川B</td><td>今日 17:58</td><td><span class="pill ok">已发布</span></td></tr>
+            </tbody>
+          </table>
+          <div class="divider"></div>
+          <div class="row"><button class="btn">暂停队列</button><button class="btn">清空已完成</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>发布回执<span class="r">失败可重试 · 截图留证</span></div>
+        <table>
+          <thead><tr><th>时间</th><th>账号</th><th>素材</th><th>千川账户</th><th>结果</th><th>失败原因</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr><td>10-10 17:58</td><td>小蒙家居</td><td>收纳盒_原版.mp4</td><td>辰萌贴纸 · 千川B</td><td><span class="pill ok">成功</span></td><td>—</td><td><span class="lnk">查看截图</span></td></tr>
+            <tr><td>10-10 17:41</td><td>梅妈妈铺</td><td>手作串珠_v1.mp4</td><td>星禾优品 · 千川A</td><td><span class="pill danger">失败</span></td><td>登录态失效（已截图）</td><td><span class="lnk">查看截图</span><span class="lnk">重试</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 待发布 / 等待执行 ========== -->
+    <section class="page" id="page-queue">
+      <div class="ph"><h2>待发布 / 等待执行</h2><span class="tag new">参考软件新增</span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>类型</label><select id="queueType"><option value="all">全部</option><option>抖音发布（图转视频）</option><option>千川发布（素材视频）</option></select></div>
+          <div class="field"><label>账号</label><select><option>全部账号</option><option>分组 · 数码</option></select></div>
+          <div class="field"><label>状态</label><select><option>全部</option><option>等待执行</option><option>已发布</option><option>失败</option></select></div>
+          <div class="field"><label>时间</label><select><option>今日</option><option>近 7 天</option></select></div>
+          <button class="btn primary"><svg class="ic"><use href="#i-search"/></svg>查询</button>
+        </div>
+        <div class="divider"></div>
+        <table>
+          <thead><tr><th style="width:34px"><input type="checkbox"></th><th style="width:40px">序号</th><th>类型</th><th>发布账号</th><th>素材名称</th><th>计划时间</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="queueBody"></tbody>
+        </table>
+        <div class="pager">
+          <span class="pg-total">共 <b id="pgTotal">0</b> 条</span>
+          <label class="pg-size">每页
+            <select id="pgSize">
+              <option value="10">10</option>
+              <option value="20">20</option>
+              <option value="30">30</option>
+              <option value="40">40</option>
+              <option value="50">50</option>
+              <option value="80">80</option>
+              <option value="100" selected>100</option>
+            </select> 条</label>
+          <div class="pg-btns" id="pgBtns"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 千川账号 ========== -->
+    <section class="page" id="page-qianchuan">
+      <div class="ph"><h2>千川账号</h2><span class="sub">绑定巨量千川账户</span></div>
+      <div class="card">
+        <div class="row">
+          <button class="btn primary"><svg class="ic"><use href="#i-plus"/></svg>绑定千川账号</button>
+          <button class="btn">获取千川ID</button>
+          <button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新状态</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>需甲方提供千川开发者凭证（附录 A / A-09），否则退化为浏览器自动化</div>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr><th>账号</th><th>千川ID</th><th>状态</th><th>素材数</th><th>违规素材</th><th>操作</th></tr></thead>
+          <tbody id="chBody">
+            <tr><td>帮宝QJAAA</td><td>756024-7353591982</td><td><span class="pill ok">在线</span></td><td>126</td><td>2</td><td><span class="lnk">刷新</span><span class="lnk">复制ID</span></td></tr>
+            <tr><td>星禾投广</td><td>756024-7353591983</td><td><span class="pill gray">离线</span></td><td>88</td><td>0</td><td><span class="lnk">刷新</span><span class="lnk">复制ID</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 违规管理 ========== -->
+    <section class="page" id="page-violation">
+      <div class="ph"><h2>违规管理</h2><span class="sub">拉取劣质/违规素材并同步删除</span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>千川账号</label><select><option>帮宝QJAAA</option></select></div>
+          <div class="field"><label>判定类型</label><select><option>全部</option><option>劣质素材</option><option>违规素材</option></select></div>
+          <button class="btn primary" id="btnScanViolation"><svg class="ic"><use href="#i-search"/></svg>扫描</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>删除将同步到千川平台，操作不可撤销</div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>劣质 / 违规素材</div>
+        <table>
+          <thead><tr><th style="width:34px"><input type="checkbox"></th><th>素材名称</th><th>判定结果</th><th>原因</th><th>检测时间</th><th>操作</th></tr></thead>
+          <tbody id="vioBody">
+            <tr><td><input type="checkbox"></td><td>拼豆钥匙扣_尾.mp4</td><td><span class="pill danger">劣质</span></td><td>画面重复度高</td><td>10-09 09:12</td><td><span class="lnk">删除</span></td></tr>
+            <tr><td><input type="checkbox"></td><td>无痕粘钩旧版.mp4</td><td><span class="pill danger">违规</span></td><td>含违规文字</td><td>10-09 09:12</td><td><span class="lnk">删除</span></td></tr>
+          </tbody>
+        </table>
+        <div class="divider"></div>
+        <div class="row"><button class="btn danger" id="btnDelViolation">批量删除（同步千川）</button><button class="btn ghost" id="btnExportDelList">导出删除清单</button><span style="margin-left:auto;color:var(--muted)">已选 0 个</span></div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>删除前二次确认（显示待删条数）；保留删除清单可导出留档（不设回收站）；分批执行并显示进度（FR-C8-01 / G-03）</div>
+      </div>
+    </section>
+
+    <!-- ========== 百应选品设置 ========== -->
+    <section class="page" id="page-selection">
+      <div class="ph"><h2>百应选品设置</h2><span class="tag new">参考软件新增</span><span class="sub">参数化选品与执行</span></div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>抖音登品目录设置</div>
+        <div class="fr"><label style="width:96px">登品目录</label><input type="text" style="flex:1" value="D:\视频素材\3.效果好\账号1"></div>
+        <div class="row" style="margin-left:96px">
+          <button class="btn"><svg class="ic"><use href="#i-folder"/></svg>选择文件夹</button>
+          <button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>重新刷新</button>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>选择抖音登录后素材保存目录，设置后自动识别新增素材</div>
+        <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>每账号有独立的下载路径（在「选品设置」弹窗配置）；目录结构＝<b>{账号下载路径}/{日期}/{商品名称}/</b>，选品文件夹内含全流程日志（每步独立日志文件），失败生成失败日志（写明原因），删除失败日志即自动重试该步骤（一次），仍失败进「日志与异常」异常报错（R29）</div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>选品设置分层<span class="r">通用设置（全局默认）→ 账号个性化（未配置则继承通用）</span></div>
+        <div class="row">
+          <button class="btn" id="btnCommonSel"><svg class="ic"><use href="#i-set"/></svg>通用设置</button>
+          <button class="btn primary" id="btnRunSel"><svg class="ic"><use href="#i-play"/></svg>自动选品一起工作</button>
+          <span class="sub">确认启用账号后，系统读取百应当前可见榜单、自动识别重点类目并加车，再继续后续流程</span>
+        </div>
+        <table id="tblSelAcct">
+          <thead><tr><th>账号ID</th><th>账号</th><th>抖音号</th><th>系统重点类目（自动推荐）</th><th>浏览器缓存路径</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr data-account-id="1" data-enabled="true" data-category-history="leaf-storage-box"><td>1</td><td>群益百货</td><td>7574…3821</td><td>—（待本批次自动识别）</td><td>…\profiles\群益百货</td><td class="selstat"><span class="pill gray">待运行</span></td><td><span class="lnk accset" data-acc="群益百货">选品设置</span></td></tr>
+            <tr data-account-id="2" data-enabled="true" data-category-history="leaf-pet-feeder"><td>2</td><td>星禾优品馆</td><td>7574…3983</td><td>—（待本批次自动识别）</td><td>…\profiles\星禾优品馆</td><td class="selstat"><span class="pill gray">待运行</span></td><td><span class="lnk accset" data-acc="星禾优品馆">选品设置</span></td></tr>
+            <tr data-account-id="3" data-enabled="true" data-category-history="leaf-shower"><td>3</td><td>辰萌贴纸</td><td>7574…1155</td><td>继承系统自动识别策略</td><td>…\profiles\辰萌贴纸</td><td class="selstat"><span class="pill gray">待运行</span></td><td><span class="lnk accset" data-acc="辰萌贴纸">选品设置</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>正式批次范围＝数据库当前全部启用账号（含矩阵 B 与新增启用账号）；开始前必须展示账号名称和内部账号 ID 清单并由用户确认。上表仅为静态演示数据，实际执行清单从数据库动态读取。</div>
+<div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>硬约束：同一账号不能再次选该账号历史已选过的末级类目；软偏好：不同账号尽量使用不同子类目，候选不足时允许跨账号复用。商品 ID 在甲方全账号池仍强制唯一。此静态示例账号的历史类目仅用于演示。</div>
+                <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>失败处理（A-53）：单来源解析错误、未尝试加车但恢复列表缺少原商品、明确的单商品业务拒绝，会记录原因并跳过，继续其余商品 / 账号；登录、验证码 / 风控、11001、连接中断、身份不明、加车结果不确定或本地状态保存失败时立即停批并保留检查点。</div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>同账号历史选过的末级类目强制排除，且同一账号每个末级类目最多加一件；跨账号优先错开子类目但允许候选不足时复用。账号也可覆盖候选上限、百应筛选、特色货品、硬阈值和走势。每日商品数 / 视频数可按 A-70 单独覆盖；未设置时继承通用默认值。<b>屏蔽词全局生效、执行设置保持通用；千川素材配额仍按 FR-C12-01 / A-28 独立执行</b>（A-43 / A-47 / A-70）</div>
+      </div>
+
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>类目选择<span class="r">默认自动推荐，可手动指定范围</span></div>
+          <div class="fr"><label for="globalCategoryMode">通用类目策略</label><select id="globalCategoryMode"><option value="auto" selected>自动推荐（默认）</option><option value="manual">手动选择类目</option></select></div>
+          <div class="fr"><label>类目来源</label><span>热点趋势、联盟榜单等百应当前可见商品的实际类目</span></div>
+          <div id="globalCategoryPicker" style="display:none;margin-top:8px">
+            <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>勾选的一级、二级或三级类目都可作为范围。只筛当前可见商品，不按类目搜索、不翻页、不遍历全部类目。已选范围：</div>
+            <div id="globalCategoryOptions" class="category-pick-list"></div>
+          </div>
+          <div id="globalCategoryAutoHint" class="hint"><svg class="ic sm"><use href="#i-link"/></svg>自动模式读取榜单当前已加载可见商品，逐个取得详情并评分，按达标商品数量和平均分推荐重点末级类目；同账号历史类目强制排除，跨账号尽量错开。</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>不论哪种模式，都按 A-67 综合评分、硬阈值、屏蔽词和本机已记录商品 ID 去重处理；商品仍由系统自动评分并加车，不提供手动商品勾选。</div>
+        </div>
+
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>本机选品登记<span class="r">单机模式</span></div>
+          <div class="fr"><label>当前状态</label><span class="pill ok">本机 SQLite 自动登记</span></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>系统自动读取和更新这台电脑上的商品 ID 与账号类目历史；加车前在本机预留，结果明确后提交或释放，不需要服务器地址、访问密钥或每轮手动连接。</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>同一账号历史选过的末级类目会排除；本机各账号之间尽量错开类目。商品 ID 去重范围仅限这台电脑，跨电脑同步暂未启用。</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>加车结果不明时本机保留记录并待核查，避免本机重复加车。</div>
+        </div>
+<div class="card">
+          <div class="card-t"><span class="bar"></span>筛选条件（洗品）· 通用设置<span class="r">商品阈值与榜单来源统一在此</span></div>
+          <div class="fr"><label>类目数量</label><select><option>全部数量</option><option>按月数量</option><option>近月数量</option></select></div>
+          <div class="fr"><label>人群</label><select><option>全部人群</option><option>黑马人群</option></select></div>
+          <div class="fr"><label>上架时间</label><select><option>全部</option><option>7 天内</option><option>15 天内</option><option>30 天内</option></select></div>
+          <div class="fr"><label>价格区间</label><select><option>全部</option><option>0–50 元</option><option>50–200 元</option></select></div>
+          <div class="fr"><label>佣金区间</label><select><option>全部</option><option>20% 以上</option></select></div>
+          <div class="divider"></div>
+          <div class="fr"><label>选品数量</label><select id="selCount"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option></select><span style="color:var(--muted);font-size:12px;margin-left:8px">自动加车上限（1–10；最终加车受账号每日配额限制）</span></div>
+          <div class="divider"></div>
+          <div class="fr"><label>查询范围</label><span class="pill info">百应榜单当前可见列表</span></div>
+          <div class="fr"><label>可见来源</label><span style="display:flex;gap:8px;flex-wrap:wrap"><span class="pill warn">热点趋势</span><span class="pill info">联盟榜单</span><span class="pill gray">其他当前可见榜单</span></span></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>只读取百应热点趋势、联盟榜单等当前已加载可见来源中的商品 ID；不翻页、不遍历全类目、不查询选品广场或商品池。来源商品按 ID 合并去重后直接成为候选，商品详情中的实际类目用于后续分类统计。</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>候选上限为自动评分后直接加车数量；先筛除缺少必需实测数据、未过硬阈值、命中屏蔽词或全账号商品 ID 已占用的商品，并排除本账号历史已选类目；末级类目按达标商品数和平均分排序，跨账号优先错开。</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>来源异常沿用 A-53：可恢复的单来源解析失败记日志后跳过；登录、风控、11001、断连或结果不确定仍停止当前账号。</div><div class="divider"></div>
+          <div class="fr"><label>带货判定</label><span style="flex:1;display:flex;gap:8px;flex-wrap:wrap">
+            <span style="font-size:12px">销售额 ≥ <input type="text" style="width:64px" value="10万"></span>
+            <span style="font-size:12px">销量 ≥ <input type="text" style="width:64px" value="1000"></span>
+            <span style="font-size:12px">转化率 ≥ <input type="text" style="width:64px" value="3%"></span>
+            <span style="font-size:12px">浏览量 ≥ <input type="text" style="width:64px" value="1万"></span>
+            <span style="font-size:12px">走势 <select><option selected>近30天上升</option><option>近30天平稳</option><option>不限制</option></select></span>
+          </span></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>候选品多时<b>优先选择走势上升的品</b>；带货数据不达标 / 走势下行 / 含屏蔽词的商品<b>自动筛掉不上传</b>（R32）</div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>抖音商品按<b>账号 + 商品 ID</b>去重：本账号已有未取消发布任务或已发布记录时，候选会标明并自动跳过；其他账号互不影响。仅未开始上传的任务取消后可重新选品；上传中或结果待核查的任务继续锁定（A-64）。</div>
+          <div class="divider"></div>
+          <div class="fr"><label>屏蔽词</label><input type="text" id="blkWord" style="flex:1" placeholder="输入屏蔽词后回车添加（商品名称包含即全局不选）"></div>
+          <div class="row" id="blkTags" style="flex-wrap:wrap;gap:6px"></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg><b>屏蔽词全局生效</b>：商品名称包含任一屏蔽词 → 商品查询 / 选品 / 罗盘选品 / 商品列表<b>任何环节直接不选</b>；内置初始表（约 50 个）可增删（R32）</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <button class="btn primary" id="btnSaveSel"><svg class="ic"><use href="#i-check"/></svg>保存</button>
+          <button class="btn ghost">取消</button>
+          <span style="margin-left:auto"></span>
+          <button class="btn" id="btnPreviewSel"><svg class="ic"><use href="#i-search"/></svg>预览筛选结果</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 设置 ========== -->
+    <section class="page" id="page-settings">
+      <div class="ph"><h2>设置</h2></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>下载设置</div>
+          <div class="fr"><label>下载目录</label><input type="text" style="flex:1" value="D:\视频素材"></div>
+          <div class="row" style="margin-left:66px"><button class="btn"><svg class="ic"><use href="#i-folder"/></svg>选择</button></div>
+          <div class="fr"><label>并发数</label><select><option>2</option><option>3</option><option>5</option></select></div>
+          <div class="fr"><label>限速间隔</label><select><option>随机 1–5 秒</option><option>随机 5–15 秒</option></select></div>
+          <div class="fr"><label>失败重试</label><select><option>3 次（指数退避）</option><option>5 次</option></select></div>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>视频规格</div>
+          <div class="fr"><label>分辨率</label><select><option>保留原始最高（≤1080p）</option><option>强制 1080p</option></select></div>
+          <div class="fr"><label>封装 / 编码</label><select><option>MP4 + H.264</option><option>MP4 + H.265</option></select></div>
+          <div class="fr"><label>音频</label><select><option>AAC 128kbps</option></select></div>
+          <div class="fr"><label>去水印策略</label><select><option>优先无水印源→裁剪→模糊</option></select></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>规格对应附录 A / A-04</div>
+        </div>
+      </div>
+    </section>
+
+
+    <!-- ========== 千川素材上传（C3） ========== -->
+    <section class="page" id="page-qcupload">
+      <div class="ph"><h2>千川素材上传</h2><span class="tag new">C3 · 自动</span><span class="sub">本地素材 → 巨量千川（主流程一环）</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button><button class="btn primary need-write" id="btnQcUpload"><svg class="ic"><use href="#i-dl"/></svg>批量上传</button></span></div>
+
+      <div class="stats">
+        <div class="stat"><div class="glow"></div><div class="k">待上传</div><div class="v num">24</div><div class="d">已选 0 条</div></div>
+        <div class="stat"><div class="k">上传中</div><div class="v num">3</div><div class="d">并发上限 2</div></div>
+        <div class="stat"><div class="k">已上传</div><div class="v num">186</div><div class="d">今日 +42</div></div>
+        <div class="stat"><div class="k">失败</div><div class="v num" style="color:var(--danger)">2</div><div class="d">可重试</div></div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>上传队列<span class="r">按「素材 → 抖音账号 → 千川账户」的关联确定目标账户</span></div>
+        <div class="task"><span class="nm">拼豆钥匙扣_v3.mp4</span><span class="bar"><i style="width:72%"></i></span><span class="pc">72%</span><span class="st"><span class="pill info">上传中</span></span></div>
+        <div class="task"><span class="nm">无痕粘钩_v2.mp4</span><span class="bar"><i style="width:38%"></i></span><span class="pc">38%</span><span class="st"><span class="pill info">上传中</span></span></div>
+        <div class="task"><span class="nm">收纳盒_原版.mp4</span><span class="bar"><i style="width:100%"></i></span><span class="pc">100%</span><span class="st"><span class="pill ok">完成</span></span></div>
+        <div class="task"><span class="nm">香薰蜡烛.mp4</span><span class="bar"><i style="width:0%"></i></span><span class="pc">0%</span><span class="st"><span class="pill danger">失败</span></span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>待上传素材</div>
+        <table>
+          <thead><tr><th style="width:34px"><input type="checkbox"></th><th>素材</th><th>抖音账号</th><th>千川账户</th><th>规格</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="qcBody">
+            <tr><td><input type="checkbox" checked></td><td>拼豆钥匙扣_v3.mp4</td><td>辰呈产品</td><td>星禾优品 · 千川A</td><td>1080p · 11.2MB</td><td><span class="pill info">上传中</span></td><td><span class="lnk">查看日志</span></td></tr>
+            <tr><td><input type="checkbox" checked></td><td>无痕粘钩_v2.mp4</td><td>梅妈妈铺</td><td>星禾优品 · 千川A</td><td>1080p · 9.8MB</td><td><span class="pill info">上传中</span></td><td><span class="lnk">查看日志</span></td></tr>
+            <tr><td><input type="checkbox"></td><td>收纳盒_原版.mp4</td><td>群益百货</td><td>辰萌贴纸 · 千川B</td><td>720p · 7.1MB</td><td><span class="pill ok">已上传</span></td><td><span class="lnk">复制素材ID</span></td></tr>
+            <tr><td><input type="checkbox"></td><td>香薰蜡烛.mp4</td><td>小蒙家居</td><td>辰萌贴纸 · 千川B</td><td>1080p · 8.3MB</td><td><span class="pill danger">失败</span></td><td><span class="lnk">重试</span><span class="lnk">截图</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>实现方式按 A-09：优先千川开放平台 API；无凭证时用浏览器自动化复用千川登录态。失败会截图留证。</div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>千川每日素材配额（FR-C12-01 / A-28）<span class="r">达上限即停止，剩余按「次日顺延」补发</span></div>
+        <div class="stats" style="margin-bottom:0">
+          <div class="stat"><div class="k">今日已选品</div><div class="v num">4 / 5</div><div class="d">上限 5 个品</div></div>
+          <div class="stat"><div class="k">千川素材已发</div><div class="v num">38 / 50</div><div class="d">剩余额度 12</div></div>
+          <div class="stat"><div class="k">超限排队</div><div class="v num" style="color:var(--warn)">6</div><div class="d">次日顺延</div></div>
+          <div class="stat"><div class="k">配额规则</div><div class="v num">5×10=50</div><div class="d">品 × 条 / 账号</div></div>
+        </div>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>千川素材三层配额（默认，可配）：每品 ≤ 10 条；每账号 ≤ 5 品 / ≤ 50 条；每 5 个账号 ≤ 25 品 / ≤ 250 条（含自动追加占用）。见 FR-C12-01、附录 A / A-28。抖音选品 / 发布配额另见 A-70，按百应账号设置。</div>
+      </div>
+    </section>
+
+    <!-- ========== 广告列表（C2） ========== -->
+    <section class="page" id="page-ads">
+      <div class="ph"><h2>广告列表</h2><span class="tag m3">C2</span><span class="sub">拉取千川广告（计划 / 素材）列表</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>拉取</button></span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>千川账户</label><select><option>全部</option><option>星禾优品 · 千川A</option><option>辰萌贴纸 · 千川B</option></select></div>
+          <div class="field"><label>状态</label><select><option>全部</option><option>投放中</option><option>已暂停</option><option>已结束</option></select></div>
+          <div class="field"><label>关键词</label><input type="text" style="width:180px" placeholder="计划名 / 素材名"></div>
+          <button class="btn primary"><svg class="ic"><use href="#i-search"/></svg>查询</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>广告（42）</div>
+        <table>
+          <thead><tr><th>计划名称</th><th>千川账户</th><th>素材数</th><th>消耗</th><th>成交金额</th><th>ROI</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="adsBody">
+            <tr><td>拼豆工具-数码-通投</td><td>星禾优品 · 千川A</td><td>6</td><td class="num">￥3,280</td><td class="num">￥9,860</td><td class="num">3.01</td><td><span class="pill ok">投放中</span></td><td><span class="lnk">详情</span><span class="lnk">暂停</span></td></tr>
+            <tr><td>居家收纳-百货-精准</td><td>星禾优品 · 千川A</td><td>4</td><td class="num">￥2,140</td><td class="num">￥7,420</td><td class="num">3.47</td><td><span class="pill ok">投放中</span></td><td><span class="lnk">详情</span><span class="lnk">暂停</span></td></tr>
+            <tr><td>香薰-家居-通投</td><td>辰萌贴纸 · 千川B</td><td>3</td><td class="num">￥860</td><td class="num">￥1,980</td><td class="num">2.30</td><td><span class="pill warn">已暂停</span></td><td><span class="lnk">详情</span><span class="lnk">启用</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 异常素材（C4） ========== -->
+    <section class="page" id="page-abnormal">
+      <div class="ph"><h2>异常素材</h2><span class="tag m3">C4</span><span class="sub">被判定异常的素材</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button></span></div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>异常素材（2）</div>
+        <table>
+          <thead><tr><th>素材</th><th>千川账户</th><th>异常类型</th><th>判定时间</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="abnBody">
+            <tr><td>香薰蜡烛.mp4</td><td>辰萌贴纸 · 千川B</td><td>低质素材（画面模糊）</td><td>10-12 18:22</td><td><span class="pill danger">待处理</span></td><td><span class="lnk">替换</span><span class="lnk">删除</span></td></tr>
+            <tr><td>亚克力摆件.mp4</td><td>星禾优品 · 千川A</td><td>含违规词（标题）</td><td>10-12 09:05</td><td><span class="pill warn">处理中</span></td><td><span class="lnk">查看原因</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 素材清理（C5） ========== -->
+    <section class="page" id="page-cleanup">
+      <div class="ph"><h2>素材清理</h2><span class="tag m3">C5</span><span class="sub">批量清理指定素材</span></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>清理条件</div>
+          <div class="fr"><label>范围</label><select><option>已发布且超过 30 天</option><option>未发布且超过 60 天</option><option>全部失败素材</option></select></div>
+          <div class="fr"><label>保留</label><select><option>保留原始素材</option><option>同时删除本地文件</option></select></div>
+          <div class="fr"><label>千川侧</label><select><option>同步删除千川素材</option><option>仅删本地</option></select></div>
+          <div class="divider"></div>
+          <div class="row"><button class="btn">预览命中</button><button class="btn danger need-write" id="btnCleanup">执行清理</button></div>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>预览结果</div>
+          <div class="kv">
+            <div class="k">命中素材</div><div><b class="num">36</b> 条</div>
+            <div class="k">预计释放</div><div><b class="num">412 MB</b></div>
+            <div class="k">同步千川</div><div>12 条</div>
+            <div class="k">不可恢复</div><div><span class="pill danger">是</span></div>
+          </div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>清理前会二次确认；操作记入日志（F3）。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 自动追加素材（C11 · R14） ========== -->
+    <section class="page" id="page-append">
+      <div class="ph"><h2>自动追加素材</h2><span class="tag new">C11 · R14</span><span class="sub">素材发布成功后满 24 小时，自动追加到关联千川计划</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button><button class="btn primary need-write" id="btnAppendNow">立即追加一次</button></span></div>
+
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>追加控制（可配）</div>
+          <div class="fr"><label>触发基准</label><select><option>素材发布成功后满 24 小时</option></select></div>
+          <div class="fr"><label>追加时间点</label><select><option>每日 09:00</option><option>每日 14:00</option><option>每日 21:00</option></select></div>
+          <div class="fr"><label>追加数量</label><input type="text" style="width:110px" value="3"><span style="color:var(--muted)">条 / 计划</span></div>
+          <div class="fr"><label>错峰间隔</label><select><option>随机 5–15 分钟</option><option>随机 15–30 分钟</option></select></div>
+          <div class="divider"></div>
+          <div class="row"><button class="btn primary need-write">保存设置</button></div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>控制项：追加数量 / 追加时间点 / 错峰间隔（SRS FR-C11-01）。</div>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>追加前状态检测</div>
+          <div class="kv">
+            <div class="k">检测①</div><div>素材发布状态（上传 / 审核发布是否成功）</div>
+            <div class="k">检测②</div><div>商品挂载状态（商品是否已挂到计划 / 作品）</div>
+            <div class="k">判定</div><div>两项均成功 → 正常追加；<b>任一未成功 → 走另一套追加逻辑</b></div>
+          </div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg><b>另一套追加逻辑细则待甲方补齐</b>（SRS 附录 A / A-26，缺口 G-10）。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>追加记录<span class="r">按计划展示：上次 / 下次追加时间与状态</span></div>
+        <table>
+          <thead><tr><th>计划</th><th>千川账户</th><th>素材发布状态</th><th>商品挂载状态</th><th>上次追加</th><th>下次追加</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="apdBody">
+            <tr><td>拼豆工具-数码-通投</td><td>星禾优品 · 千川A</td><td><span class="pill ok">已发布</span></td><td><span class="pill ok">已挂载</span></td><td>今日 09:02</td><td>明日 09:00</td><td><span class="pill ok">正常追加</span></td><td><span class="lnk">查看日志</span></td></tr>
+            <tr><td>居家收纳-百货-精准</td><td>星禾优品 · 千川A</td><td><span class="pill ok">已发布</span></td><td><span class="pill warn">未挂载</span></td><td>—</td><td>明日 09:00</td><td><span class="pill warn">走另一套逻辑</span></td><td><span class="lnk">查看日志</span></td></tr>
+            <tr><td>香薰-家居-通投</td><td>辰萌贴纸 · 千川B</td><td><span class="pill danger">发布失败</span></td><td><span class="pill gray">未检测</span></td><td>—</td><td>待定</td><td><span class="pill danger">暂停追加</span></td><td><span class="lnk">查看日志</span><span class="lnk">截图</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 计划创建（C6） ========== -->
+    <section class="page" id="page-plancreate">
+      <div class="ph"><h2>计划创建</h2><span class="tag m3">C6</span></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>基本信息</div>
+          <div class="fr"><label>计划名称</label><input type="text" style="flex:1" value="拼豆工具-数码-通投"></div>
+          <div class="fr"><label>千川账户</label><select><option>星禾优品 · 千川A</option><option>辰萌贴纸 · 千川B</option></select></div>
+          <div class="fr"><label>投放目标</label><select><option>成交</option><option>下单</option><option>商品点击</option></select></div>
+          <div class="fr"><label>预算</label><input type="text" style="width:120px" value="500"><span style="color:var(--muted)">元 / 天</span></div>
+          <div class="fr"><label>出价</label><input type="text" style="width:120px" value="2.8"><span style="color:var(--muted)">元</span></div>
+          <div class="fr"><label>投放时段</label><select><option>全天</option><option>自定义时段</option></select></div>
+          <div class="divider"></div>
+          <div class="row"><button class="btn primary need-write" id="btnCreatePlan">创建计划</button><button class="btn">存为草稿</button></div>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>关联素材</div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(118px,1fr))">
+            <div class="media"><div class="cover" style="height:78px"><span class="badge pill ok">已选</span></div><div class="meta"><div class="t">拼豆钥匙扣_v3</div></div></div>
+            <div class="media"><div class="cover" style="height:78px"><span class="badge pill ok">已选</span></div><div class="meta"><div class="t">无痕粘钩_v2</div></div></div>
+            <div class="media"><div class="cover" style="height:78px"></div><div class="meta"><div class="t">收纳盒_原版</div></div></div>
+          </div>
+          <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>素材需先经「千川素材上传（C3）」完成上传。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========== 计划管理（C7） ========== -->
+    <section class="page" id="page-planmanage">
+      <div class="ph"><h2>计划管理</h2><span class="tag m3">C7</span><span class="sub">查看 / 启停 / 编辑</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>同步状态</button></span></div>
+      <div class="card">
+        <table>
+          <thead><tr><th>计划名称</th><th>千川账户</th><th>预算</th><th>消耗</th><th>ROI</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="pmBody">
+            <tr><td>拼豆工具-数码-通投</td><td>星禾优品 · 千川A</td><td class="num">￥500/天</td><td class="num">￥3,280</td><td class="num">3.01</td><td><span class="pill ok">投放中</span></td><td><span class="lnk">编辑</span><span class="lnk need-write">暂停</span></td></tr>
+            <tr><td>居家收纳-百货-精准</td><td>星禾优品 · 千川A</td><td class="num">￥800/天</td><td class="num">￥2,140</td><td class="num">3.47</td><td><span class="pill ok">投放中</span></td><td><span class="lnk">编辑</span><span class="lnk need-write">暂停</span></td></tr>
+            <tr><td>香薰-家居-通投</td><td>辰萌贴纸 · 千川B</td><td class="num">￥300/天</td><td class="num">￥860</td><td class="num">2.30</td><td><span class="pill warn">已暂停</span></td><td><span class="lnk">编辑</span><span class="lnk need-write">启用</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 任务中心（F2） ========== -->
+    <section class="page" id="page-tasks">
+      <div class="ph"><h2>任务中心</h2><span class="tag">F2</span><span class="sub">下载 / 上传 / 发布的统一队列</span>
+        <span class="sp"><button class="btn">全部重试</button><button class="btn danger need-write" id="btnClearTasks">清空已完成</button></span></div>
+      <div class="stats">
+        <div class="stat"><div class="glow"></div><div class="k">进行中</div><div class="v num">5</div><div class="d">下载 3 · 上传 2</div></div>
+        <div class="stat"><div class="k">等待</div><div class="v num">18</div><div class="d">按顺序执行</div></div>
+        <div class="stat"><div class="k">已完成</div><div class="v num">214</div><div class="d">今日</div></div>
+        <div class="stat"><div class="k">失败</div><div class="v num" style="color:var(--danger)">2</div><div class="d">可重试</div></div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>任务队列</div>
+        <div class="task"><span class="nm">拼豆钥匙扣_v3.mp4（下载）</span><span class="bar"><i style="width:64%"></i></span><span class="pc">64%</span><span class="st"><span class="pill info">进行中</span></span></div>
+        <div class="task"><span class="nm">无痕粘钩_v2.mp4（上传千川）</span><span class="bar"><i style="width:31%"></i></span><span class="pc">31%</span><span class="st"><span class="pill info">进行中</span></span></div>
+        <div class="task"><span class="nm">收纳盒_原版.mp4（下载）</span><span class="bar"><i style="width:100%"></i></span><span class="pc">100%</span><span class="st"><span class="pill ok">完成</span></span></div>
+        <div class="task"><span class="nm">香薰蜡烛.mp4（上传千川）</span><span class="bar"><i style="width:0%"></i></span><span class="pc">0%</span><span class="st"><span class="pill danger">失败</span></span></div>
+      </div>
+    </section>
+
+    <!-- ========== 日志与异常（F3） ========== -->
+    <section class="page" id="page-logs">
+      <div class="ph"><h2>日志与异常</h2><span class="tag">F3</span><span class="sub">关键操作与异常集中查看</span>
+        <span class="sp"><button class="btn">导出日志</button><button class="btn">一键导出诊断包</button></span></div>
+      <div class="card">
+        <div class="row">
+          <div class="field"><label>级别</label><select><option>全部</option><option>错误</option><option>警告</option><option>信息</option></select></div>
+          <div class="field"><label>模块</label><select><option>全部</option><option>下载</option><option>千川</option><option>发布</option></select></div>
+          <div class="field"><label>时间</label><select><option>今日</option><option>近 7 天</option></select></div>
+          <button class="btn primary"><svg class="ic"><use href="#i-search"/></svg>查询</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>异常报错（R29 · 重试仍失败集中展示）<span class="r">共 2 条</span></div>
+        <table>
+          <thead><tr><th>账号</th><th>商品</th><th>失败步骤</th><th>失败原因</th><th>操作</th></tr></thead>
+          <tbody data-err>
+            <tr><td>群益百货</td><td>鱼缸温度计水温计…</td><td>抖音发布</td><td>发布接口超时（重试 1 次仍失败，已截图留证）</td><td><span class="lnk">查看日志</span><span class="lnk" data-del-err>删除失败日志重试</span></td></tr>
+            <tr><td>星禾优品馆</td><td>智能数字万用表…</td><td>下载视频</td><td>视频源解析失败（网络波动）</td><td><span class="lnk">查看日志</span><span class="lnk" data-del-err>删除失败日志重试</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>重试机制（R29）：任一步失败生成<b>失败日志</b>（写明原因）；<b>删除失败日志 → 自动重试该步骤（一次）</b>；仍失败 → 在此集中展示，可再次删除失败日志重试或人工处理</div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>日志</div>
+        <table>
+          <thead><tr><th>时间</th><th>级别</th><th>模块</th><th>内容</th><th>操作</th></tr></thead>
+          <tbody id="logBody">
+            <tr><td>18:22:41</td><td><span class="pill danger">错误</span></td><td>千川</td><td>香薰蜡烛.mp4 上传失败：登录态失效（已截图）</td><td><span class="lnk">截图</span></td></tr>
+            <tr><td>18:20:03</td><td><span class="pill warn">警告</span></td><td>下载</td><td>亚克力摆件 下载重试 1 次（网络波动）</td><td><span class="lnk">详情</span></td></tr>
+            <tr><td>18:11:57</td><td><span class="pill info">信息</span></td><td>发布</td><td>拼豆钥匙扣_v3 发布成功（账号：辰呈产品）</td><td><span class="lnk">详情</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ========== 商品详情录屏（J） ========== -->
+    <section class="page" id="page-record">
+      <div class="ph"><h2>商品详情录屏</h2><span class="tag new">J · 新增</span><span class="sub">商品详情页自动滚动录制为视频素材</span></div>
+      <div class="steps">
+        <div class="step done"><span class="n">1</span>打开商品详情页</div>
+        <div class="step done"><span class="n">2</span>自动滚动</div>
+        <div class="step cur"><span class="n">3</span>录制</div>
+        <div class="step"><span class="n">4</span>入库</div>
+        <div class="step"><span class="n">5</span>用于发布</div>
+      </div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>录屏参数</div>
+          <div class="fr"><label>商品</label><input type="text" style="flex:1" value="3829712 · 拼豆钥匙扣套装"></div>
+          <div class="fr"><label>分辨率</label><select><option>1080 × 1920（竖版）</option><option>720 × 1280</option></select></div>
+          <div class="fr"><label>帧率</label><select><option>30 fps</option><option>60 fps</option></select></div>
+          <div class="fr"><label>滚动速度</label><select><option>中速（约 6 屏/20 秒）</option><option>慢速</option></select></div>
+          <div class="fr"><label>停顿</label><select><option>每屏 0.8 秒</option><option>1.5 秒</option></select></div>
+          <div class="divider"></div>
+          <div class="row"><button class="btn primary need-write" id="btnRecord">开始录屏</button><button class="btn">预览详情页</button></div>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>录制结果</div>
+          <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(128px,1fr))">
+            <div class="media"><div class="cover" style="height:88px"><span class="badge pill ok">已入库</span><span class="play"><svg class="ic lg"><use href="#i-play"/></svg></span></div><div class="meta"><div class="t">3829712_录屏.mp4</div><div class="s"><span>00:28</span><span>12.4MB</span></div></div></div>
+            <div class="media"><div class="cover" style="height:88px"><span class="badge pill warn">录制中</span></div><div class="meta"><div class="t">3829713_录屏.mp4</div><div class="s"><span>00:12</span><span>—</span></div></div></div>
+          </div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>录屏内容需为自有授权商品；版权与平台协议风险由甲方承担（R-11）。</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="app" data-app="admin">
+  <aside class="sidebar" data-app="admin">
+    <div class="gt">授权与权限（管理端）</div>
+    <button class="active" data-page="admin-auth"><svg class="ic"><use href="#i-check"/></svg>授权管理</button>
+    <button data-page="admin-clients"><svg class="ic"><use href="#i-users"/></svg>客户端绑定</button>
+    <button data-page="admin-roles"><svg class="ic"><use href="#i-set"/></svg>权限分级</button>
+    <button data-page="admin-verify"><svg class="ic"><use href="#i-clock"/></svg>授权校验 / 心跳</button>
+  </aside>
+  <main class="main">
+
+    <section class="page active" id="page-admin-auth">
+      <div class="ph"><h2>授权管理</h2><span class="tag new">K1</span><span class="sub">多级代理逐级授权 · 时长池不可超发</span>
+        <span class="sp"><button class="btn"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button><button class="btn need-write" id="btnK1Recycle"><svg class="ic"><use href="#i-refresh"/></svg>回收额度</button><button class="btn primary need-write" id="btnK1Grant"><svg class="ic"><use href="#i-plus"/></svg>授予授权</button></span></div>
+      <div class="stats">
+        <div class="stat"><div class="glow"></div><div class="k">代理层级</div><div class="v num">3</div><div class="d">总管理员 + 一级 + 二级</div></div>
+        <div class="stat"><div class="k">可分配总天数</div><div class="v num">1000</div><div class="d">已分 460 / 剩余 540</div></div>
+        <div class="stat"><div class="k">7 天内到期</div><div class="v num" style="color:var(--warn)">2</div><div class="d">需续期</div></div>
+        <div class="stat"><div class="k">级联锁定</div><div class="v num" style="color:var(--danger)">1</div><div class="d">因上级停用</div></div>
+      </div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>授权树<span class="r">额度按「天」计 · 剩余可分配 = 已获 − 已分（不可超发）</span></div>
+        <table>
+          <thead><tr><th>授权对象</th><th>类型</th><th>已获天数</th><th>已分天数</th><th>剩余可分配</th><th>到期</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr><td><b>总管理员</b></td><td><span class="pill info">代理</span></td><td class="num">1000</td><td class="num">460</td><td class="num">540</td><td>—</td><td><span class="pill ok">正常</span></td><td><span class="lnk need-write">授予</span><span class="lnk need-write">回收</span></td></tr>
+            <tr><td>&nbsp;&nbsp;└ 一级代理 A</td><td><span class="pill info">代理</span></td><td class="num">300</td><td class="num">120</td><td class="num">180</td><td>2027-01-01</td><td><span class="pill ok">正常</span></td><td><span class="lnk need-write">授予</span><span class="lnk need-write">回收</span></td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└ 二级代理 A1</td><td><span class="pill info">代理</span></td><td class="num">120</td><td class="num">90</td><td class="num">30</td><td>2026-12-01</td><td><span class="pill ok">正常</span></td><td><span class="lnk need-write">授予</span><span class="lnk need-write">回收</span></td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└ 客户端 PC-001</td><td><span class="pill gray">客户端</span></td><td class="num">90</td><td>—</td><td>—</td><td>2026-11-20</td><td><span class="pill ok">剩余 80 天</span></td><td><span class="lnk need-write">续期</span><span class="lnk need-write">停用</span></td></tr>
+            <tr><td>&nbsp;&nbsp;└ 一级代理 B</td><td><span class="pill info">代理</span></td><td class="num">160</td><td class="num">40</td><td class="num">120</td><td>2026-10-20</td><td><span class="pill warn">即将到期</span></td><td><span class="lnk need-write">授予</span><span class="lnk need-write">回收</span></td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└ 二级代理 B1</td><td><span class="pill info">代理</span></td><td class="num">40</td><td class="num">20</td><td class="num">20</td><td>2026-11-05</td><td><span class="pill ok">正常</span></td><td><span class="lnk need-write">授予</span><span class="lnk need-write">回收</span></td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└ 客户端 PC-004</td><td><span class="pill gray">客户端</span></td><td class="num">0</td><td>—</td><td>—</td><td>—</td><td><span class="pill danger">已级联锁定</span></td><td><span class="lnk need-write">恢复</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>上级到期 / 停用 → 整棵下级子树连带锁定（级联失效，FR-K1-06）。</div>
+      </div>
+    </section>
+
+    <section class="page" id="page-admin-clients">
+      <div class="ph"><h2>客户端绑定</h2><span class="tag">K4</span><span class="sub">授权与具体机器绑定，防止随意扩散</span></div>
+      <div class="card">
+        <table>
+          <thead><tr><th>机器名</th><th>机器标识（machine_id）</th><th>绑定用户</th><th>在线状态</th><th>最近心跳</th><th>操作</th></tr></thead>
+          <tbody>
+            <tr><td>PC-001 · 发布机A</td><td>8f3a-2c91-77be</td><td>辰呈产品</td><td><span class="dot on"></span>在线</td><td>10 秒前</td><td><span class="lnk need-write">解绑</span></td></tr>
+            <tr><td>PC-002 · 发布机B</td><td>1d77-90ab-4e02</td><td>梅妈妈铺</td><td><span class="dot on"></span>在线</td><td>24 秒前</td><td><span class="lnk need-write">解绑</span></td></tr>
+            <tr><td>PC-003</td><td>5b20-77c3-1af9</td><td>群益百货</td><td><span class="dot off"></span>离线</td><td>2 小时前</td><td><span class="lnk need-write">解绑</span></td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>客户端首次启动上报 machine_id；管理员在此确认绑定后授权方可生效。</div>
+      </div>
+    </section>
+
+    <section class="page" id="page-admin-roles">
+      <div class="ph"><h2>权限分级</h2><span class="tag">K3</span><span class="sub">层级 × 职能（二维）</span>
+        <span class="sp"><button class="btn primary need-write" id="btnK3Save">保存权限</button></span></div>
+      <div class="card">
+        <div class="card-t"><span class="bar"></span>层级权限矩阵<span class="r">职能（管理员 / 运营 / 只读）叠加在层级之上</span></div>
+        <table class="perm">
+          <thead><tr><th>层级</th><th>向下授权</th><th>管理下级</th><th>千川 / 发布写操作</th><th>素材清理 / 违规删除</th><th>授权与客户端绑定</th></tr></thead>
+          <tbody>
+            <tr><td><b>总管理员</b></td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td></tr>
+            <tr><td>一级代理</td><td>仅限本支</td><td>仅限本支</td><td>&#10003;</td><td>—</td><td>仅限本支</td></tr>
+            <tr><td>二级代理</td><td>仅限本支</td><td>仅限本支</td><td>&#10003;</td><td>—</td><td>—</td></tr>
+            <tr><td>终端客户端</td><td>—</td><td>—</td><td>&#10003;</td><td>—</td><td>—</td></tr>
+          </tbody>
+        </table>
+        <div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>右上角「角色」切换可演示：切到「只读」后，页面上带写操作的按钮会置灰。</div>
+      </div>
+    </section>
+
+    <section class="page" id="page-admin-verify">
+      <div class="ph"><h2>授权校验 / 心跳</h2><span class="tag">K2</span><span class="sub">服务端为唯一判定方（防改时间 / 防破解）</span></div>
+      <div class="two-col">
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>心跳记录</div>
+          <table>
+            <thead><tr><th>客户端</th><th>心跳时间</th><th>剩余天数</th><th>结果</th></tr></thead>
+            <tbody>
+              <tr><td>PC-001</td><td>18:24:10</td><td class="num">80</td><td><span class="pill ok">通过</span></td></tr>
+              <tr><td>PC-002</td><td>18:24:02</td><td class="num">7</td><td><span class="pill warn">即将到期</span></td></tr>
+              <tr><td>PC-004</td><td>10-11 09:12</td><td class="num">0</td><td><span class="pill danger">已锁定</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <div class="card-t"><span class="bar"></span>校验策略</div>
+          <div class="kv">
+            <div class="k">心跳间隔</div><div>60 秒</div>
+            <div class="k">判定方</div><div>服务端（客户端仅展示剩余天数）</div>
+            <div class="k">断网宽限</div><div>24 小时（恢复后补报）</div>
+            <div class="k">到期处理</div><div>服务端下发锁定指令，客户端限制使用</div>
+            <div class="k">绑定校验</div><div>machine_id 不匹配则拒绝</div>
+          </div>
+          <div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>对应 SRS A-21 与风险 R-13（授权被绕过）。</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div class="statusbar">
+  <span class="live"><span class="dotlive"></span>已连接百应</span>
+  <span>素材库已读取：18 个商品，362 个视频</span>
+  <span>记录数：1 条</span>
+  <span>当前下载目录：D:\视频素材</span>
+  <span style="margin-left:auto"><span class="pmode">管理端</span>高保真原型 v1.41 · 静态演示</span>
+</div>
+
+<!-- 弹窗 -->
+<div class="mask" id="mask">
+  <div class="modal">
+    <div class="mh" id="mTitle"><svg class="ic lg"><use href="#i-warn"/></svg><span></span></div>
+    <div class="mb" id="mBody"></div>
+    <div class="mf" id="mFoot">
+      <button class="btn" id="mCancel">取消</button>
+      <button class="btn primary" id="mOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+/* ================= 通用分页工具（全局） =================
+   注：本文件有两个 <script>，二者都要调用 cardOf / attachPager，
+   故必须在首个 <script> 顶层（全局）定义，不能在后面的 IIFE 内定义。 */
+function cardOf(el) { return el ? el.closest('.card') : null; }
+function attachPager(card, host, total, rowFn) {
+  if (!card || !host) return;
+  var cur = 1, size = 100;
+  var wrap = document.createElement('div');
+  wrap.className = 'pager';
+  wrap.innerHTML =
+    '<span class="pg-total">共 <b>' + total + '</b> 条</span>' +
+    '<label class="pg-size">每页 <select class="pg-sel">' +
+    [10, 20, 30, 40, 50, 80, 100].map(function (v) {
+      return '<option value="' + v + '"' + (v === 100 ? ' selected' : '') + '>' + v + '</option>';
+    }).join('') +
+    '</select> 条</label><div class="pg-btns"></div>';
+  card.appendChild(wrap);
+  var sel = wrap.querySelector('.pg-sel'), btns = wrap.querySelector('.pg-btns');
+  function render() {
+    var pages = Math.max(1, Math.ceil(total / size));
+    if (cur > pages) cur = pages;
+    if (cur < 1) cur = 1;
+    var html = '', s = (cur - 1) * size, e = Math.min(s + size, total);
+    for (var i = s; i < e; i++) html += rowFn(i);
+    host.innerHTML = html;
+    var bh = '<button class="pg" data-p="1">首页</button><button class="pg" data-p="' + Math.max(1, cur - 1) + '">上一页</button>';
+    var win = [];
+    for (var p = 1; p <= pages; p++) if (p === 1 || p === pages || Math.abs(p - cur) <= 2) win.push(p);
+    var last = 0;
+    win.forEach(function (p) {
+      if (p - last > 1) bh += '<span class="pg-dots">…</span>';
+      bh += '<button class="pg' + (p === cur ? ' on' : '') + '" data-p="' + p + '">' + p + '</button>';
+      last = p;
+    });
+    bh += '<button class="pg" data-p="' + Math.min(pages, cur + 1) + '">下一页</button>' +
+      '<button class="pg" data-p="' + pages + '">末页</button>';
+    btns.innerHTML = bh;
+  }
+  sel.addEventListener('change', function () { size = parseInt(sel.value, 10); cur = 1; render(); });
+  btns.addEventListener('click', function (e) {
+    var b = e.target.closest('button.pg');
+    if (!b) return;
+    cur = parseInt(b.getAttribute('data-p'), 10);
+    render();
+  });
+  render();
+}
+
+(function () {
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+
+  /* ---------- 页面切换 ---------- */
+  var pages = $$('.page');
+  function show(key) {
+    $$('.page').forEach(function (p) { p.classList.toggle('active', p.id === 'page-' + key); });
+    $$('.sidebar button[data-page]').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-page') === key); });
+    $('.main').scrollTop = 0;
+  }
+  $('.sidebar').addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-page]');
+    if (btn) show(btn.getAttribute('data-page'));
+  });
+  $$('.topnav button, .seg button').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      $$('.seg button').forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      show(btn.getAttribute('data-top'));
+    });
+  });
+
+  /* ---------- Toast ---------- */
+  function toast(msg, type) {
+    var el = document.createElement('div');
+    el.className = 'toast ' + (type || '');
+    el.innerHTML = '<svg class="ic sm"><use href="#i-' + (type === 'err' ? 'warn' : 'check') + '"/></svg>' + msg;
+    $('#toastWrap').appendChild(el);
+    setTimeout(function () { el.remove(); }, 2200);
+  }
+
+  /* ---------- 弹窗 ---------- */
+  var mask = $('#mask'), mOk = $('#mOk'), mCancel = $('#mCancel');
+  function modal(title, body, onOk, okText) {
+    $('#mTitle span').textContent = title;
+    $('#mBody').innerHTML = body;
+    mOk.textContent = okText || '确定';
+    mask.classList.add('show');
+    mOk.onclick = function () { mask.classList.remove('show'); if (onOk) onOk(); };
+    mCancel.onclick = function () { mask.classList.remove('show'); };
+  }
+  mask.addEventListener('click', function (e) { if (e.target === mask) mask.classList.remove('show'); });
+
+  /* ================= 商品查询 ================= */
+  var videos = [
+    { t: '拼豆钥匙扣配打孔五金工具套装…', a: '在回Ying子', p: '—', pay: '—', ctr: '—', deal: '—', wm: '无水印' },
+    { t: '拼豆钥匙扣 彩色开口圈DIY材料…', a: '珠珠手作', p: '10-05', pay: '￥1,280', ctr: '4.2%', deal: '36', wm: '无水印' },
+    { t: '开口圈手工DIY配件 1000个装…', a: '手作星球', p: '10-03', pay: '￥860', ctr: '3.1%', deal: '22', wm: '已裁剪' },
+    { t: '拼豆材料包 全套工具 入门款…', a: '小满手作', p: '09-29', pay: '￥2,140', ctr: '5.6%', deal: '58', wm: '无水印' },
+    { t: '五金配件套装 打孔钳 手工必备…', a: '匠人手作', p: '09-27', pay: '￥430', ctr: '2.4%', deal: '11', wm: '无水印' }
+  ];
+  var resBody = $('#resBody'), selCount = $('#selCount');
+
+  function updateSel() {
+    var n = $$('#resBody input[type=checkbox]:checked').length;
+    selCount.textContent = n;
+    $$('.card .row .btn[data-act="download"]').forEach(function (b) { b.disabled = n === 0; });
+    $('#btnDownloadAll').disabled = n === 0;
+    $$('#resBody tr').forEach(function (tr) {
+      var cb = tr.querySelector('input[type=checkbox]');
+      tr.classList.toggle('sel', !!(cb && cb.checked));
+    });
+  }
+
+  function renderResults() {
+    resBody.innerHTML = videos.map(function (v, i) {
+      return '<tr>' +
+        '<td><input type="checkbox" class="vck" checked></td>' +
+        '<td>' + (i + 1) + '</td>' +
+        '<td><div class="thumb"></div></td>' +
+        '<td>' + v.t + '</td><td>' + v.a + '</td><td>' + v.p + '</td>' +
+        '<td>' + v.pay + '</td><td>' + v.ctr + '</td><td>' + v.deal + '</td>' +
+        '<td><span class="pill ' + (v.wm === '无水印' ? 'ok' : 'warn') + '">' + v.wm + '</span></td>' +
+        '<td><span class="lnk">v1.douyin…</span></td>' +
+        '<td><span class="lnk act-dl">下载</span><span class="lnk">查重</span><span class="lnk">转码</span></td>' +
+        '</tr>';
+    }).join('');
+    $('#resCount').textContent = '共 ' + videos.length + ' 条';
+    $('#productInfo').style.display = 'block';
+    $('#ckAll').checked = true;
+    $$('#resBody .vck').forEach(function (cb) { cb.addEventListener('change', updateSel); });
+    $$('#resBody .act-dl').forEach(function (a, i) {
+      a.addEventListener('click', function () { startTasks(['视频' + (i + 1) + '：' + videos[i].t]); });
+    });
+    updateSel();
+    toast('查询完成，共 ' + videos.length + ' 条视频');
+  }
+
+  function showLoading() {
+    var rows = '';
+    for (var i = 0; i < 4; i++) {
+      rows += '<tr><td><div class="sk" style="width:14px"></div></td><td><div class="sk" style="width:20px"></div></td>' +
+        '<td><div class="sk" style="width:42px;height:54px"></div></td><td><div class="sk" style="width:180px"></div></td>' +
+        '<td><div class="sk" style="width:60px"></div></td><td><div class="sk" style="width:50px"></div></td>' +
+        '<td><div class="sk" style="width:60px"></div></td><td><div class="sk" style="width:50px"></div></td>' +
+        '<td><div class="sk" style="width:40px"></div></td><td><div class="sk" style="width:50px"></div></td>' +
+        '<td><div class="sk" style="width:70px"></div></td><td><div class="sk" style="width:80px"></div></td></tr>';
+    }
+    resBody.innerHTML = rows;
+    $('#resCount').textContent = '查询中…';
+  }
+
+  $('#btnSearch').addEventListener('click', function () {
+    $('#productInfo').style.display = 'none';
+    showLoading();
+    setTimeout(renderResults, 850);
+  });
+  $('#btnLink').addEventListener('click', function () {
+    showLoading();
+    setTimeout(function () { renderResults(); toast('已解析单个视频链接'); }, 850);
+  });
+  $('#btnResetFilter').addEventListener('click', function () {
+    $$('.chip').forEach(function (c) { c.remove(); });
+    toast('筛选条件已重置');
+  });
+  $('#ckAll').addEventListener('change', function () {
+    $$('#resBody .vck').forEach(function (cb) { cb.checked = $('#ckAll').checked; });
+    updateSel();
+  });
+  $('#btnDownloadAll').addEventListener('click', function () {
+    modal('确认批量下载', '将按「无水印源优先」策略下载已选素材，并统一转码为 MP4 / H.264。<br>下载目录：<b>D:\\视频素材</b>', function () {
+      var names = [];
+      $$('#resBody tr').forEach(function (tr) {
+        var cb = tr.querySelector('.vck');
+        if (cb && cb.checked) names.push(tr.children[3].textContent.slice(0, 18));
+      });
+      startTasks(names);
+    }, '开始下载');
+  });
+
+  /* ================= 商品列表（参考软件新增 · 选品状态流转） ================= */
+  var PLIST_ST = { '待选品': 'gray', '已加入选品车': 'ok', '选品失败': 'danger', '发布失败': 'danger', '已上传': 'ok' };
+  var FLOW_STEPS = ['选品', '加入选品车', '下载视频', '图转视频', '抖音发布', '千川发布素材'];
+  var plist = [
+    { name: '德力西高精度温湿度计室内外物理感应磁吸式婴儿房家用室温度计', id: '3833137007014756151', spec: '1878869615750176', cat: '家居专用', st: '待选品', code: '6Y7Q231', dt: '2026-10-13 00:44:03' },
+    { name: '智能数字万用表高精度自动量程电工仪表', id: '3833137007014756152', spec: '1878869615750177', cat: '五金工具', st: '已加入选品车', code: '5T8446C', dt: '2026-10-13 00:12:11', steps: [{s:'成功'}, {s:'成功'}, {s:'失败', r:'视频源解析失败（网络波动）'}, {s:'待执行'}, {s:'待执行'}, {s:'待执行'}] },
+    { name: '充电语音万用表数显多功能电笔', id: '3833137007014756153', spec: '1878869615750178', cat: '五金工具', st: '选品失败', code: 'AJ9Q7MC', dt: '2026-10-12 22:08:47', steps: [{s:'失败', r:'百应登录态失效，未取回商品'}, {s:'待执行'}, {s:'待执行'}, {s:'待执行'}, {s:'待执行'}, {s:'待执行'}] },
+    { name: '水质检测笔TDS检测仪家用饮水过滤测试笔', id: '3833137007014756154', spec: '1878869615750179', cat: '家居专用', st: '已加入选品车', code: 'K3PM8X2', dt: '2026-10-12 15:33:05' },
+    { name: '鱼缸温度计水温计防水数显', id: '3833137007014756155', spec: '1878869615750180', cat: '宠物用品', st: '发布失败', code: '8QZ5D6F', dt: '2026-10-12 09:21:38', steps: [{s:'成功'}, {s:'成功'}, {s:'成功'}, {s:'成功'}, {s:'失败', r:'发布接口超时（已截图留证）'}, {s:'待执行'}] },
+    { name: '尼龙扎带自锁式扎线带理线带', id: '3833137007014756156', spec: '1878869615750181', cat: '五金工具', st: '已上传', code: '2W4R7YH', dt: '2026-10-11 18:02:59' },
+    { name: '电烙铁焊接工具套装恒温内热式', id: '3833137007014756157', spec: '1878869615750182', cat: '五金工具', st: '已加入选品车', code: '9NBV3CD', dt: '2026-10-11 10:44:12' },
+    { name: '水质检测笔滤芯替换装TDS笔探头', id: '3833137007014756158', spec: '1878869615750183', cat: '家居专用', st: '待选品', code: '7Y6U5IK', dt: '2026-10-10 20:17:45' }
+  ];
+  var plistBody = $('#plistBody'), btnPlistAddCart = $('#btnPlistAddCart');
+
+  function plistSteps(p) {
+    var def = [];
+    for (var i = 0; i < FLOW_STEPS.length; i++) def.push({ s: '待执行' });
+    return p.steps ? p.steps : def;
+  }
+  function stepPill(st) {
+    var cls = st === '成功' ? 'ok' : (st === '失败' ? 'danger' : (st === '重试中' ? 'info' : 'gray'));
+    return '<span class="pill ' + cls + '">' + st + '</span>';
+  }
+  function flowLogHtml(idx) {
+    var p = plist[idx], steps = plistSteps(p);
+    var rows = FLOW_STEPS.map(function (n, i) {
+      var st = steps[i] || { s: '待执行' };
+      var retryBtn = st.s === '失败' ?
+        '　<button class="btn" data-act="retry-step" data-i="' + idx + '" data-step="' + i + '" style="padding:2px 10px;font-size:12px"><svg class="ic sm"><use href="#i-refresh"/></svg>删除失败日志并自动重试</button>' : '';
+      return '<div class="fr"><label style="width:110px">' + n + '</label>' + stepPill(st.s) +
+        (st.r ? '<span style="color:var(--danger);font-size:12px;margin-left:8px">' + st.r + '</span>' : '') + retryBtn + '</div>';
+    }).join('');
+    return '<div class="hint" style="margin-bottom:8px"><svg class="ic sm"><use href="#i-link"/></svg>选品文件夹：<b>D:\\视频素材\\{账号}\\{日期}\\' + p.name.slice(0, 10) + '\\</b>（每步独立日志文件）</div>' + rows;
+  }
+  function openFlowLog(idx) {
+    var p = plist[idx];
+    modal('全流程日志 — ' + p.name.slice(0, 14) + '…', flowLogHtml(idx), null, '关闭');
+  }
+
+  function plistPill(st) { return '<span class="pill ' + PLIST_ST[st] + '">' + st + '</span>'; }
+  function renderPlist() {
+    plistBody.innerHTML = plist.map(function (p, i) {
+      return '<tr data-i="' + i + '">' +
+        '<td><input type="checkbox" class="pck"></td>' +
+        '<td><div style="display:flex;gap:10px;align-items:flex-start">' +
+          '<div class="thumb"></div>' +
+          '<div>' +
+            '<div style="font-weight:600">' + p.name + '</div>' +
+            '<div style="color:var(--muted);font-size:12px;margin-top:2px">ID：' + p.id + ' ｜ 规格：' + p.spec + '</div>' +
+            '<div style="margin-top:4px"><span class="pill info">' + p.cat + '</span></div>' +
+          '</div>' +
+        '</div></td>' +
+        '<td class="st">' + plistPill(p.st) + '</td>' +
+        '<td>' + p.code + '</td>' +
+        '<td>' + p.dt + '</td>' +
+        '<td>' +
+          '<button class="btn iact" data-a="up" style="padding:2px 12px;font-size:12px;color:#fff;background:var(--brand)">上架</button>' +
+          '<button class="btn iact" data-a="edit" style="padding:2px 12px;font-size:12px;color:#fff;background:var(--warn)">编辑</button>' +
+          '<button class="btn iact" data-a="out" style="padding:2px 12px;font-size:12px;color:#fff;background:var(--ok)">出单</button>' +
+          '<button class="btn iact" data-a="del" style="padding:2px 12px;font-size:12px;color:#fff;background:var(--danger)">删除</button>' +
+          '<button class="btn iact" data-a="log" style="padding:2px 12px;font-size:12px;background:var(--line-2)">日志</button>' +
+        '</td>' +
+        '</tr>';
+    }).join('');
+    $('#plistCount').textContent = '共 ' + plist.length + ' 条';
+    updatePlistSel();
+  }
+  function updatePlistSel() {
+    var n = $$('#plistBody .pck:checked').length;
+    btnPlistAddCart.disabled = n === 0;
+    btnPlistAutoCart.disabled = !plist.some(function (p) { return p.st === '待选品'; });
+  }
+  function autoAddCart() {
+    var ok = 0, fail = 0;
+    plist.forEach(function (p, idx) {
+      if (p.st !== '待选品') return;
+      if (idx % 4 === 2) { p.st = '选品失败'; fail++; }
+      else { p.st = '已加入选品车'; ok++; }
+      var tr = plistBody.children[idx];
+      if (tr) tr.querySelector('.st').innerHTML = plistPill(p.st);
+    });
+    updatePlistSel();
+    toast(ok + fail ? '自动加入选品车：成功 ' + ok + ' 个，失败 ' + fail + ' 个' : '当前无待选品商品');
+  }
+  $('#plistAll').addEventListener('change', function () {
+    $$('#plistBody .pck').forEach(function (cb) { cb.checked = $('#plistAll').checked; });
+    updatePlistSel();
+  });
+  plistBody.addEventListener('change', updatePlistSel);
+  plistBody.addEventListener('click', function (e) {
+    var btn = e.target.closest('button.iact');
+    if (!btn) return;
+    var tr = btn.closest('tr');
+    var a = btn.getAttribute('data-a');
+    if (a === 'del') {
+      tr.remove();
+      $('#plistCount').textContent = '共 ' + plistBody.children.length + ' 条';
+      toast('已删除商品');
+    } else if (a === 'up') {
+      toast('已上架：' + plist[tr.getAttribute('data-i')].name.slice(0, 12) + '…');
+    } else if (a === 'edit') {
+      toast('编辑商品：' + plist[tr.getAttribute('data-i')].name.slice(0, 12) + '…');
+    } else if (a === 'out') {
+      toast('已出单：' + plist[tr.getAttribute('data-i')].name.slice(0, 12) + '…');
+    } else if (a === 'log') {
+      openFlowLog(parseInt(tr.getAttribute('data-i'), 10));
+    }
+  });
+  function retryStep(idx, step) {
+    if (!plist[idx].steps) plist[idx].steps = plistSteps(plist[idx]);
+    plist[idx].steps[step].s = '重试中';
+    delete plist[idx].steps[step].r;
+    $('#mBody').innerHTML = flowLogHtml(idx);
+    toast('已删除失败日志，自动重试「' + FLOW_STEPS[step] + '」…');
+    setTimeout(function () {
+      if (idx === 4) {
+        plist[idx].steps[step].s = '失败';
+        plist[idx].steps[step].r = '重试一次仍失败：发布接口超时（已截图留证）';
+        $('#mBody').innerHTML = flowLogHtml(idx);
+        toast('重试仍失败，已进入「日志与异常」异常报错', 'err');
+      } else {
+        plist[idx].steps[step].s = '成功';
+        $('#mBody').innerHTML = flowLogHtml(idx);
+        toast('「' + FLOW_STEPS[step] + '」重试成功');
+      }
+    }, 1500);
+  }
+  /* ================= 罗盘管理（R30 新增） ================= */
+  var lpxBody = $('#lpxBody'), lpAccBody = $('#lpAccBody'), lpPlanBody = $('#lpPlanBody');
+  var lpxGoods = [
+    { name: '陶瓷保鲜盒三件套密封', id: '3833137007014756201', cat: '家居专用', sales: 1280, rate: '23%', cv: '4.8%', rb: '2.1%', reason: '销量高 + 佣金 ≥ 20% + 退款低' },
+    { name: '多功能收纳挂袋壁挂', id: '3833137007014756202', cat: '家居专用', sales: 860, rate: '21%', cv: '4.2%', rb: '3.0%', reason: '佣金 ≥ 20% 且转化稳定' },
+    { name: '免打孔增压花洒套装', id: '3833137007014756203', cat: '家居专用', sales: 2050, rate: '25%', cv: '5.1%', rb: '1.8%', reason: '冲量款：销量 2000+，退款极低' },
+    { name: '电动螺丝刀套装家用', id: '3833137007014756204', cat: '五金工具', sales: 640, rate: '18%', cv: '3.9%', rb: '4.2%', reason: '转化良好' },
+    { name: '宠物自动喂食器', id: '3833137007014756205', cat: '宠物用品', sales: 420, rate: '26%', cv: '4.5%', rb: '2.6%', reason: '高佣金 + 蓝海类目' }
+  ];
+  function addToPlist(name, id, cat) {
+    plist.unshift({ name: name, id: id, spec: String(Math.floor(Math.random() * 1e16)), cat: cat, st: '待选品', code: 'LP' + Math.random().toString(36).slice(2, 8).toUpperCase(), dt: '2026-10-17 10:00:00' });
+    renderPlist();
+  }
+  $('#btnNewLuopan').addEventListener('click', function () {
+    modal('新增罗盘账号', '将<b>跳转抖音罗盘</b>（电商罗盘）登录新账号（浏览器自动化）；登录后回读保存登录态并加入罗盘账号列表，作为「罗盘选品」数据源（R30 / A-41）。', function () {
+      lpAccBody.insertAdjacentHTML('afterbegin',
+        '<tr><td>小蒙家居</td><td>7574…6620</td><td><span class="pill ok">已登录</span></td><td>2026-10-17 10:00:00</td><td><span class="lnk">刷新登录态</span><span class="lnk">退出</span></td></tr>');
+      toast('已登录新罗盘账号：小蒙家居');
+    }, '开始登录');
+  });
+  $('#btnLpxFilter').addEventListener('click', function () {
+    lpxBody.innerHTML = lpxGoods.map(function (g, i) {
+      return '<tr data-i="' + i + '">' +
+        '<td><input type="checkbox" class="lpck" checked></td>' +
+        '<td><div style="display:flex;gap:10px;align-items:flex-start"><div class="thumb"></div><div>' +
+          '<div style="font-weight:600">' + g.name + '</div><div style="color:var(--muted);font-size:12px;margin-top:2px">ID：' + g.id + '</div></div></div></td>' +
+        '<td><span class="pill info">' + g.cat + '</span></td>' +
+        '<td class="num">' + g.sales + '</td><td class="num" style="color:var(--ok)">' + g.rate + '</td><td class="num">' + g.cv + '</td><td class="num" style="color:var(--ok)">' + g.rb + '</td>' +
+        '<td style="color:var(--muted);font-size:12px">' + g.reason + '</td>' +
+        '<td><span class="lnk lp-add">加入商品列表</span><span class="lnk lp-cart">加入选品车</span></td>' +
+        '</tr>';
+    }).join('');
+    $('#lpxCount').textContent = '共 ' + lpxGoods.length + ' 条';
+    toast('罗盘筛选完成，命中 ' + lpxGoods.length + ' 个推荐商品');
+  });
+  lpxBody.addEventListener('click', function (e) {
+    var a = e.target.closest('.lp-add');
+    if (a) {
+      var g = lpxGoods[parseInt(a.closest('tr').getAttribute('data-i'), 10)];
+      addToPlist(g.name, g.id, g.cat);
+      toast('已加入商品列表（待选品）：' + g.name.slice(0, 10) + '…');
+      return;
+    }
+    var c = e.target.closest('.lp-cart');
+    if (c) {
+      var g2 = lpxGoods[parseInt(c.closest('tr').getAttribute('data-i'), 10)];
+      toast('已加入选品车（跳转百应）：' + g2.name.slice(0, 10) + '…');
+    }
+  });
+  var lpPlans = [
+    { name: '家居好物-高佣低退', acct: '群益百货', cond: '家居专用 · 销量≥100 · 佣金≥20% · 退款≤5%', st: '已启用', dt: '2026-10-15 14:22:09' },
+    { name: '五金工具-冲量', acct: '星禾优品馆', cond: '五金工具 · 销量≥200 · 佣金≥15% · 退款≤8%', st: '已暂停', dt: '2026-10-14 09:40:55' }
+  ];
+  function renderLpPlans() {
+    lpPlanBody.innerHTML = lpPlans.map(function (p, i) {
+      return '<tr data-i="' + i + '">' +
+        '<td>' + p.name + '</td><td>' + p.acct + '</td><td>' + p.cond + '</td>' +
+        '<td><span class="pill ' + (p.st === '已启用' ? 'ok' : 'warn') + '">' + p.st + '</span></td><td>' + p.dt + '</td>' +
+        '<td><span class="lnk lp-run">运行</span><span class="lnk">编辑</span><span class="lnk lp-del">删除</span></td></tr>';
+    }).join('');
+    $('#lpPlanCount').textContent = '共 ' + lpPlans.length + ' 条';
+  }
+  lpPlanBody.addEventListener('click', function (e) {
+    var a = e.target.closest('.lp-run');
+    if (a) { show('lpxuanpin'); toast('已按方案条件进入罗盘选品'); return; }
+    var d = e.target.closest('.lp-del');
+    if (d) {
+      var tr = d.closest('tr');
+      lpPlans.splice(parseInt(tr.getAttribute('data-i'), 10), 1);
+      renderLpPlans();
+      toast('已删除罗盘方案');
+    }
+  });
+  $('#btnLpxSave').addEventListener('click', function () {
+    modal('保存为罗盘方案', '<div class="fr"><label style="width:80px">方案名称</label><input type="text" id="lpPlanName" style="flex:1" placeholder="如：家居好物-高佣低退"></div><div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>将保存当前筛选条件（账号 / 类目 / 时间 / 销量 / 佣金 / 退款）为罗盘方案，可在「罗盘列表」管理。</div>', function () {
+      var n = ($('#lpPlanName').value || '未命名方案').trim();
+      lpPlans.push({ name: n, acct: $('#lpxAcct').value, cond: '当前筛选条件', st: '已启用', dt: '2026-10-17 10:00:00' });
+      renderLpPlans();
+      toast('已保存罗盘方案：' + n);
+    }, '保存');
+  });
+  $('#btnLpNewPlan').addEventListener('click', function () { show('lpxuanpin'); toast('请在罗盘选品配置条件后保存为方案'); });
+
+  $('#btnPlistAutoCart').addEventListener('click', function () {
+    var n = plist.filter(function (p) { return p.st === '待选品'; }).length;
+    if (!n) { toast('当前无待选品商品'); return; }
+    modal('一键加入选品车（全部待选品）', '将<b>自动</b>将商品列表中全部 <b>' + n + '</b> 个「待选品」商品逐个<b>跳转百应检索并加入选品车</b>（浏览器自动化，无人值守，联动 A-34 / FR-I5-01）。<br>加入成功状态更新为「已加入选品车」，失败标记「选品失败」。', function () { autoAddCart(); }, '开始执行');
+  });
+  $('#btnPlistAddCart').addEventListener('click', function () {
+    var n = $$('#plistBody .pck:checked').length;
+    modal('批量加入选品车（勾选）', '将<b>跳转百应</b>，按勾选的 ' + n + ' 个「待选品」商品逐一检索对应商品并<b>加入选品车</b>（浏览器自动化）。<br>加入成功状态更新为「已加入选品车」，失败标记「选品失败」。', function () {
+      var ok = 0, fail = 0;
+      $$('#plistBody .pck:checked').forEach(function (cb) {
+        var idx = parseInt(cb.closest('tr').getAttribute('data-i'), 10);
+        if (plist[idx].st !== '待选品') return;
+        if (idx % 4 === 2) { plist[idx].st = '选品失败'; fail++; }
+        else { plist[idx].st = '已加入选品车'; ok++; }
+        cb.closest('tr').querySelector('.st').innerHTML = plistPill(plist[idx].st);
+      });
+      updatePlistSel();
+      toast(fail ? '已跳转百应加入选品车 ' + ok + ' 个，' + fail + ' 个选品失败' : '已跳转百应加入选品车 ' + ok + ' 个');
+    }, '开始执行');
+  });
+  renderPlist();
+
+  /* ---------- 下载任务（模拟进度） ---------- */
+  var taskCard = $('#taskCard'), taskList = $('#taskList'), timer = null;
+  function startTasks(names) {
+    taskCard.style.display = 'block';
+    var tasks = names.map(function (n) { return { n: n, p: 0, done: false }; });
+    taskList.innerHTML = tasks.map(function (t, i) {
+      return '<div class="task" data-i="' + i + '">' +
+        '<span class="nm">' + t.n + '</span>' +
+        '<span class="bar"><i style="width:0%"></i></span>' +
+        '<span class="pc">0%</span>' +
+        '<span class="st"><span class="pill gray">等待</span></span></div>';
+    }).join('');
+    $('#taskSummary').textContent = tasks.length + ' 个任务';
+    if (timer) clearInterval(timer);
+    timer = setInterval(function () {
+      var allDone = true;
+      tasks.forEach(function (t, i) {
+        var row = taskList.querySelector('[data-i="' + i + '"]');
+        if (t.done) return;
+        allDone = false;
+        t.p = Math.min(100, t.p + Math.random() * 22 + 8);
+        row.querySelector('.bar>i').style.width = t.p + '%';
+        row.querySelector('.pc').textContent = Math.floor(t.p) + '%';
+        row.querySelector('.st').innerHTML = '<span class="pill info">下载中</span>';
+        if (t.p >= 100) {
+          t.done = true;
+          row.querySelector('.st').innerHTML = '<span class="pill ok">完成</span>';
+        }
+      });
+      if (allDone) {
+        clearInterval(timer); timer = null;
+        toast('全部下载完成，已入库素材库');
+      }
+    }, 320);
+    toast('已加入下载队列：' + tasks.length + ' 个');
+  }
+
+  /* ================= 账号列表 ================= */
+  var accounts = [
+    ['辰呈产品', '186648155274999', '——', '辰呈产品', '138****5712', 26, '5%', 0, 'danger', '已注销/失联', '家居日用 / 收纳整理 / 收纳箱·盒', 12],
+    ['梅妈妈铺', '186154566913738', '——', '居家日用', '139****8864', 0, '0%', 0, 'info', '分组·居家', '家居日用 / 清洁用品 / 抹布·百洁布', 7],
+    ['群益百货', '186820302777323', '——', '三福优云选家', '137****1023', 49, '12%', 0, 'info', '分组·百货', '钟表配饰 / 时尚饰品-DIY配件 / 串珠', 31],
+    ['辰萌贴纸', '186829218974459', '——', 'ylvili辰萌贴纸', '135****4421', 42, '8%', 0, 'warn', '未就绪', '图书教育 / 文具 / 贴纸·胶带', 18],
+    ['星禾优品馆', '186421427698000', '756024-7353591982', '星禾优品馆', '186****7788', 80, '36%', 12, 'ok', '已就绪', '个护家清 / 洗护 / 洗发护发', 56],
+    ['小蒙家居', '1864024712461', '——', 'YYH-潮流服饰', '131****9902', 33, '10%', 0, 'info', '分组·服饰', '智能家居 / 五金·工具 / 手动工具', 21],
+    ['静静匠选', '186822521568623', '——', '智能家居-五金工具', '186****3344', 12, '4%', 0, 'warn', '未就绪', '智能家居 / 五金·工具 / 螺丝·紧固件', 9],
+    ['优雅美妆', '186254668361918', '——', '智能家居-五金工具', '132****6677', 45, '18%', 3, 'ok', '已就绪', '美妆 / 彩妆香水 / 口红', 27]
+  ];
+  attachPager(cardOf($('#accBody')), $('#accBody'), 26, function (i) {
+    var a = accounts[i % accounts.length];
+    return '<tr>' +
+      '<td><input type="checkbox" class="ack"></td>' +
+      '<td>' + (i + 1) + '</td><td>' + a[0] + '</td><td>' + a[1] + '</td><td>' + a[2] + '</td>' +
+      '<td>' + a[10] + '</td><td>' + a[11] + '</td><td>' + a[3] + '</td>' +
+      '<td>' + a[4] + '</td><td>' + a[5] + '</td><td>' + a[6] + '</td><td>' + a[7] + '</td>' +
+      '<td><span class="pill ' + a[8] + '">' + a[9] + '</span></td>' +
+      '<td><span class="lnk">打开百应</span><span class="lnk">抖音主站</span><span class="lnk">打开创作者中心</span><span class="lnk accset" data-acc="' + a[0] + '">选品设置</span></td>' +
+      '</tr>';
+  });
+  $('#accBody').addEventListener('click', function (e) {
+    var t = e.target.closest ? e.target.closest('.accset') : null;
+    if (t) openSelSet(t.getAttribute('data-acc'));
+  });
+
+  function updAccSel() {
+    var n = $$('#accBody .ack:checked').length;
+    $('#accSel').textContent = n;
+    $$('#accBody tr').forEach(function (tr) {
+      var cb = tr.querySelector('.ack');
+      tr.classList.toggle('sel', !!(cb && cb.checked));
+    });
+  }
+  $('#accBody').addEventListener('change', function (e) { if (e.target.classList.contains('ack')) updAccSel(); });
+  $('#accAll').addEventListener('change', function () {
+    $$('#accBody .ack').forEach(function (cb) { cb.checked = $('#accAll').checked; });
+    updAccSel();
+  });
+  $('#btnNewAcc').addEventListener('click', function () {
+    modal('新建账号', '请输入账号名称与抖音号，并选择运营分类。保存后将在该账号专属 Chrome profile 分别打开百应和创作者中心，请在两个页面分别扫码/登录。两处登录态会保存在本机该账号独立的浏览器资料中；抖音主站登录不代表两处均已登录。', function () {
+      toast('账号已保存，正在打开专属百应和创作者中心');
+      setTimeout(function () {
+        modal('新账号登录准备（原型演示）', '百应工作台和抖音创作者中心已在同一账号专属 Chrome profile 中分别打开。请逐个检查页面并扫码/登录；登录态会留在此 profile。', function () {
+          toast('已确认完成两处登录（原型演示）');
+        }, '我已检查两处');
+      }, 120);
+    }, '保存并登录');
+  });
+  $('#btnExec').addEventListener('click', function () {
+    var n = $$('#accBody .ack:checked').length;
+    if (!n) { toast('请先勾选账号', 'err'); return; }
+    modal('确认执行', '将对已选的 <b>' + n + '</b> 个账号执行批量操作（打开浏览器 / 拉取信息 / 分配账号），操作可能耗时较长。', function () {
+      toast('已提交执行任务：' + n + ' 个账号');
+    }, '确认执行');
+  });
+
+  /* ================= 素材库（按账号分类管理） ================= */
+  var mediaData = [
+    { f: '拼豆钥匙扣_v3.mp4', info: '3829712… · 1080p · 11.2MB', wm: '无水印', fb: '首发', yz: '优质', acct: '群益百货' },
+    { f: '无痕粘钩_v2.mp4', info: '3829713… · 1080p · 9.8MB', wm: '无水印', fb: '首发', yz: '优质', acct: '星禾优品馆' },
+    { f: '收纳盒_原版.mp4', info: '3829714… · 720p · 7.1MB', wm: '已裁剪', fb: '未首发', yz: '非优质', acct: '辰萌贴纸' },
+    { f: '拼豆钥匙扣_尾.mp4', info: '3829712… · 1080p · 12.4MB', wm: '无水印', fb: '首发', yz: '非优质', acct: '群益百货' },
+    { f: '首饰打磨工具.mp4', info: '3829715… · 1080p · 14.6MB', wm: '无水印', fb: '首发', yz: '优质', acct: '星禾优品馆' },
+    { f: '香薰蜡烛.mp4', info: '3829716… · 1080p · 8.3MB', wm: '无水印', fb: '待判定', yz: '待判定', acct: '小蒙家居' },
+    { f: '亚克力摆件.mp4', info: '3829717… · 1080p · 10.5MB', wm: '已裁剪', fb: '未首发', yz: '非优质', acct: '辰呈产品' },
+    { f: '手工串珠包.mp4', info: '3829718… · 1080p · 13.1MB', wm: '无水印', fb: '首发', yz: '优质', acct: '梅妈妈铺' }
+  ];
+  var mediaGrid = $('#mediaGrid'), mediaCard = cardOf(mediaGrid), mediaView = 'grid', mediaAcct = '全部', mediaPager = null;
+  function statePill(v, good) {
+    var cls = v === '待判定' ? 'gray' : (v === good ? 'ok' : 'warn');
+    return '<span class="pill ' + cls + '">' + v + '</span>';
+  }
+  function mediaCardHtml(m, idx) {
+    return '<div class="media">' +
+      '<div class="cover"><span class="badge pill ' + (m.wm === '无水印' ? 'ok' : 'warn') + '">' + m.wm + '</span>' +
+      '<span class="play"><svg class="ic lg"><use href="#i-play"/></svg></span></div>' +
+      '<div class="meta"><div class="t">' + m.f.replace('.mp4', '') + '_' + (idx + 1) + '.mp4</div>' +
+      '<div class="s"><span>' + m.info + '</span>' +
+      '<span style="display:flex;gap:4px">' + statePill(m.fb, '首发') + statePill(m.yz, '优质') + '</span></div>' +
+      '<div class="s" style="color:var(--brand);margin-top:2px">账号：' + m.acct + '</div></div></div>';
+  }
+  function mediaFiltered() {
+    return mediaAcct === '全部' ? mediaData : mediaData.filter(function (m) { return m.acct === mediaAcct; });
+  }
+  function removeMediaPager() {
+    if (mediaPager) { mediaPager.remove(); mediaPager = null; }
+  }
+  function renderMediaGrid() {
+    removeMediaPager();
+    var list = mediaFiltered();
+    var total = mediaAcct === '全部' ? 60 : list.length;
+    mediaPager = attachPager(mediaCard, mediaGrid, total, function (i) {
+      return mediaCardHtml(list[i % list.length], i);
+    });
+  }
+  function renderMediaGroup() {
+    removeMediaPager();
+    var groups = {};
+    mediaFiltered().forEach(function (m) { (groups[m.acct] = groups[m.acct] || []).push(m); });
+    mediaGrid.innerHTML = Object.keys(groups).map(function (acct) {
+      var arr = groups[acct];
+      return '<div class="card-t" style="margin-top:14px"><span class="bar"></span>' + acct +
+        '<span class="r">' + arr.length + ' 条素材</span></div>' +
+        '<div class="grid">' + arr.map(function (m, i) { return mediaCardHtml(m, i); }).join('') + '</div>';
+    }).join('');
+  }
+  function renderMedia() {
+    if (mediaView === 'group') renderMediaGroup(); else renderMediaGrid();
+  }
+  $$('#mediaViewSeg button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      $$('#mediaViewSeg button').forEach(function (x) { x.classList.remove('active'); });
+      b.classList.add('active');
+      mediaView = b.getAttribute('data-v');
+      renderMedia();
+    });
+  });
+  $('#mediaAcct').addEventListener('change', function () {
+    mediaAcct = this.value;
+    renderMedia();
+  });
+  renderMedia();
+
+  /* ================= 投放看板（R33 改造 · 指标卡 + 精细化明细表） ================= */
+  var dashBody = $('#dashBody'), dashCard = cardOf(dashBody);
+  var dashAccs = ['星禾优品 · 千川A', '辰萌贴纸 · 千川B', '群益百货 · 千川C'];
+  var dashGoods = ['陶瓷保鲜盒三件套', '多功能收纳挂袋', '免打孔增压花洒', '宠物自动喂食器', '香薰蜡烛礼盒', '电动螺丝刀套装', '拼豆钥匙扣', '水质检测笔'];
+  var dashSts = [['ok', '投放中'], ['warn', '已暂停'], ['gray', '已结束']];
+  function moneyFmt(n) { return '￥' + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function dashRow(i) {
+    var acc = dashAccs[i % 3], g = dashGoods[i % 8];
+    var cost = 50 + ((i * 137) % 3000);
+    var orders = 5 + ((i * 29) % 180);
+    var gmv = orders * (9 + (i % 6) * 2.5);
+    var refund = gmv * (0.02 + (i % 4) * 0.01);
+    var roi = (gmv - refund) / cost;
+    var comm = (gmv - refund) * 0.2 * 0.9;
+    var prof = comm - cost;
+    var st = dashSts[i % 3];
+    var use = Math.min(100, Math.round(cost / 10000 * 100));
+    var hh = String((i * 7) % 24);
+    if (hh.length < 2) hh = '0' + hh;
+    return '<tr>' +
+      '<td><input type="checkbox" class="dck"></td>' +
+      '<td>' + acc + '</td>' +
+      '<td><div style="font-weight:600">' + g + '</div><div style="color:var(--muted);font-size:12px">商品全域投放 ' + hh + ':16:07</div></td>' +
+      '<td><span class="pill ' + st[0] + '">' + st[1] + '</span></td>' +
+      '<td><div style="font-size:12px;color:var(--muted)">日预算 ￥10,000.00</div><div class="task" style="margin-top:3px"><span class="nm" style="min-width:32px">' + use + '%</span><span class="bar"><i style="width:' + use + '%"></i></span></div></td>' +
+      '<td class="num">' + moneyFmt(cost) + '</td><td class="num">' + orders + '</td>' +
+      '<td class="num">' + moneyFmt(gmv) + '</td><td class="num">' + moneyFmt(refund) + '</td>' +
+      '<td class="num" style="color:' + (roi >= 1 ? 'var(--ok)' : 'var(--danger)') + '">' + roi.toFixed(2) + '</td>' +
+      '<td class="num">' + (3 + i % 6) + '</td>' +
+      '<td class="num" style="color:var(--ok)">' + (60 + i % 30) + '%</td>' +
+      '<td class="num" style="color:var(--ok)">' + (40 + i % 35) + '%</td>' +
+      '<td class="num">' + moneyFmt(comm) + '</td>' +
+      '<td class="num" style="color:' + (prof >= 0 ? 'var(--ok)' : 'var(--danger)') + '">' + moneyFmt(prof) + '</td>' +
+      '<td><span class="lnk">一键托管</span><span class="lnk">生成工单</span><span class="lnk">查看计划素材</span></td>' +
+      '</tr>';
+  }
+  if (dashBody) attachPager(dashCard, dashBody, 202, dashRow);
+  var dashViewSeg = document.getElementById('dashViewSeg');
+  if (dashViewSeg) dashViewSeg.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-v]');
+    if (!b) return;
+    $$('#dashViewSeg button').forEach(function (x) { x.classList.remove('active'); });
+    b.classList.add('active');
+    $('#dashDetail').style.display = b.getAttribute('data-v') === 'detail' ? 'block' : 'none';
+    $('#dashUpload').style.display = b.getAttribute('data-v') === 'upload' ? 'block' : 'none';
+  });
+  if (dashBody) dashBody.addEventListener('change', function (e) {
+    if (e.target.classList && e.target.classList.contains('dck')) {
+      $('#dashSel').textContent = $$('#dashBody .dck:checked').length;
+    }
+  });
+  var btnDashSync = document.getElementById('btnDashSync');
+  if (btnDashSync) btnDashSync.addEventListener('click', function () {
+    modal('同步数据（R34）', '将执行：① <b>回读千川明细</b>（本客户端各千川计划日粒度：消耗 / 订单数 / 销售额 / 退款销售额 / ROI / 有效佣金 / 盈亏）；② 更新本地看板数据；③ <b>24 小时定时上报服务端</b>（用于佣金计算）。<br>本地指标（素材数 / 首发率 / 优质率）<b>不上报</b>；看板仅展示本客户端本地数据。', function () {
+      toast('已回读千川明细并更新本地看板，进入 24h 上报周期');
+    }, '开始同步');
+  });
+
+  /* ================= 其他交互 ================= */
+  $('#btnSavePlan').addEventListener('click', function () { toast('发布计划已保存'); });
+  $('#btnRunNow').addEventListener('click', function () {
+    modal('立即执行自动发布', '将通过浏览器自动化脚本，对已选账号各执行一次发布（模拟人工操作）。<br>执行过程中可随时中断；失败会截图留证并可重试。', function () {
+      toast('已启动自动发布任务');
+    }, '开始执行');
+  });
+  var swAutoQc = document.getElementById('swAutoQc');
+  if (swAutoQc) swAutoQc.addEventListener('change', function () {
+    toast(this.checked ? '已启用千川自动发布' : '已关闭千川自动发布');
+  });
+  var btnSavePlanQc = document.getElementById('btnSavePlanQc');
+  if (btnSavePlanQc) btnSavePlanQc.addEventListener('click', function () { toast('千川发布计划已保存'); });
+  var btnRunNowQc = document.getElementById('btnRunNowQc');
+  if (btnRunNowQc) btnRunNowQc.addEventListener('click', function () {
+    modal('立即执行千川发布', '将通过浏览器自动化，对已选账号/千川账户各执行一次素材发布（模拟人工操作）。<br>失败会截图留证并可重试。', function () {
+      toast('已启动千川发布任务');
+    }, '开始执行');
+  });
+  $('#btnSaveSel').addEventListener('click', function () { toast('选品设置已保存'); });
+
+  /* ================= 屏蔽词（R32 · 全局） ================= */
+  var BLK_WORDS = ['罗永浩','郝劭文','正能量小明','小明','贾乃亮','木森','森弟','大漠叔叔','别叫我马大哈','查文娟','娟砸的废话bot','笑笑姐','小蝴蝶','心动方程式','与辉','董与辉','K总','达乐','老罗','大舞台','朱朱','乡妹朱朱','朱婷','农村涛涛励志百货','小熊励志百货','励志娃聪聪百货','乐观励志阿文百货','励志阿文百货','农村励志小聪百货','周周百货园','毛毛和爷爷的小店','小勇在努力','黄家敏','匡赐有好物','与辉同行','汉森','罗总','郝邵文','交个朋友','博学罗交个朋友','亮哥','罗罗','亮亮','安安','唐梦琪','三公主','唐三妹','一路向前','一颗小小草'];
+  function renderBlkTags() {
+    var el = $('#blkTags');
+    if (el) el.innerHTML = BLK_WORDS.map(function (w) {
+      return '<span class="chip">' + w + '<span class="x" data-blk-del="' + w + '"><svg class="ic sm"><use href="#i-plus"/></svg></span></span>';
+    }).join('');
+  }
+  var blkWord = document.getElementById('blkWord');
+  if (blkWord) blkWord.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      var v = this.value.trim();
+      if (v && BLK_WORDS.indexOf(v) < 0) { BLK_WORDS.push(v); renderBlkTags(); toast('已添加屏蔽词：' + v); }
+      this.value = '';
+      e.preventDefault();
+    }
+  });
+  var blkTags = document.getElementById('blkTags');
+  if (blkTags) blkTags.addEventListener('click', function (e) {
+    var x = e.target.closest('[data-blk-del]');
+    if (x) {
+      var i = BLK_WORDS.indexOf(x.getAttribute('data-blk-del'));
+      if (i >= 0) BLK_WORDS.splice(i, 1);
+      renderBlkTags();
+      toast('已删除屏蔽词');
+    }
+  });
+  renderBlkTags();
+
+  /* ================= 自动选品一起工作（A-104 · 百应榜单 + 账号历史类目排除） ================= */
+  var selCands = [
+    { name: '大容量食品密封收纳盒', id: '3833137007014756301', sources: ['热点趋势'], category: '家居日用', categoryPath: '家居日用 / 收纳整理 / 收纳箱/盒', subcategoryId: 'leaf-storage-box', score: 94.2, trend: '上升', ok: true, blk: false, locked: false, fleetLocked: false },
+    { name: '可折叠衣物收纳箱', id: '3833137007014756309', sources: ['联盟榜单'], category: '家居日用', categoryPath: '家居日用 / 收纳整理 / 收纳箱/盒', subcategoryId: 'leaf-storage-box', score: 91.4, trend: '上升', ok: true, blk: false, locked: false, fleetLocked: false },
+    { name: '多功能收纳挂袋壁挂', id: '3833137007014756302', sources: ['联盟榜单'], category: '家居日用', categoryPath: '家居日用 / 收纳整理 / 挂袋', subcategoryId: 'leaf-wall-bag', score: 92.1, trend: '上升', ok: true, blk: false, locked: true, fleetLocked: false },
+    { name: '宠物自动喂食器', id: '3833137007014756303', sources: ['联盟榜单'], category: '宠物用品', categoryPath: '宠物用品 / 宠物智能设备 / 喂食器', subcategoryId: 'leaf-pet-feeder', score: 90.0, trend: '上升', ok: true, blk: false, locked: false, fleetLocked: false },
+    { name: '免打孔增压花洒套装', id: '3833137007014756304', sources: ['热点趋势', '联盟榜单'], category: '卫浴用品', categoryPath: '卫浴用品 / 淋浴设备 / 花洒', subcategoryId: 'leaf-shower', score: 88.6, trend: '上升', ok: true, blk: false, locked: false, fleetLocked: false },
+    { name: '陶瓷保鲜盒三件套', id: '3833137007014756305', sources: ['热点趋势'], category: '家居日用', categoryPath: '家居日用 / 厨房收纳 / 保鲜盒', subcategoryId: 'leaf-food-box', score: 86.4, trend: '上升', ok: true, blk: false, locked: false, fleetLocked: false },
+    { name: '智能感应夜灯', id: '3833137007014756306', sources: ['联盟榜单'], category: '智能家居', categoryPath: '智能家居 / 家居电器 / 感应灯', subcategoryId: 'leaf-sensor-light', score: 84.2, trend: '平稳', ok: true, blk: false, locked: false, fleetLocked: false },
+    { name: '罗永浩同款保温杯', id: '3833137007014756307', sources: ['热点趋势'], category: '厨房餐饮', categoryPath: '厨房餐饮 / 水具 / 保温杯', subcategoryId: 'leaf-thermos', score: 83.3, trend: '上升', ok: true, blk: true, locked: false, fleetLocked: false },
+    { name: '电动螺丝刀套装', id: '3833137007014756308', sources: ['联盟榜单'], category: '五金工具', categoryPath: '五金工具 / 电动工具 / 螺丝刀', subcategoryId: 'leaf-screwdriver', score: 70.5, trend: '下行', ok: false, blk: false, locked: false, fleetLocked: false }
+  ];
+  var globalCategoryMode = 'auto';
+  var globalManualCategories = new Set();
+  var accountCategoryModes = Object.create(null);
+  var accountManualCategories = Object.create(null);
+  function categoryChoicesForCandidate(candidate) {
+    var path = String(candidate.categoryPath || '').split(' / ');
+    var choices = [];
+    if (path[0]) choices.push({ id: 'root:' + path[0], level: 1, label: path[0] });
+    if (path[0] && path[1]) choices.push({ id: 'second:' + path[0] + ' / ' + path[1], level: 2, label: path[0] + ' / ' + path[1] });
+    if (candidate.subcategoryId && path.length >= 3) choices.push({ id: 'leaf:' + candidate.subcategoryId, level: 3, label: candidate.categoryPath });
+    return choices;
+  }
+  function categoryMatchesSelection(candidate, selectedCategories) {
+    if (!selectedCategories || selectedCategories.size === 0) return false;
+    return categoryChoicesForCandidate(candidate).some(function (choice) { return selectedCategories.has(choice.id); });
+  }
+  function escapeCategoryText(value) {
+    return String(value).replace(/[&<>"']/g, function (character) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character];
+    });
+  }
+  function renderCategoryPickList(containerId, selectedCategories) {
+    var container = document.getElementById(containerId);
+    if (!container) return;
+    var options = { 1: Object.create(null), 2: Object.create(null), 3: Object.create(null) };
+    selCands.forEach(function (candidate) {
+      categoryChoicesForCandidate(candidate).forEach(function (choice) {
+        options[choice.level][choice.id] = choice.label;
+      });
+    });
+    container.innerHTML = [1, 2, 3].map(function (level) {
+      var rows = Object.keys(options[level]).sort(function (a, b) { return options[level][a].localeCompare(options[level][b], 'zh-CN'); });
+      if (!rows.length) return '';
+      return '<div class="category-pick-group"><b>' + ['','一级类目','二级类目','三级类目'][level] + '</b>' + rows.map(function (id) {
+        return '<label class="category-pick-option"><input type="checkbox" data-category-choice="' + escapeCategoryText(id) + '" ' + (selectedCategories.has(id) ? 'checked' : '') + '><span>' + escapeCategoryText(options[level][id]) + '</span></label>';
+      }).join('') + '</div>';
+    }).join('');
+    container.insertAdjacentHTML('afterbegin', '<div class="category-pick-count">已选 ' + selectedCategories.size + ' 项</div>');
+    container.addEventListener('change', function (event) {
+      var input = event.target;
+      if (!input || input.type !== 'checkbox' || !input.hasAttribute('data-category-choice')) return;
+      var id = input.getAttribute('data-category-choice');
+      if (input.checked) selectedCategories.add(id); else selectedCategories.delete(id);
+      var count = container.querySelector('.category-pick-count');
+      if (count) count.textContent = '已选 ' + selectedCategories.size + ' 项';
+    });
+  }
+  var globalCategoryModeSelect = document.getElementById('globalCategoryMode');
+  if (globalCategoryModeSelect) {
+    globalCategoryModeSelect.addEventListener('change', function () {
+      globalCategoryMode = globalCategoryModeSelect.value === 'manual' ? 'manual' : 'auto';
+      var picker = document.getElementById('globalCategoryPicker');
+      var autoHint = document.getElementById('globalCategoryAutoHint');
+      if (picker) picker.style.display = globalCategoryMode === 'manual' ? '' : 'none';
+      if (autoHint) autoHint.style.display = globalCategoryMode === 'auto' ? '' : 'none';
+    });
+  }
+  renderCategoryPickList('globalCategoryOptions', globalManualCategories);
+  var categoryHistoryKey = 'touguang-a104-category-history-v1';
+  var globalProductHistoryKey = 'touguang-a104-global-product-history-v1';
+  var globalProductHistory = [];
+  try { globalProductHistory = JSON.parse(localStorage.getItem(globalProductHistoryKey) || '[]') || []; } catch (e) { globalProductHistory = []; }
+  var categoryHistoryStore = {};
+  try { categoryHistoryStore = JSON.parse(localStorage.getItem(categoryHistoryKey) || '{}') || {}; } catch (e) { categoryHistoryStore = {}; }
+  function readAccountCategoryHistory(row) {
+    var id = row.getAttribute('data-account-id');
+    var saved = categoryHistoryStore[id];
+    var raw = Array.isArray(saved) ? saved : (row.getAttribute('data-category-history') || '').split(',');
+    return Array.from(new Set(raw.filter(function (value) { return !!value; })));
+  }
+  function startSelectionFlow() {
+    var limitEl = $('#selCount');
+    var limit = limitEl ? (parseInt(limitEl.value, 10) || 5) : 5;
+    var accountRows = $$('#tblSelAcct tbody tr[data-enabled="true"]');
+    var accounts = accountRows.map(function (row, index) {
+      var id = row.getAttribute('data-account-id');
+      return { row: row, id: id, name: row.cells[1].textContent.trim(), index: index, history: readAccountCategoryHistory(row), categoryMode: accountCategoryModes[id] || 'inherit', products: [], categories: [] };
+    });
+    if (globalCategoryMode === 'manual' && globalManualCategories.size === 0) {
+      modal('请先选择类目', '当前通用策略为“手动选择类目”，请先勾选至少一个一级、二级或三级类目，再开始自动选品。', null, '知道了');
+      return;
+    }
+    var missingAccountCategory = accounts.filter(function (account) {
+      return account.categoryMode === 'manual' && !(accountManualCategories[account.id] instanceof Set && accountManualCategories[account.id].size);
+    });
+    if (missingAccountCategory.length) {
+      modal('请先完成账号类目选择', missingAccountCategory.map(function (account) { return account.name; }).join('、') + '已设为手动选类目，但尚未勾选类目。', null, '知道了');
+      return;
+    }
+    function accountCategoryScope(account) {
+      if (account.categoryMode === 'manual') return accountManualCategories[account.id] || new Set();
+      if (account.categoryMode === 'inherit' && globalCategoryMode === 'manual') return globalManualCategories;
+      return null;
+    }
+    function candidateAllowedForAccount(candidate, account) {
+      var scope = accountCategoryScope(account);
+      return !scope || categoryMatchesSelection(candidate, scope);
+    }
+    var seenSourceIds = Object.create(null);
+    var qualified = selCands.filter(function (c) {
+      if (!c.ok || c.blk || c.locked || c.fleetLocked || globalProductHistory.indexOf(c.id) >= 0 || seenSourceIds[c.id]) return false;
+      seenSourceIds[c.id] = true;
+      return true;
+    });
+    var grouped = Object.create(null);
+    qualified.forEach(function (c) {
+      if (!grouped[c.subcategoryId]) grouped[c.subcategoryId] = { id: c.subcategoryId, path: c.categoryPath, name: c.categoryPath.split(' / ').pop(), parent: c.category, items: [], owners: [] };
+      grouped[c.subcategoryId].items.push(c);
+    });
+    var categories = Object.keys(grouped).map(function (key) {
+      var g = grouped[key];
+      g.items.sort(function (a, b) { return b.score - a.score; });
+      g.count = g.items.length;
+      g.avg = g.items.reduce(function (sum, c) { return sum + c.score; }, 0) / g.count;
+      g.best = g.items[0].score;
+      return g;
+    }).sort(function (a, b) { return b.count - a.count || b.avg - a.avg || b.best - a.best || a.path.localeCompare(b.path, 'zh-CN'); });
+    var assignedIds = Object.create(null);
+    function addCategoryProducts(category, account) {
+      if (account.history.indexOf(category.id) >= 0 || account.products.length >= limit) return false;
+      var added = false;
+      for (var itemIndex = 0; itemIndex < category.items.length; itemIndex++) {
+        var c = category.items[itemIndex];
+        if (account.products.length >= limit || assignedIds[c.id] || !candidateAllowedForAccount(c, account)) continue;
+        assignedIds[c.id] = true;
+        c.selectedAccount = account;
+        account.products.push(c);
+        added = true;
+        break; // 同一账号的同一末级类目只加一件商品。
+      }
+      if (added && category.owners.indexOf(account) < 0) category.owners.push(account);
+      return added;
+    }
+    /* 第一轮优先让每个末级类目只进入一个账号；这是偏好，不是跨账号硬锁。 */
+    categories.forEach(function (category) {
+      var owner = accounts.filter(function (a) { return a.history.indexOf(category.id) < 0 && a.products.length < limit && category.items.some(function (c) { return candidateAllowedForAccount(c, a); }); })
+        .sort(function (a, b) { return a.products.length - b.products.length || a.categories.length - b.categories.length || a.index - b.index; })[0];
+      if (owner && addCategoryProducts(category, owner)) owner.categories.push(category);
+    });
+    /* 独立类目商品分配完仍有账号空额时，允许跨账号复用类目，但仍排除该账号历史已选类目并锁住已分配商品 ID。 */
+    var madeProgress = true;
+    while (madeProgress) {
+      madeProgress = false;
+      accounts.slice().sort(function (a, b) { return a.products.length - b.products.length || a.index - b.index; }).forEach(function (account) {
+        if (account.products.length >= limit) return;
+        var reusable = categories.filter(function (category) {
+          return account.history.indexOf(category.id) < 0 && category.owners.indexOf(account) < 0 && category.items.some(function (c) { return !assignedIds[c.id] && candidateAllowedForAccount(c, account); });
+        }).sort(function (a, b) { return b.count - a.count || b.avg - a.avg || b.best - a.best; });
+        var category = reusable[0];
+        if (!category) return;
+        var before = account.products.length;
+        addCategoryProducts(category, account);
+        if (account.products.length > before) {
+          account.categories.push(category);
+          madeProgress = true;
+        }
+      });
+    }
+    var selected = accounts.reduce(function (all, a) { return all.concat(a.products); }, []);
+    if (!selected.length) {
+      modal('自动选品完成 · 暂无可加车商品', '当前可见榜单商品没有通过数据阈值、屏蔽词、全账号商品 ID 去重及本账号历史类目检查；没有商品加入选品车。', null, '知道了');
+      return;
+    }
+    accounts.forEach(function (a) {
+      var summary = a.categories.map(function (g) { return g.name + '（' + g.count + '个，均分' + g.avg.toFixed(1) + '）'; }).join('；');
+      if (a.row.cells[3]) a.row.cells[3].textContent = summary || '无新类目商品（历史类目不复选）';
+      var status = a.row.querySelector('.selstat');
+      if (status) status.innerHTML = a.products.length
+        ? '<span class="pill ok">已完成 · 自动加车 ' + a.products.length + ' 个</span>'
+        : '<span class="pill warn">未分配 · 无新类目商品</span>';
+      var nextHistory = Array.from(new Set(a.history.concat(a.categories.map(function (g) { return g.id; }))));
+      categoryHistoryStore[a.id] = nextHistory;
+      a.row.setAttribute('data-category-history', nextHistory.join(','));
+    });
+    try { localStorage.setItem(categoryHistoryKey, JSON.stringify(categoryHistoryStore)); } catch (e) {}
+    globalProductHistory = Array.from(new Set(globalProductHistory.concat(selected.map(function (c) { return c.id; }))));
+    try { localStorage.setItem(globalProductHistoryKey, JSON.stringify(globalProductHistory)); } catch (e) {}
+    selected.forEach(function (c) {
+      plist.unshift({
+        name: c.name, id: c.id, spec: String(Math.floor(Math.random() * 1e16)),
+        cat: c.category, account: c.selectedAccount.name, st: '已加入选品车',
+        code: 'A104' + Math.random().toString(36).slice(2, 8).toUpperCase(),
+        dt: '本批次全局商品 ID 去重后自动加车'
+      });
+    });
+    renderPlist();
+    toast('自动选品完成：' + selected.length + ' 个高分商品加入选品车；同账号历史类目未重复');
+    var categoryHtml = categories.map(function (g, i) {
+      var ownerLabel = g.owners.length ? '优先分配：' + g.owners.map(function (a) { return a.name; }).join('、') : '无账号可用（均为历史已选类目或达到上限）';
+      var reused = g.owners.length > 1 ? '，跨账号按候选不足时复用' : '';
+      return '<div class="fr"><label style="width:24px">#' + (i + 1) + '</label><span style="flex:1;white-space:normal"><b>' + g.path + '</b>　<span class="pill info">达标商品 ' + g.count + ' 个</span>　<span class="pill gray">平均分 ' + g.avg.toFixed(1) + '</span>　<span class="pill ' + (g.owners.length > 1 ? 'warn' : 'ok') + '">' + ownerLabel + reused + '</span></span></div>';
+    }).join('');
+    var accountHtml = accounts.map(function (a) {
+      var cats = a.categories.map(function (g) { return g.path; }).join('、') || '本账号历史类目均排除，暂无新类目';
+      var historyNames = a.history.map(function (id) { var found = selCands.filter(function (c) { return c.subcategoryId === id; })[0]; return found ? found.categoryPath.split(' / ').pop() : id; }).join('、') || '无';
+      return '<div class="fr"><span style="width:150px"><b>' + a.name + '</b>（ID ' + a.id + '）</span><span style="flex:1;white-space:normal">已选历史：' + historyNames + '；本批新类目：' + cats + '</span><span class="pill ' + (a.products.length ? 'ok' : 'warn') + '">' + a.products.length + ' 个商品</span></div>';
+    }).join('');
+    var productHtml = selected.map(function (c) {
+      var sources = c.sources.map(function (source) {
+        return '<span class="pill ' + (source === '热点趋势' ? 'warn' : 'info') + '">' + source + '</span>';
+      }).join(' ');
+      return '<div class="fr"><span style="flex:1;white-space:normal"><b>' + c.name + '</b><br><span style="color:var(--muted);font-size:11px">' + c.categoryPath + '　' + sources + '　账号：' + c.selectedAccount.name + '</span></span><span class="pill gray">' + c.score.toFixed(1) + ' 分</span><span class="pill ok">已自动加车</span></div>';
+    }).join('');
+    var skipped = selCands.filter(function (c) { return selected.indexOf(c) < 0; }).map(function (c) {
+      var reason = c.locked ? '商品 ID 已在账号池出现，按全局唯一规则跳过'
+        : c.fleetLocked || globalProductHistory.indexOf(c.id) >= 0 ? '全账号池商品 ID 已占用，强制跳过'
+        : c.blk ? '命中全局屏蔽词，自动跳过'
+        : !c.ok ? '硬阈值未达标 / 走势下行，自动跳过'
+        : accounts.every(function (a) { return a.categoryMode === 'inherit' && globalCategoryMode === 'manual'; }) && !categoryMatchesSelection(c, globalManualCategories) ? '不属于通用手动选择的类目范围'
+        : accounts.every(function (a) { return !candidateAllowedForAccount(c, a); }) ? '不属于当前账号手动选择的类目范围'
+        : accounts.every(function (a) { return a.history.indexOf(c.subcategoryId) >= 0; }) ? '所有候选账号历史都选过此类目，硬性排除'
+        : '账号商品上限已满，或商品 ID 已分配给其他账号';
+      return '<div class="fr"><span style="flex:1;white-space:normal">' + c.name + '（' + c.categoryPath + '）</span><span style="color:var(--danger);font-size:11px">' + reason + '</span></div>';
+    }).join('');
+    modal('选品完成 · 自动加车',
+      '<div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>只读热点趋势、联盟榜单等百应当前可见列表；示意：当前可见 40 条，按商品 ID 合并后 9 个详情候选。商品 ID 在这台电脑的账号池内去重；每个账号历史选过的末级类目强制排除。</div>' +
+      '<div class="divider"></div><b>账号与类目分配</b>' + accountHtml +
+      '<div class="divider"></div><b>末级子类目评分（按达标商品数、平均分排序）</b>' + categoryHtml +
+      '<div class="divider"></div><b>自动加车商品</b>' + productHtml +
+      '<div class="divider"></div><b>自动跳过</b>' + skipped +
+      '<div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>类目规则：同账号历史选过的末级类目永久排除，且本轮每个末级类目最多加一件商品；本机账号之间尽量错开，候选不足时允许复用。商品 ID 去重仅覆盖这台电脑；本页为原型演示。</div>',
+      null, '知道了');
+  }  $('#btnRunSel').addEventListener('click', function () {
+    var rows = $$('#tblSelAcct tbody tr').filter(function (row) { return row.getAttribute('data-enabled') === 'true'; });
+    if (!rows.length) { toast('没有启用账号，无法创建选品批次', 'err'); return; }
+    var accountsHtml = rows.map(function (row) {
+      var cells = row.querySelectorAll('td');
+      return '<div class="fr"><b style="width:70px">ID ' + row.getAttribute('data-account-id') + '</b><span>' + cells[1].textContent.trim() + '</span></div>';
+    }).join('');
+    modal('确认选品批次账号', '本批次将按数据库当前全部启用账号执行，包含矩阵 B 和新增启用账号。以下为原型演示清单，实际客户端须动态显示数据库中的全部启用账号名称与内部 ID：<br><br>' + accountsHtml + '<br><div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>确认后才创建批次并调用平台；取消则不创建批次。</div>', function () {
+      startSelectionFlow();
+    }, '确认账号并继续');
+  });
+  $('#btnCommonSel').addEventListener('click', function () {
+    modal('通用设置（选品）', '通用设置＝全局默认选品口径，账号未单独配置筛选条件时<b>继承</b>此设置。账号可在「选品设置」弹窗开启独立筛选覆盖（A-47）。<br><b>屏蔽词始终全局生效；执行设置仍在通用设置调整；抖音每日配额为通用默认，可在账号个性化设置中覆盖（A-70）；千川 FR-C12-01 独立适用</b>（A-43 / FR-I6-01）。', function () { toast('通用设置已保存'); }, '保存');
+  });
+  $$('#tblSelAcct .accset').forEach(function (el) {
+    el.addEventListener('click', function () { openSelSet(el.getAttribute('data-acc')); });
+  });
+
+  /* ================= 选品设置（按账号弹窗 · R27） ================= */
+  function selDialog(name) {
+    return '' +
+      '<div class="fr"><label style="width:96px">浏览器缓存路径</label><input type="text" style="flex:1" value="D:\\视频素材\\profiles\\' + name + '"></div>' +
+      '<div class="row" style="margin-left:96px">' +
+        '<button class="btn" data-act="pick-profile"><svg class="ic"><use href="#i-folder"/></svg>选择文件夹</button>' +
+        '<button class="btn" data-act="reset-profile">恢复默认</button>' +
+      '</div>' +
+      '<div class="hint"><svg class="ic sm"><use href="#i-warn"/></svg>该账号的百应、抖音授权和自动操作共用此目录；请选择包含 Default 的账号目录，修改路径后先保存，再打开授权。</div>' +
+      '<div class="divider"></div>' +
+      '<div class="fr"><label style="width:96px">账号下载路径</label><input type="text" style="flex:1" value="D:\\视频素材\\' + name + '"></div>' +
+      '<div class="row" style="margin-left:96px">' +
+        '<button class="btn" data-act="pick-dir"><svg class="ic"><use href="#i-folder"/></svg>选择文件夹</button>' +
+        '<button class="btn" data-act="reset-dir">恢复默认</button>' +
+      '</div>' +
+      '<div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>该账号下载目录结构：<b>D:\\视频素材\\' + name + '\\{日期}\\{商品名称}\\</b>，选品文件夹内含全流程日志（每步独立日志文件）；任一步失败生成失败日志（写明原因），删除失败日志即自动重试该步骤（一次），仍失败进「日志与异常」异常报错（R29）。</div>' +
+      '<div class="divider"></div>' +
+      '<div class="fr"><label style="width:96px">本账号类目策略</label><select id="accountCategoryMode"><option value="inherit">沿用通用设置</option><option value="auto">自动推荐</option><option value="manual">手动选择类目</option></select></div>' +
+      '<div id="accountCategoryPicker" style="display:none;margin-top:8px"><div class="hint"><svg class="ic sm"><use href="#i-link"/></svg>勾选的类目只筛当前可见商品，不按类目搜索或翻页；商品仍由系统自动评分和加车。</div><div id="accountCategoryOptions" class="category-pick-list"></div></div>' +
+      '<div id="accountCategoryInheritHint" class="hint" style="display:none"><svg class="ic sm"><use href="#i-link"/></svg>此账号跟随通用类目策略：自动推荐，或使用通用设置中勾选的类目范围。</div>' +
+      '<div id="accountCategoryAutoHint" class="hint"><svg class="ic sm"><use href="#i-link"/></svg>自动模式按百应当前可见商品推荐重点类目；同账号历史类目强制排除，与其他账号尽量错开，候选不足时允许复用。</div>' +
+      '<div class="divider"></div>' +
+      '<div class="fr"><label style="width:96px">本账号每日配额</label><label style="flex:1"><input type="checkbox" id="accountQuotaOverride" style="width:auto">单独设置本账号每日商品数 / 视频数</label></div>' +
+      '<div class="hint">关闭时继承通用默认值（5 个商品 / 50 条视频）；每个商品最多 10 条。仅用于客户端选品和本地发布排程，不代表平台吞吐承诺。</div>' +
+      '<div id="accountQuotaFields" style="display:none;margin-top:10px">' +
+        '<div class="fr"><label>每日商品数上限</label><input type="number" min="1" value="5"></div>' +
+        '<div class="fr"><label>每日视频数上限</label><input type="number" min="1" value="50"></div>' +
+      '</div>' +
+      '<div class="divider"></div>' +
+      '<label class="fr"><input type="checkbox" id="accountFilterOverride" style="width:auto">为此账号单独配置选品筛选条件</label>' +
+      '<div class="hint">关闭时继承通用筛选。屏蔽词始终全局生效；执行设置保持通用，每日配额按账号设置或继承通用值。</div>' +
+      '<div id="accountFilterFields" style="display:none;margin-top:10px">' +
+        '<div class="fr"><label>自动加车上限（1–10）</label><input type="number" min="1" max="10" value="5"></div>' +
+        '<div class="fr"><label>带货数据走势</label><select><option>上升优先</option><option>不限走势</option></select></div>' +
+        '<div class="fr"><label>销售额阈值</label><input type="number" min="0" placeholder="不限"></div>' +
+        '<div class="fr"><label>销量阈值</label><input type="number" min="0" placeholder="不限"></div>' +
+        '<div class="fr"><label>转化率阈值（%）</label><input type="number" min="0" step="0.1" placeholder="不限"></div>' +
+        '<div class="fr"><label>浏览量阈值</label><input type="number" min="0" placeholder="不限"></div>' +
+        '<div class="fr"><label>百应带货情况筛选</label><select><option>使用百应动态筛选项</option></select></div>' +
+        '<div class="fr"><label>百应商品信息筛选</label><select><option>使用百应动态筛选项</option></select></div>' +
+        '<div class="fr"><label>特色货品</label><select><option>使用百应动态特色货品</option></select></div>' +
+        '<div class="fr"><label>来源范围</label><span class="pill info">百应当前可见榜单</span></div>' +
+        '<div class="hint">仅读取热点趋势、联盟榜单等已在百应页面中当前可见的商品，不翻页、不爬取全类目、不从选品广场兜底。来源商品按商品 ID 合并后直接进入详情评分；商品自身类目用于系统推荐重点类目。</div>' +
+        '<div class="hint">高分商品按现有综合评分及本账号阈值筛出，自动取候选上限数量加车；同账号历史已选类目强制排除；跨账号优先使用不同子类目但不是硬约束，候选不足时可复用。关闭独立筛选时继承通用评分、候选上限和来源规则。</div>' +      '</div>';
+  }
+  function openSelSet(name) {
+    var row = $$('#tblSelAcct tbody tr').filter(function (item) { return item.cells[1].textContent.trim() === name; })[0];
+    var accountId = row ? row.getAttribute('data-account-id') : name;
+    accountManualCategories[accountId] = accountManualCategories[accountId] || new Set();
+    modal('选品设置 — ' + name, selDialog(name), function () { toast('已保存「' + name + '」的选品设置'); }, '保存');
+    var modeSelect = document.getElementById('accountCategoryMode');
+    var picker = document.getElementById('accountCategoryPicker');
+    var inheritHint = document.getElementById('accountCategoryInheritHint');
+    var autoHint = document.getElementById('accountCategoryAutoHint');
+    if (modeSelect) {
+      modeSelect.value = accountCategoryModes[accountId] || 'inherit';
+      modeSelect.addEventListener('change', function () {
+        accountCategoryModes[accountId] = modeSelect.value;
+        if (picker) picker.style.display = modeSelect.value === 'manual' ? '' : 'none';
+        if (inheritHint) inheritHint.style.display = modeSelect.value === 'inherit' ? '' : 'none';
+        if (autoHint) autoHint.style.display = modeSelect.value === 'auto' ? '' : 'none';
+      });
+      if (picker) picker.style.display = modeSelect.value === 'manual' ? '' : 'none';
+      if (inheritHint) inheritHint.style.display = modeSelect.value === 'inherit' ? '' : 'none';
+      if (autoHint) autoHint.style.display = modeSelect.value === 'auto' ? '' : 'none';
+      renderCategoryPickList('accountCategoryOptions', accountManualCategories[accountId]);
+    }
+    
+  }
+  $('#mBody').addEventListener('click', function (e) {
+    var t = e.target.closest ? e.target.closest('[data-act]') : null;
+    if (!t) return;
+    var act = t.getAttribute('data-act');
+    if (act === 'pick-profile') toast('已选择账号目录（原型演示）');
+    else if (act === 'reset-profile') toast('已恢复默认缓存路径');
+    else if (act === 'pick-dir') toast('已选择账号下载路径（原型演示）');
+    else if (act === 'reset-dir') toast('已恢复默认下载路径');
+    else if (act === 'retry-step') retryStep(parseInt(t.getAttribute('data-i'), 10), parseInt(t.getAttribute('data-step'), 10));
+  });
+  $('#mBody').addEventListener('change', function (e) {
+    var target = e.target;
+    if (target && target.id === 'accountCategoryMode') return;
+    if (target && target.id === 'accountQuotaOverride') {
+      var quotaFields = $( '#accountQuotaFields' );
+      if (quotaFields) quotaFields.style.display = target.checked ? '' : 'none';
+      return;
+    }
+    if (!target || target.id !== 'accountFilterOverride') return;
+    var fields = $('#accountFilterFields');
+    if (fields) fields.style.display = target.checked ? '' : 'none';
+  });
+
+  /* ================= 账号列表 · 矩阵控制（R27） ================= */
+  var btnRunLog = document.getElementById('btnRunLog');
+  if (btnRunLog) btnRunLog.addEventListener('click', function () { show('logs'); });
+  var btnSaveNow = document.getElementById('btnSaveNow');
+  if (btnSaveNow) btnSaveNow.addEventListener('click', function () {
+    modal('即时保存到服务端（R35）', '将<b>立即</b>把本客户端数据（账号状态 + 千川明细：消耗 / 订单 / 销售额 / 退款 / ROI / 佣金 / 盈亏）<b>保存到服务端</b>（监督下游，甲方可随时拉取）；已上报数据不删除，佣金按留存数据结算。<br><b>账号注销实时检测</b>：回读失败（登录态失效 / 账号不存在）即标记「已注销 / 失联」并停止回读上报；管理端可查看。', function () {
+      toast('已即时保存到服务端（监督下游），账号状态已实时同步');
+    }, '立即保存');
+  });
+  var btnDouyinSet = document.getElementById('btnDouyinSet');
+  if (btnDouyinSet) btnDouyinSet.addEventListener('click', function () { show('settings'); });
+  var btnCommonSet = document.getElementById('btnCommonSet');
+  if (btnCommonSet) btnCommonSet.addEventListener('click', function () {
+    modal('通用设置', '全局默认参数（下载 / 视频规格 / 选品筛选条件）。账号未启用独立筛选时继承通用筛选（A-47）。<br><b>屏蔽词全局生效，执行设置保持通用；抖音每日配额可按 A-70 覆盖，千川素材配额仍按 FR-C12-01 独立执行</b>（A-43 / FR-I6-01）。', function () { toast('通用设置已保存'); }, '保存');
+  });
+  $('#btnPreviewSel').addEventListener('click', function () {
+    modal('筛选结果预览', '按当前条件命中 <b>128</b> 个商品（选项来自百应接口，结果与百应一致）。', function () {
+      show('product'); toast('已带入筛选条件到商品查询');
+    }, '带入商品查询');
+  });
+  $('#btnScanViolation').addEventListener('click', function () { toast('扫描完成，发现 2 条劣质/违规素材'); });
+  $('#btnDelViolation').addEventListener('click', function () {
+    modal('危险操作确认', '本次待删 <b>2</b> 条，将<b>同步删除千川平台侧素材</b>，不可撤销。执行方式：<b>分批删除 + 显示进度</b>，删除清单自动留存并可导出。是否继续？', function () {
+      toast('已提交删除（同步千川，分批执行中…）');
+    }, '确认删除');
+  });
+  $('#btnExportDelList').addEventListener('click', function () { toast('已导出删除清单（CSV）'); });
+
+  /* 初始页 */
+  show('accounts');
+})();
+</script>
+
+<script>
+(function () {
+  var $ = function (s, r) { return (r || document).querySelector(s); };
+  var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+  function toast(msg) {
+    var w = document.getElementById('toastWrap'); if (!w) return;
+    var el = document.createElement('div'); el.className = 'toast';
+    el.textContent = msg; w.appendChild(el); setTimeout(function () { el.remove(); }, 2200);
+  }
+  function showIn(app, key) {
+    $$('.app[data-app="' + app + '"] .page').forEach(function (p) { p.classList.toggle('active', p.id === 'page-' + key); });
+    $$('.app[data-app="' + app + '"] .sidebar button[data-page]').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-page') === key); });
+    var m = $('.app[data-app="' + app + '"] .main'); if (m) m.scrollTop = 0;
+  }
+  function setApp(name) {
+    document.body.classList.toggle('mode-admin', name === 'admin');
+    var qs = document.getElementById('quickSeg');
+    if (qs) qs.style.display = (name === 'admin') ? 'none' : '';
+    $$('.appsw button').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-app') === name); });
+    var first = $('.app[data-app="' + name + '"] .sidebar button[data-page]');
+    if (first) showIn(name, first.getAttribute('data-page'));
+    toast(name === 'admin' ? '已切换到管理端（授权 / 权限 / 客户端绑定）' : '已切换到客户端');
+  }
+  $$('.appsw button').forEach(function (b) {
+    b.addEventListener('click', function () { setApp(b.getAttribute('data-app')); });
+  });
+  var adminSb = $('.app[data-app="admin"] .sidebar');
+  if (adminSb) adminSb.addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-page]');
+    if (b) showIn('admin', b.getAttribute('data-page'));
+  });
+  var roleSel = document.getElementById('roleSel');
+  if (roleSel) roleSel.addEventListener('change', function () {
+    document.body.classList.toggle('role-readonly', roleSel.value === 'readonly');
+    toast('已切换角色：' + roleSel.options[roleSel.selectedIndex].text);
+  });
+  function on(id, msg) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener('click', function () { toast(msg); });
+  }
+  on('btnQcUpload', '已加入千川上传队列（原型演示）');
+  on('btnCleanup', '已提交清理任务（原型演示，已记入日志）');
+  on('btnCreatePlan', '计划已创建（原型演示）');
+  on('btnClearTasks', '已清空已完成任务（原型演示）');
+  on('btnRecord', '已开始录屏（原型演示）');
+  on('btnAppendNow', '已触发追加（原型演示）');
+  on('btnK1Grant', '已提交授权（原型演示）');
+  on('btnK1Recycle', '已回收额度（原型演示）');
+  var queueData = (function () {
+    var accs = ['星禾优品馆', '群益百货', '梅妈妈铺', '辰呈产品', '小蒙家居', '静静匠选', '优雅美妆', '辰萌贴纸'];
+    var sts = [['warn', '等待执行'], ['ok', '已发布'], ['danger', '失败'], ['gray', '已取消']];
+    var types = ['抖音发布（图转视频）', '千川发布（素材视频）'];
+    var arr = [];
+    function p2(n) { return (n < 10 ? '0' : '') + n; }
+    for (var i = 0; i < 123; i++) {
+      var s = sts[i % 4];
+      arr.push({
+        no: i + 1,
+        type: types[i % 2],
+        acc: accs[i % accs.length],
+        name: '素材_' + (1000 + i) + '.mp4',
+        time: '今日 ' + p2(9 + (i % 10)) + ':' + p2((i * 7) % 60),
+        cls: s[0],
+        st: s[1]
+      });
+    }
+    return arr;
+  })();
+  var pgCur = 1;
+
+  function pgRender() {
+    var sizeEl = document.getElementById('pgSize');
+    if (!sizeEl) return;
+    var size = parseInt(sizeEl.value, 10);
+    var typeEl = document.getElementById('queueType');
+    var type = typeEl ? typeEl.value : 'all';
+    var rows = type === 'all' ? queueData : queueData.filter(function (r) { return r.type === type; });
+    var pages = Math.max(1, Math.ceil(rows.length / size));
+    if (pgCur > pages) pgCur = pages;
+    if (pgCur < 1) pgCur = 1;
+    var start = (pgCur - 1) * size;
+    var end = Math.min(start + size, rows.length);
+    var html = '';
+    for (var i = start; i < end; i++) {
+      var r = rows[i];
+      var op = r.st === '失败'
+        ? '<span class="lnk">重试</span><span class="lnk">查看原因</span>'
+        : '<span class="lnk">编辑</span><span class="lnk">取消</span>';
+      html += '<tr><td><input type="checkbox"></td><td>' + r.no + '</td><td>' + r.type + '</td><td>' + r.acc + '</td><td>' + r.name +
+        '</td><td>' + r.time + '</td><td><span class="pill ' + r.cls + '">' + r.st + '</span></td><td>' + op + '</td></tr>';
+    }
+    document.getElementById('queueBody').innerHTML = html;
+    document.getElementById('pgTotal').textContent = rows.length;
+
+    var bh = '<button class="pg" data-p="1">首页</button>' +
+      '<button class="pg" data-p="' + Math.max(1, pgCur - 1) + '">上一页</button>';
+    var win = [];
+    for (var p = 1; p <= pages; p++) {
+      if (p === 1 || p === pages || Math.abs(p - pgCur) <= 2) win.push(p);
+    }
+    var last = 0;
+    win.forEach(function (p) {
+      if (p - last > 1) bh += '<span class="pg-dots">…</span>';
+      bh += '<button class="pg' + (p === pgCur ? ' on' : '') + '" data-p="' + p + '">' + p + '</button>';
+      last = p;
+    });
+    bh += '<button class="pg" data-p="' + Math.min(pages, pgCur + 1) + '">下一页</button>' +
+      '<button class="pg" data-p="' + pages + '">末页</button>';
+    document.getElementById('pgBtns').innerHTML = bh;
+  }
+
+  var pgSize = document.getElementById('pgSize');
+  if (pgSize) pgSize.addEventListener('change', function () { pgCur = 1; pgRender(); });
+  var queueType = document.getElementById('queueType');
+  if (queueType) queueType.addEventListener('change', function () { pgCur = 1; pgRender(); });
+  var pgBtns = document.getElementById('pgBtns');
+  if (pgBtns) pgBtns.addEventListener('click', function (e) {
+    var b = e.target.closest('button.pg');
+    if (!b) return;
+    pgCur = parseInt(b.getAttribute('data-p'), 10);
+    pgRender();
+  });
+  pgRender();
+  /* ================= 通用分页（其他列表页） =================
+     注：cardOf / attachPager 已在首个 <script> 顶层全局定义（首个 <script> 也要调用），此处不再重复定义。 */
+  function z2(n) { return (n < 10 ? '0' : '') + n; }
+  var P_ACC = ['辰呈产品', '梅妈妈铺', '群益百货', '小蒙家居', '静静匠选', '优雅美妆'];
+  var P_CH = ['星禾优品 · 千川A', '辰萌贴纸 · 千川B'];
+
+  var chBody = document.getElementById('chBody');
+  if (chBody) attachPager(cardOf(chBody), chBody, 12, function (i) {
+    var off = i % 3 === 0;
+    return '<tr><td>千川账户_' + (i + 1) + '</td><td>756024-735359' + (1980 + i) + '</td>' +
+      '<td><span class="pill ' + (off ? 'gray' : 'ok') + '">' + (off ? '离线' : '在线') + '</span></td>' +
+      '<td>' + (60 + i * 3) + '</td><td>' + (i % 5) + '</td>' +
+      '<td><span class="lnk">刷新</span><span class="lnk">复制ID</span></td></tr>';
+  });
+
+  var vioBody = document.getElementById('vioBody');
+  if (vioBody) attachPager(cardOf(vioBody), vioBody, 20, function (i) {
+    var bad = i % 3 === 0;
+    return '<tr><td><input type="checkbox"></td><td>素材_' + (3000 + i) + '.mp4</td>' +
+      '<td><span class="pill danger">' + (bad ? '违规' : '劣质') + '</span></td>' +
+      '<td>' + (bad ? '含违规文字' : '画面重复度高') + '</td>' +
+      '<td>10-0' + (1 + i % 9) + ' 09:' + z2(i % 60) + '</td><td><span class="lnk">删除</span></td></tr>';
+  });
+
+  var qcBody = document.getElementById('qcBody');
+  if (qcBody) attachPager(cardOf(qcBody), qcBody, 45, function (i) {
+    var st = [['warn', '待上传'], ['info', '上传中'], ['ok', '已上传'], ['danger', '失败']][i % 4];
+    return '<tr><td><input type="checkbox"></td><td>素材_' + (2000 + i) + '.mp4</td>' +
+      '<td>' + P_ACC[i % P_ACC.length] + '</td><td>' + P_CH[i % 2] + '</td>' +
+      '<td>1080p · 11.2MB</td><td><span class="pill ' + st[0] + '">' + st[1] + '</span></td>' +
+      '<td><span class="lnk">查看日志</span></td></tr>';
+  });
+
+  var adsBody = document.getElementById('adsBody');
+  if (adsBody) attachPager(cardOf(adsBody), adsBody, 42, function (i) {
+    var paused = i % 3 === 0;
+    return '<tr><td>计划_' + (100 + i) + '</td><td>' + P_CH[i % 2] + '</td><td>' + (3 + i % 8) + '</td>' +
+      '<td class="num">￥' + (860 + i * 37) + '</td><td class="num">￥' + (1980 + i * 91) + '</td>' +
+      '<td class="num">' + (2.1 + (i % 15) / 10).toFixed(2) + '</td>' +
+      '<td><span class="pill ' + (paused ? 'warn' : 'ok') + '">' + (paused ? '已暂停' : '投放中') + '</span></td>' +
+      '<td><span class="lnk">详情</span><span class="lnk">暂停</span></td></tr>';
+  });
+
+  var abnBody = document.getElementById('abnBody');
+  if (abnBody) attachPager(cardOf(abnBody), abnBody, 22, function (i) {
+    var t = i % 2 === 0;
+    return '<tr><td>素材_' + (4000 + i) + '.mp4</td><td>' + P_CH[i % 2] + '</td>' +
+      '<td>' + (t ? '低质素材（画面模糊）' : '含违规词（标题）') + '</td>' +
+      '<td>10-12 ' + z2(8 + i % 12) + ':' + z2((i * 11) % 60) + '</td>' +
+      '<td><span class="pill ' + (t ? 'danger' : 'warn') + '">' + (t ? '待处理' : '处理中') + '</span></td>' +
+      '<td><span class="lnk">查看原因</span></td></tr>';
+  });
+
+  var apdBody = document.getElementById('apdBody');
+  if (apdBody) attachPager(cardOf(apdBody), apdBody, 16, function (i) {
+    var k = i % 3;
+    var pub = ['<span class="pill ok">已发布</span>', '<span class="pill ok">已发布</span>', '<span class="pill danger">发布失败</span>'][k];
+    var mnt = ['<span class="pill ok">已挂载</span>', '<span class="pill warn">未挂载</span>', '<span class="pill gray">未检测</span>'][k];
+    var stt = ['<span class="pill ok">正常追加</span>', '<span class="pill warn">走另一套逻辑</span>', '<span class="pill danger">暂停追加</span>'][k];
+    return '<tr><td>计划_' + (200 + i) + '</td><td>' + P_CH[i % 2] + '</td><td>' + pub + '</td><td>' + mnt + '</td>' +
+      '<td>' + (k === 2 ? '—' : '今日 ' + z2(9 + i % 6) + ':02') + '</td><td>明日 09:00</td><td>' + stt + '</td>' +
+      '<td><span class="lnk">查看日志</span></td></tr>';
+  });
+
+  var pmBody = document.getElementById('pmBody');
+  if (pmBody) attachPager(cardOf(pmBody), pmBody, 24, function (i) {
+    var paused = i % 4 === 0;
+    return '<tr><td>计划_' + (300 + i) + '</td><td>' + P_CH[i % 2] + '</td>' +
+      '<td class="num">￥' + (300 + i * 50) + '/天</td><td class="num">￥' + (860 + i * 41) + '</td>' +
+      '<td class="num">' + (2.2 + (i % 12) / 10).toFixed(2) + '</td>' +
+      '<td><span class="pill ' + (paused ? 'warn' : 'ok') + '">' + (paused ? '已暂停' : '投放中') + '</span></td>' +
+      '<td><span class="lnk">编辑</span><span class="lnk need-write">暂停</span></td></tr>';
+  });
+
+  var logBody = document.getElementById('logBody');
+  var errTab = document.querySelector('#page-logs tbody[data-err]');
+  if (errTab) errTab.addEventListener('click', function (e) {
+    var a = e.target.closest('[data-del-err]');
+    if (!a) return;
+    modal('删除失败日志并自动重试', '将删除该步骤的<b>失败日志</b>，并自动重试该步骤<b>一次</b>；若仍失败将再次进入「异常报错」。是否继续？', function () {
+      toast('已删除失败日志，自动重试该步骤（一次）…');
+    }, '确认重试');
+  });
+  if (logBody) attachPager(cardOf(logBody), logBody, 120, function (i) {
+    var lv = [['danger', '错误'], ['warn', '警告'], ['info', '信息']][i % 3];
+    var mod = ['下载', '千川', '发布'][i % 3];
+    var txt = ['下载重试 1 次（网络波动）', '上传失败：登录态失效（已截图）', '发布成功'][i % 3];
+    return '<tr><td>' + z2(8 + i % 12) + ':' + z2((i * 7) % 60) + ':' + z2((i * 13) % 60) + '</td>' +
+      '<td><span class="pill ' + lv[0] + '">' + lv[1] + '</span></td><td>' + mod + '</td>' +
+      '<td>任务 #' + (1000 + i) + ' ' + txt + '</td><td><span class="lnk">详情</span></td></tr>';
+  });
+
+  on('btnK3Save', '权限已保存（原型演示）');
+})();
+</script>
+</body>
+</html>
