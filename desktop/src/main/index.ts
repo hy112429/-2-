@@ -18,6 +18,7 @@ import { registerPublishArtifactsIpc } from './publish_artifacts'
 import { registerProductListIpc } from './product_list'
 import { registerQianchuanApiIpc, disposeQianchuanApi } from './qianchuan_api'
 import { registerPostPublishQianchuanMaterialIpc } from './post_publish_qianchuan_material'
+import { disposeQianchuanPlanScheduler, registerQianchuanPlanIpc, startQianchuanPlanScheduler } from './qianchuan_plan'
 import { disposeSelectionScheduleScheduler, registerSelectionScheduleIpc, startSelectionScheduleScheduler } from './selection_scheduler'
 import { registerCenterMachineOnStartup } from './center_client_bootstrap'
 
@@ -126,6 +127,7 @@ app.whenReady().then(() => {
   registerQianchuanUploadIpc()
   registerQianchuanApiIpc()
   registerPostPublishQianchuanMaterialIpc()
+  registerQianchuanPlanIpc()
   registerQianchuanViolationIpc()
   registerPublishArtifactsIpc()
   registerProductListIpc()
@@ -153,6 +155,7 @@ app.whenReady().then(() => {
   // 全自动发布仅处理用户已启用且到达本地计划时间的新任务。
   if (!isolatedTestRoot) startAutoPublisher()
   if (!isolatedTestRoot) startQianchuanUploadScheduler()
+  if (!isolatedTestRoot) startQianchuanPlanScheduler()
   if (!isolatedTestRoot) startSelectionScheduleScheduler()
 
   // 开发时保留 F12 开发者工具、Ctrl+R 刷新等快捷键；生产环境自动禁用
@@ -173,6 +176,7 @@ app.whenReady().then(() => {
 app.on('before-quit', () => {
   disposeAutoPublisher()
   disposeQianchuanUploadScheduler()
+  disposeQianchuanPlanScheduler()
   disposeQianchuanApi()
   disposeSelectionCooldown()
   disposeSelectionScheduleScheduler()

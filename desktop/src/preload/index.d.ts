@@ -526,6 +526,12 @@ declare global {
         setPostPublishEnabled(enabled: boolean): Promise<Record<string, unknown>>
         postPublishRuns(): Promise<Record<string, unknown>>
         retryPostPublishRun(queueId: number): Promise<Record<string, unknown>>
+        planConfig(qcId: number): Promise<Record<string, unknown>>
+        savePlanConfig(params: { qianchuanAccountId: number; enabled: boolean; dailyBudgetYuan: number; materialSource: 'homepage' | 'uploaded' | 'both'; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>>
+        planJobs(qcId?: number): Promise<Record<string, unknown>>
+        retrySafePlan(id: number): Promise<Record<string, unknown>>
+        reviewPlanPresent(params: { id: number; remotePlanId: string }): Promise<Record<string, unknown>>
+        reviewPlanAbsent(params: { id: number; note: string }): Promise<Record<string, unknown>>
         scanViolations(qcId: number): Promise<Record<string, unknown>>
         prepareViolationDeletion(params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>>
         violationBatch(batchId: number): Promise<Record<string, unknown>>

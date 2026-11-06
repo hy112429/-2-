@@ -423,6 +423,17 @@ const qianchuan = {
   postPublishRuns: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:postPublish:runs'),
   retryPostPublishRun: (queueId: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:postPublish:retry', queueId),
+  planConfig: (qcId: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:config', qcId),
+  savePlanConfig: (params: { qianchuanAccountId: number; enabled: boolean; dailyBudgetYuan: number; materialSource: 'homepage' | 'uploaded' | 'both'; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:saveConfig', toPlainIpcPayload(params)),
+  planJobs: (qcId?: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:jobs', qcId),
+  retrySafePlan: (id: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:retrySafe', id),
+  reviewPlanPresent: (params: { id: number; remotePlanId: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:reviewPresent', toPlainIpcPayload(params)),
+  reviewPlanAbsent: (params: { id: number; note: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:reviewAbsent', toPlainIpcPayload(params)),
   scanViolations: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:scan', qcId),
   prepareViolationDeletion: (params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:violations:prepare', toPlainIpcPayload(params)),

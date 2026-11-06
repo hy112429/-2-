@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
 import QianchuanViolationsView from './QianchuanViolationsView.vue'
+import QianchuanPlanView from './QianchuanPlanView.vue'
 
 interface Target { account_id: number; account_name: string; qianchuan_account_id: number | null; qc_name: string | null; qc_id: string | null }
 interface QianchuanAccount { id: number; qc_name: string | null; qc_id: string | null; subject?: string | null; login_state?: string }
@@ -250,6 +251,7 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
       </article></div>
     </details>
     <p v-if="message" class="hint">{{ message }}</p><p v-if="progress" class="progress" role="status">{{ progress }}</p>
+    <QianchuanPlanView :qianchuan-account-id="qcId" />
     <QianchuanViolationsView v-if="linked.some(row => row.qianchuan_account_id === qcId)" :qianchuan-account-id="qcId" />
     <div class="columns">
       <section class="panel"><header class="panel-head"><div><h2>可选素材</h2><small>可入队 {{ eligible.length }} / {{ assets.length }}</small></div><button class="btn" :disabled="!eligible.length" @click="selectAll">全选可用</button></header>

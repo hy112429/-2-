@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import { getClientPaths, getDownloadDir } from './app-dirs'
 import { runEngineCommand, runScript } from './engine'
 import { queryPlayableVideos, resolveAuthorizedAweme } from './qianchuan_api'
+import { scheduleQianchuanPlanForPublish } from './qianchuan_plan'
 import {
   enqueuePostPublishAssets,
   getPostPublishEligibleAssets,
@@ -291,6 +292,8 @@ export async function runPostPublishQianchuanMaterialForQueue(
 
 /** 发布成功钩子：只排入本机异步微任务，不等待千川 API / 下载 / Step17。 */
 export function firePostPublishQianchuanMaterial(queueId: number, trigger: TriggerSource): void {
+  // 付费计划与 P-33 下载开关独立；预算/素材准入由计划队列再次核对。
+  scheduleQianchuanPlanForPublish(queueId)
   setImmediate(() => {
     void runPostPublishQianchuanMaterialForQueue(queueId, trigger).then((result) => {
       console.info(`[发布后千川素材] 队列 #${queueId} 编排已返回：${String(result.status ?? (result.started ? 'running' : 'skipped'))}`)
