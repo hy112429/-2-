@@ -44,7 +44,7 @@ Step 27 客户端应从最后一次有效心跳起使用进程内单调计时，
 
 ## 本机验证
 
-新增 `spring-boot-starter-test` 仅供 JUnit/Mockito 校验边界和接口门禁，不进入运行包。需要本机已有 JDK 17、Maven、MySQL 8 二进制及 Docker Desktop。隔离脚本使用全新 MySQL 数据目录和 Redis 7 容器，端口为 13318、16388、18092；不会访问已有业务库或复用其他 Redis 容器。
+新增 `spring-boot-starter-test` 仅供 JUnit/Mockito 校验边界和接口门禁，不进入运行包。需要本机已有 JDK 17、Maven、MySQL 8 二进制及 Docker Desktop。隔离脚本支持 Windows PowerShell 5.1 和 PowerShell 7；文件使用带 BOM 的 UTF-8，避免 5.1 将中文误读成语法字符。脚本使用全新 MySQL 数据目录和 Redis 7 容器，端口为 13318、16388、18092；不会访问已有业务库或复用其他 Redis 容器。
 
 ```powershell
 Set-Location -LiteralPath 'D:\抖音电商\投广管理客户端-step24-20261106\server\touguang-center'

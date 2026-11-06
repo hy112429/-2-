@@ -1,4 +1,4 @@
-# Step 24 隔离联测：独立 MySQL 8、Redis 7 容器和服务端，不接触业务库。
+﻿# Step 24 隔离联测：独立 MySQL 8、Redis 7 容器和服务端，不接触业务库。
 $ErrorActionPreference = 'Stop'
 $mysqlHome = 'D:\mysql-8.0.29-winx64'
 $mysqlExe = Join-Path $mysqlHome 'bin\mysqld.exe'
@@ -17,6 +17,7 @@ $appProcess = $null
 $dbPassword = [guid]::NewGuid().ToString('N') + 'Aa1!'
 $adminPassword = [guid]::NewGuid().ToString('N') + 'Bb2!'
 $readonlyPassword = [guid]::NewGuid().ToString('N') + 'Cc3!'
+Add-Type -AssemblyName System.Net.Http
 $http = [System.Net.Http.HttpClient]::new()
 $http.Timeout = [timespan]::FromSeconds(12)
 
