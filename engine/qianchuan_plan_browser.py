@@ -12,9 +12,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
+from urllib.request import urlopen
 
 from db import emit
-from qianchuan_browser import read_verified_port
 
 
 HOST = "qianchuan.jinritemai.com"
@@ -27,6 +27,26 @@ class Stopped(RuntimeError):
     def __init__(self, message: str, stage: str):
         super().__init__(message)
         self.stage = stage
+
+
+def _read_verified_port(profile_path: Path, expected_port: int, qc_id: int, account_id: int) -> int:
+    allowed = {f"qianchuan-{qc_id}", f"account-{account_id}"}
+    if profile_path.name.lower() not in allowed:
+        raise Stopped("浏览器资料目录与本次抖音/千川绑定不一致", "profile")
+    try:
+        actual = int((profile_path / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()[0])
+    except (OSError, ValueError, IndexError) as error:
+        raise Stopped("客户端专属浏览器未运行或端口不可读", "profile") from error
+    if actual != expected_port or not 1 <= expected_port <= 65535:
+        raise Stopped("客户端专属浏览器端口与资料目录不一致", "profile")
+    try:
+        with urlopen(f"http://127.0.0.1:{expected_port}/json/version", timeout=2) as response:
+            payload = json.load(response)
+        if not isinstance(payload.get("webSocketDebuggerUrl"), str):
+            raise ValueError("缺少 CDP 连接")
+    except Exception as error:
+        raise Stopped("客户端专属浏览器 CDP 无法连接", "profile") from error
+    return expected_port
 
 
 def _unique(locator: Any, label: str) -> Any:
@@ -263,7 +283,7 @@ def _diagnostic(args: argparse.Namespace, page: Any | None, stage: str, reason: 
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
-    if args.budget_fen < 1 or not re.fullmatch(r"\d{1,20}", args.product_id) or not re.fullmatch(r"\d{1,20}", args.advertiser_id):
+    if args.account_id < 1 or args.qianchuan_account_id < 1 or args.budget_fen < 1 or not re.fullmatch(r"\d{1,20}", args.product_id) or not re.fullmatch(r"\d{1,20}", args.advertiser_id):
         return {"ok": True, "status": "failed", "reason": "计划输入参数无效", "submitAttempted": False}
     browser = None
     page = None
@@ -277,7 +297,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     try:
         from playwright.sync_api import sync_playwright
 
-        read_verified_port(args.profile_path, args.cdp_port, args.qianchuan_account_id)
+        _read_verified_port(args.profile_path, args.cdp_port, args.qianchuan_account_id, args.account_id)
         with sync_playwright() as playwright:
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{args.cdp_port}")
             if len(browser.contexts) != 1:
@@ -318,14 +338,41 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "submitAttempted": submitted, "diagnosticPath": diagnostic}
 
 
+def inspect_profile(args: argparse.Namespace) -> dict[str, Any]:
+    """只读确认现有标签中的广告主；不新开页面、不改变当前草稿。"""
+    try:
+        from playwright.sync_api import sync_playwright
+
+        _read_verified_port(args.profile_path, args.cdp_port, args.qianchuan_account_id, args.account_id)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{args.cdp_port}", timeout=5000)
+            try:
+                if len(browser.contexts) != 1:
+                    raise Stopped("浏览器上下文数量异常", "inspect")
+                for page in browser.contexts[0].pages:
+                    try:
+                        _account_gate(page, args.advertiser_id, "inspect")
+                        return {"ok": True, "match": True, "profile": args.profile_path.name}
+                    except Exception:
+                        continue
+                return {"ok": True, "match": False, "profile": args.profile_path.name}
+            finally:
+                browser.close()
+    except Exception as error:
+        return {"ok": True, "match": False, "profile": args.profile_path.name, "reason": str(error)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="千川商品全域计划浏览器执行器")
     sub = parser.add_subparsers(dest="command", required=True)
+    inspect = sub.add_parser("inspect")
     command = sub.add_parser("publish")
-    command.add_argument("--cdp-port", type=int, required=True)
-    command.add_argument("--profile-path", type=Path, required=True)
-    command.add_argument("--qianchuan-account-id", type=int, required=True)
-    command.add_argument("--advertiser-id", required=True)
+    for target in (inspect, command):
+        target.add_argument("--cdp-port", type=int, required=True)
+        target.add_argument("--profile-path", type=Path, required=True)
+        target.add_argument("--qianchuan-account-id", type=int, required=True)
+        target.add_argument("--account-id", type=int, required=True)
+        target.add_argument("--advertiser-id", required=True)
     command.add_argument("--product-id", required=True)
     command.add_argument("--plan-name", required=True)
     command.add_argument("--budget-fen", type=int, required=True)
@@ -338,7 +385,7 @@ def main() -> int:
     command.add_argument("--aigc-enabled", type=int, choices=(0, 1), required=True)
     command.add_argument("--diagnostics-dir", type=Path, required=True)
     args = parser.parse_args()
-    return emit(execute(args))
+    return emit(inspect_profile(args) if args.command == "inspect" else execute(args))
 
 
 if __name__ == "__main__":

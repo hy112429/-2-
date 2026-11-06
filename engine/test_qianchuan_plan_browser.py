@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from io import BytesIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from qianchuan_plan_browser import Stopped, _account_gate, _plan_id
+from qianchuan_plan_browser import Stopped, _account_gate, _plan_id, _read_verified_port
 
 
 class _Body:
@@ -46,6 +50,18 @@ class QianchuanPlanBrowserTest(unittest.TestCase):
     def test_plan_id_requires_known_response_field(self) -> None:
         self.assertEqual(_plan_id({"data": {"plan_id": "123456789"}}), "123456789")
         self.assertEqual(_plan_id({"data": {"material_id": "123456789"}}), "")
+
+    def test_only_bound_browser_profiles_can_be_reused(self) -> None:
+        with TemporaryDirectory() as root:
+            for name in ("qianchuan-3", "account-5"):
+                profile = Path(root) / name
+                profile.mkdir()
+                (profile / "DevToolsActivePort").write_text("9222\n", encoding="utf-8")
+                with patch("qianchuan_plan_browser.urlopen", return_value=BytesIO(b'{"webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/test"}')):
+                    self.assertEqual(_read_verified_port(profile, 9222, 3, 5), 9222)
+            wrong = Path(root) / "account-6"
+            with self.assertRaisesRegex(Stopped, "不一致"):
+                _read_verified_port(wrong, 9222, 3, 5)
 
 
 if __name__ == "__main__":

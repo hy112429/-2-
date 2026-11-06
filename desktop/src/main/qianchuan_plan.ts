@@ -32,10 +32,7 @@ async function command(...args: string[]): Promise<Json> {
 export function scheduleQianchuanPlanForPublish(queueId: number): void {
   setImmediate(() => {
     void command('refresh', '--publish-queue-id', String(positiveId(queueId, '发布队列 ID')))
-      .then((result) => {
-        const job = object(result['job'])
-        if (result['queued'] === true && job['id']) void runOnePlan(Number(job['id']))
-      })
+      // 每分钟调度器处理任务，避免与刚结束的抖音发布共用浏览器。
       .catch((error) => console.info(`[千川投放计划] 发布队列 #${queueId} 暂未入队：${String(error)}`))
   })
 }
@@ -45,12 +42,26 @@ async function runOnePlan(id: number): Promise<Json> {
   const queued = object((await command('job', '--id', String(id)))['job'])
   if (queued['status'] !== 'queued') return { ok: false, reason: '计划任务不处于待执行状态' }
   const qcId = positiveId(queued['qianchuan_account_id'], '千川账户 ID')
+  const accountId = positiveId(queued['account_id'], '抖音账号 ID')
   if (!reserveQianchuanAccount(qcId)) return { ok: false, reason: '该千川账户正在处理其他任务' }
   activeJobs.add(id)
   let claimed = false
   try {
-    const connection = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
-    if (!connection) return { ok: false, reason: '千川专属浏览器未打开；保留待执行计划' }
+    let connection: Awaited<ReturnType<typeof existingManagedBrowserConnection>> = null
+    for (const profileKey of [`qianchuan-${qcId}`, `account-${accountId}`]) {
+      const candidate = await existingManagedBrowserConnection(profileKey)
+      if (!candidate) continue
+      const inspection = await runEngineCommand('qianchuan_plan_browser.py', [
+        'inspect', '--cdp-port', String(candidate.port), '--profile-path', candidate.profilePath,
+        '--qianchuan-account-id', String(qcId), '--account-id', String(accountId),
+        '--advertiser-id', String(queued['advertiser_id'])
+      ])
+      if (inspection.ok && object(inspection.result)['match'] === true) {
+        connection = candidate
+        break
+      }
+    }
+    if (!connection) return { ok: false, reason: '未找到已登录目标广告主的专属浏览器；保留待执行计划' }
     const claim = await command('claim', '--id', String(id))
     if (claim['claimed'] !== true) return claim
     claimed = true
@@ -59,7 +70,8 @@ async function runOnePlan(id: number): Promise<Json> {
     mkdirSync(diagnosticDir, { recursive: true })
     const outcome = await runEngineCommand('qianchuan_plan_browser.py', [
       'publish', '--cdp-port', String(connection.port), '--profile-path', connection.profilePath,
-      '--qianchuan-account-id', String(qcId), '--advertiser-id', String(job['advertiser_id']),
+      '--qianchuan-account-id', String(qcId), '--account-id', String(accountId),
+      '--advertiser-id', String(job['advertiser_id']),
       '--product-id', String(job['product_id']), '--plan-name', String(job['plan_name']),
       '--budget-fen', String(job['budget_fen']), '--material-source', String(job['material_source']),
       '--remote-material-id', String(job['remote_material_id'] ?? ''),
