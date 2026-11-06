@@ -8,6 +8,9 @@ import com.touguang.center.entity.ClientEntity;
 import com.touguang.center.entity.UserEntity;
 import com.touguang.center.repository.mapper.ClientMapper;
 import com.touguang.center.repository.mapper.UserMapper;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.List;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -16,10 +19,12 @@ import org.springframework.transaction.annotation.Transactional;
 public class ClientService {
     private final ClientMapper clients;
     private final UserMapper users;
+    private final Clock clock;
 
-    public ClientService(ClientMapper clients, UserMapper users) {
+    public ClientService(ClientMapper clients, UserMapper users, Clock clock) {
         this.clients = clients;
         this.users = users;
+        this.clock = clock;
     }
 
     @Transactional
@@ -31,7 +36,7 @@ public class ClientService {
 
     public List<ClientView> list() {
         return clients.selectList(new LambdaQueryWrapper<ClientEntity>().orderByDesc(ClientEntity::getId))
-                .stream().map(ClientService::view).toList();
+                .stream().map(this::view).toList();
     }
 
     @Transactional
@@ -49,9 +54,12 @@ public class ClientService {
         return view(clients.selectById(clientId));
     }
 
-    private static ClientView view(ClientEntity client) {
+    private ClientView view(ClientEntity client) {
+        String onlineStatus = client.getLastHeartbeatAt() == null ? "UNKNOWN"
+                : Duration.between(client.getLastHeartbeatAt(), LocalDateTime.now(clock)).getSeconds() > 180
+                    ? "OFFLINE" : "ONLINE";
         return new ClientView(client.getId(), client.getMachineId(), client.getMachineName(),
                 client.getStatus(), client.getBoundUserId(), client.getBoundAt(),
-                client.getOnlineStatus(), client.getLastHeartbeatAt(), client.getCreatedAt());
+                onlineStatus, client.getLastHeartbeatAt(), client.getCreatedAt());
     }
 }

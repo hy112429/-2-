@@ -1,6 +1,8 @@
-# 投广管理客户端中心服务端（Step 22–23）
+# 投广管理客户端中心服务端（Step 22–24）
 
-Spring Boot 3.5 / Java 17，使用 MySQL 8、Redis 7、MyBatis-Plus 与 Flyway。Step 22 提供健康检查；Step 23 增加账号、角色、权限与客户端登记/绑定接口。不承载视频或媒体处理。
+Spring Boot 3.5 / Java 17，使用 MySQL 8、Redis 7、MyBatis-Plus 与 Flyway。Step 22 提供健康检查；Step 23 增加账号、角色、权限与客户端登记/绑定接口；Step 24 增加机器授权和心跳校验。不承载视频或媒体处理。
+
+Step 24 的接口、断网规则和隔离验证见 [机器授权与心跳](docs/step24-license-heartbeat.md)。
 
 ## 目录
 
@@ -9,9 +11,9 @@ src/main/java/com/touguang/center/
   common/       统一返回体、业务异常与全局异常处理
   config/       MyBatis-Plus、Redis 与接口权限拦截器
   controller/   HTTP 接口
-  service/      健康检查、认证与客户端绑定逻辑
+  service/      健康检查、认证、客户端绑定与授权心跳逻辑
   repository/   MyBatis-Plus Mapper
-  entity/       用户与客户端实体
+  entity/       用户、客户端与授权实体
   dto/          API 数据对象
 src/main/resources/
   application.yml
@@ -96,4 +98,4 @@ Step 23 的建表 SQL、初始化管理员、登录、角色权限、客户端�
 - MySQL 与 Redis 仅内网监听、最小网段放行；管理端口不得暴露公网。
 - 健康检查只报告依赖状态，不回显密钥、连接串或异常堆栈。
 - 按 SRS G.2，中心服务端只存元数据与缩略图、只做账号权限/任务调度/日志/授权校验；**不存视频文件、不做媒体处理**。
-- Step 23 只实现身份与机器绑定基础，不修改客户端本机选品登记或 `selection-registry`，不部署甲方。心跳、到期锁定与中心任务调度属于后续步骤。
+- Step 23 的身份与机器绑定、Step 24 的服务端授权及心跳均不修改客户端本机选品登记或 `selection-registry`，也不部署甲方。客户端自动心跳及锁定属于 Step 27，中心任务调度属于 Step 25。

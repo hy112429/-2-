@@ -2,6 +2,7 @@ package com.touguang.center.controller;
 
 import com.touguang.center.common.ApiResponse;
 import com.touguang.center.config.PublicApi;
+import com.touguang.center.config.LicenseExempt;
 import com.touguang.center.config.RequirePermission;
 import com.touguang.center.dto.IdentityDtos.BindClientRequest;
 import com.touguang.center.dto.IdentityDtos.ClientView;
@@ -18,6 +19,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
+@LicenseExempt
 @RequestMapping("/api/clients")
 public class ClientController {
     private final ClientService clients;

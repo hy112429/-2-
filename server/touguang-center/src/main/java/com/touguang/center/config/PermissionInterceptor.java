@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.touguang.center.common.ApiResponse;
 import com.touguang.center.dto.IdentityDtos.UserView;
 import com.touguang.center.service.AuthService;
+import com.touguang.center.service.LicenseService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
@@ -17,10 +18,12 @@ public class PermissionInterceptor implements HandlerInterceptor {
     public static final String CURRENT_USER = "center.currentUser";
     public static final String CURRENT_TOKEN = "center.currentToken";
     private final AuthService auth;
+    private final LicenseService licenses;
     private final ObjectMapper json;
 
-    public PermissionInterceptor(AuthService auth, ObjectMapper json) {
+    public PermissionInterceptor(AuthService auth, LicenseService licenses, ObjectMapper json) {
         this.auth = auth;
+        this.licenses = licenses;
         this.json = json;
     }
 
@@ -35,6 +38,12 @@ public class PermissionInterceptor implements HandlerInterceptor {
         UserView user = auth.authenticate(token, request.getHeader("X-Machine-Id"));
         if (user == null) return deny(response, "请先登录或重新登录");
         if (!user.permissions().contains(required.value())) return deny(response, "当前账号没有此操作权限");
+        String machineId = request.getHeader("X-Machine-Id");
+        boolean exempt = method.hasMethodAnnotation(LicenseExempt.class)
+                || method.getBeanType().isAnnotationPresent(LicenseExempt.class);
+        if (machineId != null && !machineId.isBlank() && !exempt && !licenses.canUse(machineId)) {
+            return deny(response, "机器授权未生效、已停用或已到期");
+        }
         request.setAttribute(CURRENT_USER, user);
         request.setAttribute(CURRENT_TOKEN, token);
         return true;

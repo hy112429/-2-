@@ -1,6 +1,7 @@
 package com.touguang.center.controller;
 
 import com.touguang.center.common.ApiResponse;
+import com.touguang.center.config.LicenseExempt;
 import com.touguang.center.config.RequirePermission;
 import com.touguang.center.repository.mapper.IdentityMapper;
 import java.util.List;
@@ -10,6 +11,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
+@LicenseExempt
 @RequestMapping("/api")
 public class RoleController {
     private final IdentityMapper identities;

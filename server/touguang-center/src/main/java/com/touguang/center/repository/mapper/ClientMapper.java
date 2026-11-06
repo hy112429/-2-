@@ -14,6 +14,12 @@ public interface ClientMapper extends BaseMapper<ClientEntity> {
     @Select("SELECT * FROM center_client WHERE machine_id=#{machineId}")
     ClientEntity findByMachineId(@Param("machineId") String machineId);
 
+    @Select("SELECT * FROM center_client WHERE id=#{clientId} FOR UPDATE")
+    ClientEntity lockById(@Param("clientId") long clientId);
+
     @Update("UPDATE center_client SET status='BOUND', bound_user_id=#{userId}, bound_at=COALESCE(bound_at,CURRENT_TIMESTAMP(3)) WHERE id=#{clientId} AND (bound_user_id IS NULL OR bound_user_id=#{userId})")
     int bind(@Param("clientId") long clientId, @Param("userId") long userId);
+
+    @Update("UPDATE center_client SET last_heartbeat_at=#{receivedAt}, online_status='ONLINE' WHERE id=#{clientId}")
+    int markHeartbeat(@Param("clientId") long clientId, @Param("receivedAt") java.time.LocalDateTime receivedAt);
 }
