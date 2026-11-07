@@ -14,12 +14,15 @@ const compiledSource = ts.transpileModule(source, {
 function loadIsolatedScenario(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'post-publish-qc-'))
   const state = { enabled: true, run: null, updates: [], beginCount: 0 }
-  const calls = { auth: 0, query: 0, download: 0, enqueue: 0, markPublished: 0, downloadTasks: [], enqueuedAssetIds: [] }
+  const calls = { auth: 0, query: 0, download: 0, enqueue: 0, markPublished: 0, waitForCart: 0, downloadTasks: [], enqueuedAssetIds: [] }
   const stubs = {
     electron: { ipcMain: { handle() {} } },
     './app-dirs': {
       getClientPaths: () => ({ databasePath: path.join(root, 'isolated.sqlite') }),
       getDownloadDir: () => path.join(root, 'downloads')
+    },
+    './baiying_batch': {
+      async waitForCartVideoDownload() { calls.waitForCart += 1 }
     },
     './engine': {
       async runEngineCommand(script, args) {
@@ -79,7 +82,7 @@ function loadIsolatedScenario(options = {}) {
       async enqueuePostPublishAssets(_accountId, _productId, _qcId, assetIds) {
         calls.enqueue += 1
         calls.enqueuedAssetIds = assetIds
-        return { ok: true, acceptedCount: 1, jobs: [{ id: 1 }] }
+        return { ok: true, acceptedCount: 1, jobs: [{ id: 1, assetId: assetIds[0] }] }
       }
     }
   }
@@ -173,6 +176,22 @@ async function main() {
   assert.equal(failed.status, 'failed_download')
   assert.equal(failedDownload.calls.enqueue, 0)
 
+  const reusable = loadIsolatedScenario({
+    authError: true,
+    eligibleRows: [
+      { assetId: 91, accountId: 4, productId: '3851408796480045486', sourceType: 'web_download', eligible: true },
+      { assetId: 92, accountId: 5, productId: '3851408796480045486', sourceType: 'web_download', eligible: true },
+      { assetId: 93, accountId: 4, productId: '3851408796480045486', sourceType: 'detail_generated', eligible: true }
+    ]
+  })
+  const reused = await reusable.api.runPostPublishQianchuanMaterialForQueue(52)
+  assert.equal(reused.status, 'enqueued')
+  assert.deepEqual(reusable.calls.enqueuedAssetIds, [91])
+  assert.equal(reusable.calls.auth, 0)
+  assert.equal(reusable.calls.query, 0)
+  assert.equal(reusable.calls.download, 0)
+  assert.equal(reusable.calls.waitForCart, 1)
+
   fs.rmSync(noAuth.root, { recursive: true, force: true })
   fs.rmSync(noBinding.root, { recursive: true, force: true })
   fs.rmSync(noQuota.root, { recursive: true, force: true })
@@ -183,7 +202,8 @@ async function main() {
   fs.rmSync(success.root, { recursive: true, force: true })
   fs.rmSync(generatedOnly.root, { recursive: true, force: true })
   fs.rmSync(failedDownload.root, { recursive: true, force: true })
-  process.stdout.write('post-publish Qianchuan isolation: PASS (blocked_auth, blocked_binding, skipped_quota, skipped_no_video, failed_download, idempotence, published-only hook, mark-published trigger, account/product attribution, detail_generated excluded)\n')
+  fs.rmSync(reusable.root, { recursive: true, force: true })
+  process.stdout.write('post-publish Qianchuan isolation: PASS (blocked_auth, blocked_binding, skipped_quota, skipped_no_video, failed_download, idempotence, published-only hook, mark-published trigger, account/product attribution, detail_generated excluded, reuse-cart-download)\n')
 }
 
 main().catch((error) => {

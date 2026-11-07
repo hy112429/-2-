@@ -6,8 +6,8 @@ import QianchuanVideoQueryPanel from './QianchuanVideoQueryPanel.vue'
 /**
  * 商品查询主界面（真实数据链路）
  *
- * 数据链路：商品 ID → 百应缓存；缺视频时在来源账号的已登录百应重新读取详情；
- * 同时搜索已授权千川账户。各来源只展示实际返回的视频直链。
+ * 数据链路：商品 ID → 选品记录自动确定账号 → 该账号百应「带货内容」；
+ * 只下载同款带货作品的完整视频，账号额度单独保存。
  */
 
 interface CachedProduct {
@@ -29,8 +29,45 @@ const searchBusy = ref(false)
 const error = ref('')
 const searchStatus = ref('')
 const foundProduct = ref<CachedProduct | null>(null)
-const qianchuanPanel = ref<{ searchProduct: (id: string) => Promise<{ videoCount: number; reason: string; authorized: boolean }> } | null>(null)
-const foundVideoUrls = computed(() => foundProduct.value ? videoUrlsOf(foundProduct.value) : [])
+interface PromotionVideo {
+  videoId: string
+  url: string
+  title: string
+  author: string
+  duration?: number
+  publishTime?: number
+  shareUrl?: string
+}
+const promotionVideos = ref<PromotionVideo[]>([])
+const promotionAvailable = ref(0)
+const queryAccountId = ref<number | null>(null)
+const queryAccountName = ref('')
+const queryAccountSource = ref('')
+const queryAccountDownloadPath = ref('')
+const queryQuota = ref(10)
+const quotaNotice = ref('')
+const foundVideoUrls = computed(() => promotionVideos.value.map((video) => video.url))
+
+watch(queryAccountId, async (accountId) => {
+  if (accountId === null) return
+  const result = await window.api.baiying.promotionQuota({ accountId })
+  if (result.ok && result.quota && queryAccountId.value === accountId) queryQuota.value = result.quota
+})
+
+async function saveQueryQuota(): Promise<void> {
+  const accountId = queryAccountId.value
+  if (accountId === null) {
+    quotaNotice.value = '请先查询商品，让软件自动确定选品账号'
+    return
+  }
+  const limit = Number(queryQuota.value)
+  if (!Number.isSafeInteger(limit) || limit < 10) {
+    quotaNotice.value = '每账号下载额度必须是至少 10 条的整数'
+    return
+  }
+  const result = await window.api.baiying.promotionQuota({ accountId, limit })
+  quotaNotice.value = result.ok ? `已为该账号保存每商品 ${result.quota} 条的下载额度` : result.error ?? '保存失败'
+}
 
 function videoUrlsOf(product: CachedProduct): string[] {
   const stored = Array.isArray(product.video_urls) ? product.video_urls : []
@@ -138,60 +175,6 @@ function queryCachedProduct(id: string): Promise<{ found: boolean; product?: Cac
   })
 }
 
-async function refreshBaiyingVideos(id: string, product: CachedProduct): Promise<{ product: CachedProduct; reason: string }> {
-  if (!/^\d{8,20}$/.test(product.commodity_id ?? '')) {
-    return { product, reason: '本机没有该商品的推广 ID，无法打开百应详情' }
-  }
-  if (batchRunning.value) return { product, reason: '百应批量抓取正在运行，请完成后再搜索' }
-  const listed = await window.api.baiying.batchAccounts()
-  if (!listed.ok) return { product, reason: listed.error ?? '读取百应采集账号失败' }
-  const accounts = listed.accounts ?? []
-  const owner = accounts.find(row => row.id === product.account_id)
-    ?? accounts.find(row => row.id === batchAccountId.value)
-    ?? (accounts.length === 1 ? accounts[0] : undefined)
-  if (!owner) return { product, reason: accounts.length ? '商品来源账号不明确；请在下方选择百应采集账号' : '没有启用的百应采集账号' }
-
-  searchStatus.value = `正在用百应账号「${owner.name}」读取商品详情视频…`
-  let taskId = ''
-  let resultMessage = ''
-  const buffered: BaiyingBatchEvent[] = []
-  let resolveFinished!: (value: string) => void
-  const finished = new Promise<string>((resolve) => { resolveFinished = resolve })
-  const handle = (event: BaiyingBatchEvent): void => {
-    if (event.taskId !== taskId) return
-    if (event.type === 'product') resultMessage = event.message ?? ''
-    if (event.type === 'error') resolveFinished(event.message ?? '百应详情读取失败')
-    if (event.type === 'result') resolveFinished(resultMessage || '百应详情未返回视频直链')
-  }
-  const off = window.api.baiying.onBatchEvent((event) => {
-    if (!taskId) buffered.push(event)
-    else handle(event)
-  })
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    const reply = await window.api.baiying.batchStart({
-      productIds: [`${id}:${product.commodity_id}`], accountId: owner.id
-    })
-    if (!reply.taskId) return { product, reason: reply.error ?? '百应详情读取未启动' }
-    taskId = reply.taskId
-    buffered.forEach(handle)
-    timer = setTimeout(() => resolveFinished('百应详情读取超时'), 80_000)
-    const reason = await finished
-    if (reason === '百应详情读取超时') await window.api.baiying.batchCancel(taskId)
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      const refreshed = await queryCachedProduct(id)
-      if (refreshed.product && videoUrlsOf(refreshed.product).length) {
-        return { product: refreshed.product, reason: `百应详情取得 ${videoUrlsOf(refreshed.product).length} 条视频直链` }
-      }
-      if (attempt < 11) await new Promise(resolve => setTimeout(resolve, 250))
-    }
-    return { product, reason }
-  } finally {
-    if (timer) clearTimeout(timer)
-    off()
-  }
-}
-
 async function search(): Promise<void> {
   if (searchBusy.value) return
   const id = productId.value.trim()
@@ -201,35 +184,53 @@ async function search(): Promise<void> {
   }
   searchBusy.value = true
   error.value = ''
-  searchStatus.value = '正在搜索百应与千川视频…'
+  searchStatus.value = '正在查找同款带货作品…'
   foundProduct.value = null
+  promotionVideos.value = []
+  promotionAvailable.value = 0
+  queryAccountId.value = null
+  queryAccountName.value = ''
+  queryAccountSource.value = ''
+  queryAccountDownloadPath.value = ''
+  quotaNotice.value = ''
   previewText.value = ''
-  const qianchuanSearch = qianchuanPanel.value?.searchProduct(id)
-    .catch((cause: unknown) => ({ videoCount: 0, reason: `千川查询失败：${String(cause)}`, authorized: false }))
   try {
     const r = await queryCachedProduct(id)
-    let baiyingReason = '百应缓存没有此商品及其推广 ID'
-    if (r.found && r.product) {
-      foundProduct.value = r.product
-      if (videoUrlsOf(r.product).length) baiyingReason = `百应缓存已有 ${videoUrlsOf(r.product).length} 条视频直链`
-      else {
-        const refreshed = await refreshBaiyingVideos(id, r.product)
-        foundProduct.value = refreshed.product
-        baiyingReason = refreshed.reason
-      }
+    const product: CachedProduct = r.product ?? { product_id: id, captured_at: new Date().toISOString() }
+    foundProduct.value = product
+    const result = await window.api.baiying.promotionVideos({ productId: id })
+    if (!result.ok) throw new Error(result.error ?? '读取同款带货作品失败')
+    if (!Number.isSafeInteger(result.accountId) || !result.accountId || result.accountId < 1) {
+      throw new Error('未能确认该商品的选品账号，已停止下载')
     }
-    const qianchuan = await qianchuanSearch
-    const baiyingCount = foundProduct.value ? videoUrlsOf(foundProduct.value).length : 0
-    const qianchuanCount = qianchuan?.videoCount ?? 0
-    searchStatus.value = `本次找到：百应 ${baiyingCount} 条、千川 ${qianchuanCount} 条。${qianchuanCount ? '千川结果见下方展开区。' : ''}`
-    if (!baiyingCount && !qianchuanCount) {
-      error.value = `未取得视频链接。百应：${baiyingReason}；千川：${qianchuan?.reason ?? '查询入口不可用'}`
-    }
+    queryAccountId.value = result.accountId
+    queryAccountName.value = result.accountName || `账号-${result.accountId}`
+    queryAccountSource.value = result.accountSource || '选品记录'
+    queryAccountDownloadPath.value = result.downloadPath || ''
+    if (Number.isSafeInteger(result.limit) && result.limit && result.limit >= 10) queryQuota.value = result.limit
+    foundProduct.value = { ...product, account_id: result.accountId, commodity_id: result.commodityId ?? product.commodity_id }
+    promotionVideos.value = result.videos ?? []
+    promotionAvailable.value = result.available ?? promotionVideos.value.length
+    if (!promotionVideos.value.length) throw new Error('百应带货内容没有可下载的同款视频')
+    const started = await downloadFound()
+    if (!started) throw new Error(queueSummary.value || '下载队列未启动')
+    searchStatus.value = `已按${queryAccountSource.value}匹配「${queryAccountName.value}」。百应找到 ${promotionAvailable.value} 条同款带货作品，按该账号额度选取 ${promotionVideos.value.length} 条，已启动下载队列。${result.cacheWarning ? `推广 ID 缓存待检查：${result.cacheWarning}` : ''}`
   } catch (err) {
-    error.value = `商品视频搜索失败：${String(err)}`
+    error.value = `商品视频搜索失败：${err instanceof Error ? err.message : String(err)}`
   } finally {
     searchBusy.value = false
   }
+}
+
+async function pasteIdAndDownload(): Promise<void> {
+  if (searchBusy.value || queueRunning.value) return
+  const copied = await window.api.baiying.clipboardProductId()
+  if (!copied.ok || !copied.productId) {
+    error.value = copied.error ?? '未读取到商品 ID'
+    return
+  }
+  productId.value = copied.productId
+  await search()
 }
 
 // ---------------------------------------------------------------- 预览 / 下载目录
@@ -240,12 +241,11 @@ function videoPreview(): void {
     previewText.value = '（未选择商品）请先搜索'
     return
   }
-  const urls = videoUrlsOf(p)
-  if (!urls.length) {
-    previewText.value = '百应未返回该商品的视频直链；请查看搜索结果中的千川来源与具体原因。'
+  if (!promotionVideos.value.length) {
+    previewText.value = '百应未返回该商品的同款带货作品视频。'
     return
   }
-  previewText.value = `【${p.title ?? p.product_id}】\n商品ID：${p.product_id}\n佣金率：${p.cos_ratio ?? '-'}%\n${urls.map((url, index) => `视频 ${index + 1}：${url}`).join('\n')}`
+  previewText.value = `【${p.title ?? p.product_id}】\n商品ID：${p.product_id}\n百应同款带货作品：${promotionVideos.value.length} 条\n${promotionVideos.value.map((video, index) => `${index + 1}. ${video.author}｜${video.title}｜作品ID ${video.videoId}`).join('\n')}`
 }
 
 function clearPreview(): void {
@@ -1120,20 +1120,23 @@ async function downloadCached(): Promise<void> {
 }
 
 /** 下载当前搜索命中的商品视频（单任务，走同一队列） */
-async function downloadFound(): Promise<void> {
+async function downloadFound(): Promise<boolean> {
   const p = foundProduct.value
-  if (!p || !foundVideoUrls.value.length || queueRunning.value) return
+  if (!p || !foundVideoUrls.value.length || queueRunning.value || queryAccountId.value === null) return false
+  if (!downloadDir.value) downloadDir.value = await window.api.dir.getDownloadDir()
+  const accountRoot = queryAccountDownloadPath.value || `${downloadDir.value}\\账号-${queryAccountId.value}`
   const date = localDate()
-  const timestamp = fileTimestamp()
-  const tasks = foundVideoUrls.value.map((url, index) => ({
-    id: `${p.product_id}-${index + 1}`,
+  const tasks = promotionVideos.value.map((video, index) => ({
+    id: `${p.product_id}-${video.videoId}`,
     product_id: p.product_id,
-    url,
-    dest: `${downloadDir.value}\\${baiyingAccountFolder(p)}\\${date}\\${p.product_id}\\${p.product_id}_${videoIdFromUrl(url, index)}_${String(index + 1).padStart(3, '0')}_${timestamp}.mp4`
+    account_id: queryAccountId.value,
+    verify_video: true,
+    url: video.url,
+    dest: `${accountRoot}\\${date}\\${p.product_id}\\${p.product_id}_${video.videoId}_${String(index + 1).padStart(3, '0')}_${video.publishTime ? fileTimestampFromSeconds(video.publishTime) : fileTimestamp()}.mp4`
   }))
   queueTasks.value = tasks.map((t) => ({
     ...t,
-    sourceNoWatermark: true,
+    sourceNoWatermark: false,
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -1147,10 +1150,17 @@ async function downloadFound(): Promise<void> {
   })
   if (!reply.taskId) {
     queueSummary.value = `队列启动失败：${reply.error ?? '未知错误'}`
-    return
+    return false
   }
   queueEngineId.value = reply.taskId
   queueRunning.value = true
+  return true
+}
+
+function fileTimestampFromSeconds(seconds: number): string {
+  const date = new Date(seconds * 1000)
+  if (!Number.isFinite(date.getTime())) return fileTimestamp()
+  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}${String(date.getDate()).padStart(2, '0')}${String(date.getHours()).padStart(2, '0')}${String(date.getMinutes()).padStart(2, '0')}${String(date.getSeconds()).padStart(2, '0')}`
 }
 
 // ---------------------------------------------------------------- 抖音链接批量解析下载（补充路径）
@@ -1413,7 +1423,7 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="query">
-    <header class="query-head"><h1>商品查询与下载</h1><span>商品 ID 一次搜索百应与千川视频</span></header>
+    <header class="query-head"><h1>商品查询与下载</h1><span>输入商品 ID，下载百应同款带货作品视频</span></header>
     <!-- ---------- 搜索区 ---------- -->
     <div class="search-bar">
       <label class="fld">
@@ -1426,19 +1436,33 @@ onBeforeUnmount(() => {
         />
       </label>
 
-      <button class="btn primary" :disabled="searchBusy" @click="search">
-        {{ searchBusy ? '查询中…' : '搜索' }}
+      <button class="btn primary" :disabled="searchBusy || queueRunning" @click="search">
+        {{ searchBusy ? '查询中…' : '搜索并下载' }}
       </button>
+      <button class="btn" :disabled="searchBusy || queueRunning" @click="pasteIdAndDownload">粘贴 ID 并下载</button>
       <p v-if="searchStatus" class="notice" role="status">{{ searchStatus }}</p>
       <div v-if="error" class="search-feedback">
         <span class="error">{{ error }}</span>
       </div>
     </div>
 
-    <QianchuanVideoQueryPanel ref="qianchuanPanel" />
+    <div class="search-bar">
+      <label class="fld">
+        <span class="fld-label">选品账号（自动匹配）</span>
+        <span class="input">{{ queryAccountId === null ? '查询商品后自动识别' : `${queryAccountName}（ID ${queryAccountId}）` }}</span>
+      </label>
+      <label class="fld">
+        <span class="fld-label">该账号每商品下载额度（至少 10 条）</span>
+        <input v-model.number="queryQuota" class="input" type="number" min="10" step="1" :disabled="queryAccountId === null" />
+      </label>
+      <button class="btn" :disabled="queryAccountId === null" @click="saveQueryQuota">保存额度</button>
+      <p v-if="quotaNotice" class="notice">{{ quotaNotice }}</p>
+    </div>
+
+    <QianchuanVideoQueryPanel />
 
     <!-- ---------- 真实数据标注 ---------- -->
-    <p v-if="foundProduct" class="real-tag">数据来源：百应缓存库（用户在百应浏览时自动采集）</p>
+    <p v-if="foundProduct" class="real-tag">商品信息来自百应缓存；视频来自选品账号百应「带货内容」</p>
 
     <!-- ---------- 商品信息 ---------- -->
     <div v-if="foundProduct" class="product-card">
@@ -1453,7 +1477,7 @@ onBeforeUnmount(() => {
     <!-- 常用操作保持在结果上方，普通窗口无需滚到表格底部。 -->
     <div class="action-bar">
       <button class="btn primary" :disabled="!foundVideoUrls.length || queueRunning" @click="downloadFound">
-        {{ queueRunning ? '队列运行中…' : `下载全部视频（${foundVideoUrls.length}）` }}
+        {{ queueRunning ? '队列运行中…' : `重新下载本次视频（${foundVideoUrls.length}）` }}
       </button>
       <button class="btn danger" :disabled="!queueRunning" @click="cancelAll">取消全部</button>
       <button class="btn" @click="chooseDir">设置下载目录</button>
@@ -1515,19 +1539,19 @@ onBeforeUnmount(() => {
       <p class="edit-model-note">首次运行需联网下载约 500 MB 的中文语音模型，模型缓存在当前下载目录；后续识别可离线使用。</p>
     </section>
 
-    <!-- ---------- 视频结果（展示该商品采集到的全部素材视频直链） ---------- -->
+    <!-- ---------- 视频结果（仅展示该商品的同款带货作品） ---------- -->
     <div class="table-wrap">
       <table class="grid">
         <thead>
           <tr>
             <th class="c-check">勾选</th>
             <th class="c-video">视频状态</th>
-            <th class="c-url">视频地址</th>
+            <th class="c-url">带货作品</th>
           </tr>
         </thead>
         <tbody>
           <template v-if="foundProduct">
-            <tr v-for="(url, videoIndex) in foundVideoUrls" :key="`${foundProduct.product_id}-${videoIndex}`" class="checked">
+            <tr v-for="(video, videoIndex) in promotionVideos" :key="`${foundProduct.product_id}-${video.videoId}`" class="checked">
               <td class="c-check">
                 <input type="checkbox" checked disabled />
               </td>
@@ -1536,11 +1560,11 @@ onBeforeUnmount(() => {
                   视频 {{ videoIndex + 1 }} / {{ foundVideoUrls.length }}
                 </span>
               </td>
-              <td class="c-url mono" :title="url">
-                {{ url }}
+              <td class="c-url" :title="video.title">
+                {{ video.author }}｜{{ video.title }}（作品 ID：{{ video.videoId }}）
               </td>
             </tr>
-            <tr v-if="!foundVideoUrls.length"><td colspan="3">百应没有可用视频直链；本次搜索也会自动查询已授权的千川账户，结果见上方千川区。</td></tr>
+            <tr v-if="!foundVideoUrls.length"><td colspan="3">百应尚未返回该商品的同款带货作品视频。</td></tr>
           </template>
           <template v-else>
             <tr class="empty-row"><td colspan="3">搜索商品 ID 后展示真实商品视频直链</td></tr>
@@ -1551,6 +1575,7 @@ onBeforeUnmount(() => {
 
     <p v-if="dirNotice" class="notice">{{ dirNotice }}</p>
     <p class="dir-line">当前下载目录：<span class="mono">{{ downloadDir }}</span></p>
+    <p v-if="queryAccountId !== null && foundProduct" class="dir-line">本商品自动分类目录：<span class="mono">{{ queryAccountDownloadPath || `${downloadDir}\\账号-${queryAccountId}` }}\{{ localDate() }}\{{ foundProduct.product_id }}</span></p>
 
     <!-- ---------- 百应批量抓取（T-15） ---------- -->
     <div class="queue-panel">

@@ -13,6 +13,7 @@ import {
   type RegistryCandidate
 } from './selection_registry'
 import { randomUUID } from 'crypto'
+import { fireCartVideoDownload } from './baiying_batch'
 
 /**
  * 抖音 / 百应 登录态管理与后台探针视图
@@ -824,6 +825,7 @@ export function registerLoginIpc(): void {
       const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
       const completedById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
       const settlementWarnings: string[] = []
+      const confirmedDownloads: Array<{ productId: string; commodityId: string }> = []
       const registryReleaseEvents: Array<{
         productId: string
         outcome: 'NOT_ADDED'
@@ -855,9 +857,15 @@ export function registerLoginIpc(): void {
         try {
           await finishRegistryReservation(token, outcome)
           if (releaseEvent) releaseEvent.settled = true
+          if (outcome === 'ADDED' && item?.cartAdded === true && /^\d{8,20}$/.test(productId)) {
+            confirmedDownloads.push({ productId, commodityId: String(item.commodityId ?? candidate.commodityId ?? '') })
+          }
         } catch (error) {
           settlementWarnings.push(`${productId}本机登记结算暂未确认：${error instanceof Error ? error.message : String(error)}`)
         }
+      }
+      for (const item of confirmedDownloads) {
+        fireCartVideoDownload(params.accountId, item.productId, item.commodityId)
       }
       const rejected = reservationResult.rejected.map((item) => ({ ...item }))
       return {

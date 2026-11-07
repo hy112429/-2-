@@ -185,6 +185,7 @@ declare global {
     id: number
     name: string
     profilePath?: string
+    downloadPath?: string
   }
 
   /** 批量抓取事件（主进程 → 渲染进程，baiying:event） */
@@ -462,6 +463,24 @@ declare global {
       }
       /** 百应批量抓取（T-15） */
       baiying: {
+        /** 读取用户刚从百应复制的商品 ID；其他剪贴板内容不返回。 */
+        clipboardProductId(): Promise<{ ok: boolean; productId?: string; error?: string }>
+        /** 读取或保存该账号的同款带货作品下载额度。 */
+        promotionQuota(params: { accountId: number; limit?: number }): Promise<{ ok: boolean; quota?: number; error?: string }>
+        /** 从百应商品「带货内容」读取完整作品视频。 */
+        promotionVideos(params: { productId: string }): Promise<{
+          ok: boolean
+          accountId?: number
+          accountName?: string
+          accountSource?: string
+          downloadPath?: string
+          commodityId?: string
+          cacheWarning?: string
+          available?: number
+          limit?: number
+          videos?: Array<{ videoId: string; url: string; title: string; author: string; duration?: number; publishTime?: number; shareUrl?: string }>
+          error?: string
+        }>
         /** 读取启用账号与各自专属百应浏览器 profile。 */
         batchAccounts(): Promise<{ ok?: boolean; accounts?: BaiyingBatchAccount[]; error?: string }>
         /** 使用选中账号的专属百应 profile 按商品 ID 逐页抓取缓存。 */
