@@ -294,6 +294,34 @@ class QianchuanBrowserTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["remoteMaterialId"], "7700000000000000001")
             self.assertTrue(result["items"][1]["submitAttempted"])
 
+    def test_batch_failure_before_file_selection_is_safe_for_single_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = []
+            for name in ("one.mp4", "two.mp4"):
+                path = root / name
+                path.write_bytes(b"isolated video")
+                options.append(qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                                path, name, root / "evidence"))
+            fake_page = types.SimpleNamespace()
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", return_value=None), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_files", side_effect=qc.UploadStopped(
+                     "上传窗口未打开", stage="file_input")), \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, option, result: result):
+                result = qc.upload_material_batch(options)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual([item["status"] for item in result["items"]], ["failed", "failed"])
+            self.assertEqual([item["submitAttempted"] for item in result["items"]], [False, False])
+
     def test_batch_reuses_all_existing_materials_without_selecting_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

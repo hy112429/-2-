@@ -1012,7 +1012,8 @@ def recover_interrupted(
                 "UPDATE qianchuan_upload_jobs SET status = 'needs_review', "
                 "error_code = 'PROCESS_INTERRUPTED', "
                 "error_message = '上传执行器中断；远端结果未确认，须核查后处理', "
-                "failure_stage = 'interrupted', completed_at = ?, updated_at = ? WHERE id = ?",
+                "failure_stage = 'interrupted', submit_attempted = 1, "
+                "completed_at = ?, updated_at = ? WHERE id = ?",
                 (now_text(), now_text(), job_id),
             )
             _event(connection, job_id, "interrupted", "needs_review",
@@ -1020,6 +1021,39 @@ def recover_interrupted(
                    details={"quotaHeld": True, "olderThanMinutes": older_than_minutes})
         connection.commit()
         return {"ok": True, "recoveredJobIds": recovered, "count": len(recovered)}
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def requeue_preflight_batch(
+    connection: sqlite3.Connection, job_ids: List[int],
+) -> Dict[str, Any]:
+    """把尚未开始选文件的批量任务安全退回队列，供单条路径回退。"""
+    if not 1 <= len(job_ids) <= 10 or len(set(job_ids)) != len(job_ids) or any(i <= 0 for i in job_ids):
+        raise ValueError("批量回排须提供 1–10 个不重复的任务 ID")
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        rows = [_job(connection, job_id) for job_id in job_ids]
+        if any(row["status"] != "uploading" or int(row["submit_attempted"])
+               or row["remote_material_id"] for row in rows):
+            raise ValueError("仅未开始平台写入且无远端回执的批量任务可安全回排")
+        timestamp = now_text()
+        for row in rows:
+            job_id = int(row["id"])
+            connection.execute(
+                "UPDATE qianchuan_upload_jobs SET status = 'queued', "
+                "error_code = '', error_message = '', failure_stage = '', "
+                "screenshot_path = '', started_at = NULL, completed_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = 'uploading'",
+                (timestamp, job_id),
+            )
+            _event(connection, job_id, "batch_preflight", "queued",
+                   "批量上传尚未选择文件，安全回退单条上传路径",
+                   details={"remoteWriteAttempted": False, "fallback": "single"})
+        connection.commit()
+        return {"ok": True, "jobIds": job_ids, "count": len(job_ids)}
     except Exception:
         connection.rollback()
         raise
@@ -1176,6 +1210,8 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("--manual-action-required", action="store_true")
     interrupted = commands.add_parser("recover-interrupted", help="显式隔离超时的上传中任务，保留配额待人工核查")
     interrupted.add_argument("--older-than-minutes", type=int, default=30)
+    requeue = commands.add_parser("requeue-preflight-batch", help="批量尚未选文件时回排，供单条路径安全回退")
+    requeue.add_argument("--ids", required=True, help="逗号分隔的任务 ID")
     retry = commands.add_parser("retry-safe", help="人工重排明确未触及远端写入的失败任务")
     retry.add_argument("--id", type=int, required=True)
     review = commands.add_parser("resolve-review-absent", help="人工核对远端无素材后解除隔离并重排")
@@ -1239,6 +1275,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                               args.manual_action_required)
             elif args.command == "recover-interrupted":
                 result = recover_interrupted(connection, args.older_than_minutes)
+            elif args.command == "requeue-preflight-batch":
+                result = requeue_preflight_batch(
+                    connection, [int(part.strip()) for part in args.ids.split(",") if part.strip()]
+                )
             elif args.command == "retry-safe":
                 result = retry_safe(connection, args.id)
             elif args.command == "resolve-review-absent":

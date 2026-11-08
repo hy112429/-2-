@@ -342,6 +342,30 @@ async function runBatchUpload(jobs: Json[]): Promise<Json> {
     const browserItems = Array.isArray(browser['items']) ? browser['items'] as Json[] : []
     const manualActionRequired = browserItems.some((item) => item['manualActionRequired'] === true)
     const byName = new Map(browserItems.map((item) => [stringValue(item['assetName']), item]))
+    // 浏览器在文件选择前失败时，队列仍可安全回排并走原单条路径；一旦
+    // 有文件已选择、提交已开始或回执缺失，则绝不回退，交由待核查流程处理。
+    const noTouchFailedIds: number[] = []
+    const confirmedItems: Array<{ id: number; remoteId: string }> = []
+    let hasUncertainItem = false
+    for (const job of claimedJobs) {
+      const item = byName.get(stringValue(job['materialName']))
+      const remoteId = stringValue(item?.['remoteMaterialId'])
+      if (browserOutcome.ok && item?.['status'] === 'succeeded' && remoteId) {
+        confirmedItems.push({ id: jobIdFrom(job['id']), remoteId })
+      } else if (browserOutcome.ok && item?.['status'] === 'failed' &&
+                 item['submitAttempted'] !== true && !remoteId) {
+        noTouchFailedIds.push(jobIdFrom(job['id']))
+      } else {
+        hasUncertainItem = true
+      }
+    }
+    if (browserOutcome.ok && noTouchFailedIds.length > 0 && !hasUncertainItem) {
+      for (const item of confirmedItems) {
+        await queueCommand('complete', ['--id', String(item.id), '--remote-material-id', item.remoteId])
+      }
+      await queueCommand('requeue-preflight-batch', ['--ids', noTouchFailedIds.join(',')])
+      return { ok: false, status: 'preflight_failed', error: '批量尚未选择文件，已安全回退单条上传路径' }
+    }
     const results: Json[] = []
     for (const job of claimedJobs) {
       const id = jobIdFrom(job['id'])

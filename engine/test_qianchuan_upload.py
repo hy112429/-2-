@@ -458,8 +458,28 @@ class QianchuanUploadTests(unittest.TestCase):
         result = qc.recover_interrupted(self.connection, 30, datetime(2026, 11, 1, 10, 31))
         self.assertEqual(result["recoveredJobIds"], [job])
         self.assertEqual(qc.list_jobs(self.connection)["rows"][0]["status"], "needs_review")
+        self.assertTrue(qc._job_payload(qc._job(self.connection, job))["submitAttempted"])
         with self.assertRaisesRegex(ValueError, "不可再次领取"):
             qc.claim(self.connection, job, today=TODAY)
+
+    def test_batch_preflight_can_requeue_only_before_file_selection(self) -> None:
+        assets = [self.add_asset("p-preflight") for _ in range(2)]
+        jobs = qc.enqueue(self.connection, self.account_id, assets, today=TODAY)["jobs"]
+        ids = [int(item["id"]) for item in jobs]
+        qc.claim_batch(self.connection, ids, today=TODAY)
+        result = qc.requeue_preflight_batch(self.connection, ids)
+        self.assertEqual(result["jobIds"], ids)
+        self.assertEqual([qc._job_payload(qc._job(self.connection, job_id))["status"] for job_id in ids],
+                         ["queued", "queued"])
+        self.assertEqual(qc.list_events(self.connection, ids[0])["rows"][-1]["stage"], "batch_preflight")
+
+        qc.claim(self.connection, ids[0], today=TODAY)
+        self.connection.execute(
+            "UPDATE qianchuan_upload_jobs SET submit_attempted = 1 WHERE id = ?", (ids[0],)
+        )
+        self.connection.commit()
+        with self.assertRaisesRegex(ValueError, "仅未开始平台写入"):
+            qc.requeue_preflight_batch(self.connection, [ids[0]])
 
 
 if __name__ == "__main__":
