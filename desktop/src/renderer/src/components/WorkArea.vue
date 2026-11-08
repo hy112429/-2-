@@ -138,6 +138,7 @@ watch(
       </div>
     </template>
 
+
     <template v-else-if="props.nav === '选品日志'">
       <div class="query-body">
         <SelectionLogsView />

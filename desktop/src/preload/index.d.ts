@@ -147,6 +147,12 @@ declare global {
     candidateSnapshot: Record<string, unknown>
     selectedAt: string
     updatedAt: string
+    recordSource: 'selection' | 'qianchuan_upload'
+    materialCount: number
+    materialFirstCount: number
+    materialMovedCount: number
+    materialPendingCount: number
+    materialOtherCount: number
   }
 
   /** engine:run 入参 */
@@ -328,7 +334,7 @@ declare global {
           options?: { profileKey?: string; profilePath?: string }
         ): Promise<{ ok: boolean; url: string; external: boolean; profilePath?: string; port?: number; title?: string; error?: string }>
         inspectBaiyingSelection(options: { profileKey: string; profilePath?: string; includeCategoryTree?: boolean }): Promise<Record<string, unknown>>
-        checkAccountLogins(params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>>
+        checkAccountLogins(params: { accountId: number; profilePath?: string; closeAfterAutomation?: boolean }): Promise<Record<string, unknown>>
         inspectAccountPages(params: { accountId: number; profilePath?: string }): Promise<{
           ok: boolean
           inspectable: boolean
@@ -352,6 +358,7 @@ declare global {
           maxSelectedProducts?: number
           stopAfterCart?: boolean
           previewOnly?: boolean
+          closeAfterAutomation?: boolean
         }): Promise<Record<string, unknown>>
         getSelectionRegistrySnapshot(accountKey: string, candidates: Array<{ productId: string; leafCategoryId: string }>): Promise<{
           usedProductIds: string[]
@@ -532,6 +539,8 @@ declare global {
         uploadTargets(): Promise<Record<string, unknown>>
         eligibleAssets(accountId: number): Promise<Record<string, unknown>>
         uploadJobs(accountId?: number): Promise<Record<string, unknown>>
+        materialRecords(params: { accountId: number; productId: string }): Promise<Record<string, unknown>>
+        refreshMaterialStatus(jobId: number): Promise<Record<string, unknown>>
         enqueueUpload(params: { accountId: number; assetIds: number[]; qianchuanAccountId: number }): Promise<Record<string, unknown>>
         runUpload(jobId: number): Promise<Record<string, unknown>>
         retrySafeUpload(jobId: number): Promise<Record<string, unknown>>
@@ -545,6 +554,13 @@ declare global {
         setPostPublishEnabled(enabled: boolean): Promise<Record<string, unknown>>
         postPublishRuns(): Promise<Record<string, unknown>>
         retryPostPublishRun(queueId: number): Promise<Record<string, unknown>>
+        planSettings(qcId: number): Promise<Record<string, unknown>>
+        savePlanSettings(params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>>
+        planJobs(qcId?: number): Promise<Record<string, unknown>>
+        planSupplements(): Promise<Record<string, unknown>>
+        runPlan(jobId: number): Promise<Record<string, unknown>>
+        retryBlockedPlan(jobId: number): Promise<Record<string, unknown>>
+        resolvePlan(params: { id: number; present: boolean; note: string; remotePlanId?: string }): Promise<Record<string, unknown>>
         scanViolations(qcId: number): Promise<Record<string, unknown>>
         prepareViolationDeletion(params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>>
         violationBatch(batchId: number): Promise<Record<string, unknown>>

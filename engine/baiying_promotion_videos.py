@@ -183,31 +183,30 @@ def existing_video_ids(db_path: str, account_id: int, product_id: str) -> dict:
     """只认同账号、同商品、已入素材库且文件仍存在的网页下载视频。"""
     database = Path(db_path)
     if not database.is_file():
-        return {"ok": True, "videoIds": []}
+        return {"ok": True, "videoIds": [], "files": []}
     connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
     try:
         table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='assets'"
         ).fetchone()
         if not table:
-            return {"ok": True, "videoIds": []}
+            return {"ok": True, "videoIds": [], "files": []}
         rows = connection.execute(
             "SELECT video_id, file_path FROM assets WHERE account_id=? AND product_id=? "
             "AND source_type='web_download' AND status='ready'",
             (account_id, product_id),
         )
-        video_ids = {
-            str(video_id) for video_id, file_path in rows
-            if video_id and Path(str(file_path)).is_file()
-        }
-        return {"ok": True, "videoIds": sorted(video_ids)}
+        files = [(str(video_id), str(file_path)) for video_id, file_path in rows
+                 if video_id and Path(str(file_path)).is_file()]
+        return {"ok": True, "videoIds": sorted({item[0] for item in files}),
+                "files": [{"videoId": video_id, "filePath": path} for video_id, path in files]}
     finally:
         connection.close()
 
 
 def set_quota(db_path: str, account_id: int, limit: int) -> int:
-    if limit < MIN_QUOTA:
-        raise ValueError(f"每账号下载额度至少 {MIN_QUOTA} 条")
+    if not MIN_QUOTA <= limit <= 500:
+        raise ValueError(f"每账号下载额度须为 {MIN_QUOTA}–500 条")
     with quota_connection(db_path) as connection:
         connection.execute(
             "INSERT INTO baiying_promotion_video_quota(account_id, video_limit) VALUES (?, ?) "
@@ -325,12 +324,34 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
                 # 保留用户从选品广场打开的原生 URL（其中可能有不同的页面展示参数）。
                 target_url = page.url
             page.goto(target_url, wait_until="commit", timeout=20_000)
+            if urlparse(page.url).hostname != "buyin.jinritemai.com":
+                raise RuntimeError("该账号百应登录态已失效；请在该账号专属浏览器登录百应后重试")
             tab = page.get_by_text("带货内容", exact=True)
-            tab.wait_for(state="visible", timeout=20_000)
+            try:
+                tab.wait_for(state="visible", timeout=20_000)
+            except PlaywrightTimeoutError as error:
+                if urlparse(page.url).hostname != "buyin.jinritemai.com":
+                    raise RuntimeError("该账号百应登录态已失效；请在该账号专属浏览器登录百应后重试") from error
+                raise
             with page.expect_response(lambda response: is_sale_response(response, product_id), timeout=20_000) as pending:
                 tab.click(timeout=10_000)
-            videos, available = parse_page(pending.value, product_id)
-            seen = {video["videoId"] for video in videos}
+            first_page, available = parse_page(pending.value, product_id)
+            videos: list[dict] = []
+            seen_ids: set[str] = set()
+            seen_sources: set[str] = set()
+
+            def add_unique(page_videos: list[dict]) -> None:
+                for video in page_videos:
+                    # 百应可能给同一视频源分配多个 content_id；仅按 ID 去重会把
+                    # 字节相同的文件下载和上传多次，千川最终仍归并成一个素材 ID。
+                    source = urlparse(video["url"]).path
+                    if video["videoId"] in seen_ids or source in seen_sources:
+                        continue
+                    videos.append(video)
+                    seen_ids.add(video["videoId"])
+                    seen_sources.add(source)
+
+            add_unique(first_page)
             page_number = 1
             while len(videos) < limit and page_number * 12 < available:
                 page_number += 1
@@ -342,10 +363,7 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
                 page_videos, _ = parse_page(pending.value, product_id)
                 if not page_videos:
                     break
-                for video in page_videos:
-                    if video["videoId"] not in seen:
-                        videos.append(video)
-                        seen.add(video["videoId"])
+                add_unique(page_videos)
             return {
                 "ok": True,
                 "productId": product_id,
@@ -372,6 +390,7 @@ def main() -> int:
     parser.add_argument("--product-id")
     parser.add_argument("--commodity-id")
     parser.add_argument("--profile-path")
+    parser.add_argument("--candidate-limit", type=int)
     args = parser.parse_args()
     try:
         if args.resolve_account or args.find_open_product:
@@ -399,7 +418,10 @@ def main() -> int:
             raise ValueError("百应推广 ID 格式无效")
         if not args.profile_path:
             raise ValueError("缺少账号专属浏览器路径")
-        return output(discover(args.profile_path, args.product_id, args.commodity_id, quota))
+        candidate_limit = args.candidate_limit if args.candidate_limit is not None else quota
+        if not quota <= candidate_limit <= 500:
+            raise ValueError("候选读取上限须在账号额度到 500 条之间")
+        return output(discover(args.profile_path, args.product_id, args.commodity_id, candidate_limit))
     except (OSError, ValueError, RuntimeError, sqlite3.Error, PlaywrightTimeoutError) as error:
         return output({"ok": False, "error": str(error)})
 

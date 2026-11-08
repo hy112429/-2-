@@ -3,7 +3,7 @@ import type { Cookie } from 'electron'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { attachProbe } from './probe'
-import { commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
+import { closeAutomationLaunchedBrowser, commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
 import { getClientPaths } from './app-dirs'
 import {
   beginRegistryReservation,
@@ -631,16 +631,29 @@ export function registerLoginIpc(): void {
     return commandManagedBrowser('inspect-selection', { includeCategoryTree: options.includeCategoryTree === true }, options)
   })
 
-  ipcMain.handle('browser:checkAccountLogins', async (_e, params: { accountId: number; profilePath?: string }) => {
+  ipcMain.handle('browser:checkAccountLogins', async (_e, params: { accountId: number; profilePath?: string; closeAfterAutomation?: boolean }) => {
     if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
       throw new Error('登录预检账号 ID 无效')
     }
-    return commandManagedBrowser('check-account-logins', {
-      accountId: params.accountId
-    }, {
+    const options = {
       profileKey: `account-${params.accountId}`,
       profilePath: params.profilePath
-    })
+    }
+    const result = await commandManagedBrowser('check-account-logins', {
+      accountId: params.accountId
+    }, options)
+    const loginConfirmed = [result['baiying'], result['creatorCenter']].every((item) =>
+      item && typeof item === 'object' && (item as Record<string, unknown>)['state'] === 'logged_in'
+    )
+    if (params.closeAfterAutomation === true && loginConfirmed) {
+      try {
+        await closeAutomationLaunchedBrowser(options)
+      } catch (error) {
+        // 登录状态结果优先返回；窗口清理失败只记日志，不把已确认登录误报为检查失败。
+        console.warn(`[登录预检] 账号 ${params.accountId} 的浏览器未能自动关闭：${String(error)}`)
+      }
+    }
+    return result
   })
 
   ipcMain.handle('browser:inspectAccountPages', async (_e, params: { accountId: number; profilePath?: string }) => {
@@ -669,6 +682,7 @@ export function registerLoginIpc(): void {
     maxSelectedProducts?: number
     stopAfterCart?: boolean
     previewOnly?: boolean
+    closeAfterAutomation?: boolean
   }) => {
     if (!params || typeof params.profileKey !== 'string' || !Number.isInteger(params.accountId) || params.accountId < 1) {
       throw new Error('百应选品参数无效')
@@ -682,8 +696,20 @@ export function registerLoginIpc(): void {
         event.sender.send('browser:selectionProgress', { accountId: params.accountId, ...progress })
       }
     }
+    const runManagedSelection = async (data: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const result = await commandManagedBrowser('run-selection', data, browserOptions, onProgress)
+      if (params.closeAfterAutomation === true) {
+        try {
+          await closeAutomationLaunchedBrowser(browserOptions)
+        } catch (error) {
+          // 不用浏览器清理失败覆盖已完成的加车结果；下次账号切换时可继续复用该 profile。
+          console.warn(`[自动选品] 账号 ${params.accountId} 的浏览器未能自动关闭：${String(error)}`)
+        }
+      }
+      return result
+    }
     if (params.previewOnly === true) {
-      return commandManagedBrowser('run-selection', params, browserOptions, onProgress)
+      return runManagedSelection(params)
     }
 
     const accountKey = `local:${params.accountId}`
@@ -706,7 +732,7 @@ export function registerLoginIpc(): void {
         throw new Error('详情恢复只允许读取一个已确认加车的原商品；本次未执行加车。')
       }
       // 商品已在前序阶段确认加车；这里只恢复详情素材，不重新占用登记或发起第二次加车。
-      return commandManagedBrowser('run-selection', params, browserOptions, onProgress)
+      return runManagedSelection(params)
     }
     const maxSelected = Number(params.maxSelectedProducts)
     const fallbackRows = params.allowCandidateFallback === true
@@ -821,7 +847,7 @@ export function registerLoginIpc(): void {
     }
     const runParams = { ...params, selectedIndexes: reservedIndexes }
     try {
-      const result = await commandManagedBrowser('run-selection', runParams, browserOptions, onProgress)
+      const result = await runManagedSelection(runParams)
       const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
       const completedById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
       const settlementWarnings: string[] = []

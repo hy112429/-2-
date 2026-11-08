@@ -7,48 +7,50 @@ const emit = defineEmits<{
   (e: 'update:active', value: string): void
 }>()
 
-// 按日常操作顺序分组，降低选品、素材和发布入口之间的切换成本。
-const NAV_GROUPS = [
-  { title: '工作台', items: [{ label: '投放看板', icon: '▦' }] },
-  { title: '选品与素材', items: [{ label: '选品设置', icon: '◇' }, { label: '选品日志', icon: '≡' }, { label: '素材与工具', icon: '▧' }] },
-  { title: '发布与计划', items: [{ label: '商品列表', icon: '▤' }, { label: '发布队列', icon: '▷' }, { label: '千川管理', icon: '▤' }] },
-  { title: '账户与系统', items: [{ label: '连接与工具', icon: '⌘' }, { label: '账号管理', icon: '♙' }] }
+// 甲方日常只需要四个入口；低频页面仍可在“更多功能”中找到。
+const MAIN_ITEMS = [
+  { value: '投放看板', label: '工作概览', icon: '▦' },
+  { value: '选品设置', label: '开始选品', icon: '◇' },
+  { value: '发布队列', label: '发布进度', icon: '▷' },
+  { value: '千川管理', label: '千川素材', icon: '▤' }
 ]
-
-const expanded = ref<Record<string, boolean>>({
-  工作台: true,
-  选品与素材: true,
-  发布与计划: true,
-  账户与系统: true
-})
-
-function toggleGroup(title: string): void {
-  expanded.value[title] = !expanded.value[title]
-}
+const MORE_ITEMS = [
+  { value: '商品列表', label: '商品列表', icon: '▤' },
+  { value: '选品日志', label: '选品记录', icon: '≡' },
+  { value: '素材与工具', label: '素材库', icon: '▧' },
+  { value: '账号管理', label: '账号管理', icon: '♙' },
+  { value: '连接与工具', label: '连接与工具', icon: '⌘' }
+]
+const moreExpanded = ref(false)
 
 watch(() => props.active, (active) => {
-  const group = NAV_GROUPS.find((item) => item.items.some((navItem) => navItem.label === active))
-  if (group) expanded.value[group.title] = true
-})
+  if (MORE_ITEMS.some((item) => item.value === active)) moreExpanded.value = true
+}, { immediate: true })
 </script>
 
 <template>
   <aside class="nav">
-    <div v-for="group in NAV_GROUPS" :key="group.title" class="nav-group">
-      <button type="button" class="group-title" :aria-expanded="expanded[group.title]" @click="toggleGroup(group.title)">
-        <span>{{ group.title }}</span>
-        <span class="group-chevron" :class="{ collapsed: !expanded[group.title] }">⌄</span>
+    <div class="nav-group">
+      <div class="group-title">常用功能</div>
+      <div class="group-items">
+        <button v-for="item in MAIN_ITEMS" :key="item.value" type="button" class="nav-item"
+          :class="{ active: item.value === props.active }"
+          :aria-current="item.value === props.active ? 'page' : undefined"
+          @click="emit('update:active', item.value)">
+          <span class="nav-icon" aria-hidden="true">{{ item.icon }}</span>
+          <span class="label">{{ item.label }}</span>
+        </button>
+      </div>
+    </div>
+    <div class="nav-group more-group">
+      <button type="button" class="group-title" :aria-expanded="moreExpanded" @click="moreExpanded = !moreExpanded">
+        <span>更多功能</span><span class="group-chevron" :class="{ collapsed: !moreExpanded }">⌄</span>
       </button>
-      <div v-if="expanded[group.title]" class="group-items">
-        <button
-          v-for="item in group.items"
-          :key="item.label"
-          type="button"
-          class="nav-item"
-          :class="{ active: item.label === props.active }"
-          :aria-current="item.label === props.active ? 'page' : undefined"
-          @click="emit('update:active', item.label)"
-        >
+      <div v-if="moreExpanded" class="group-items">
+        <button v-for="item in MORE_ITEMS" :key="item.value" type="button" class="nav-item"
+          :class="{ active: item.value === props.active }"
+          :aria-current="item.value === props.active ? 'page' : undefined"
+          @click="emit('update:active', item.value)">
           <span class="nav-icon" aria-hidden="true">{{ item.icon }}</span>
           <span class="label">{{ item.label }}</span>
         </button>
@@ -66,7 +68,7 @@ watch(() => props.active, (active) => {
   scrollbar-width: thin;
 }
 
-.nav-group + .nav-group { margin-top: 11px; }
+.nav-group + .nav-group { margin-top: 22px; }
 
 .group-title {
   width: 100%;
@@ -82,6 +84,7 @@ watch(() => props.active, (active) => {
 }
 
 .group-title:hover { color: #e6eeff; }
+.more-group > .group-title { border: 0; background: none; cursor: pointer; font-family: inherit; }
 .group-chevron { color: #7c8799; font-size: 14px; transition: transform .15s; }
 .group-chevron.collapsed { transform: rotate(-90deg); }
 .group-items { display: flex; flex-direction: column; gap: 3px; }

@@ -14,6 +14,15 @@ interface ProductRow extends ProductListRow {
 }
 interface AccountOption { id: number; name: string }
 interface ProductDraft { title: string; sku: string; categoryText: string }
+interface MaterialRecord {
+  id: number
+  materialName: string
+  remoteMaterialId: string
+  reviewStatus: string
+  materialEvaluation: string
+  evaluationCheckedAt: string
+  completedAt: string
+}
 
 const STATUS_LABELS: Record<ProductState, string> = {
   pending: '待选品',
@@ -42,6 +51,11 @@ const progressText = ref('')
 const selectedKeys = ref(new Set<string>())
 const editing = ref<ProductRow | null>(null)
 const editDraft = reactive<ProductDraft>({ title: '', sku: '', categoryText: '' })
+const materialProduct = ref<ProductRow | null>(null)
+const materialRecords = ref<MaterialRecord[]>([])
+const materialLoading = ref(false)
+const materialError = ref('')
+const materialRefreshingId = ref(0)
 let searchTimer: number | undefined
 
 const pageCount = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
@@ -55,6 +69,54 @@ function displayDate(value: string): string {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value.replace('T', ' ') : date.toLocaleString('zh-CN', { hour12: false })
+}
+
+function materialQuality(record: MaterialRecord): string {
+  const value = (record.materialEvaluation ?? '').trim()
+  if (!record.evaluationCheckedAt || !value || value === '-') return '待判定'
+  if (value.includes('搬运')) return '搬运'
+  if (value.includes('首发')) return '首发'
+  return value
+}
+
+function platformStatus(value: string, checkedAt: string): string {
+  return checkedAt && value && value !== '-' ? value : '平台暂未显示'
+}
+
+async function loadMaterialRecords(row: ProductRow): Promise<void> {
+  materialLoading.value = true
+  materialError.value = ''
+  try {
+    const result = await window.api.qianchuan.materialRecords({ accountId: row.accountId, productId: row.productId })
+    if (result.ok === false) throw new Error(String(result.error ?? '读取千川素材失败'))
+    materialRecords.value = Array.isArray(result.rows) ? result.rows as MaterialRecord[] : []
+  } catch (error) {
+    materialError.value = String(error)
+  } finally {
+    materialLoading.value = false
+  }
+}
+
+function openMaterialRecords(row: ProductRow): void {
+  materialProduct.value = row
+  materialRecords.value = []
+  void loadMaterialRecords(row)
+}
+
+async function refreshMaterialRecord(record: MaterialRecord): Promise<void> {
+  if (!materialProduct.value) return
+  materialRefreshingId.value = record.id
+  materialError.value = ''
+  try {
+    const result = await window.api.qianchuan.refreshMaterialStatus(record.id)
+    if (result.ok === false) throw new Error(String(result.error ?? '平台状态查询失败'))
+    await loadMaterialRecords(materialProduct.value)
+    await load()
+  } catch (error) {
+    materialError.value = String(error)
+  } finally {
+    materialRefreshingId.value = 0
+  }
 }
 
 async function load(): Promise<void> {
@@ -374,7 +436,7 @@ onMounted(() => { void load() })
       <div>
         <div class="eyebrow">发布与计划 / 商品管理</div>
         <h1>商品列表</h1>
-        <p>按账号跟踪选品、加车和后续发布状态；选品成功后会自动登记到这里。</p>
+        <p>按账号查看选品、发布和千川素材；点击“查看素材质量”可查看平台判定。</p>
       </div>
       <div class="header-actions">
         <button class="btn" :disabled="loading || busy" @click="load">刷新</button>
@@ -409,7 +471,7 @@ onMounted(() => { void load() })
 
     <div class="table-card card">
       <div class="table-caption">
-        <div><strong>选品记录</strong><span>{{ pageLabel }}</span></div>
+        <div><strong>商品记录</strong><span>{{ pageLabel }}</span></div>
         <small>加车只重试待处理商品；结果不明时会转为待核查，避免重复提交。</small>
       </div>
       <div class="table-scroll">
@@ -430,6 +492,7 @@ onMounted(() => { void load() })
                     <strong :title="row.title">{{ row.title || '未获取商品名称' }}</strong>
                     <span>{{ row.accountName }} · ID {{ row.productId }}</span>
                     <small>规格：{{ row.sku || '—' }}　分类：{{ row.categoryLabels.join(' / ') || '—' }}</small>
+                    <button v-if="row.materialCount" type="button" class="material-summary" @click="openMaterialRecords(row)">千川已上传 {{ row.materialCount }} · 首发 {{ row.materialFirstCount }} · 搬运 {{ row.materialMovedCount }} · 待判定 {{ row.materialPendingCount }}<template v-if="row.materialOtherCount"> · 其他 {{ row.materialOtherCount }}</template>　查看素材质量</button>
                     <small v-if="row.failureReason" class="failure-reason">{{ row.failureReason }}</small>
                   </div>
                 </div>
@@ -440,10 +503,11 @@ onMounted(() => { void load() })
               <td>
                 <div class="row-actions">
                   <button v-if="row.status === 'pending' || row.status === 'selection_failed'" class="text-button" :disabled="busy" @click="runCart([row], '单品加车')">加车</button>
+                  <button v-if="row.materialCount" class="text-button" @click="openMaterialRecords(row)">查看素材质量</button>
                   <button class="text-button" disabled title="当前版本没有经验证的百应上架接口">上架</button>
-                  <button class="text-button" @click="openEdit(row)">编辑</button>
+                  <button v-if="row.recordSource === 'selection'" class="text-button" @click="openEdit(row)">编辑</button>
                   <button class="text-button" :disabled="row.status !== 'cart_added'" :title="row.status !== 'cart_added' ? '商品确认加车后才可创建发布计划' : '创建发布计划'" @click="createPublishTask(row)">出单</button>
-                  <button class="text-button danger" :disabled="busy" @click="deleteRow(row)">删除</button>
+                  <button v-if="row.recordSource === 'selection'" class="text-button danger" :disabled="busy" @click="deleteRow(row)">删除</button>
                 </div>
               </td>
             </tr>
@@ -464,6 +528,23 @@ onMounted(() => { void load() })
         <span>第 {{ page }} / {{ pageCount }} 页</span>
         <button class="btn" :disabled="page >= pageCount || loading" @click="goPage(page + 1)">下一页</button>
       </footer>
+    </div>
+
+    <div v-if="materialProduct" class="modal-backdrop" @click.self="materialProduct = null">
+      <section class="material-dialog" role="dialog" aria-modal="true" aria-label="商品素材质量">
+        <header><div><h2>商品素材质量</h2><span>{{ materialProduct.accountName }} · {{ materialProduct.title || materialProduct.productId }}</span></div><button class="close-button" @click="materialProduct = null">×</button></header>
+        <p class="material-hint">千川视频库的判定会在这里更新。上传成功不代表审核通过；没有返回判定时显示“待判定”。</p>
+        <div class="material-dialog-actions"><span>已上传 {{ materialRecords.length }} 条</span><button class="btn" :disabled="materialLoading" @click="loadMaterialRecords(materialProduct)">刷新记录</button></div>
+        <p v-if="materialError" class="notice error">{{ materialError }}</p>
+        <p v-if="materialLoading" class="material-empty">正在读取素材状态…</p>
+        <p v-else-if="!materialRecords.length" class="material-empty">暂未找到该商品的千川上传记录。</p>
+        <div v-else class="material-list">
+          <article v-for="record in materialRecords" :key="record.id" class="material-record">
+            <div class="material-record-title"><strong :title="record.materialName">{{ record.materialName }}</strong><span class="quality-pill" :class="{ moved: materialQuality(record) === '搬运', first: materialQuality(record) === '首发' }">{{ materialQuality(record) }}</span></div>
+            <div class="material-meta"><span>素材 ID：{{ record.remoteMaterialId }}</span><span>审核：{{ platformStatus(record.reviewStatus, record.evaluationCheckedAt) }}</span><span>核对：{{ displayDate(record.evaluationCheckedAt) }}</span><button class="text-button" :disabled="materialRefreshingId === record.id" @click="refreshMaterialRecord(record)">{{ materialRefreshingId === record.id ? '查询中…' : '查询平台' }}</button></div>
+          </article>
+        </div>
+      </section>
     </div>
 
     <div v-if="editing" class="modal-backdrop" @click.self="editing = null">
@@ -521,6 +602,8 @@ th:nth-child(3) { width:116px; } th:nth-child(4) { width:125px; } th:nth-child(5
 .product-copy strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .product-copy span,.product-copy small { color:var(--text-muted); font-size:10px; }
 .failure-reason { overflow:hidden; color:#b42318!important; text-overflow:ellipsis; white-space:nowrap; }
+.material-summary { align-self:flex-start; padding:0; border:0; background:transparent; color:#2563eb; font-size:10px; text-align:left; cursor:pointer; }
+.material-summary:hover { text-decoration:underline; }
 .status-pill { display:inline-flex; align-items:center; min-height:24px; padding:0 8px; border-radius:99px; background:#eff6ff; color:#2563eb; font-size:10px; white-space:nowrap; }
 .status-cart_added,.status-published,.status-uploaded { color:#168044; background:#e9f8ef; }
 .status-selection_failed,.status-publish_failed { color:#b42318; background:#fff0ef; }
@@ -543,6 +626,12 @@ th:nth-child(3) { width:116px; } th:nth-child(4) { width:125px; } th:nth-child(5
 .close-button { border:0; background:transparent; color:var(--text-muted); font-size:24px; cursor:pointer; }
 .edit-dialog label { display:flex; flex-direction:column; gap:5px; margin-top:14px; font-size:11px; color:var(--text-muted); }
 .edit-dialog input { width:100%; }.edit-dialog p { margin:13px 0; }.edit-dialog footer { justify-content:flex-end; margin-top:14px; }
+.material-dialog { display:flex; flex-direction:column; gap:10px; width:min(760px,calc(100vw - 36px)); max-height:min(720px,calc(100vh - 36px)); padding:18px; border:1px solid var(--border); border-radius:12px; background:#fff; box-shadow:0 18px 48px rgba(15,23,42,.22); }
+.material-dialog header,.material-dialog-actions,.material-record-title,.material-meta { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.material-dialog h2 { margin:0 0 4px; font-size:16px; }.material-dialog header span,.material-hint,.material-dialog-actions,.material-meta { color:var(--text-muted); font-size:11px; }
+.material-hint { margin:0; line-height:1.5; }.material-dialog-actions { padding:5px 0; }.material-empty { padding:24px; color:var(--text-muted); text-align:center; }
+.material-list { display:flex; flex-direction:column; gap:8px; overflow:auto; }.material-record { padding:11px; border:1px solid var(--border); border-radius:8px; }.material-record-title strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }.material-meta { justify-content:flex-start; flex-wrap:wrap; margin-top:7px; }.material-meta .text-button { margin-left:auto; }
+.quality-pill { flex-shrink:0; padding:3px 8px; border-radius:99px; color:#64748b; background:#f1f5f9; font-size:11px; }.quality-pill.first { color:#168044; background:#e9f8ef; }.quality-pill.moved { color:#b42318; background:#fff0ef; }
 @media (max-width:1100px) { th:nth-child(4),td:nth-child(4),th:nth-child(5),td:nth-child(5) { display:none; }.action-col { width:170px; } }
 @media (max-width:920px) { .page-header { align-items:flex-start; flex-direction:column; }.header-actions { align-self:flex-end; }.toolbar-end { width:100%; justify-content:flex-end; }.action-col { width:160px; }.row-actions { gap:5px; } }
 </style>

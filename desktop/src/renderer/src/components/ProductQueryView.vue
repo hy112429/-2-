@@ -61,8 +61,8 @@ async function saveQueryQuota(): Promise<void> {
     return
   }
   const limit = Number(queryQuota.value)
-  if (!Number.isSafeInteger(limit) || limit < 10) {
-    quotaNotice.value = '每账号下载额度必须是至少 10 条的整数'
+  if (!Number.isSafeInteger(limit) || limit < 10 || limit > 500) {
+    quotaNotice.value = '每账号下载额度必须是 10–500 条的整数'
     return
   }
   const result = await window.api.baiying.promotionQuota({ accountId, limit })
@@ -1446,20 +1446,23 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <details class="advanced-panel">
+      <summary>账号额度与千川授权设置</summary>
     <div class="search-bar">
       <label class="fld">
         <span class="fld-label">选品账号（自动匹配）</span>
         <span class="input">{{ queryAccountId === null ? '查询商品后自动识别' : `${queryAccountName}（ID ${queryAccountId}）` }}</span>
       </label>
       <label class="fld">
-        <span class="fld-label">该账号每商品下载额度（至少 10 条）</span>
-        <input v-model.number="queryQuota" class="input" type="number" min="10" step="1" :disabled="queryAccountId === null" />
+        <span class="fld-label">该账号每商品下载额度（10–500 条）</span>
+        <input v-model.number="queryQuota" class="input" type="number" min="10" max="500" step="1" :disabled="queryAccountId === null" />
       </label>
       <button class="btn" :disabled="queryAccountId === null" @click="saveQueryQuota">保存额度</button>
       <p v-if="quotaNotice" class="notice">{{ quotaNotice }}</p>
     </div>
 
     <QianchuanVideoQueryPanel />
+    </details>
 
     <!-- ---------- 真实数据标注 ---------- -->
     <p v-if="foundProduct" class="real-tag">商品信息来自百应缓存；视频来自选品账号百应「带货内容」</p>
@@ -1474,18 +1477,22 @@ onBeforeUnmount(() => {
       <div class="p-col"><span class="p-label">抓取时间</span>{{ foundProduct.captured_at.slice(0, 16) }}</div>
     </div>
 
-    <!-- 常用操作保持在结果上方，普通窗口无需滚到表格底部。 -->
+    <button v-if="queueRunning" class="btn danger" @click="cancelAll">取消当前下载</button>
+    <details class="advanced-panel">
+      <summary>重新下载、预览与保存位置</summary>
     <div class="action-bar">
       <button class="btn primary" :disabled="!foundVideoUrls.length || queueRunning" @click="downloadFound">
         {{ queueRunning ? '队列运行中…' : `重新下载本次视频（${foundVideoUrls.length}）` }}
       </button>
-      <button class="btn danger" :disabled="!queueRunning" @click="cancelAll">取消全部</button>
       <button class="btn" @click="chooseDir">设置下载目录</button>
       <button class="btn" :disabled="!foundProduct" @click="videoPreview">视频预览</button>
       <button class="btn" @click="clearPreview">清空预览</button>
     </div>
+    </details>
 
     <!-- ---------- 本地视频自动剪辑 ---------- -->
+    <details class="advanced-panel" :open="editBusy || undefined">
+      <summary>视频剪辑与字幕（可选）</summary>
     <section class="edit-panel">
       <div class="edit-heading">
         <div>
@@ -1538,8 +1545,11 @@ onBeforeUnmount(() => {
       <p v-if="editSubtitlePath" class="edit-subtitle-path">字幕文件：<span class="mono">{{ editSubtitlePath }}</span></p>
       <p class="edit-model-note">首次运行需联网下载约 500 MB 的中文语音模型，模型缓存在当前下载目录；后续识别可离线使用。</p>
     </section>
+    </details>
 
     <!-- ---------- 视频结果（仅展示该商品的同款带货作品） ---------- -->
+    <details class="advanced-panel">
+      <summary>查看同款带货作品（{{ foundVideoUrls.length }} 条）</summary>
     <div class="table-wrap">
       <table class="grid">
         <thead>
@@ -1572,12 +1582,18 @@ onBeforeUnmount(() => {
         </tbody>
       </table>
     </div>
+    </details>
 
     <p v-if="dirNotice" class="notice">{{ dirNotice }}</p>
+    <details class="advanced-panel">
+      <summary>查看本地保存目录</summary>
     <p class="dir-line">当前下载目录：<span class="mono">{{ downloadDir }}</span></p>
     <p v-if="queryAccountId !== null && foundProduct" class="dir-line">本商品自动分类目录：<span class="mono">{{ queryAccountDownloadPath || `${downloadDir}\\账号-${queryAccountId}` }}\{{ localDate() }}\{{ foundProduct.product_id }}</span></p>
+    </details>
 
     <!-- ---------- 百应批量抓取（T-15） ---------- -->
+    <details class="advanced-panel">
+      <summary>批量抓取、缓存与链接解析（高级工具）</summary>
     <div class="queue-panel">
       <div class="queue-head">
         <b>百应批量抓取</b>
@@ -1688,11 +1704,15 @@ onBeforeUnmount(() => {
         说明：支持抖音四类输入（分享短链/视频页链接/口令文本/视频ID），解析为无水印地址后自动批量下载到「抖音素材」目录；头条/小红书待 POC
       </p>
     </div>
+    </details>
 
     <!-- ---------- 下载任务队列（批量下载） ---------- -->
     <div class="queue-panel">
       <div class="queue-head">
-        <b>下载任务队列</b>
+        <b>下载进度</b>
+        <details class="queue-options">
+          <summary>下载参数</summary>
+          <div>
         <label class="cfg">
           并发数
           <input v-model.number="workers" class="input cfg-input" type="number" min="1" max="8" />
@@ -1701,6 +1721,8 @@ onBeforeUnmount(() => {
           最大重试
           <input v-model.number="maxRetries" class="input cfg-input" type="number" min="0" max="10" />
         </label>
+          </div>
+        </details>
       </div>
 
       <p v-if="queueSummary" class="notice">{{ queueSummary }}</p>
@@ -1799,6 +1821,13 @@ onBeforeUnmount(() => {
 .query > * {
   flex-shrink: 0;
 }
+.advanced-panel { border: 1px solid var(--border); border-radius: var(--radius); background: #fff; }
+.advanced-panel > summary { padding: 10px 12px; cursor: pointer; color: var(--text); font-size: 12px; font-weight: 600; }
+.advanced-panel[open] > summary { border-bottom: 1px solid var(--border); }
+.advanced-panel > :not(summary) { margin: 10px 12px; }
+.queue-options { margin-left: auto; position: relative; font-size: 12px; }
+.queue-options summary { cursor: pointer; color: var(--text-muted); }
+.queue-options > div { display: flex; gap: 10px; align-items: center; padding: 8px 0; }
 .query-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
 .query-head h1 { margin: 0; color: var(--text); font-size: 18px; }
 .query-head span { color: var(--text-muted); font-size: 11px; }

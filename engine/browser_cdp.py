@@ -4635,6 +4635,19 @@ def run_watch(profile_path: Path) -> int:
                             emit({"type": "result", "id": command_id, **result})
                         except Exception as error:
                             emit({"type": "result", "id": command_id, "ok": False, "error": str(error)})
+                    elif action == "close-browser":
+                        try:
+                            # 仅由主进程在确认 Chrome 是本轮自动启动后调用；关闭浏览器窗口会保留磁盘 profile 和登录态。
+                            browser_cdp = browser.new_browser_cdp_session()
+                            browser_cdp.send("Browser.close")
+                            emit({"type": "result", "id": command_id, "ok": True, "browserClosed": True})
+                            running = False
+                        except Exception as error:
+                            if not browser.is_connected():
+                                emit({"type": "result", "id": command_id, "ok": True, "browserClosed": True})
+                                running = False
+                            else:
+                                emit({"type": "result", "id": command_id, "ok": False, "error": str(error)})
                     elif action == "stop":
                         emit({"type": "result", "id": command_id, "ok": True})
                         running = False

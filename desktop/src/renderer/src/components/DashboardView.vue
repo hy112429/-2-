@@ -115,12 +115,16 @@ async function refresh(): Promise<void> {
 }
 
 const activeRows = computed(() => rows.value.filter((row) => row.status !== 'cancelled'))
+const attentionRows = computed(() => rows.value.filter((row) =>
+  row.status === 'awaiting_confirmation' ||
+  ['needs_review', 'submission_uncertain'].includes(row.platform_status)
+).sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at))).slice(0, 3))
 const metrics = computed(() => [
-  { label: '已加车商品', value: products.value.length, note: '所有账号的本地成功记录', tone: 'blue', mark: '品' },
-  { label: '待确认发布', value: rows.value.filter((row) => row.status === 'awaiting_confirmation').length, note: '等待你确认本地排期', tone: 'amber', mark: '确' },
-  { label: '待上传', value: activeRows.value.filter((row) => row.platform_status === 'not_uploaded').length, note: '尚未提交到创作者中心', tone: 'cyan', mark: '传' },
-  { label: '待核查', value: rows.value.filter((row) => ['needs_review', 'submission_uncertain', 'submitting'].includes(row.platform_status)).length, note: '上传或发布状态需要确认', tone: 'red', mark: '查' },
-  { label: '已发布', value: rows.value.filter((row) => row.platform_status === 'published').length, note: '已记录平台发布结果', tone: 'green', mark: '发' }
+  { label: '已选商品', value: products.value.length, note: '所有账号', tone: 'blue', mark: '品' },
+  { label: '需要处理', value: rows.value.filter((row) =>
+    row.status === 'awaiting_confirmation' || ['needs_review', 'submission_uncertain'].includes(row.platform_status)
+  ).length, note: '待确认或待核查', tone: 'amber', mark: '待' },
+  { label: '已发布', value: rows.value.filter((row) => row.platform_status === 'published').length, note: '平台已确认', tone: 'green', mark: '发' }
 ])
 
 const filteredRows = computed(() => {
@@ -206,15 +210,15 @@ onMounted(() => void refresh())
   <section class="dashboard">
     <header class="dashboard-heading">
       <div>
-        <div class="eyebrow">运营工作台</div>
-        <h1>投放总览</h1>
-        <p>从选品加车到视频发布，集中查看所有账号的本地任务进度。</p>
+        <div class="eyebrow">工作台</div>
+        <h1>今天的工作</h1>
+        <p>从选品开始，随时查看发布和千川素材进度。</p>
       </div>
       <div class="heading-actions">
         <button type="button" class="button button-quiet" :disabled="loading" @click="refresh">
           <span class="refresh-mark" :class="{ spinning: loading }">↻</span>{{ loading ? '正在更新' : '刷新数据' }}
         </button>
-        <button type="button" class="button button-primary" @click="emit('navigate', '选品设置')">进入选品</button>
+        <button type="button" class="button button-primary" @click="emit('navigate', '选品设置')">开始选品</button>
       </div>
     </header>
 
@@ -237,25 +241,25 @@ onMounted(() => void refresh())
     <section class="workflow-card" aria-label="业务流程">
       <div class="section-heading">
         <div>
-          <h2>业务流程</h2>
-          <span>按当前本地记录汇总</span>
+          <h2>常用操作</h2>
+          <span>按顺序查看每一步</span>
         </div>
         <div class="account-scope"><i></i>统计所有账号</div>
       </div>
       <div class="workflow-steps">
         <button type="button" class="workflow-step" @click="emit('navigate', '选品设置')">
           <span class="step-icon step-blue">01</span>
-          <span class="step-copy"><b>百应选品</b><small>{{ products.length }} 个商品已加车</small></span>
-          <span class="step-arrow">›</span>
-        </button>
-        <button type="button" class="workflow-step" @click="emit('navigate', '素材与工具')">
-          <span class="step-icon step-purple">02</span>
-          <span class="step-copy"><b>素材与视频</b><small>{{ activeRows.length }} 条发布视频任务</small></span>
+          <span class="step-copy"><b>开始选品</b><small>{{ products.length }} 个商品已选</small></span>
           <span class="step-arrow">›</span>
         </button>
         <button type="button" class="workflow-step" @click="emit('navigate', '发布队列')">
+          <span class="step-icon step-purple">02</span>
+          <span class="step-copy"><b>查看发布</b><small>{{ activeRows.length }} 条发布任务</small></span>
+          <span class="step-arrow">›</span>
+        </button>
+        <button type="button" class="workflow-step" @click="emit('navigate', '千川管理')">
           <span class="step-icon step-green">03</span>
-          <span class="step-copy"><b>创作者中心</b><small>{{ rows.filter((row) => row.platform_status === 'published' || row.platform_status === 'submitted_review').length }} 条已提交或已发布</small></span>
+          <span class="step-copy"><b>查看千川素材</b><small>上传和审核状态</small></span>
           <span class="step-arrow">›</span>
         </button>
       </div>
@@ -264,11 +268,22 @@ onMounted(() => void refresh())
     <section class="task-card">
       <div class="task-heading">
         <div>
-          <h2>任务动态</h2>
-          <span>优先显示需核查与待确认任务</span>
+          <h2>需要你处理</h2>
+          <span>没有待处理事项时，流程会继续运行</span>
         </div>
-        <button type="button" class="text-action" @click="emit('navigate', '发布队列')">打开发布队列 <span>→</span></button>
+        <button type="button" class="text-action" @click="emit('navigate', '发布队列')">查看发布进度 <span>→</span></button>
       </div>
+
+      <div v-if="attentionRows.length" class="attention-list">
+        <button v-for="row in attentionRows" :key="row.id" type="button" class="attention-item" @click="emit('navigate', '发布队列')">
+          <span><strong>{{ row.product_name || row.title || '未命名商品' }}</strong><small>{{ row.account_name }} · {{ row.status === 'awaiting_confirmation' ? '待确认' : platformStatus(row.platform_status) }}</small></span>
+          <span class="attention-arrow">查看 ›</span>
+        </button>
+      </div>
+      <p v-else class="attention-empty">当前没有需要你手动处理的发布任务。</p>
+
+      <details class="task-details">
+        <summary>查看全部任务与筛选（{{ rows.length }}）</summary>
 
       <div class="filters">
         <label class="search-field">
@@ -352,6 +367,7 @@ onMounted(() => void refresh())
           <button type="button" class="button button-quiet refresh-list" :disabled="loading" @click="refresh">更新列表</button>
         </div>
       </footer>
+      </details>
     </section>
   </section>
 </template>
@@ -375,7 +391,7 @@ h1,h2,p { margin:0; }
 @keyframes spin { to { transform:rotate(360deg); } }
 .load-error { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 13px; border:1px solid #f0c8c5; border-radius:6px; background:#fff4f3; color:#ad3f3a; font-size:12px; }
 .load-error button,.clear-filters { border:0; background:none; color:#397af5; font:inherit; cursor:pointer; }
-.metric-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:11px; }
+.metric-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:11px; }
 .metric-card,.workflow-card,.task-card { border:1px solid var(--border); border-radius:var(--radius); background:#fff; box-shadow:var(--shadow-card); }
 .metric-card { min-height:112px; padding:13px 15px 12px; border-top:3px solid #a9c4f7; }
 .metric-card:nth-child(2) { border-top-color:#e9c181; }.metric-card:nth-child(3) { border-top-color:#8ac8d6; }.metric-card:nth-child(4) { border-top-color:#e6a29e; }.metric-card:nth-child(5) { border-top-color:#8fc9ae; }
@@ -401,6 +417,17 @@ h1,h2,p { margin:0; }
 .step-arrow { margin-left:auto; color:#b1bac8; font-size:20px; line-height:1; }
 .task-card { min-height:0; padding:14px 16px 0; display:flex; flex-direction:column; }
 .task-heading { padding-bottom:12px; }
+.attention-list { display:flex; flex-direction:column; gap:7px; padding-bottom:13px; }
+.attention-item { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; padding:10px 12px; border:1px solid #edf0f5; border-radius:7px; background:#fbfcff; text-align:left; color:#35415a; }
+.attention-item:hover { background:#f2f6ff; border-color:#c9d9f6; }
+.attention-item span:first-child { display:flex; flex-direction:column; min-width:0; gap:4px; }
+.attention-item strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+.attention-item small { color:#a24d41; font-size:11px; }
+.attention-arrow { flex-shrink:0; color:#397af5; font-size:11px; }
+.attention-empty { margin:0 0 13px; padding:13px; border-radius:7px; background:#f1f8f4; color:#3f7557; font-size:12px; }
+.task-details { border-top:1px solid #edf0f5; padding:11px 0 14px; }
+.task-details summary { width:max-content; color:#397af5; cursor:pointer; font-size:12px; font-weight:600; }
+.task-details[open] summary { margin-bottom:12px; }
 .text-action { border:0; background:none; color:#397af5; font-size:11px; font-weight:600; cursor:pointer; }
 .text-action span { padding-left:3px; font-size:14px; }
 .filters { display:flex; align-items:end; gap:9px; flex-wrap:wrap; padding:10px; border:1px solid #e9edf3; border-radius:7px; background:#f8f9fb; }

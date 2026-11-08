@@ -17,6 +17,9 @@ const CHROME_CANDIDATES = [
 const CDP_START_TIMEOUT_MS = 30_000
 const bridgeSessions = new Map<string, BridgeSession>()
 const creatingSessions = new Map<string, Promise<BridgeSession>>()
+// 只跟踪当前客户端进程亲自启动的 Chrome；不会关闭用户手动打开的专属浏览器。
+const automationLaunchedProfiles = new Set<string>()
+const userOpenedProfiles = new Set<string>()
 // 自定义 profile 路径不能反推出业务账号，通过明确的 account-{id} profileKey 关联采集来源。
 const baiyingAccountByProfilePath = new Map<string, number | null>()
 let bridgeSequence = 0
@@ -191,7 +194,17 @@ async function waitForActivePort(profilePath: string): Promise<number> {
   )
 }
 
+async function waitForBrowserClosed(profilePath: string, timeoutMs = 6_000): Promise<boolean> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await readActivePort(profilePath) === null) return true
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250))
+  }
+  return false
+}
+
 async function launchChrome(profilePath: string): Promise<number> {
+  const profileKey = canonicalProfilePath(profilePath)
   const activePort = await readActivePort(profilePath)
   if (activePort !== null) return activePort
 
@@ -207,7 +220,9 @@ async function launchChrome(profilePath: string): Promise<number> {
   ], { detached: true, stdio: 'ignore', windowsHide: false })
   child.on('error', () => undefined)
   child.unref()
-  return waitForActivePort(profilePath)
+  const port = await waitForActivePort(profilePath)
+  automationLaunchedProfiles.add(profileKey)
+  return port
 }
 
 function parseBridgeLine(line: string, session: BridgeSession, readyResolve: (value: BridgeSession) => void, readyReject: (error: Error) => void): void {
@@ -536,6 +551,41 @@ export async function commandManagedBrowser(
   return result
 }
 
+/**
+ * 只关闭本客户端进程为自动化启动的 Chrome。手动打开或其他进程已有的 Chrome 保持原样，
+ * profile 目录和平台 Cookie 不删除，下一次仍可复用登录态。
+ */
+export async function closeAutomationLaunchedBrowser(options: OpenManagedBrowserOptions): Promise<boolean> {
+  const profilePath = resolveProfilePath(options, false)
+  const key = canonicalProfilePath(profilePath)
+  if (!automationLaunchedProfiles.has(key) || userOpenedProfiles.has(key)) return false
+  if (await readActivePort(profilePath) === null) {
+    automationLaunchedProfiles.delete(key)
+    const staleSession = bridgeSessions.get(key)
+    if (staleSession) retireSession(profilePath, staleSession)
+    return true
+  }
+  const existing = bridgeSessions.get(key)
+  if (existing?.pending.size) throw new Error('账号浏览器仍有执行中的操作，暂不关闭。')
+
+  try {
+    const { session, result } = await sendManagedCommand(profilePath, 'close-browser')
+    if (result['ok'] !== true) throw new Error(String(result['error'] ?? 'Chrome 未确认关闭'))
+    if (!await waitForBrowserClosed(profilePath)) throw new Error('Chrome 收到关闭命令后仍保持运行。')
+    automationLaunchedProfiles.delete(key)
+    retireSession(profilePath, session)
+    return true
+  } catch (error) {
+    if (await readActivePort(profilePath) === null) {
+      automationLaunchedProfiles.delete(key)
+      const session = bridgeSessions.get(key)
+      if (session) retireSession(profilePath, session)
+      return true
+    }
+    throw error
+  }
+}
+
 export async function openManagedBrowser(
   url: string,
   options: OpenManagedBrowserOptions
@@ -544,6 +594,7 @@ export async function openManagedBrowser(
     const profilePath = resolveProfilePath(options)
     registerBaiyingAccount(options, profilePath)
     const { session, result } = await sendManagedCommand(profilePath, 'open', { url })
+    userOpenedProfiles.add(canonicalProfilePath(profilePath))
     return {
       ok: true,
       external: true,
@@ -593,4 +644,6 @@ export function disposeExternalBrowserBridges(): void {
   }
   bridgeSessions.clear()
   creatingSessions.clear()
+  automationLaunchedProfiles.clear()
+  userOpenedProfiles.clear()
 }

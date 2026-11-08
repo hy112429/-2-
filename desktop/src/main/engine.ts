@@ -51,7 +51,11 @@ const ALLOWED_SCRIPTS = new Set([
 
 /** 仅主进程可调用：队列终态与千川页面执行不能由渲染进程任意伪造。 */
 const INTERNAL_SCRIPTS = new Set([
-  'qianchuan_upload.py', 'qianchuan_browser.py', 'qianchuan_violations.py', 'post_publish_material.py'
+  'qianchuan_upload.py', 'qianchuan_browser.py', 'qianchuan_material_status.py',
+  'qianchuan_violations.py', 'qianchuan_plan.py', 'qianchuan_plan_browser.py',
+  'qianchuan_plan_supplement_browser.py',
+  'post_publish_material.py', 'baiying_cart_download_state.py',
+  'video_visual_dedupe.py'
 ])
 
 /** 正在运行的任务表：taskId -> 句柄（含取消标志与强杀入口） */

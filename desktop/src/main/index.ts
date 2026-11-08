@@ -5,7 +5,7 @@ import { registerLoginIpc, disposeLogin } from './login'
 import { registerEngineIpc, disposeEngine } from './engine'
 import { getIsolatedTestRoot, registerAppDirsIpc } from './app-dirs'
 import { registerAssetsIpc } from './assets'
-import { registerBaiyingBatchIpc, disposeBaiyingBatch } from './baiying_batch'
+import { registerBaiyingBatchIpc, disposeBaiyingBatch, startCartVideoDownloadScheduler } from './baiying_batch'
 import { registerToutiaoBatchIpc, disposeToutiaoBatch } from './toutiao_batch'
 import { registerAccountLoginIpc, disposeAccountLogin } from './account_login'
 import { disposeExternalBrowserBridges } from './external_browser'
@@ -13,11 +13,12 @@ import { registerWatermarkIpc, registerFrameProtocol } from './watermark'
 import { getAutoPublisherProgress, runAutoPublisherNow, runImmediatePublishNow, runManualRetryPublishNow, startAutoPublisher, disposeAutoPublisher } from './auto_publisher'
 import { disposeSelectionCooldown, registerSelectionCooldownIpc } from './selection_cooldown'
 import { disposeQianchuanUploadScheduler, registerQianchuanUploadIpc, startQianchuanUploadScheduler } from './qianchuan_upload'
+import { disposeQianchuanPlanScheduler, registerQianchuanPlanIpc, startQianchuanPlanScheduler } from './qianchuan_plan'
 import { registerQianchuanViolationIpc } from './qianchuan_violations'
 import { registerPublishArtifactsIpc } from './publish_artifacts'
 import { registerProductListIpc } from './product_list'
 import { registerQianchuanApiIpc, disposeQianchuanApi } from './qianchuan_api'
-import { registerPostPublishQianchuanMaterialIpc } from './post_publish_qianchuan_material'
+import { disposePostPublishReconcileScheduler, registerPostPublishQianchuanMaterialIpc, startPostPublishReconcileScheduler } from './post_publish_qianchuan_material'
 import { disposeSelectionScheduleScheduler, registerSelectionScheduleIpc, startSelectionScheduleScheduler } from './selection_scheduler'
 import { registerCenterMachineOnStartup } from './center_client_bootstrap'
 
@@ -124,6 +125,7 @@ app.whenReady().then(() => {
   // 注册 Python 引擎 IPC（子进程拉起 / 进度转发 / 取消）
   registerEngineIpc()
   registerQianchuanUploadIpc()
+  registerQianchuanPlanIpc()
   registerQianchuanApiIpc()
   registerPostPublishQianchuanMaterialIpc()
   registerQianchuanViolationIpc()
@@ -153,6 +155,9 @@ app.whenReady().then(() => {
   // 全自动发布仅处理用户已启用且到达本地计划时间的新任务。
   if (!isolatedTestRoot) startAutoPublisher()
   if (!isolatedTestRoot) startQianchuanUploadScheduler()
+  if (!isolatedTestRoot) startQianchuanPlanScheduler()
+  if (!isolatedTestRoot) startCartVideoDownloadScheduler()
+  if (!isolatedTestRoot) startPostPublishReconcileScheduler()
   if (!isolatedTestRoot) startSelectionScheduleScheduler()
 
   // 开发时保留 F12 开发者工具、Ctrl+R 刷新等快捷键；生产环境自动禁用
@@ -173,6 +178,8 @@ app.whenReady().then(() => {
 app.on('before-quit', () => {
   disposeAutoPublisher()
   disposeQianchuanUploadScheduler()
+  disposeQianchuanPlanScheduler()
+  disposePostPublishReconcileScheduler()
   disposeQianchuanApi()
   disposeSelectionCooldown()
   disposeSelectionScheduleScheduler()

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import db
 import qianchuan_upload as qc
@@ -41,6 +42,11 @@ class QianchuanUploadTests(unittest.TestCase):
             );
         """)
         qc.ensure_schema(self.connection)
+        quality_patch = patch.object(qc, "inspect_video", return_value={
+            "verdict": "unconfirmed", "reason": "隔离测试未发现移动水印", "evidence": {},
+        })
+        quality_patch.start()
+        self.addCleanup(quality_patch.stop)
         self.account_id = self.add_account("账号A")
         self.qc_id = self.add_qc(self.account_id)
         self.connection.commit()
@@ -110,6 +116,91 @@ class QianchuanUploadTests(unittest.TestCase):
         self.assertEqual(rows[0]["assetId"], asset)
         self.assertFalse(rows[0]["eligible"])
         self.assertIn("尚未确认抖音发布", rows[0]["reason"])
+
+    def test_confirmed_moving_watermark_rejected_before_enqueue(self) -> None:
+        asset = self.add_asset("p-watermark")
+        with patch.object(qc, "inspect_video", return_value={
+            "verdict": "poor_quality", "reason": "确认移动文字水印", "evidence": {"frames": 4},
+        }):
+            result = qc.enqueue(self.connection, self.account_id, [asset], today=TODAY)
+        self.assertEqual(result["acceptedCount"], 0)
+        self.assertIn("劣质", result["rejected"][0]["reason"])
+        eligible = qc.eligible_assets(self.connection, self.account_id)["rows"][0]
+        self.assertFalse(eligible["eligible"])
+        self.assertEqual(eligible["qualityVerdict"], "poor_quality")
+        self.assertFalse(self.connection.execute(
+            "SELECT 1 FROM qianchuan_upload_jobs WHERE asset_id = ?", (asset,)
+        ).fetchone())
+
+    def test_queued_asset_newly_detected_is_stopped_before_browser_upload(self) -> None:
+        asset = self.add_asset("p-late-watermark")
+        job = qc.enqueue(self.connection, self.account_id, [asset], today=TODAY)["jobs"][0]["id"]
+        path = Path(self.connection.execute("SELECT file_path FROM assets WHERE id = ?", (asset,)).fetchone()[0])
+        path.write_bytes(b"changed video")
+        with patch.object(qc, "inspect_video", return_value={
+            "verdict": "poor_quality", "reason": "确认移动文字水印", "evidence": {"frames": 4},
+        }):
+            result = qc.claim(self.connection, job, today=TODAY)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["rejected"])
+        self.assertEqual(result["job"]["status"], "rejected_quality")
+        self.assertEqual(self.connection.execute(
+            "SELECT error_code FROM qianchuan_upload_jobs WHERE id = ?", (job,)
+        ).fetchone()[0], "MOVING_WATERMARK")
+        with self.assertRaisesRegex(ValueError, "不可再次领取"):
+            qc.claim(self.connection, job, today=TODAY)
+        with self.assertRaisesRegex(ValueError, "仅明确未开始"):
+            qc.retry_safe(self.connection, job, today=TODAY)
+
+    def test_batch_claim_locks_same_product_once_and_keeps_individual_ids(self) -> None:
+        assets = [self.add_asset("p-batch") for _ in range(3)]
+        jobs = qc.enqueue(self.connection, self.account_id, assets, today=TODAY)["jobs"]
+        ids = [job["id"] for job in jobs]
+        claimed = qc.claim_batch(self.connection, ids, today=TODAY)
+        self.assertEqual([job["id"] for job in claimed["jobs"]], ids)
+        self.assertEqual({job["status"] for job in claimed["jobs"]}, {"uploading"})
+        with self.assertRaisesRegex(ValueError, "状态已变化"):
+            qc.claim_batch(self.connection, ids, today=TODAY)
+        for index, job_id in enumerate(ids):
+            qc.complete(self.connection, job_id, f"remote-batch-{index}")
+        count = self.connection.execute(
+            "SELECT uploaded_count FROM qianchuan_product_upload_status "
+            "WHERE account_id = ? AND product_id = 'p-batch'", (self.account_id,)
+        ).fetchone()[0]
+        self.assertEqual(count, 3)
+
+    def test_batch_claim_rejects_mixed_products_without_touching_queue(self) -> None:
+        first = qc.enqueue(self.connection, self.account_id,
+                           [self.add_asset("p-first")], today=TODAY)["jobs"][0]["id"]
+        second = qc.enqueue(self.connection, self.account_id,
+                            [self.add_asset("p-second")], today=TODAY)["jobs"][0]["id"]
+        with self.assertRaisesRegex(ValueError, "同一抖音账号、商品"):
+            qc.claim_batch(self.connection, [first, second], today=TODAY)
+        self.assertEqual(qc._job(self.connection, first)["status"], "queued")
+        self.assertEqual(qc._job(self.connection, second)["status"], "queued")
+
+    def test_batch_claim_rejects_changed_watermark_without_claiming_other_files(self) -> None:
+        assets = [self.add_asset("p-watermark-batch") for _ in range(2)]
+        ids = [job["id"] for job in
+               qc.enqueue(self.connection, self.account_id, assets, today=TODAY)["jobs"]]
+        path = Path(self.connection.execute(
+            "SELECT file_path FROM assets WHERE id = ?", (assets[1],)).fetchone()[0])
+        path.write_bytes(b"changed watermark video")
+        with patch.object(qc, "inspect_video", return_value={
+            "verdict": "poor_quality", "reason": "确认移动水印", "evidence": {},
+        }):
+            result = qc.claim_batch(self.connection, ids, today=TODAY)
+        self.assertTrue(result["rejected"])
+        self.assertEqual(qc._job(self.connection, ids[0])["status"], "queued")
+        self.assertEqual(qc._job(self.connection, ids[1])["status"], "rejected_quality")
+
+    def test_suspected_moving_text_is_allowed_to_queue(self) -> None:
+        asset = self.add_asset("p-suspected")
+        with patch.object(qc, "inspect_video", return_value={
+            "verdict": "suspected", "reason": "证据不足", "evidence": {},
+        }):
+            result = qc.enqueue(self.connection, self.account_id, [asset], today=TODAY)
+        self.assertEqual(result["acceptedCount"], 1)
 
     def test_ambiguous_or_missing_qianchuan_binding_refused(self) -> None:
         asset = self.add_asset("p-bind")
@@ -215,6 +306,43 @@ class QianchuanUploadTests(unittest.TestCase):
         self.assertTrue(duplicate["ok"])
         self.assertEqual(duplicate["acceptedCount"], 0)
         self.assertEqual(duplicate["rejected"][0]["jobId"], job)
+
+    def test_material_jobs_can_be_filtered_by_account_and_product(self) -> None:
+        first = self.add_asset("1111111111111111111")
+        second = self.add_asset("2222222222222222222")
+        first_job = qc.enqueue(self.connection, self.account_id, [first], today=TODAY)["jobs"][0]["id"]
+        qc.enqueue(self.connection, self.account_id, [second], today=TODAY)
+        scoped = qc.list_jobs(self.connection, self.account_id, product_id="1111111111111111111")
+        self.assertEqual([row["id"] for row in scoped["rows"]], [first_job])
+        self.assertEqual(qc.list_jobs(self.connection, self.account_id + 1, product_id="1111111111111111111")["rows"], [])
+        with self.assertRaisesRegex(ValueError, "商品 ID"):
+            qc.list_jobs(self.connection, self.account_id, product_id="111' OR 1=1")
+
+    def test_same_remote_material_counts_once_and_allows_unique_replacement(self) -> None:
+        qc.quota_config(self.connection, self.account_id, {
+            "perProductVideos": 2, "perAccountVideos": 2,
+        })
+        assets = [self.add_asset("p-remote-dedupe") for _ in range(3)]
+        first_two = qc.enqueue(self.connection, self.account_id, assets[:2], today=TODAY)["jobs"]
+        for item in first_two:
+            self.assertEqual(item["scheduledDate"], TODAY.isoformat())
+            qc.claim(self.connection, item["id"], today=TODAY)
+            qc.complete(self.connection, item["id"], "same-remote-id")
+        remaining = qc.product_quota_remaining(self.connection, self.account_id, "p-remote-dedupe", TODAY)
+        self.assertEqual(remaining["remaining"], 1)
+        self.assertEqual(remaining["usage"]["productVideos"], 1)
+        uploaded = self.connection.execute(
+            "SELECT uploaded_count FROM qianchuan_product_upload_status "
+            "WHERE account_id = ? AND product_id = 'p-remote-dedupe'", (self.account_id,),
+        ).fetchone()[0]
+        self.assertEqual(uploaded, 1)
+        progress = qc.product_progress(self.connection, self.account_id, "p-remote-dedupe")
+        self.assertEqual(progress["uploadedUniqueCount"], 1)
+        self.assertEqual(progress["successfulJobCount"], 2)
+        replacement = qc.enqueue(self.connection, self.account_id, [assets[2]], today=TODAY)
+        self.assertEqual(replacement["jobs"][0]["scheduledDate"], TODAY.isoformat())
+        pending = qc.product_progress(self.connection, self.account_id, "p-remote-dedupe")
+        self.assertEqual(pending["pendingCount"], 1)
 
     def test_five_account_groups_are_stable_and_group_quota_applies(self) -> None:
         qc.quota_config(self.connection, 0, {"perGroupProducts": 1, "perGroupVideos": 1})

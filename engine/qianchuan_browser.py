@@ -1,6 +1,6 @@
 """千川素材上传的独立 CDP 执行器。
 
-只连接 Step 11 已打开的 qianchuan-{id} profile。页面结构未获得实页证据时，
+只连接已打开且校验归属的千川或抖音账号专属 profile。页面结构未获得实页证据时，
 选择器必须唯一，提交结果必须回读远端素材 ID；不确定的写入一律隔离待核查。
 """
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 
@@ -28,8 +28,8 @@ REMOTE_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 SUCCESS_TEXT = re.compile(r"上传成功|提交成功|保存成功|创建成功")
 FAIL_TEXT = re.compile(r"上传失败|上传中断|网络异常|请求失败|操作被拦截")
 CAPTCHA_TEXT = re.compile(r"请完成验证|滑动验证|安全验证|人机验证|验证码错误")
-NAV_LABELS = ("素材中心", "素材管理", "素材库", "视频素材", "素材")
-UPLOAD_LABELS = ("上传素材", "上传视频", "新建素材", "新增素材", "上传")
+NAV_LABELS = ("视频库", "素材中心", "素材管理", "素材库", "视频素材", "素材")
+UPLOAD_LABELS = ("点击上传", "上传素材", "上传视频", "新建素材", "新增素材", "上传")
 SUBMIT_LABELS = ("确认上传", "提交素材", "开始上传", "提交", "保存", "确定", "完成")
 
 
@@ -43,8 +43,10 @@ class UploadOptions:
     diagnostics_dir: Path
     min_delay_ms: int = 800
     max_delay_ms: int = 2_000
-    upload_timeout_s: int = 120
-    result_timeout_s: int = 60
+    upload_timeout_s: int = 600
+    result_timeout_s: int = 120
+    advertiser_id: str = ""
+    douyin_account_id: int = 0
 
 
 class UploadStopped(RuntimeError):
@@ -88,9 +90,11 @@ def is_login_page(url: str) -> bool:
     return host in {QIANCHUAN_HOST, "business.oceanengine.com"} and "/login" in path
 
 
-def read_verified_port(profile_path: Path, expected_port: int, account_id: int) -> int:
+def read_verified_port(profile_path: Path, expected_port: int, account_id: int,
+                       douyin_account_id: int = 0) -> int:
     """防止把别的账号的 CDP 端口传给本次上传。"""
-    expected_name = f"qianchuan-{account_id}"
+    expected_name = (f"account-{douyin_account_id}" if douyin_account_id > 0
+                     else f"qianchuan-{account_id}")
     if profile_path.name.lower() != expected_name:
         raise UploadStopped(f"千川浏览器目录应为 {expected_name}，实际为 {profile_path.name}", stage="profile")
     try:
@@ -112,6 +116,10 @@ def read_verified_port(profile_path: Path, expected_port: int, account_id: int) 
 def _validate(options: UploadOptions) -> None:
     if options.qianchuan_account_id <= 0:
         raise UploadStopped("千川账户 ID 无效", stage="input")
+    if options.advertiser_id and not re.fullmatch(r"\d{8,20}", options.advertiser_id):
+        raise UploadStopped("千川广告主 ID 无效", stage="input")
+    if options.douyin_account_id and (options.douyin_account_id <= 0 or not options.advertiser_id):
+        raise UploadStopped("复用抖音账号浏览器时必须指定账号和千川广告主 ID", stage="input")
     if not options.asset_name.strip():
         raise UploadStopped("素材名称为空", stage="input")
     if options.asset_path.suffix.lower() != ".mp4" or not options.asset_path.is_file():
@@ -173,17 +181,36 @@ def _check_page_gate(page: Any, stage: str) -> None:
         raise UploadStopped("千川页面显示登录表单，请人工登录", stage=stage, manual=True)
 
 
-def _select_page(browser: Any) -> Any:
+def _advertiser_matches_page(page: Any, advertiser_id: str) -> bool:
+    parsed = urlparse(page.url)
+    declared = parse_qs(parsed.query).get("aavid", [])
+    if declared:
+        return declared == [advertiser_id]
+    if "/openapi/" in parsed.path:
+        return False
+    try:
+        return advertiser_id in _page_text(page)
+    except Exception:
+        return False
+
+
+def _select_page(browser: Any, advertiser_id: str = "") -> Any:
     contexts = browser.contexts
     if len(contexts) != 1:
         raise UploadStopped(f"千川浏览器上下文数量异常：{len(contexts)}", stage="connect")
     pages = contexts[0].pages
-    candidates = [page for page in pages if is_qianchuan_page(page.url)]
+    candidates = [page for page in pages if is_qianchuan_page(page.url)
+                  and "/openapi/" not in urlparse(page.url).path]
+    if advertiser_id:
+        candidates = [page for page in candidates
+                      if _advertiser_matches_page(page, advertiser_id)]
     if not candidates:
         login_pages = [page for page in pages if is_login_page(page.url)]
         if len(login_pages) == 1:
             return login_pages[0]  # 由登录闸门拦下，并留下登录页截图。
-        reason = "千川登录页不唯一，请人工核对" if login_pages else "千川工作台页面未打开"
+        reason = ("专属浏览器未显示目标千川广告主，请核对右上角账户 ID"
+                  if advertiser_id else
+                  "千川登录页不唯一，请人工核对" if login_pages else "千川工作台页面未打开")
         raise UploadStopped(reason, stage="connect", manual=bool(login_pages))
     material_pages = [page for page in candidates if MATERIAL_PATH.search(urlparse(page.url).path)]
     chosen = material_pages if material_pages else candidates
@@ -218,6 +245,12 @@ def _open_material_area(page: Any, options: UploadOptions) -> Any:
             return page
         next_control = next((control for label in NAV_LABELS
                              if (control := _named_control(page, label)) is not None), None)
+        if next_control is None:
+            tools_menu = _one_visible(page.get_by_text("工具", exact=True))
+            if tools_menu is not None:
+                tools_menu.hover(timeout=5_000)
+                next_control = next((control for label in NAV_LABELS
+                                     if (control := _named_control(page, label)) is not None), None)
         if next_control is None:
             break
         before_url = page.url
@@ -255,13 +288,16 @@ def _file_input(page: Any) -> Any | None:
 
 
 def _choose_file(page: Any, options: UploadOptions, mark_selection_started: Callable[[], None]) -> None:
+    file_timeout_ms = options.upload_timeout_s * 1_000
     file_input = _file_input(page)
     if file_input is not None:
         mark_selection_started()
-        file_input.set_input_files(str(options.asset_path), timeout=10_000)
+        file_input.set_input_files(str(options.asset_path), timeout=file_timeout_ms)
         return
-    trigger = next((control for label in UPLOAD_LABELS
-                    if (control := _named_control(page, label)) is not None), None)
+    # 千川视频库先弹上传窗口，窗口内的“点击上传”才打开原生文件选择器。
+    trigger = (_named_control(page, "点击上传") or
+               next((control for label in UPLOAD_LABELS
+                     if (control := _named_control(page, label)) is not None), None))
     if trigger is None:
         raise UploadStopped("素材页没有可唯一定位的上传入口", stage="file_input")
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -272,14 +308,24 @@ def _choose_file(page: Any, options: UploadOptions, mark_selection_started: Call
     except PlaywrightTimeoutError as error:
         # 有些版本点击后只打开弹窗，未立即弹原生文件选择器。
         file_input = _file_input(page)
-        if file_input is None:
+        if file_input is not None:
+            mark_selection_started()
+            file_input.set_input_files(str(options.asset_path), timeout=file_timeout_ms)
+            return
+        inner_trigger = _named_control(page, "点击上传")
+        if inner_trigger is None or trigger.inner_text().strip() == "点击上传":
             raise UploadStopped(f"点击上传入口后未出现文件控件：{error}", stage="file_input") from error
+        try:
+            with page.expect_file_chooser(timeout=5_000) as chooser:
+                inner_trigger.click(timeout=5_000)
+        except PlaywrightTimeoutError as nested_error:
+            raise UploadStopped(f"上传弹窗未打开文件选择器：{nested_error}", stage="file_input") from nested_error
         mark_selection_started()
-        file_input.set_input_files(str(options.asset_path), timeout=10_000)
+        chooser.value.set_files(str(options.asset_path), timeout=file_timeout_ms)
         return
     # 已收到文件选择事件后若设置文件失败，不再尝试第二次，避免重复上传。
     mark_selection_started()
-    chooser.value.set_files(str(options.asset_path))
+    chooser.value.set_files(str(options.asset_path), timeout=file_timeout_ms)
 
 
 def _upload_ready(page: Any, asset_path: Path) -> tuple[bool, str]:
@@ -291,14 +337,26 @@ def _upload_ready(page: Any, asset_path: Path) -> tuple[bool, str]:
     hundred_percent = bool(re.search(r"(?:^|\s)100\s*%", text))
     if name_visible and (success_visible or hundred_percent):
         return True, "页面显示文件名和上传完成标记"
+    # 实页上传完成时仅显示绿色完成图标；“确定”此前保持禁用。
+    confirm = _one_visible(page.get_by_role("button", name="确定", exact=True))
+    if name_visible and "已选择1/100" in text and confirm is not None and confirm.is_enabled():
+        return True, "页面显示文件名且上传窗口允许确认"
     return False, "上传中或未出现文件名与完成标记"
 
 
 def _wait_upload_ready(page: Any, options: UploadOptions) -> None:
+    # 文件选择后页面可能短暂重绘，单次 body 读取超时不代表上传失败。
+    # 只在原任务的等待窗口内重读页面，不重新选择文件或发起第二次上传。
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
     deadline = time.monotonic() + options.upload_timeout_s
     while time.monotonic() < deadline:
-        _check_page_gate(page, "upload_wait")
-        ready, note = _upload_ready(page, options.asset_path)
+        try:
+            _check_page_gate(page, "upload_wait")
+            ready, note = _upload_ready(page, options.asset_path)
+        except PlaywrightTimeoutError:
+            time.sleep(1)
+            continue
         if ready:
             return
         if note.startswith("页面提示"):
@@ -373,13 +431,15 @@ def confirmed_response_id(responses: list[Any]) -> tuple[str | None, str | None]
 
 
 def _dom_remote_id(page: Any, name: str) -> str | None:
-    """仅从包含本素材名称的行中取显式 materialId，避免拿到账号或别的素材 ID。"""
-    return page.evaluate("""(name) => {
+    """仅从包含本素材名称的行中取显式素材 ID，避免拿到账号或别的素材 ID。"""
+    return page.evaluate(r"""(name) => {
       const matches = [];
       for (const row of document.querySelectorAll('tr,[role="row"],[data-material-id]')) {
-        if (!row.textContent?.includes(name)) continue;
+        const title = row.querySelector('.title');
+        if (title?.textContent?.trim() !== name) continue;
         const value = row.getAttribute('data-material-id') ||
-          row.querySelector('[data-material-id]')?.getAttribute('data-material-id');
+          row.querySelector('[data-material-id]')?.getAttribute('data-material-id') ||
+          row.textContent?.match(/ID[：:]\s*(\d{8,20})/)?.[1];
         if (value && /^[A-Za-z0-9_-]{8,64}$/.test(value)) matches.push(value);
       }
       const unique = [...new Set(matches)];
@@ -387,9 +447,26 @@ def _dom_remote_id(page: Any, name: str) -> str | None:
     }""", name)
 
 
+def _search_material_id(page: Any, name: str) -> str | None:
+    """按完整文件名刷新视频库，只接受同一行显示的素材 ID。"""
+    search = _one_visible(page.locator('input[placeholder*="视频名称/ID搜索"]'))
+    if search is None or not search.is_enabled():
+        return _dom_remote_id(page, name)
+    search.fill(name, timeout=5_000)
+    search.press("Enter", timeout=5_000)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        remote_id = _dom_remote_id(page, name)
+        if remote_id:
+            return remote_id
+        time.sleep(0.5)
+    return None
+
+
 def _wait_confirmation(page: Any, responses: list[Any], options: UploadOptions,
                        prior_remote_id: str | None) -> tuple[str | None, str | None]:
     deadline = time.monotonic() + options.result_timeout_s
+    next_search_at = time.monotonic()
     while time.monotonic() < deadline:
         _check_page_gate(page, "verify")
         text = _page_text(page)
@@ -401,10 +478,17 @@ def _wait_confirmation(page: Any, responses: list[Any], options: UploadOptions,
         )
         if remote_id and same_material_visible:
             return remote_id, endpoint
-        if SUCCESS_TEXT.search(text):
-            remote_id = _dom_remote_id(page, options.asset_name)
+        remote_id = _dom_remote_id(page, options.asset_name)
+        if remote_id and remote_id != prior_remote_id:
+            return remote_id, "material_row"
+        if time.monotonic() >= next_search_at:
+            next_search_at = time.monotonic() + 10
+            try:
+                remote_id = _search_material_id(page, options.asset_name)
+            except Exception:
+                remote_id = None  # 弹窗关闭和列表刷新期间允许下轮重试。
             if remote_id and remote_id != prior_remote_id:
-                return remote_id, "material_row"
+                return remote_id, "material_search"
         time.sleep(1)
     return None, None
 
@@ -458,21 +542,28 @@ def upload_material(options: UploadOptions) -> dict[str, Any]:
     submitted = False
     try:
         _validate(options)
-        port = read_verified_port(options.profile_path, options.cdp_port, options.qianchuan_account_id)
+        port = read_verified_port(options.profile_path, options.cdp_port,
+                                  options.qianchuan_account_id, options.douyin_account_id)
         # 延迟导入使输入校验/协议单测不依赖本机安装 Playwright 浏览器。
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as playwright:
             stage = "connect"
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15_000)
-            page = _select_page(browser)
+            page = _select_page(browser, options.advertiser_id)
             _check_page_gate(page, stage)
             responses: list[Any] = []
             stage = "navigate"
             page = _open_material_area(page, options)
-            page.on("response", responses.append)
+            if options.advertiser_id and not _advertiser_matches_page(page, options.advertiser_id):
+                raise UploadStopped("素材页未显示目标千川广告主，已停止文件选择", stage="navigate")
+            page.on("response", lambda response: responses.append(response))
             _delay(options)
-            prior_remote_id = _dom_remote_id(page, options.asset_name)
+            prior_remote_id = _search_material_id(page, options.asset_name)
+            if prior_remote_id:
+                return _save_evidence(page, options,
+                                      _result("succeeded", "千川已有同名素材，已回读远端 ID", "verify",
+                                              False, prior_remote_id), "material_search")
             responses.clear()  # 不把打开素材页时的旧响应当成本次提交回执。
             stage = "file_input"
             # 找不到控件时明确未提交；真正设置文件前开始保守隔离窗口。
@@ -508,20 +599,194 @@ def upload_material(options: UploadOptions) -> dict[str, Any]:
         return _save_evidence(page, options, _result(status, f"千川上传在 {stage} 阶段异常：{error}", stage, submitted))
 
 
+def _choose_files(page: Any, options: UploadOptions, paths: list[Path],
+                  mark_selection_started: Callable[[], None]) -> None:
+    """仅在千川确认多选能力后，一次把所有文件交给同一个上传窗口。"""
+    timeout = options.upload_timeout_s * 1_000
+    file_input = _file_input(page)
+    if file_input is None:
+        trigger = (_named_control(page, "点击上传") or
+                   next((control for label in UPLOAD_LABELS
+                         if (control := _named_control(page, label)) is not None), None))
+        if trigger is None:
+            raise UploadStopped("素材页没有可唯一定位的上传入口", stage="file_input")
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        try:
+            with page.expect_file_chooser(timeout=5_000) as chooser:
+                trigger.click(timeout=5_000)
+        except PlaywrightTimeoutError:
+            file_input = _file_input(page)
+            if file_input is None:
+                inner = _named_control(page, "点击上传")
+                if inner is None or trigger.inner_text().strip() == "点击上传":
+                    raise UploadStopped("上传窗口没有打开多选文件控件", stage="file_input")
+                with page.expect_file_chooser(timeout=5_000) as chooser:
+                    inner.click(timeout=5_000)
+                if not chooser.value.is_multiple():
+                    raise UploadStopped("千川当前上传窗口不支持多选", stage="file_input")
+                mark_selection_started()
+                chooser.value.set_files([str(path) for path in paths], timeout=timeout)
+                return
+        else:
+            if not chooser.value.is_multiple():
+                raise UploadStopped("千川当前上传窗口不支持多选", stage="file_input")
+            mark_selection_started()
+            chooser.value.set_files([str(path) for path in paths], timeout=timeout)
+            return
+    if file_input is None or file_input.get_attribute("multiple") is None:
+        raise UploadStopped("千川当前视频文件控件不支持多选", stage="file_input")
+    mark_selection_started()
+    file_input.set_input_files([str(path) for path in paths], timeout=timeout)
+
+
+def _wait_batch_ready(page: Any, options: UploadOptions, names: list[str]) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    deadline = time.monotonic() + options.upload_timeout_s
+    selected = re.compile(r"已选择\s*" + str(len(names)) + r"\s*/\s*100")
+    while time.monotonic() < deadline:
+        try:
+            _check_page_gate(page, "upload_wait")
+            text = _page_text(page)
+            if FAIL_TEXT.search(text):
+                raise UploadStopped("批量上传窗口提示失败；请核查远端素材", stage="upload_wait", manual=True)
+            confirm = _one_visible(page.get_by_role("button", name="确定", exact=True))
+            if selected.search(text) and all(name in text for name in names) and \
+                    confirm is not None and confirm.is_enabled():
+                return
+        except PlaywrightTimeoutError:
+            pass
+        time.sleep(1)
+    raise UploadStopped("批量文件未全部显示上传完成，未点击确认；请核查远端素材", stage="upload_wait", manual=True)
+
+
+def upload_material_batch(options_list: list[UploadOptions]) -> dict[str, Any]:
+    """同一广告主的一批素材只提交一次；每条仍按完整文件名独立回读远端 ID。"""
+    page = None
+    stage = "input"
+    submitted = False
+    manual_action_required = False
+    confirmed: dict[str, str] = {}
+    names = [option.asset_name for option in options_list]
+    try:
+        if not 2 <= len(options_list) <= 10:
+            raise UploadStopped("批量上传只接受 2–10 条素材", stage="input")
+        first = options_list[0]
+        if len(set(names)) != len(names) or len({str(o.asset_path) for o in options_list}) != len(options_list):
+            raise UploadStopped("批量上传文件名或路径重复", stage="input")
+        for option in options_list:
+            _validate(option)
+            if (option.profile_path, option.cdp_port, option.qianchuan_account_id,
+                option.advertiser_id, option.douyin_account_id) != (
+                first.profile_path, first.cdp_port, first.qianchuan_account_id,
+                first.advertiser_id, first.douyin_account_id):
+                raise UploadStopped("批量素材归属的千川账户不一致", stage="input")
+            if option.asset_path.name != option.asset_name:
+                raise UploadStopped("批量素材名必须等于本地文件名", stage="input")
+        port = read_verified_port(first.profile_path, first.cdp_port,
+                                  first.qianchuan_account_id, first.douyin_account_id)
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            stage = "connect"
+            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15_000)
+            page = _select_page(browser, first.advertiser_id)
+            _check_page_gate(page, stage)
+            stage = "navigate"
+            page = _open_material_area(page, first)
+            if first.advertiser_id and not _advertiser_matches_page(page, first.advertiser_id):
+                raise UploadStopped("素材页不是目标广告主，未选择文件", stage="navigate")
+            _delay(first)
+            # 已存在的同名素材直接回读，不再重复上传。
+            for option in options_list:
+                remote_id = _search_material_id(page, option.asset_name)
+                if remote_id:
+                    confirmed[option.asset_name] = remote_id
+            pending = [option for option in options_list if option.asset_name not in confirmed]
+            if pending:
+                stage = "file_input"
+                def mark_selection_started() -> None:
+                    nonlocal submitted
+                    submitted = True
+                _choose_files(page, first, [option.asset_path for option in pending], mark_selection_started)
+                stage = "upload_wait"
+                _wait_batch_ready(page, first, [option.asset_name for option in pending])
+                stage = "submit"
+                control = _submit_control(page)
+                if control is None:
+                    raise UploadStopped("批量上传窗口没有可确认的提交按钮", stage="submit")
+                control.click(timeout=5_000)
+                stage = "verify"
+                deadline = time.monotonic() + first.result_timeout_s
+                while time.monotonic() < deadline and len(confirmed) < len(options_list):
+                    _check_page_gate(page, stage)
+                    for option in pending:
+                        if option.asset_name in confirmed:
+                            continue
+                        remote_id = _search_material_id(page, option.asset_name)
+                        if remote_id:
+                            confirmed[option.asset_name] = remote_id
+                    if len(confirmed) < len(options_list):
+                        time.sleep(2)
+        reason = "已按完整文件名从千川视频库回读远端素材 ID"
+    except UploadStopped as error:
+        reason = str(error)
+        stage = error.stage
+        manual_action_required = error.manual
+    except Exception as error:
+        reason = f"批量上传在 {stage} 阶段异常：{error}"
+    ids = list(confirmed.values())
+    duplicated_ids = {remote_id for remote_id in ids if ids.count(remote_id) > 1}
+    items = []
+    for option in options_list:
+        remote_id = confirmed.get(option.asset_name)
+        if remote_id in duplicated_ids:
+            remote_id = None
+        status = "succeeded" if remote_id else "needs_review" if submitted else "failed"
+        item = _save_evidence(page, option, _result(
+            status, reason if remote_id else
+            f"{reason}；该文件未回读到唯一素材 ID，请核查远端后处理", stage,
+            submitted and option.asset_name not in confirmed, remote_id))
+        item["manualActionRequired"] = manual_action_required
+        items.append({"assetName": option.asset_name, **item})
+    return {"ok": True, "status": "succeeded" if all(i["status"] == "succeeded" for i in items)
+            else "needs_review" if submitted else "failed", "items": items}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="通过 Step 11 千川专属 Chrome 只执行一次素材上传")
-    parser.add_argument("upload", choices=["upload"])
+    parser.add_argument("upload", choices=["upload", "batch-upload"])
     parser.add_argument("--profile-path", type=Path, required=True)
     parser.add_argument("--cdp-port", type=int, required=True)
     parser.add_argument("--qianchuan-account-id", type=int, required=True)
-    parser.add_argument("--asset-path", type=Path, required=True)
-    parser.add_argument("--asset-name", required=True)
+    parser.add_argument("--advertiser-id", default="")
+    parser.add_argument("--douyin-account-id", type=int, default=0)
+    parser.add_argument("--asset-path", type=Path)
+    parser.add_argument("--asset-name", default="")
+    parser.add_argument("--batch-assets-json", default="[]")
     parser.add_argument("--diagnostics-dir", type=Path, required=True)
     parser.add_argument("--min-delay-ms", type=int, default=800)
     parser.add_argument("--max-delay-ms", type=int, default=2_000)
-    parser.add_argument("--upload-timeout-s", type=int, default=120)
-    parser.add_argument("--result-timeout-s", type=int, default=60)
+    parser.add_argument("--upload-timeout-s", type=int, default=600)
+    parser.add_argument("--result-timeout-s", type=int, default=120)
     args = parser.parse_args(argv)
+    if args.upload == "upload" and args.asset_path is None:
+        parser.error("单条上传必须提供 --asset-path")
+    if args.upload == "batch-upload":
+        try:
+            assets = json.loads(args.batch_assets_json)
+            if not isinstance(assets, list) or not 2 <= len(assets) <= 10:
+                raise ValueError("批量素材须为 2–10 条")
+            options_list = [UploadOptions(
+                profile_path=args.profile_path, cdp_port=args.cdp_port,
+                qianchuan_account_id=args.qianchuan_account_id,
+                asset_path=Path(item["filePath"]), asset_name=item["materialName"],
+                diagnostics_dir=args.diagnostics_dir, min_delay_ms=args.min_delay_ms,
+                max_delay_ms=args.max_delay_ms, upload_timeout_s=args.upload_timeout_s,
+                result_timeout_s=args.result_timeout_s, advertiser_id=args.advertiser_id,
+                douyin_account_id=args.douyin_account_id) for item in assets]
+        except (ValueError, TypeError, KeyError) as error:
+            parser.error(f"批量素材参数无效：{error}")
+        print(json.dumps(upload_material_batch(options_list), ensure_ascii=False), flush=True)
+        return 0
     options = UploadOptions(
         profile_path=args.profile_path, cdp_port=args.cdp_port,
         qianchuan_account_id=args.qianchuan_account_id,
@@ -529,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
         diagnostics_dir=args.diagnostics_dir,
         min_delay_ms=args.min_delay_ms, max_delay_ms=args.max_delay_ms,
         upload_timeout_s=args.upload_timeout_s, result_timeout_s=args.result_timeout_s,
+        advertiser_id=args.advertiser_id, douyin_account_id=args.douyin_account_id,
     )
     result = upload_material(options)
     print(json.dumps(result, ensure_ascii=False), flush=True)

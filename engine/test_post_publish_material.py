@@ -92,6 +92,46 @@ class PostPublishMaterialTests(unittest.TestCase):
         self.assertTrue(retried["shouldRun"])
         self.assertEqual(retried["run"]["attemptCount"], 2)
 
+    def test_partial_upload_run_is_reconciled_until_remote_target_complete(self) -> None:
+        material.begin(self.connection, self.published_id, "mark-published")
+        material.update_run(self.connection, self.published_id, "awaiting_upload", "已入队 3 条")
+        self.connection.execute(
+            "UPDATE post_publish_material_runs SET updated_at='2000-01-01T00:00:00' "
+            "WHERE publish_queue_id=?", (self.published_id,),
+        )
+        self.connection.commit()
+        self.assertEqual(len(material.due_runs(self.connection)["rows"]), 1)
+        resumed = material.begin(self.connection, self.published_id, "reconcile")
+        self.assertTrue(resumed["shouldRun"])
+        self.assertEqual(resumed["run"]["attemptCount"], 2)
+        material.update_run(self.connection, self.published_id, "completed", "不同素材达标")
+        self.assertEqual(material.due_runs(self.connection)["rows"], [])
+        self.assertFalse(material.begin(self.connection, self.published_id, "reconcile")["shouldRun"])
+
+    def test_exhausted_run_reconciles_only_after_upload_job_changes(self) -> None:
+        material.begin(self.connection, self.published_id, "mark-published")
+        material.update_run(self.connection, self.published_id, "candidate_exhausted", "候选不足", video_count=0)
+        self.connection.execute(
+            "UPDATE post_publish_material_runs SET updated_at='2000-01-01T00:00:00' "
+            "WHERE publish_queue_id=?", (self.published_id,),
+        )
+        self.connection.commit()
+        self.assertEqual(material.due_runs(self.connection)["rows"], [])
+        self.connection.execute(
+            "CREATE TABLE qianchuan_upload_jobs "
+            "(id INTEGER PRIMARY KEY, account_id INTEGER, product_id TEXT, updated_at TEXT)"
+        )
+        self.connection.execute(
+            "INSERT INTO qianchuan_upload_jobs (account_id, product_id, updated_at) "
+            "VALUES (?, ?, '2026-11-07T20:00:00')",
+            (self.account_id, "1234567890123456789"),
+        )
+        self.connection.commit()
+        self.assertEqual(len(material.due_runs(self.connection)["rows"]), 1)
+        resumed = material.begin(self.connection, self.published_id, "remote-progress-changed")
+        self.assertTrue(resumed["shouldRun"])
+        self.assertEqual(resumed["run"]["attemptCount"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

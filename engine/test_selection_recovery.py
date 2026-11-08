@@ -30,6 +30,38 @@ class SelectionRecoveryTests(unittest.TestCase):
         self.connection.close()
         self.temp_dir.cleanup()
 
+    def test_product_list_includes_uploaded_only_products_and_material_quality(self):
+        self.connection.execute(
+            "CREATE TABLE qianchuan_upload_jobs (id INTEGER PRIMARY KEY, account_id INTEGER, "
+            "qianchuan_account_id INTEGER, product_id TEXT, remote_material_id TEXT, "
+            "material_evaluation TEXT, evaluation_checked_at TEXT, completed_at TEXT, "
+            "updated_at TEXT, status TEXT)"
+        )
+        self.connection.execute(
+            "INSERT INTO product_list_rows "
+            "(account_id, account_name, product_id, title, batch_id, selected_at, updated_at) "
+            "VALUES (11, '测试账号', '1111111111111111111', '已选商品', 'batch-a', '2026-11-08T09:00:00', '2026-11-08T09:00:00')"
+        )
+        self.connection.executemany(
+            "INSERT INTO qianchuan_upload_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded')",
+            [
+                (1, 11, 2, '1111111111111111111', '90000001', '首发', '2026-11-08T10:00:00', '2026-11-08T09:30:00', '2026-11-08T10:00:00'),
+                (2, 12, 3, '2222222222222222222', '90000002', '搬运', '2026-11-08T11:00:00', '2026-11-08T10:30:00', '2026-11-08T11:00:00'),
+                (3, 12, 3, '2222222222222222222', '90000002', '搬运', '2026-11-08T11:10:00', '2026-11-08T10:30:00', '2026-11-08T11:10:00'),
+                (4, 12, 3, '2222222222222222222', '90000003', '', '', '2026-11-08T10:30:00', '2026-11-08T11:20:00'),
+            ],
+        )
+        result = selection_recovery.list_product_rows(self.connection)
+        self.assertEqual(result['total'], 2)
+        existing = next(row for row in result['rows'] if row['productId'].startswith('111'))
+        uploaded_only = next(row for row in result['rows'] if row['productId'].startswith('222'))
+        self.assertEqual((existing['status'], existing['materialFirstCount']), ('uploaded', 1))
+        self.assertEqual(uploaded_only['recordSource'], 'qianchuan_upload')
+        self.assertEqual((uploaded_only['materialCount'], uploaded_only['materialMovedCount'], uploaded_only['materialPendingCount']), (2, 1, 1))
+        self.assertEqual(selection_recovery.list_product_rows(self.connection, account_id=12, status='uploaded')['total'], 1)
+        self.assertEqual(selection_recovery.list_product_rows(self.connection, query='222222')['total'], 1)
+        self.assertEqual(selection_recovery.list_product_rows(self.connection, status='pending')['total'], 0)
+
     def test_running_batch_and_candidate_checkpoint_survive_reopen(self):
         selection_recovery.update_account(self.connection, "batch-a", 11, {
             "state": "in_progress",
@@ -138,6 +170,54 @@ class SelectionRecoveryTests(unittest.TestCase):
         parsed = json.loads(result.stdout)
         self.assertEqual(parsed["batch"]["batchId"], "cli-batch")
         self.assertEqual(parsed["batch"]["accounts"][0]["state"], "queued")
+
+    def test_latest_read_on_missing_database_does_not_create_file(self):
+        missing_db = Path(self.temp_dir.name) / "missing.db"
+        result = subprocess.run(
+            [sys.executable, str(Path(selection_recovery.__file__)), "--db", str(missing_db),
+             "batch", "latest"],
+            capture_output=True, text=True, encoding="utf-8", timeout=5,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(json.loads(result.stdout), {"batch": None})
+        self.assertFalse(missing_db.exists())
+
+    def test_latest_read_does_not_wait_for_writer(self):
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(selection_recovery.__file__)), "--db", str(self.db_path),
+                 "batch", "latest"],
+                capture_output=True, text=True, encoding="utf-8", timeout=5,
+                env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+                check=False,
+            )
+        finally:
+            self.connection.rollback()
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(json.loads(result.stdout)["batch"]["batchId"], "batch-a")
+
+    def test_checkpoint_output_is_one_line_and_history_remains_complete(self):
+        for index in range(205):
+            selection_recovery.append_run_log(self.connection, "batch-a", 11, {
+                "stage": "候选检查", "code": "INFO_TEST", "message": f"第 {index} 条日志",
+            })
+        result = subprocess.run(
+            [sys.executable, str(Path(selection_recovery.__file__)), "--db", str(self.db_path),
+             "batch", "latest"],
+            capture_output=True, text=True, encoding="utf-8", timeout=5,
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"},
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        logs = json.loads(result.stdout)["batch"]["runLogs"]
+        self.assertEqual(len(logs), 200)
+        self.assertEqual(logs[0]["message"], "第 5 条日志")
+        self.assertEqual(logs[-1]["message"], "第 204 条日志")
+        self.assertEqual(len(selection_recovery.list_run_logs(self.connection, "batch-a")), 205)
 
     def test_completed_batch_is_not_returned_as_pending(self):
         selection_recovery.update_account(self.connection, "batch-a", 11, {

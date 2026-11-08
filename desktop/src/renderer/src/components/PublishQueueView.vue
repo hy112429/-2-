@@ -1086,8 +1086,8 @@ onUnmounted(() => {
   <section class="publish-page">
     <header class="page-head">
       <div>
-        <h1>抖音发布管理</h1>
-        <p>查看队列、处理异常与回执</p>
+        <h1>发布进度</h1>
+        <p>查看商品发布状态，需要处理的任务会显示在记录中</p>
       </div>
       <div class="head-actions">
         <label class="account-picker">账号
@@ -1095,11 +1095,16 @@ onUnmounted(() => {
             <option v-for="account in accountTabs" :key="account.id" :value="account.id">{{ account.name }} · {{ accountPlanCount(account.id) }} 条</option>
           </select>
         </label>
-        <button class="button primary" :disabled="!activeAccount || activeAccount.status !== 'active'" @click="openCreateForm">新建计划</button>
-        <button class="button review-toggle" :class="{ enabled: manualReviewActive }" :disabled="schedulerSettingsSaving" :aria-pressed="manualReviewActive" @click="toggleManualReview">人工复核：{{ manualReviewActive ? '已开' : '已关' }}</button>
-        <button class="button" @click="openSchedulerSettings">调度设置</button>
-        <button class="button" @click="exportReceipts">导出回执</button>
         <button class="button" :disabled="loading" @click="refresh">{{ loading ? '读取中…' : '刷新队列' }}</button>
+        <details class="header-more">
+          <summary>更多操作</summary>
+          <div class="header-more-actions">
+            <button class="button primary" :disabled="!activeAccount || activeAccount.status !== 'active'" @click="openCreateForm">新建计划</button>
+            <button class="button review-toggle" :class="{ enabled: manualReviewActive }" :disabled="schedulerSettingsSaving" :aria-pressed="manualReviewActive" @click="toggleManualReview">人工复核：{{ manualReviewActive ? '已开' : '已关' }}</button>
+            <button class="button" @click="openSchedulerSettings">调度设置</button>
+            <button class="button" @click="exportReceipts">导出回执</button>
+          </div>
+        </details>
       </div>
     </header>
 
@@ -1218,7 +1223,7 @@ onUnmounted(() => {
         <div class="card-title">
           <h2>{{ activeAccount.name }}发布记录</h2>
           <span>{{ accountRows.length }} 条记录</span>
-          <button class="button" :disabled="busyId !== null || selectedRetryIds.length === 0" @click="retrySelected">批量重试已勾选（{{ selectedRetryIds.length }}）</button>
+          <button v-if="selectedRetryIds.length" class="button" :disabled="busyId !== null" @click="retrySelected">批量重试已勾选（{{ selectedRetryIds.length }}）</button>
         </div>
         <nav v-if="accountPageCount > 1" class="queue-pagination" aria-label="发布记录分页">
           <span>第 {{ accountPage }} / {{ accountPageCount }} 页 · 每页 {{ accountPageSize }} 条</span>
@@ -1313,6 +1318,9 @@ onUnmounted(() => {
 .publish-page { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior-y: contain; overflow-anchor: none; scrollbar-gutter: stable; padding: 2px 3px 14px; color: var(--text); }
 .page-head { position: sticky; top: 0; z-index: 12; display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; padding: 8px 4px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
 .head-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.header-more { position: relative; font-size: 12px; }
+.header-more > summary { cursor: pointer; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.header-more-actions { position: absolute; right: 0; top: calc(100% + 5px); z-index: 15; display: flex; flex-direction: column; align-items: stretch; gap: 6px; min-width: 160px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
 .account-picker { display: flex; flex-direction: row; align-items: center; gap: 5px; white-space: nowrap; }
 .account-picker select { width: auto; min-width: 130px; max-width: 180px; }
 .review-toggle.enabled { border-color: #86efac; background: #f0fdf4; color: #166534; }

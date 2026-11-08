@@ -26,7 +26,8 @@ def now_text() -> str:
 
 
 def emit(payload: Dict[str, Any], code: int = 0) -> int:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    # Electron 按行读取；大批次的多行 JSON 会触发逐行反复解析。
+    print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     return code
 
 
@@ -81,7 +82,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
-    """历史日志查询专用连接；不建表、不迁移、不写入数据库。"""
+    """选品批次读取专用连接；不建表、不迁移、不写入数据库。"""
     resolved_path = db_path.expanduser().resolve()
     if not resolved_path.is_file():
         raise FileNotFoundError(f"找不到本机数据库：{resolved_path}")
@@ -136,29 +137,34 @@ def sanitize_log_text(value: Any, limit: int) -> str:
     return text[:limit]
 
 
-def list_run_logs(connection: sqlite3.Connection, batch_id: str) -> list[Dict[str, Any]]:
-    rows = connection.execute(
+def run_log_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": int(row["log_id"]),
+        "batchId": row["batch_id"],
+        "accountId": int(row["account_id"]),
+        "accountName": row["account_name"],
+        "productId": row["product_id"],
+        "productTitle": row["product_title"],
+        "stage": row["stage"],
+        "code": row["code"],
+        "message": row["message"],
+        "detail": row["detail"],
+        "createdAt": row["created_at"],
+    }
+
+
+def list_run_logs(connection: sqlite3.Connection, batch_id: str, limit: Optional[int] = None) -> list[Dict[str, Any]]:
+    query = (
         "SELECT log_id, batch_id, account_id, account_name, product_id, product_title, "
         "stage, code, message, detail, created_at FROM selection_run_logs "
-        "WHERE batch_id = ? ORDER BY log_id",
-        (batch_id,),
-    ).fetchall()
-    return [
-        {
-            "id": int(row["log_id"]),
-            "batchId": row["batch_id"],
-            "accountId": int(row["account_id"]),
-            "accountName": row["account_name"],
-            "productId": row["product_id"],
-            "productTitle": row["product_title"],
-            "stage": row["stage"],
-            "code": row["code"],
-            "message": row["message"],
-            "detail": row["detail"],
-            "createdAt": row["created_at"],
-        }
-        for row in rows
-    ]
+        "WHERE batch_id = ? ORDER BY log_id"
+    )
+    if limit is None:
+        rows = connection.execute(query, (batch_id,)).fetchall()
+    else:
+        rows = connection.execute(query + " DESC LIMIT ?", (batch_id, max(1, limit))).fetchall()
+        rows.reverse()
+    return [run_log_dict(row) for row in rows]
 
 
 def append_run_log(
@@ -206,10 +212,7 @@ def append_run_log(
     row = connection.execute(
         "SELECT * FROM selection_run_logs WHERE log_id = ?", (cursor.lastrowid,)
     ).fetchone()
-    return next(
-        (item for item in list_run_logs(connection, batch_id) if item["id"] == int(row["log_id"])),
-        {},
-    ) if row else {}
+    return run_log_dict(row) if row else {}
 
 
 # 保留旧函数名，兼容已有脚本和测试调用。
@@ -221,7 +224,8 @@ def batch_dict(connection: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, An
         "SELECT * FROM selection_run_accounts WHERE batch_id = ? ORDER BY sequence_no, account_id",
         (row["batch_id"],),
     ).fetchall()
-    run_logs = list_run_logs(connection, row["batch_id"])
+    # 启动恢复只需近期日志；完整过程记录由 batch logs 单独查询。
+    run_logs = list_run_logs(connection, row["batch_id"], limit=200)
     return {
         "batchId": row["batch_id"],
         "state": row["state"],
@@ -277,6 +281,20 @@ def recent_batch(connection: sqlite3.Connection) -> Optional[Dict[str, Any]]:
         "SELECT * FROM selection_run_batches ORDER BY created_at DESC, updated_at DESC LIMIT 1"
     ).fetchone()
     return batch_dict(connection, row) if row else None
+
+
+def read_batch_checkpoint(connection: sqlite3.Connection, action: str) -> Optional[Dict[str, Any]]:
+    """只读恢复检查点；空库直接返回，残缺表结构明确报错。"""
+    existing_tables = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "selection_run_batches" not in existing_tables:
+        return None
+    if not {"selection_run_accounts", "selection_run_logs"}.issubset(existing_tables):
+        raise ValueError("选品批次表结构不完整，请检查本地数据库")
+    return latest_incomplete_batch(connection) if action == "latest" else recent_batch(connection)
 
 
 def list_batches(
@@ -626,6 +644,8 @@ def list_product_rows(
     upload_status: Dict[tuple[int, str], tuple[str, str]] = {}
     publish_status: Dict[tuple[int, str], tuple[str, str, str]] = {}
     product_covers: Dict[str, str] = {}
+    product_details: Dict[str, tuple[str, str, str]] = {}
+    material_jobs: Dict[tuple[int, str], Dict[tuple[int, str], sqlite3.Row]] = {}
     if "qianchuan_product_upload_status" in table_names:
         upload_status = {
             (int(row["account_id"]), str(row["product_id"])): (str(row["status"]), str(row["updated_at"] or ""))
@@ -642,19 +662,49 @@ def list_product_rows(
                 str(row["published_at"] or row["updated_at"] or ""),
             ))
     if "baiying_products" in table_names:
-        product_covers = {
-            str(row["product_id"]): str(row["cover_url"] or "")
-            for row in connection.execute("SELECT product_id, cover_url FROM baiying_products WHERE cover_url IS NOT NULL AND cover_url <> ''").fetchall()
-        }
+        for detail in connection.execute("SELECT product_id, title, commodity_id, cover_url FROM baiying_products"):
+            product_details[str(detail["product_id"])] = (
+                str(detail["title"] or ""), str(detail["commodity_id"] or ""), str(detail["cover_url"] or ""))
+        product_covers = {key: detail[2] for key, detail in product_details.items()}
+    if "qianchuan_upload_jobs" in table_names:
+        job_columns = {str(column["name"]) for column in connection.execute("PRAGMA table_info(qianchuan_upload_jobs)")}
+        evaluation_column = "material_evaluation" if "material_evaluation" in job_columns else "'' AS material_evaluation"
+        checked_column = "evaluation_checked_at" if "evaluation_checked_at" in job_columns else "'' AS evaluation_checked_at"
+        for job in connection.execute(
+            "SELECT account_id, qianchuan_account_id, product_id, remote_material_id, "
+            f"{evaluation_column}, {checked_column}, completed_at, updated_at "
+            "FROM qianchuan_upload_jobs WHERE status = 'succeeded' "
+            "AND remote_material_id <> '' ORDER BY id DESC"
+        ):
+            key = (int(job["account_id"]), str(job["product_id"]))
+            remote_key = (int(job["qianchuan_account_id"]), str(job["remote_material_id"]))
+            material_jobs.setdefault(key, {}).setdefault(remote_key, job)
+
+    def material_summary(key: tuple[int, str]) -> Dict[str, int]:
+        jobs = list(material_jobs.get(key, {}).values())
+        moved = sum(bool(job["evaluation_checked_at"]) and
+                    "搬运" in str(job["material_evaluation"] or "") for job in jobs)
+        first = sum(bool(job["evaluation_checked_at"]) and
+                    "首发" in str(job["material_evaluation"] or "")
+                    and "搬运" not in str(job["material_evaluation"] or "") for job in jobs)
+        pending = sum(not job["evaluation_checked_at"] or
+                      str(job["material_evaluation"] or "").strip() in {"", "-"} for job in jobs)
+        return {"materialCount": len(jobs), "materialFirstCount": first,
+                "materialMovedCount": moved, "materialPendingCount": pending,
+                "materialOtherCount": len(jobs) - first - moved - pending}
+
     products = []
+    existing_keys: set[tuple[int, str]] = set()
     for row in rows:
-        item = dict(row)
         key = (int(row["account_id"]), str(row["product_id"]))
+        existing_keys.add(key)
         base_status = str(row["status"])
         uploaded, upload_updated_at = upload_status.get(key, ("", ""))
-        effective = "uploaded" if uploaded == "uploaded" else base_status
+        effective = "uploaded" if uploaded == "uploaded" or key in material_jobs else base_status
         reason = str(row["failure_reason"] or "")
-        updated_at = upload_updated_at if effective == "uploaded" else str(row["updated_at"])
+        uploaded_job_time = max(
+            (str(job["updated_at"] or "") for job in material_jobs.get(key, {}).values()), default="")
+        updated_at = (upload_updated_at or uploaded_job_time or str(row["updated_at"])) if effective == "uploaded" else str(row["updated_at"])
         platform_status, platform_error, publish_updated_at = publish_status.get(key, ("", "", ""))
         if effective != "uploaded" and platform_status == "published":
             effective = "published"
@@ -682,14 +732,43 @@ def list_product_rows(
             "status": effective, "failureReason": reason, "batchId": str(row["batch_id"]),
             "candidateSnapshot": decode_json(row["candidate_json"], {}),
             "selectedAt": str(row["selected_at"]), "updatedAt": updated_at,
+            "recordSource": "selection", **material_summary(key),
         })
-    accounts = connection.execute(
+    account_rows = connection.execute(
         "SELECT DISTINCT account_id AS id, account_name AS name FROM product_list_rows WHERE deleted_at IS NULL ORDER BY account_name"
     ).fetchall()
+    listed_account_ids = {int(row["id"]) for row in account_rows} | {key[0] for key in material_jobs}
+    account_names = {int(row["id"]): str(row["name"]) for row in account_rows}
+    if "accounts" in table_names:
+        for account in connection.execute("SELECT id, name FROM accounts"):
+            if int(account["id"]) in listed_account_ids:
+                account_names[int(account["id"])] = str(account["name"])
+    for key, jobs_by_remote in material_jobs.items():
+        if key in existing_keys:
+            continue
+        name = account_names.get(key[0], f"账号 {key[0]}")
+        detail = product_details.get(key[1], ("", "", ""))
+        if account_id is not None and key[0] != account_id:
+            continue
+        if normalized_query and not any(normalized_query in value for value in (key[1], detail[0], name)):
+            continue
+        if status and status != "uploaded":
+            continue
+        latest = max(jobs_by_remote.values(), key=lambda job: str(job["updated_at"] or ""))
+        timestamp = str(latest["completed_at"] or latest["updated_at"] or "")
+        products.append({
+            "accountId": key[0], "accountName": name, "productId": key[1],
+            "title": detail[0], "commodityId": detail[1], "sourceUrl": "", "coverUrl": detail[2],
+            "sku": "", "categoryLabels": [], "status": "uploaded", "failureReason": "",
+            "batchId": "", "candidateSnapshot": {}, "selectedAt": timestamp,
+            "updatedAt": str(latest["updated_at"] or timestamp), "recordSource": "qianchuan_upload",
+            **material_summary(key),
+        })
+    products.sort(key=lambda item: (item["selectedAt"], item["accountId"], item["productId"]), reverse=True)
     return {
         "ok": True, "rows": products[safe_offset:safe_offset + safe_limit], "total": len(products),
         "limit": safe_limit, "offset": safe_offset,
-        "accounts": [{"id": int(row["id"]), "name": str(row["name"])} for row in accounts],
+        "accounts": [{"id": key, "name": value} for key, value in sorted(account_names.items(), key=lambda pair: pair[1])],
     }
 
 
@@ -1202,10 +1281,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     try:
-        # 历史日志查询必须先走 mode=ro；不能调用会建表、切换 WAL 的写连接。
-        if args.command == "batch" and args.action in {"list", "logs"}:
+        # 所有批次读取先走 mode=ro；不能调用会建表、切换 WAL 的写连接。
+        if args.command == "batch" and args.action in {"latest", "recent", "list", "logs"}:
+            if args.action in {"latest", "recent"} and not args.db.expanduser().is_file():
+                return emit({"batch": None})
             connection = connect_readonly(args.db)
             try:
+                if args.action in {"latest", "recent"}:
+                    return emit({"batch": read_batch_checkpoint(connection, args.action)})
                 if args.action == "list":
                     return emit(list_batches(
                         connection,
@@ -1222,10 +1305,6 @@ def main() -> int:
 
         connection = connect(args.db)
         try:
-            if args.command == "batch" and args.action == "latest":
-                return emit({"batch": latest_incomplete_batch(connection)})
-            if args.command == "batch" and args.action == "recent":
-                return emit({"batch": recent_batch(connection)})
             if args.command == "batch" and args.action == "create":
                 payload = json.load(sys.stdin)
                 return emit({"batch": create_batch(connection, args.batch_id, payload)})

@@ -430,7 +430,7 @@ function workflowIndexForStage(stageValue: string, mode: SelectionProgressState[
   if (/发布|投稿|队列|上传视频|创作者中心|封面|关联百应|发布选项/.test(stage)) return 7
   if (/登记加车配额|记录(?:加车|商品|选品车)?配额|配额记录/.test(stage)) return 5
   if (/加车|核验并处理|处理选中商品|商品数据分析|选品车|候选商品处理/.test(stage)) return 4
-  if (/评分|筛选与互斥|类目推荐|推荐类目|互斥分配|候选分配|ID 去重|ID去重|本机登记|候选计划已就绪|候选统一/.test(stage)) return 3
+  if (/评分|筛选与互斥|类目推荐|推荐类目|互斥分配|候选分配|ID 去重|ID去重|本机登记|核对本机选品记录|保存选品批次|候选计划已就绪|候选统一/.test(stage)) return 3
   if (/统一采集|百应筛选|获取候选|候选预览|查询百应候选|应用选品条件|material_list|来源|热点|联盟|榜单|商品列表/.test(stage)) return 1
   if (/账号配额预检/.test(stage)) return 0
   if (/每日配额|剩余配额|账号配额|quota_check/.test(stage)) return 2
@@ -1141,11 +1141,14 @@ function runEngine(
   return new Promise((resolve, reject) => {
     let settled = false
     let taskId: string | null = null
+    let timedOut = false
+    let timeoutId: number | null = null
     const pendingEvents: EngineEventPayload[] = []
     let off: () => void = () => undefined
     const finish = (callback: () => void): void => {
       if (settled) return
       settled = true
+      if (timeoutId !== null) window.clearTimeout(timeoutId)
       off()
       callback()
     }
@@ -1159,16 +1162,31 @@ function runEngine(
       if (!taskId) pendingEvents.push(event)
       else handleEvent(event)
     })
-    window.setTimeout(() => finish(() => reject(new Error(`引擎命令超时（${Math.round(timeoutMs / 1000)} 秒）`))), timeoutMs)
+    timeoutId = window.setTimeout(() => {
+      timedOut = true
+      if (taskId) void window.api.engine.cancel(taskId).catch(() => undefined)
+      const operation = script === 'selection_settings.py' && args.includes('quota')
+        ? '读取账号剩余配额'
+        : script === 'publish_queue.py' && args.includes('product-locks')
+          ? '检查商品发布记录'
+          : script === 'selection_recovery.py'
+            ? '读写选品批次记录'
+            : script
+      finish(() => reject(new Error(`${operation}超时（${Math.round(timeoutMs / 1000)} 秒）；已请求停止引擎任务，请先检查选品记录再重试。`)))
+    }, timeoutMs)
     // Electron IPC 使用结构化克隆；Vue 的 reactive/ref 对象不能直接跨进程传递。
     const plainStdinJson = stdinJson === undefined ? undefined : JSON.parse(JSON.stringify(stdinJson)) as unknown
     void window.api.engine.run({ script, args, stdinJson: plainStdinJson }).then((reply) => {
       if (!reply.taskId) finish(() => reject(new Error(reply.error ?? '引擎任务启动失败')))
       else {
         taskId = reply.taskId
+        if (timedOut) {
+          void window.api.engine.cancel(taskId).catch(() => undefined)
+          return
+        }
         pendingEvents.splice(0).forEach(handleEvent)
       }
-    })
+    }).catch((cause) => finish(() => reject(cause)))
   })
 }
 
@@ -1747,7 +1765,7 @@ async function chooseGlobalDownloadPath(): Promise<void> {
 
 function ensureAccountPathsSaved(): boolean {
   if (!accountPathsHaveUnsavedChanges.value) return true
-  error.value = '账号路径有未保存的修改。请先点击“保存账号设置”；新批次不会读取未保存的路径。'
+  error.value = '账号路径还没保存，选品没有启动。请展开“调整筛选条件与账号设置”，点击“保存账号设置”；如果浏览器资料路径填的是视频文件夹，请先点该路径旁的“恢复默认”。'
   return false
 }
 
@@ -1815,12 +1833,12 @@ async function refreshAccountCategories(): Promise<void> {
   }
 }
 
-async function saveAccount(): Promise<void> {
-  if (accountId.value === null || busy.value) return
+async function saveAccount(): Promise<boolean> {
+  if (accountId.value === null || busy.value) return false
   const targetAccountId = accountId.value
   if (!isSelectionAccountInScope(targetAccountId)) {
     error.value = '所选账号已不存在，账号设置未保存。'
-    return
+    return false
   }
   busy.value = true
   error.value = ''
@@ -1828,14 +1846,14 @@ async function saveAccount(): Promise<void> {
     if (accountDraft.browserProfilePath) {
       const directoryValidation = await window.api.dir.validateProfileDir(accountDraft.browserProfilePath)
       if (!directoryValidation.ok) {
-        throw new Error(directoryValidation.error ?? '浏览器缓存目录校验失败')
+        throw new Error(directoryValidation.error ?? '浏览器登录资料文件夹不能使用。请点“恢复默认”；视频保存位置请填写“视频保存位置”。')
       }
       const profileValidation = await window.api.browser.validateProfilePath({
         profileKey: 'account-' + targetAccountId,
         profilePath: directoryValidation.path ?? accountDraft.browserProfilePath
       })
       if (!profileValidation.ok || !profileValidation.path) {
-        throw new Error(profileValidation.error ?? '浏览器缓存目录校验失败')
+        throw new Error(`浏览器登录资料文件夹不能使用：${profileValidation.error ?? '请点“恢复默认”后重试'}`)
       }
       accountDraft.browserProfilePath = profileValidation.path
     }
@@ -1843,7 +1861,7 @@ async function saveAccount(): Promise<void> {
     if (accountDraft.downloadPath.trim()) {
       const downloadValidation = await window.api.dir.canonicalizePath(accountDraft.downloadPath)
       if (!downloadValidation.ok || !downloadValidation.path) {
-        throw new Error(downloadValidation.error ?? '账号下载路径无效')
+        throw new Error(`视频保存位置不能使用：${downloadValidation.error ?? '请重新选择文件夹或点“恢复默认”'}`)
       }
       accountDraft.downloadPath = downloadValidation.path
     }
@@ -1893,8 +1911,10 @@ async function saveAccount(): Promise<void> {
       : '账号选品设置已保存；每日限额继承通用默认值。'
     emit('saved', targetAccountId)
     if (props.dialogOnly) emit('close')
+    return true
   } catch (cause) {
     error.value = String(cause instanceof Error ? cause.message : cause)
+    return false
   } finally {
     busy.value = false
   }
@@ -2007,6 +2027,11 @@ async function prepareBatchCandidatePlans(
     let preview: Record<string, unknown>
     let quota: Record<string, unknown>
     try {
+      // 先完成本地配额查询，再启动较慢的百应页面采集。并行时若本地命令
+      // 30 秒超时，浏览器仍可能采集到“候选预览完成”，导致界面误报整轮失败。
+      quota = await runEngine('selection_settings.py', [
+        '--db', DB_PATH, 'quota', 'get', '--account-id', String(account.id)
+      ])
       const previewRequest: Promise<Record<string, unknown>> = seededRows?.length
         ? Promise.resolve({
             ok: true,
@@ -2023,14 +2048,10 @@ async function prepareBatchCandidatePlans(
             settings,
             accountId: account.id,
             downloadPath: context.downloadPath,
-            previewOnly: true
+            previewOnly: true,
+            closeAfterAutomation: true
           }))
-      ;[preview, quota] = await Promise.all([
-        previewRequest,
-        runEngine('selection_settings.py', [
-          '--db', DB_PATH, 'quota', 'get', '--account-id', String(account.id)
-        ])
-      ])
+      preview = await previewRequest
     } catch (cause) {
       const classification = toUserSelectionError(cause).classification
       if (accountSwitchFailures && (
@@ -2056,6 +2077,12 @@ async function prepareBatchCandidatePlans(
       }
       throw cause
     }
+    reportSelectionProgress(account.id, '核对本机选品记录', {
+      accountIndex: targetIndex + 1,
+      accountTotal: orderedTargets.length,
+      completedAccounts: targetIndex,
+      message: '百应候选已返回，正在排除本机登记和已发布商品。'
+    })
     let rows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
     collectedSourceIdsByAccount.set(account.id, new Map(
       [...new Set(rows.flatMap((candidate) => candidate.sources ?? []))].map((sourceKey) => [
@@ -2633,7 +2660,7 @@ async function executeAccountSelection(
             }
           : await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
               ...profile, settings: candidateQuerySettings, accountId: targetAccountId,
-              downloadPath: context.downloadPath, previewOnly: true
+              downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: true
             }))
         if (preview.ok !== true) throw new Error(String(preview.error ?? '百应候选获取失败'))
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
@@ -2894,7 +2921,8 @@ async function executeAccountSelection(
           refreshCandidatesById: resumeCart,
           analyzeBeforeCart: !resumeAfterCart,
           maxSelectedProducts,
-          previewOnly: false
+          previewOnly: false,
+          closeAfterAutomation: true
         }))
         if (result.ok !== true) throw new Error(String(result.error ?? '百应选品执行失败'))
 
@@ -3246,7 +3274,8 @@ async function executeAccountSelection(
               : row),
             recoverExistingCart: true,
             refreshCandidatesById: true,
-            previewOnly: false
+            previewOnly: false,
+            closeAfterAutomation: true
           }))
           if (detail.ok !== true) throw new Error(String(detail.error ?? '百应商品详情采集失败'))
           const returned = Array.isArray(detail.completed) ? detail.completed as Array<Record<string, unknown>> : []
@@ -3750,6 +3779,21 @@ function decodeLoginPlatformResult(value: unknown, fallback: string): LoginPlatf
   }
 }
 
+function appendUncheckedLoginTargets(
+  results: LoginPreflightAccount[],
+  targets: LoginPreflightTarget[],
+  startIndex: number,
+  reason: string
+): void {
+  for (const target of targets.slice(startIndex)) {
+    results.push({
+      ...target,
+      baiying: { state: 'unknown', message: reason },
+      creatorCenter: { state: 'unknown', message: reason }
+    })
+  }
+}
+
 async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<LoginPreflightAccount[]> {
   const results: LoginPreflightAccount[] = []
   for (const [targetIndex, target] of targets.entries()) {
@@ -3770,13 +3814,26 @@ async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<Login
         baiying: { state: 'unknown', message },
         creatorCenter: { state: 'unknown', message }
       })
-      continue
+      appendUncheckedLoginTargets(
+        results,
+        targets,
+        targetIndex + 1,
+        `因账号「${target.accountName}」的浏览器配置无法确认，此账号尚未检查。`
+      )
+      reportSelectionProgress(target.accountId, '等待账号浏览器配置处理', {
+        accountIndex: targetIndex + 1,
+        accountTotal: targets.length,
+        completedAccounts: targetIndex,
+        message: `账号「${target.accountName}」的浏览器配置无法确认；已暂停后续账号检查。`
+      })
+      return results
     }
     const checkOnce = async (): Promise<LoginPreflightAccount> => {
       try {
         const response = await window.api.browser.checkAccountLogins({
           accountId: target.accountId,
-          profilePath: target.profilePath
+          profilePath: target.profilePath,
+          closeAfterAutomation: true
         })
         if (response.ok !== true) {
           const message = typeof response.error === 'string' ? response.error : '登录状态检查失败，无法确认。'
@@ -3820,6 +3877,21 @@ async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<Login
       percent: Math.floor((targetIndex + 1) * 100 / targets.length),
       message: `账号「${target.accountName}」登录状态检查完成（${targetIndex + 1}/${targets.length}）。`
     })
+    if (!loginTargetsPassed([checked.value])) {
+      appendUncheckedLoginTargets(
+        results,
+        targets,
+        targetIndex + 1,
+        `因账号「${target.accountName}」需要登录或验证，此账号尚未检查。`
+      )
+      reportSelectionProgress(target.accountId, '等待账号登录或验证', {
+        accountIndex: targetIndex + 1,
+        accountTotal: targets.length,
+        completedAccounts: targetIndex,
+        message: `账号「${target.accountName}」需要登录或验证；已暂停检查后续账号，窗口保留供处理。`
+      })
+      return results
+    }
   }
   return results
 }
@@ -4606,6 +4678,11 @@ async function runSelectionBatch(): Promise<void> {
       }
       preparedCandidatePlans = candidatePlansForBatchPayload(candidatePlans)
       payload.candidatePlan = preparedCandidatePlans
+      selectionProgress.value = {
+        ...selectionProgress.value!,
+        stage: '保存选品批次',
+        message: '候选计划已整理，正在写入本机批次记录。'
+      }
       const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
       batch = created.batch as SelectionRecoveryBatch
       if (previewCandidatePool.value && candidatePlanAccounts.some((account) => account.id === previewCandidatePool.value?.accountId)) {
@@ -4933,6 +5010,23 @@ async function runSelectionBatch(): Promise<void> {
 }
 
 const runSelectionBatchOnce = createSingleFlight(runSelectionBatch)
+
+function discardUnsavedAccountPaths(): void {
+  accountDraft.browserProfilePath = savedAccountPaths.browserProfilePath
+  accountDraft.downloadPath = savedAccountPaths.downloadPath
+  error.value = ''
+}
+
+async function startSelectionFromButton(): Promise<void> {
+  if (accountPathsHaveUnsavedChanges.value) {
+    if (accountId.value === null) {
+      error.value = '请先选择账号，再开始选品。'
+      return
+    }
+    if (!await saveAccount()) return
+  }
+  await startSelection()
+}
 
 async function startSelection(): Promise<boolean> {
   const autoStartBatchId = automaticResumeBatchId
@@ -5444,8 +5538,11 @@ onUnmounted(() => {
         </section>
         <section class="card">
           <h2>账号路径</h2>
-          <label class="path-field">浏览器缓存路径<div><input v-model="accountDraft.browserProfilePath" :disabled="busy" placeholder="留空使用此账号的独立 profile"><button class="btn" :disabled="busy" @click="chooseProfilePath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
-          <label class="path-field">账号下载路径<div><input v-model="accountDraft.downloadPath" :disabled="busy" placeholder="留空使用此账号的独立下载目录"><button class="btn" :disabled="busy" @click="chooseDownloadPath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+          <label class="path-field">视频保存位置<div><input v-model="accountDraft.downloadPath" :disabled="busy" placeholder="留空使用软件默认位置"><button class="btn" :disabled="busy" @click="chooseDownloadPath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+          <details class="compact-help browser-profile-advanced" :open="Boolean(accountDraft.browserProfilePath) || undefined"><summary>浏览器登录资料（{{ accountDraft.browserProfilePath ? '已自定义' : '使用默认' }}，一般无需修改）</summary>
+            <label class="path-field">浏览器登录资料文件夹<div><input v-model="accountDraft.browserProfilePath" :disabled="busy" placeholder="留空使用软件默认位置"><button class="btn" :disabled="busy" @click="chooseProfilePath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
+            <p class="hint">这里不是视频保存位置。自定义文件夹必须包含 Chrome 的 Default 文件夹；不确定时请点“恢复默认”。</p>
+          </details>
           <p v-if="accountPathsHaveUnsavedChanges" class="hint warning">路径有未保存修改；新批次仍会使用上次保存的目录。点击下方“保存”后才生效；已有素材不会移动，已开始处理的恢复批次沿用原路径。</p>
           <p class="hint warning">百应、抖音授权与账号自动操作共用该账号 profile。自定义目录必须包含 Default；路径变更后先保存，再刷新类目或打开授权。账号下载目录与其他账号隔离。</p>
         </section>
@@ -5460,17 +5557,26 @@ onUnmounted(() => {
   <section v-else class="selection-page">
     <header class="page-head">
       <div>
-        <h1>选品设置与自动选品</h1>
-        <p>三源候选去重 · 按账号设置路径和限额</p>
+        <h1>开始选品</h1>
+        <p>按已保存的规则，为启用账号自动挑选商品</p>
       </div>
       <div class="head-actions">
-        <button class="btn" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="activeTab === '通用设置' ? saveGlobal() : saveAccount()">{{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}</button>
-        <button class="btn" :disabled="busy" @click="previewCandidates">预览候选</button>
-        <button class="btn primary" :disabled="busy || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelection()">
-          {{ selectionCooldownRemaining > 0 ? `冷却中（${selectionCooldownRemaining} 秒）` : recoveryBatch?.state === 'needs_retry' ? '继续选品' : '自动选品一起工作' }}
+        <button class="btn primary" :disabled="busy || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelectionFromButton">
+          {{ selectionCooldownRemaining > 0 ? `冷却中（${selectionCooldownRemaining} 秒）` : accountPathsHaveUnsavedChanges ? '保存设置并开始选品' : recoveryBatch?.state === 'needs_retry' ? '继续选品' : '自动选品一起工作' }}
         </button>
       </div>
     </header>
+    <div v-if="accountPathsHaveUnsavedChanges" class="selection-path-warning" role="status">
+      <span>账号路径有改动。点击上方按钮会先保存，再开始选品；如果路径填错，可撤销本次修改。</span>
+      <button class="btn" type="button" :disabled="busy" @click="discardUnsavedAccountPaths">撤销路径修改</button>
+    </div>
+    <p v-if="error" class="error selection-top-feedback" role="alert">{{ selectionErrorPresentation.userMessage }}</p>
+    <details v-if="error && selectionErrorPresentation.diagnostic" class="selection-diagnostic">
+      <summary>查看错误详情</summary><pre>{{ selectionErrorPresentation.diagnostic }}</pre>
+    </details>
+    <p v-if="notice" class="notice selection-top-feedback" role="status">{{ selectionNoticePresentation.userMessage }}</p>
+    <details class="client-advanced">
+      <summary>每日定时选品：{{ dailySelectionSchedule.enabled ? `已开启，每天 ${dailySelectionSchedule.time}` : '未开启' }}</summary>
     <section class="daily-selection-schedule" aria-label="每日定时选品">
       <div class="daily-selection-copy">
         <strong>每日定时选品</strong>
@@ -5493,6 +5599,7 @@ onUnmounted(() => {
         {{ dailySelectionSchedule.saving ? '保存中…' : '保存定时' }}
       </button>
     </section>
+    </details>
     <details v-if="accounts.length" class="account-statuses"><summary>账号选品状态（{{ accounts.length }}）</summary><span v-for="account in accounts" :key="account.id">{{ account.name }}：{{ accountStatuses[account.id] }}</span></details>
     <section v-if="selectionCooldownArmed" class="selection-cooldown" role="status" aria-live="polite">
       <strong>百应暂时限流</strong>
@@ -5550,6 +5657,12 @@ onUnmounted(() => {
       </details>
     </section>
 
+    <details class="client-advanced selection-settings-advanced" :open="Boolean(error) || recoveryBatch?.state === 'needs_retry' || undefined">
+      <summary>调整筛选条件与账号设置</summary>
+      <div class="advanced-actions">
+        <button class="btn" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="activeTab === '通用设置' ? saveGlobal() : saveAccount()">{{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}</button>
+        <button class="btn" :disabled="busy" @click="previewCandidates">预览候选</button>
+      </div>
     <div class="tabs">
       <button :class="{ active: activeTab === '通用设置' }" @click="activeTab = '通用设置'">通用设置</button>
       <button :class="{ active: activeTab === '账号个性化' }" @click="activeTab = '账号个性化'">账号个性化选品</button>
@@ -5574,13 +5687,8 @@ onUnmounted(() => {
           </template>
           <button v-if="candidates.length" class="btn" type="button" @click="jumpToSelectionSection('candidate-pool')">候选池 {{ candidates.length }}</button>
         </nav>
-        <p v-if="notice" class="notice">{{ selectionNoticePresentation.userMessage }}</p>
         <details v-if="notice && selectionNoticePresentation.diagnostic" class="selection-diagnostic">
           <summary>查看诊断详情</summary><pre>{{ selectionNoticePresentation.diagnostic }}</pre>
-        </details>
-        <p v-if="error" class="error">{{ selectionErrorPresentation.userMessage }}</p>
-        <details v-if="error && selectionErrorPresentation.diagnostic" class="selection-diagnostic">
-          <summary>查看诊断详情</summary><pre>{{ selectionErrorPresentation.diagnostic }}</pre>
         </details>
         <section v-if="recoveryBatch?.state === 'needs_retry'" class="recovery-card">
           <div>
@@ -5818,10 +5926,12 @@ onUnmounted(() => {
           </section>
           <section id="account-path" class="card">
             <div class="section-title"><h2>账号路径</h2><button class="btn" :disabled="busy" @click="resetAccountPaths">恢复两个路径默认值</button></div>
-            <label class="path-field">托管 Chrome profile 路径（目录须包含 Default）<div><input v-model="accountDraft.browserProfilePath" placeholder="留空使用客户端专用账号 profile"><button class="btn" @click="chooseProfilePath">选择文件夹</button><button class="btn" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
-            <label class="path-field">账号下载路径<div><input v-model="accountDraft.downloadPath" placeholder="留空使用账号独立默认目录"><button class="btn" @click="chooseDownloadPath">选择文件夹</button><button class="btn" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+            <label class="path-field">视频保存位置<div><input v-model="accountDraft.downloadPath" placeholder="留空使用软件默认位置"><button class="btn" @click="chooseDownloadPath">选择文件夹</button><button class="btn" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+            <details class="compact-help browser-profile-advanced" :open="Boolean(accountDraft.browserProfilePath) || undefined"><summary>浏览器登录资料（{{ accountDraft.browserProfilePath ? '已自定义' : '使用默认' }}，一般无需修改）</summary>
+              <label class="path-field">浏览器登录资料文件夹<div><input v-model="accountDraft.browserProfilePath" placeholder="留空使用软件默认位置"><button class="btn" @click="chooseProfilePath">选择文件夹</button><button class="btn" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
+              <p class="hint">这里不是视频保存位置。自定义文件夹必须包含 Chrome 的 Default 文件夹；不确定时请点“恢复默认”。</p>
+            </details>
             <p v-if="accountPathsHaveUnsavedChanges" class="hint warning">路径有未保存修改；新批次仍会使用上次保存的目录。点击“保存账号设置”后才生效；已有素材不会移动，已开始处理的恢复批次沿用原路径。</p>
-            <details class="compact-help"><summary>浏览器路径说明</summary><p class="hint warning">留空时使用客户端独立 profile。已有 Chrome 默认目录或正在使用的目录不能作为托管 profile。</p></details>
           </section>
         </template>
 
@@ -5851,6 +5961,7 @@ onUnmounted(() => {
         <BrowserPane default-target="baiying" :profile-key="browserProfileKey" :profile-path="accountDraft.browserProfilePath || undefined" />
       </aside>
     </div>
+    </details>
     <Teleport to="body">
       <section
         v-if="bannedWordsDialogOpen"
@@ -5979,6 +6090,16 @@ onUnmounted(() => {
 .account-settings-dialog .path-field input { flex: 1; min-width: 120px; }
 .account-settings-dialog .path-field button { white-space: nowrap; }
 .selection-page { display: flex; flex-direction: column; width: 100%; min-width: 0; min-height: 0; gap: 10px; color: var(--text); }
+.selection-path-warning { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-shrink: 0; margin: 0; padding: 10px 12px; border: 1px solid #e8cf96; border-radius: var(--radius); background: #fff8e9; color: #74511c; font-size: 12px; line-height: 1.5; }
+.selection-path-warning .btn { flex-shrink: 0; }
+.selection-top-feedback { flex-shrink: 0; margin: 0; line-height: 1.5; }
+.client-advanced { flex-shrink: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
+.client-advanced > summary { cursor: pointer; padding: 12px 14px; color: var(--text); font-size: 13px; font-weight: 600; }
+.client-advanced[open] > summary { border-bottom: 1px solid var(--border); }
+.client-advanced .daily-selection-schedule { margin: 10px; }
+.selection-settings-advanced .advanced-actions { display: flex; gap: 8px; padding: 10px 12px 0; }
+.selection-settings-advanced .tabs { margin: 10px 12px 0; }
+.selection-settings-advanced .body-layout { min-height: 440px; max-height: 65vh; padding: 10px 12px 12px; }
 .page-head { position: relative; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 0; background: var(--bg-app); }
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .daily-selection-schedule { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 11px 14px; border: 1px solid #cfdef8; border-radius: var(--radius); background: linear-gradient(110deg, #f5f9ff, #ffffff); font-size: 12px; box-shadow: var(--shadow-card); }
@@ -6047,6 +6168,8 @@ onUnmounted(() => {
 .filter-card[open] > summary { margin-bottom: 12px; }
 .account-filter-details { margin-top: 9px; }
 .compact-help { margin-top: 8px; }
+.browser-profile-advanced { padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-app); }
+.browser-profile-advanced .hint { margin: 8px 0 0; }
 .category-mode-options { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; }
 .category-mode-options label { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; cursor: pointer; }
 .category-mode-options input { margin: 0; accent-color: var(--brand); }

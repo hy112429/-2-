@@ -51,7 +51,7 @@ const browser = {
     ipcRenderer.invoke('browser:inspectBaiyingSelection', options),
 
   /** 复用账号专属外部 Chrome profile，只读核验百应和创作者中心登录态。 */
-  checkAccountLogins: (params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>> =>
+  checkAccountLogins: (params: { accountId: number; profilePath?: string; closeAfterAutomation?: boolean }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('browser:checkAccountLogins', toPlainIpcPayload(params)),
 
   /** 只读读取账号专属 Chrome 中百应与创作者中心页面是否已打开；不会启动浏览器或检查登录态。 */
@@ -83,6 +83,7 @@ const browser = {
     maxSelectedProducts?: number
     stopAfterCart?: boolean
     previewOnly?: boolean
+    closeAfterAutomation?: boolean
   }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('browser:runBaiyingSelection', toPlainIpcPayload(params)),
 
@@ -425,6 +426,10 @@ const qianchuan = {
     ipcRenderer.invoke('qianchuan:upload:eligibleAssets', accountId),
   uploadJobs: (accountId?: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:upload:jobs', accountId),
+  materialRecords: (params: { accountId: number; productId: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:materialRecords', params),
+  refreshMaterialStatus: (jobId: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:refreshMaterialStatus', jobId),
   enqueueUpload: (params: { accountId: number; assetIds: number[]; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:upload:enqueue', params),
   runUpload: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:run', jobId),
@@ -445,6 +450,15 @@ const qianchuan = {
   postPublishRuns: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:postPublish:runs'),
   retryPostPublishRun: (queueId: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:postPublish:retry', queueId),
+  planSettings: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:settings', qcId),
+  savePlanSettings: (params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:saveSettings', toPlainIpcPayload(params)),
+  planJobs: (qcId?: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:jobs', qcId),
+  planSupplements: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:supplements'),
+  runPlan: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:run', jobId),
+  retryBlockedPlan: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:retryBlocked', jobId),
+  resolvePlan: (params: { id: number; present: boolean; note: string; remotePlanId?: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:resolve', toPlainIpcPayload(params)),
   scanViolations: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:scan', qcId),
   prepareViolationDeletion: (params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:violations:prepare', toPlainIpcPayload(params)),
