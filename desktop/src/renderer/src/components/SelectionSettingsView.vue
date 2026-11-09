@@ -1117,6 +1117,7 @@ const accountDraft = reactive({
   selectionMode: 'inherit' as 'inherit' | 'general' | 'category',
   categoryMode: 'inherit' as 'inherit' | 'auto' | 'manual',
   categorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
+  excludedCategorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
   browserProfilePath: '',
   downloadPath: '',
   dailyQuotaOverride: { enabled: false, perAccountProducts: 5, perAccountVideos: 50 }
@@ -1340,6 +1341,7 @@ function normalizeCurrentCategorySelections(): void {
   global.categorySelection = normalizeCategorySelection(global.categorySelection, categories.value)
   global.excludedCategorySelection = normalizeCategorySelection(global.excludedCategorySelection, categories.value)
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
+  accountDraft.excludedCategorySelection = normalizeCategorySelection(accountDraft.excludedCategorySelection, categories.value)
 }
 
 function pruneCategorySelectionToCatalog(
@@ -1366,10 +1368,12 @@ function pruneCurrentCategorySelections(): number {
   const globalResult = pruneCategorySelectionToCatalog(global.categorySelection, categories.value)
   const globalExcludedResult = pruneCategorySelectionToCatalog(global.excludedCategorySelection, categories.value)
   const accountResult = pruneCategorySelectionToCatalog(accountDraft.categorySelection, categories.value)
+  const accountExcludedResult = pruneCategorySelectionToCatalog(accountDraft.excludedCategorySelection, categories.value)
   global.categorySelection = globalResult.selection
   global.excludedCategorySelection = globalExcludedResult.selection
   accountDraft.categorySelection = accountResult.selection
-  return globalResult.removed + globalExcludedResult.removed + accountResult.removed
+  accountDraft.excludedCategorySelection = accountExcludedResult.selection
+  return globalResult.removed + globalExcludedResult.removed + accountResult.removed + accountExcludedResult.removed
 }
 
 async function loadGlobal(): Promise<void> {
@@ -1445,7 +1449,12 @@ async function loadAccountSettings(): Promise<void> {
   accountDraft.categorySelection = {
     level1: [...(selected.level1 ?? [])], level2: [...(selected.level2 ?? [])], level3: [...(selected.level3 ?? [])]
   }
+  const excluded = (value.excludedCategorySelection ?? global.excludedCategorySelection ?? {}) as Record<string, string[]>
+  accountDraft.excludedCategorySelection = {
+    level1: [...(excluded.level1 ?? [])], level2: [...(excluded.level2 ?? [])], level3: [...(excluded.level3 ?? [])]
+  }
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
+  accountDraft.excludedCategorySelection = normalizeCategorySelection(accountDraft.excludedCategorySelection, categories.value)
   accountDraft.browserProfilePath = String(value.browserProfilePath ?? '')
   accountDraft.downloadPath = String(value.downloadPath ?? '')
   const savedDailyQuota = (value.dailyQuotaOverride ?? {}) as Record<string, unknown>
@@ -1615,6 +1624,8 @@ const excludedLevel2Options = computed(() => categories.value.filter((item) => g
 const excludedLevel3Options = computed(() => excludedLevel2Options.value.filter((item) => global.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 const accountLevel2Options = computed(() => categories.value.filter((item) => accountDraft.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const accountLevel3Options = computed(() => accountLevel2Options.value.filter((item) => accountDraft.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
+const accountExcludedLevel2Options = computed(() => categories.value.filter((item) => accountDraft.excludedCategorySelection.level1.includes(item.id)).flatMap((item) => item.children))
+const accountExcludedLevel3Options = computed(() => accountExcludedLevel2Options.value.filter((item) => accountDraft.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 function selectedCategoryCount(selection: { level1: string[]; level2: string[]; level3: string[] }): number {
   return selection.level1.length + selection.level2.length + selection.level3.length
 }
@@ -1656,10 +1667,10 @@ function categoryAction(level: CategoryLevel, scope: 'global' | 'account', actio
   updateCategory(level, scope)
 }
 
-function updateExcludedCategory(level: CategoryLevel): void {
-  const selected = global.excludedCategorySelection
-  const lv2 = excludedLevel2Options.value
-  const lv3 = excludedLevel3Options.value
+function updateExcludedCategory(level: CategoryLevel, scope: 'global' | 'account'): void {
+  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
+  const lv2 = scope === 'global' ? excludedLevel2Options.value : accountExcludedLevel2Options.value
+  const lv3 = scope === 'global' ? excludedLevel3Options.value : accountExcludedLevel3Options.value
   if (level === 'level1') {
     const allowed = new Set(lv2.map((item) => item.id))
     selected.level2 = selected.level2.filter((id) => allowed.has(id))
@@ -1670,25 +1681,29 @@ function updateExcludedCategory(level: CategoryLevel): void {
   }
 }
 
-function toggleExcludedCategory(id: string, level: CategoryLevel, checked: boolean): void {
-  const current = global.excludedCategorySelection[level]
-  global.excludedCategorySelection[level] = checked
+function toggleExcludedCategory(id: string, level: CategoryLevel, scope: 'global' | 'account', checked: boolean): void {
+  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
+  const current = selected[level]
+  selected[level] = checked
     ? current.includes(id) ? current : [...current, id]
     : current.filter((item) => item !== id)
-  updateExcludedCategory(level)
+  updateExcludedCategory(level, scope)
 }
 
-function excludedCategoryAction(level: CategoryLevel, action: 'all' | 'invert' | 'clear'): void {
+function excludedCategoryAction(level: CategoryLevel, scope: 'global' | 'account', action: 'all' | 'invert' | 'clear'): void {
   const options = level === 'level1'
     ? level1Options.value
-    : level === 'level2' ? excludedLevel2Options.value : excludedLevel3Options.value
-  const current = global.excludedCategorySelection[level]
-  global.excludedCategorySelection[level] = action === 'clear'
+    : level === 'level2'
+      ? (scope === 'global' ? excludedLevel2Options.value : accountExcludedLevel2Options.value)
+      : (scope === 'global' ? excludedLevel3Options.value : accountExcludedLevel3Options.value)
+  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
+  const current = selected[level]
+  selected[level] = action === 'clear'
     ? []
     : action === 'all'
       ? options.map((item) => item.id)
       : options.map((item) => item.id).filter((id) => !current.includes(id))
-  updateExcludedCategory(level)
+  updateExcludedCategory(level, scope)
 }
 
 async function saveGlobal(): Promise<void> {
@@ -1886,6 +1901,7 @@ async function saveAccount(): Promise<boolean> {
       selectionMode: accountDraft.selectionMode,
       categoryMode: accountDraft.categoryMode,
       categorySelection: JSON.parse(JSON.stringify(accountDraft.categorySelection)),
+      excludedCategorySelection: JSON.parse(JSON.stringify(accountDraft.excludedCategorySelection)),
       browserProfilePath: accountDraft.browserProfilePath,
       downloadPath: accountDraft.downloadPath,
       dailyQuotaOverride: {
@@ -2277,7 +2293,9 @@ async function prepareAccountRunContext(
   const accountSettings = accountSettingsOverride ?? settingsRoot.account ?? {}
   const categoryTree = JSON.parse(JSON.stringify(categories.value)) as CategoryNode[]
   const globalCategory = (globalSnapshot.categorySelection ?? {}) as Record<string, string[]>
+  const globalExcludedCategory = (globalSnapshot.excludedCategorySelection ?? {}) as Record<string, string[]>
   const storedCategory = (accountSettings.categorySelection ?? {}) as Record<string, string[]>
+  const storedExcludedCategory = (accountSettings.excludedCategorySelection ?? {}) as Record<string, string[]>
   const accountCategory = normalizeCategorySelection({
     level1: [...(storedCategory.level1 ?? [])],
     level2: [...(storedCategory.level2 ?? [])],
@@ -2300,6 +2318,16 @@ async function prepareAccountRunContext(
     level2: [...(globalCategory.level2 ?? [])],
     level3: [...(globalCategory.level3 ?? [])]
   }, categoryTree)
+  const normalizedGlobalExcludedCategory = normalizeCategorySelection({
+    level1: [...(globalExcludedCategory.level1 ?? [])],
+    level2: [...(globalExcludedCategory.level2 ?? [])],
+    level3: [...(globalExcludedCategory.level3 ?? [])]
+  }, categoryTree)
+  const normalizedAccountExcludedCategory = normalizeCategorySelection({
+    level1: [...(storedExcludedCategory.level1 ?? [])],
+    level2: [...(storedExcludedCategory.level2 ?? [])],
+    level3: [...(storedExcludedCategory.level3 ?? [])]
+  }, categoryTree)
   const effectiveCategorySelection = accountCategoryMode === 'manual'
     ? accountCategory
     : accountCategoryMode === 'inherit' && globalCategoryMode === 'manual'
@@ -2315,6 +2343,11 @@ async function prepareAccountRunContext(
   settings.selectionMode = effectiveSelectionMode
   settings.categoryMode = effectiveCategoryMode
   settings.categorySelection = effectiveCategorySelection
+  settings.excludedCategorySelection = accountSelectionMode === 'inherit'
+    ? normalizedGlobalExcludedCategory
+    : (Object.prototype.hasOwnProperty.call(accountSettings, 'excludedCategorySelection')
+      ? normalizedAccountExcludedCategory
+      : normalizedGlobalExcludedCategory)
   if (effectiveSelectionMode === 'category' && effectiveCategoryMode === 'manual' && !hasSelectedCategory(effectiveCategorySelection)) {
     const accountName = accounts.value.find((account) => account.id === targetAccountId)?.name ?? `账号 ${targetAccountId}`
     throw new Error(`${accountName}处于手动选类目模式，但没有已选类目。请先选择类目或切回自动推荐。`)
@@ -2524,17 +2557,17 @@ async function executeAccountSelection(
       }
       const rejected = previewPlan.rejectedCandidates
       const excludedByCategoryCount = rejected.filter((candidate) =>
-        candidate.thresholdReasons?.includes('命中通用设置中排除的类目')
+        candidate.thresholdReasons?.includes('命中当前设置中排除的类目')
       ).length
       const thresholdRejectedCount = Math.max(0, rejected.length - excludedByCategoryCount)
       const firstThresholdReason = rejected.find((candidate) =>
-        !candidate.thresholdReasons?.includes('命中通用设置中排除的类目')
+        !candidate.thresholdReasons?.includes('命中当前设置中排除的类目')
       )?.thresholdReasons?.[0]
       const rejectionSummary = [
         thresholdRejectedCount
           ? `另有 ${thresholdRejectedCount} 个候选因列表实测数据未达阈值被排除${firstThresholdReason ? `，示例：${firstThresholdReason}` : ''}`
           : '',
-        excludedByCategoryCount ? `通用设置排除类目过滤 ${excludedByCategoryCount} 个候选` : ''
+        excludedByCategoryCount ? `排除类目过滤 ${excludedByCategoryCount} 个候选` : ''
       ].filter(Boolean).map((item) => `；${item}`).join('')
       const previewSourceResults = previewPlan.prioritySourceResults
       const categorySummary = previewPlan.recommendedCategories.length
@@ -5466,7 +5499,34 @@ onUnmounted(() => {
             <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode" value="category" :disabled="busy"> 品类模式</label>
           </div>
           <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目）' }}。</p>
-          <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用通用设置中的 {{ selectedCategoryCount(global.excludedCategorySelection) }} 个排除类目。</p>
+          <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用本账号设置中的 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 个排除类目。</p>
+          <p v-else class="hint">该账号使用品类模式；下方排除类目会在选定的品类范围内继续生效。</p>
+          <details v-if="accountDraft.selectionMode !== 'inherit'" class="category-picker">
+            <summary>排除类目（本账号）· 已选 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 项</summary>
+            <p class="hint">只影响当前账号；选中上级类目时会排除其下级。账号沿用通用模式时，请到通用设置调整排除类目。</p>
+            <div class="category-grid">
+              <div v-for="(group, index) in [level1Options, accountExcludedLevel2Options, accountExcludedLevel3Options]" :key="index" class="category-level">
+                <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
+                <div class="category-options">
+                  <label v-for="item in group" :key="item.id" class="category-option">
+                    <input
+                      type="checkbox"
+                      :checked="accountDraft.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
+                      :disabled="busy"
+                      @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', ($event.target as HTMLInputElement).checked)"
+                    >
+                    <span>{{ item.name }}</span>
+                  </label>
+                  <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                </div>
+                <div class="mini-actions">
+                  <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'all')">全选</button>
+                  <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'invert')">反选</button>
+                  <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'clear')">清空</button>
+                </div>
+              </div>
+            </div>
+          </details>
           <template v-if="accountDraft.selectionMode === 'category' || (accountDraft.selectionMode === 'inherit' && global.selectionMode === 'category')">
           <div class="category-mode-options" role="group" aria-label="账号品类筛选策略">
             <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode" value="inherit" :disabled="busy"> 沿用通用设置</label>
@@ -5757,16 +5817,16 @@ onUnmounted(() => {
                         type="checkbox"
                         :checked="global.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
                         :disabled="busy"
-                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), ($event.target as HTMLInputElement).checked)"
+                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', ($event.target as HTMLInputElement).checked)"
                       >
                       <span>{{ item.name }}</span>
                     </label>
                     <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
                   </div>
                   <div class="mini-actions">
-                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'all')">全选</button>
-                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'invert')">反选</button>
-                    <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'clear')">清空</button>
+                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'all')">全选</button>
+                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'invert')">反选</button>
+                    <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'clear')">清空</button>
                   </div>
                 </div>
               </div>
@@ -5850,14 +5910,37 @@ onUnmounted(() => {
           <section id="account-mode" class="card">
             <div class="section-title"><h2>账号与品类</h2><select v-model.number="accountId" class="account-select" :disabled="busy"><option v-for="account in selectionScopeAccounts" :key="account.id" :value="account.id">{{ account.name }}（{{ account.status }}）</option></select></div>
             <p v-if="!accounts.length" class="hint">请先在账号管理中添加账号。</p>
-          <p class="hint">账号可继承通用数据/品类模式，也可单独切换；通用数据模式默认覆盖全部类目，并应用通用设置中的排除类目。</p>
+            <p class="hint">账号可继承通用数据/品类模式，也可单独切换；切换为单独模式后，可在下方配置本账号排除类目。</p>
             <div class="category-mode-options" role="group" aria-label="账号选品模式">
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="inherit" :disabled="busy"> 沿用通用模式</label>
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="general" :disabled="busy"> 通用数据模式</label>
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="category" :disabled="busy"> 品类模式</label>
             </div>
             <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目）' }}。</p>
-            <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用通用设置中的 {{ selectedCategoryCount(global.excludedCategorySelection) }} 个排除类目。</p>
+            <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用本账号设置中的 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 个排除类目。</p>
+            <p v-else class="hint">该账号使用品类模式；下方排除类目会在选定的品类范围内继续生效。</p>
+            <details v-if="accountDraft.selectionMode !== 'inherit'" class="category-picker">
+              <summary>排除类目（本账号）· 已选 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 项</summary>
+              <p class="hint">只影响当前账号；选中上级类目时会排除其下级。账号沿用通用模式时，请到通用设置调整排除类目。</p>
+              <div class="category-grid">
+                <div v-for="(group, index) in [level1Options, accountExcludedLevel2Options, accountExcludedLevel3Options]" :key="index" class="category-level">
+                  <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
+                  <div class="category-options">
+                    <label v-for="item in group" :key="item.id" class="category-option">
+                      <input
+                        type="checkbox"
+                        :checked="accountDraft.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
+                        :disabled="busy"
+                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', ($event.target as HTMLInputElement).checked)"
+                      >
+                      <span>{{ item.name }}</span>
+                    </label>
+                    <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                  </div>
+                  <div class="mini-actions"><button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'all')">全选</button><button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'invert')">反选</button><button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'clear')">清空</button></div>
+                </div>
+              </div>
+            </details>
             <template v-if="accountDraft.selectionMode === 'category' || (accountDraft.selectionMode === 'inherit' && global.selectionMode === 'category')">
             <div class="category-mode-options" role="group" aria-label="账号品类筛选策略">
               <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode-settings" value="inherit" :disabled="busy"> 沿用通用设置</label>
