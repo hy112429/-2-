@@ -833,10 +833,39 @@ def claim_batch(connection: sqlite3.Connection, job_ids: List[int],
         if any((int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"]))
                != (account_id, qc_id, product_id) for row in rows):
             raise ValueError("批量任务必须属于同一抖音账号、商品和千川账户")
-        if any(row["status"] != "queued" or row["scheduled_date"] != today.isoformat() or
+        today_text = today.isoformat()
+        if any(row["status"] != "queued" or
+               row["scheduled_date"] > today_text or
                (row["next_retry_at"] and row["next_retry_at"] > now.isoformat(timespec="seconds"))
                for row in rows):
             raise ValueError("批量任务存在未到期或状态已变化的素材")
+        # 重启后可能同时积压多条跨日任务。先在当前事务中把旧日期临时
+        # 重排到今天，再按整批检查配额；不足时回滚，交给安全的单条路径
+        # 逐条重排，避免一半任务被批量锁住。
+        overdue_ids = [int(row["id"]) for row in rows if row["scheduled_date"] < today_text]
+        if overdue_ids:
+            placeholders = ",".join("?" for _ in overdue_ids)
+            connection.execute(
+                f"UPDATE qianchuan_upload_jobs SET scheduled_date = ?, updated_at = ? "
+                f"WHERE id IN ({placeholders})",
+                (today_text, now_text(), *overdue_ids),
+            )
+            limits = _limits(connection, account_id)
+            members = connection.execute(
+                "SELECT account_id FROM qianchuan_quota_group_members WHERE group_id = ?",
+                (int(first["quota_group_id"]),),
+            ).fetchall()
+            group_limits = [_limits(connection, int(member["account_id"])) for member in members]
+            group_video_cap = min(item["perGroupVideos"] for item in group_limits)
+            group_product_cap = min(item["perGroupProducts"] for item in group_limits)
+            usage = _quota_usage(connection, account_id, int(first["quota_group_id"]),
+                                 product_id, today_text)
+            if (usage["productVideos"] > limits["perProductVideos"] or
+                    usage["accountVideos"] > limits["perAccountVideos"] or
+                    usage["accountProducts"] > limits["perAccountProducts"] or
+                    usage["groupVideos"] > group_video_cap or
+                    usage["groupProducts"] > group_product_cap):
+                raise ValueError("跨日批量任务重排后当日配额不足")
         running = int(connection.execute(
             "SELECT COUNT(*) FROM qianchuan_upload_jobs WHERE status = 'uploading'"
         ).fetchone()[0])

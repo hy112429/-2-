@@ -169,6 +169,41 @@ class QianchuanUploadTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(count, 3)
 
+    def test_batch_claim_reschedules_overdue_jobs_together_after_restart(self) -> None:
+        assets = [self.add_asset("p-overdue-batch") for _ in range(2)]
+        jobs = qc.enqueue(self.connection, self.account_id, assets, today=TODAY)["jobs"]
+        ids = [int(item["id"]) for item in jobs]
+        yesterday = (TODAY - timedelta(days=1)).isoformat()
+        self.connection.execute(
+            "UPDATE qianchuan_upload_jobs SET scheduled_date = ? WHERE id IN (?, ?)",
+            (yesterday, *ids),
+        )
+        self.connection.commit()
+        claimed = qc.claim_batch(self.connection, ids, today=TODAY,
+                                  now=datetime(2026, 11, 1, 10, 0))
+        self.assertEqual({job["status"] for job in claimed["jobs"]}, {"uploading"})
+        self.assertEqual({job["scheduledDate"] for job in claimed["jobs"]}, {TODAY.isoformat()})
+
+    def test_batch_claim_rolls_back_overdue_reschedule_when_today_is_full(self) -> None:
+        assets = [self.add_asset("p-overdue-full") for _ in range(2)]
+        jobs = qc.enqueue(self.connection, self.account_id, assets, today=TODAY)["jobs"]
+        ids = [int(item["id"]) for item in jobs]
+        yesterday = (TODAY - timedelta(days=1)).isoformat()
+        self.connection.execute(
+            "UPDATE qianchuan_upload_jobs SET scheduled_date = ? WHERE id IN (?, ?)",
+            (yesterday, *ids),
+        )
+        qc.quota_config(self.connection, self.account_id, {"perProductVideos": 1})
+        self.connection.commit()
+        with self.assertRaisesRegex(ValueError, "跨日批量任务重排后当日配额不足"):
+            qc.claim_batch(self.connection, ids, today=TODAY)
+        rows = self.connection.execute(
+            "SELECT status, scheduled_date FROM qianchuan_upload_jobs WHERE id IN (?, ?) ORDER BY id",
+            ids,
+        ).fetchall()
+        self.assertEqual([(row["status"], row["scheduled_date"]) for row in rows],
+                         [("queued", yesterday), ("queued", yesterday)])
+
     def test_batch_claim_rejects_mixed_products_without_touching_queue(self) -> None:
         first = qc.enqueue(self.connection, self.account_id,
                            [self.add_asset("p-first")], today=TODAY)["jobs"][0]["id"]

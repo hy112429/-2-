@@ -294,6 +294,42 @@ class QianchuanBrowserTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["remoteMaterialId"], "7700000000000000001")
             self.assertTrue(result["items"][1]["submitAttempted"])
 
+    def test_batch_duplicate_remote_ids_are_not_marked_as_unique_successes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = []
+            for name in ("one.mp4", "two.mp4"):
+                path = root / name
+                path.write_bytes(b"same content")
+                options.append(qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                                path, name, root / "evidence"))
+            fake_page = types.SimpleNamespace()
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+            def choose_files(_page, _options, _paths, started):
+                started()
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", side_effect=[None, None,
+                                                                         "7700000000000000001",
+                                                                         "7700000000000000001"]), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_files", side_effect=choose_files), \
+                 patch.object(qc, "_wait_batch_ready"), \
+                 patch.object(qc, "_submit_control", return_value=types.SimpleNamespace(click=lambda **_k: None)), \
+                 patch.object(qc.time, "monotonic", side_effect=[0, 1, 121]), \
+                 patch.object(qc.time, "sleep"), \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, option, result: result):
+                result = qc.upload_material_batch(options)
+            self.assertEqual([item["status"] for item in result["items"]],
+                             ["needs_review", "needs_review"])
+            self.assertEqual([item["remoteMaterialId"] for item in result["items"]], [None, None])
+            self.assertEqual([item["submitAttempted"] for item in result["items"]], [True, True])
+
     def test_batch_failure_before_file_selection_is_safe_for_single_fallback(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

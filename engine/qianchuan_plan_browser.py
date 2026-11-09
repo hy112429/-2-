@@ -251,6 +251,82 @@ def video_drawer(page, source: str, search_term: str, remote_id: str,
     return True
 
 
+def video_drawer_batch(page, materials: list[tuple[str, str]],
+                       selected_before: int, allow_missing: bool = False) -> tuple[list[str], list[str]]:
+    """在同一个选材窗口内选择多条已上传素材。
+
+    千川计划页的“我的视频”窗口支持多选。逐条打开窗口会重复等待列表、
+    搜索框和确认按钮，上传后素材较多时耗时明显；这里保持每条素材的
+    ID、文件名和卡片标题核对，只把窗口打开/确认各做一次。
+    """
+    if not materials:
+        return [], []
+    exact(page, "添加视频").click(timeout=8_000)
+    tab = page.get_by_text("我的视频", exact=True)
+    tab.first.wait_for(state="visible", timeout=10_000)
+    one(tab, "我的视频页签")
+    page.get_by_text("来源", exact=False).first.wait_for(state="visible", timeout=10_000)
+    one(page.locator(".ovui-select").filter(has_text="来源："), "素材来源筛选").click(timeout=8_000)
+    choice = page.get_by_text("本地上传", exact=True)
+    choice.first.wait_for(state="visible", timeout=8_000)
+    one(choice, "素材来源").click(timeout=8_000)
+
+    search = page.locator('input[placeholder*="视频名称/ID搜索"]').first
+    search.wait_for(state="visible", timeout=10_000)
+    selected: list[str] = []
+    skipped: list[str] = []
+    for remote_id, material_name in materials:
+        term = material_name.strip()
+        if not term:
+            raise UploadStopped("视频缺少可核对的名称", stage="video")
+        search.fill(remote_id)
+        search.press("Enter")
+        candidates = page.get_by_text(term, exact=True)
+        try:
+            candidates.first.wait_for(state="visible", timeout=6_000)
+        except PlaywrightTimeoutError as error:
+            # 平台有时按文件名索引，有时按素材 ID 索引；同一窗口内切换一次查询。
+            search.fill(term)
+            search.press("Enter")
+            try:
+                candidates.first.wait_for(state="visible", timeout=6_000)
+            except PlaywrightTimeoutError:
+                if allow_missing:
+                    skipped.append(remote_id)
+                    continue
+                raise UploadStopped("千川计划页未找到匹配的已上传视频，请核对平台选材资格",
+                                     stage="video") from error
+        item = one(candidates, "视频名称")
+        card = one(item.locator("xpath=ancestor::*[contains(@class,'oc-create-material-card-wrapper')][1]"),
+                   "视频卡片")
+        if card.get_attribute("title") != term:
+            raise UploadStopped("平台素材名称与本机文件名不一致", stage="video")
+        card.click(timeout=8_000)
+        expected = selected_before + len(selected) + 1
+        page.get_by_text(re.compile(rf"已选择\s*{expected}/\d+")).first.wait_for(
+            state="visible", timeout=5_000)
+        selected.append(remote_id)
+
+    if not selected:
+        buttons = page.get_by_role("button", name="取消", exact=True)
+        visible = [buttons.nth(i) for i in range(buttons.count()) if buttons.nth(i).is_visible()]
+        if visible:
+            visible[-1].click(timeout=8_000)
+        return selected, skipped
+    confirm = exact(page, "确定")
+    if not confirm.is_enabled():
+        raise UploadStopped("平台未接受批量视频选择", stage="video")
+    confirm.click(timeout=8_000)
+    final_count = selected_before + len(selected)
+    count_text = page.get_by_text(re.compile(r"视频\s*\(\s*\d+\s*\)"))
+    numbers = [int(match.group(1)) for match in
+               (re.search(r"视频\s*\(\s*(\d+)\s*\)", count_text.nth(i).inner_text())
+                for i in range(count_text.count())) if match]
+    if final_count not in numbers:
+        raise UploadStopped(f"平台视频数量未达到 {final_count} 条", stage="video")
+    return selected, skipped
+
+
 def add_title(page, title: str):
     value = title.strip()[:55]
     if not value:
@@ -326,17 +402,15 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
         if source in ("uploaded", "both"):
             if not materials:
                 raise UploadStopped("可用千川上传视频为空", stage=stage)
-            # 千川投放选材可能尚未收录全部上传成功的素材；只选平台实际可见的同名视频。
-            for material_id, material_name in materials:
-                if selected_count >= 10:
-                    break
-                if video_drawer(page, "uploaded", material_name, material_id,
-                                selected_count + 1, allow_missing=True):
-                    selected_count += 1
-                    uploaded_count += 1
-                    selected_material_ids.append(material_id)
-                else:
-                    skipped_material_ids.append(material_id)
+            # 千川投放选材可能尚未收录全部上传成功的素材；在一个多选窗口内
+            # 逐条核对同名卡片，减少重复打开窗口、切换来源和等待列表的耗时。
+            remaining = materials[:max(0, 10 - selected_count)]
+            selected, skipped = video_drawer_batch(
+                page, remaining, selected_count, allow_missing=True)
+            selected_count += len(selected)
+            uploaded_count += len(selected)
+            selected_material_ids.extend(selected)
+            skipped_material_ids.extend(skipped)
         if uploaded_count == 0:
             raise UploadStopped("千川计划页尚无可选的已上传视频；已停止发布，稍后重试", stage=stage)
         if source == "my_video":
