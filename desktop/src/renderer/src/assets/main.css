@@ -87,6 +87,15 @@ input::placeholder, textarea::placeholder { color: #97a4b8; }
 ::selection { background: #d7e6ff; color: #173967; }
 
 * { scrollbar-width: thin; scrollbar-color: #c4d0df transparent; }
+
+@media (max-width: 1120px) {
+  :root { --w-nav: 150px; --h-top: 52px; }
+}
+
+@media (max-width: 980px) {
+  :root { --w-nav: 138px; --h-top: 50px; font-size: 13px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }

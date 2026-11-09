@@ -135,6 +135,16 @@ watch(() => props.active, (active) => {
 }
 
 .label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+@media (max-width: 980px) {
+  .nav { padding-top: 9px; }
+  .nav-group + .nav-group { margin-top: 12px; }
+  .group-title { padding-left: 12px; font-size: 10px; }
+  .nav-item { gap: 7px; min-height: 34px; padding: 6px 8px; }
 }
 </style>

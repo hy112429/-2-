@@ -19,6 +19,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ (event: 'navigate', value: string): void }>()
 const selectionSettingsOpened = ref(false)
+const focusedSection = ref(false)
 const scheduledStart = ref<SelectionScheduleDue | null>(null)
 const receivedScheduleDates = new Set<string>()
 const pendingProductDraft = ref<{ accountId: number; productId: string; title: string; sourceUrl: string } | null>(null)
@@ -56,6 +57,10 @@ function openQianchuanAccounts(): void {
   emit('navigate', '账号管理')
 }
 
+function toggleFocusedSection(): void {
+  focusedSection.value = !focusedSection.value
+}
+
 watch(() => props.nav, (nav) => {
   if (nav === '选品设置') selectionSettingsOpened.value = true
 }, { immediate: true })
@@ -86,8 +91,15 @@ watch(
 </script>
 
 <template>
-  <main class="work">
-    <div class="crumb">{{ props.top === '商品查询' ? '商品查询' : `${props.top} / ${props.nav}` }}</div>
+  <div class="work-shell">
+    <div v-if="focusedSection" class="work-focus-backdrop" @click="focusedSection = false"></div>
+    <main class="work" :class="{ 'work--focused': focusedSection }">
+      <div class="crumb">
+        <span>{{ props.top === '商品查询' ? '商品查询' : `${props.top} / ${props.nav}` }}</span>
+        <button class="focus-button" type="button" :aria-label="focusedSection ? '还原当前板块' : '单独显示当前板块'" @click="toggleFocusedSection">
+          {{ focusedSection ? '还原板块' : '单独显示' }}
+        </button>
+      </div>
 
     <!-- 顶部菜单优先决定主界面，避免停留在发布队列时点「商品查询」仍看到旧页面。 -->
     <template v-if="props.top === '商品查询'">
@@ -169,10 +181,19 @@ watch(
         @scheduled-start-handled="acknowledgeScheduledStart"
       />
     </div>
-  </main>
+    </main>
+  </div>
 </template>
 
 <style scoped>
+.work-shell {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
 .work {
   display: flex;
   flex-direction: column;
@@ -186,6 +207,24 @@ watch(
   overflow: hidden;
 }
 
+.work-focus-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(15, 23, 42, .48);
+}
+
+.work--focused {
+  position: fixed;
+  inset: clamp(18px, 5vh, 48px) clamp(18px, 6vw, 96px);
+  z-index: 90;
+  padding: 15px 18px 18px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-app);
+  box-shadow: var(--shadow-float);
+}
+
 .crumb {
   flex-shrink: 0;
   display: flex;
@@ -196,7 +235,10 @@ watch(
   font-size: 12px;
   font-weight: 600;
 }
+.crumb > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .crumb::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }
+.focus-button { flex: 0 0 auto; min-height: 26px; margin-left: auto; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-panel); color: var(--text-muted); font-size: 11px; }
+.focus-button:hover { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
 
 .content {
   display: flex;
@@ -236,5 +278,17 @@ watch(
 
 .dashboard-body {
   overflow: hidden;
+}
+
+@media (max-width: 1120px) {
+  .work { padding: 10px 12px 12px; }
+  .content { flex-direction: column; overflow: auto; }
+  .panel.browser, .panel.console { flex: 0 0 auto; min-height: 280px; }
+}
+
+@media (max-height: 700px) {
+  .work { padding-top: 8px; padding-bottom: 8px; }
+  .crumb { margin-bottom: 6px; }
+  .panel.browser, .panel.console { min-height: 220px; }
 }
 </style>

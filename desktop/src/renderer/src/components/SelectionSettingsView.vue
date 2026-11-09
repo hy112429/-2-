@@ -6155,9 +6155,9 @@ onUnmounted(() => {
 @keyframes selection-progress-slide { from { transform: translateX(-20%); } to { transform: translateX(210%); } }
 .body-layout { display: flex; flex: 1; min-height: 0; gap: 10px; }
 .settings-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior-y: contain; overflow-anchor: none; scrollbar-gutter: stable; padding: 1px 4px 12px 1px; scroll-padding-top: 48px; }
-.settings-jumps { position: sticky; top: 0; z-index: 2; display: flex; gap: 6px; overflow-x: auto; padding: 7px 2px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
+.settings-jumps { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 2px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
 .settings-jumps .btn { flex: 0 0 auto; min-height: 28px; padding: 0 10px; white-space: nowrap; font-size: 12px; }
-.browser-panel { width: 43%; min-width: 420px; min-height: 0; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.browser-panel { width: 43%; min-width: 0; min-height: 0; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
 .card { margin-bottom: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
 .card h2 { margin: 0 0 10px; font-size: 15px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -6307,5 +6307,18 @@ onUnmounted(() => {
 .failure-log-entry details { color: var(--text-muted); font-size: 11px; }
 .failure-log-entry summary { cursor: pointer; }
 .failure-log-entry pre { max-height: 240px; margin: 6px 0 0; padding: 8px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: var(--radius); background: var(--bg-app); font: 11px/1.45 Consolas, monospace; }
-@media (max-width: 1150px) { .browser-panel { width: 38%; min-width: 340px; } .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1150px) {
+  .browser-panel { width: 38%; min-width: 0; }
+  .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .body-layout { display: flex; flex-direction: column; gap: 10px; }
+  .settings-scroll { order: 1; min-height: 360px; }
+  .browser-panel { order: 2; width: 100%; max-height: 240px; overflow: auto; }
+  .settings-jumps { position: static; }
+}
+@media (max-height: 700px) {
+  .browser-panel { max-height: 190px; }
+  .card { margin-bottom: 8px; padding: 11px; }
+}
 </style>

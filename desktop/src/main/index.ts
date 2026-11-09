@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, protocol } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, protocol, screen } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { registerLoginIpc, disposeLogin } from './login'
@@ -61,12 +61,19 @@ if (!hasSingleInstanceLock) {
 
 /** 创建主窗口 */
 function createWindow(): void {
+  // 在 1366×768 等常见屏幕上，固定 1280×800 会让非最大化窗口超出工作区，
+  // 用户看到的就是底部按钮和状态栏被截断。按当前工作区夹出安全尺寸，
+  // 仍保留足够宽度给主导航和内容区。
+  const workArea = screen.getPrimaryDisplay().workAreaSize
+  const width = Math.min(WINDOW_WIDTH, Math.max(960, workArea.width - 40))
+  const height = Math.min(WINDOW_HEIGHT, Math.max(600, workArea.height - 40))
   const mainWindow = new BrowserWindow({
-    width: WINDOW_WIDTH,
-    height: WINDOW_HEIGHT,
+    width,
+    height,
     // 最小尺寸：比默认尺寸小一圈，保证布局不被压塌
-    minWidth: 1024,
-    minHeight: 640,
+    minWidth: Math.min(1024, width),
+    minHeight: Math.min(640, height),
+    center: true,
     title: WINDOW_TITLE,
     // show: false + ready-to-show 再显示：避免先闪一个白屏再出现内容
     show: false,
