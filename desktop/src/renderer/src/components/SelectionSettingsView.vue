@@ -2397,7 +2397,7 @@ async function prepareAccountRunContext(
   if (!profileValidation.ok || !profileValidation.path) {
     throw new Error(profileValidation.error ?? '账号浏览器缓存路径校验失败')
   }
-  const rawDownloadPath = configuredDownloadPath || defaultRoot + '\\账号-' + targetAccountId
+  const rawDownloadPath = configuredDownloadPath || defaultRoot + '\\' + defaultAccountDownloadFolderName(targetAccountId)
   const downloadValidation = await window.api.dir.canonicalizePath(rawDownloadPath)
   if (!downloadValidation.ok || !downloadValidation.path) {
     throw new Error(downloadValidation.error ?? '账号下载路径解析失败')
@@ -3551,6 +3551,19 @@ function normalizedResourcePath(value: string): string {
   return value.trim().replace(/\//g, '\\').replace(/[\\]+$/, '').toLowerCase()
 }
 
+function safePathSegment(value: unknown, fallback: string): string {
+  const segment = String(value ?? '').trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .slice(0, 80)
+  return segment && segment !== '.' && segment !== '..' ? segment : fallback
+}
+
+function defaultAccountDownloadFolderName(accountId: number): string {
+  const accountName = accounts.value.find((account) => account.id === accountId)?.name
+  return safePathSegment(accountName, `账号-${accountId}`)
+}
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']'
   if (value && typeof value === 'object') {
@@ -3671,7 +3684,7 @@ async function resolveSavedEffectiveDownloadPath(accountId: number): Promise<str
   const settingsRoot = (saved.settings ?? {}) as { account?: Record<string, unknown> }
   const configuredPath = String(settingsRoot.account?.downloadPath ?? '').trim()
   const defaultRoot = (await window.api.dir.getDownloadDir()).replace(/[\\/]+$/, '')
-  const rawPath = configuredPath || `${defaultRoot}\\账号-${accountId}`
+  const rawPath = configuredPath || `${defaultRoot}\\${defaultAccountDownloadFolderName(accountId)}`
   const result = await window.api.dir.canonicalizePath(rawPath)
   if (!result.ok || !result.path) {
     throw new Error(result.error ?? `账号 ${accountId} 的当前下载目录无法解析`)

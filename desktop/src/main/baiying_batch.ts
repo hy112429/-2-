@@ -30,6 +30,14 @@ const MAX_BATCH = 500
 /** 间隔下限：太快会被平台风控，固定下限 2s */
 const MIN_INTERVAL_MS = 2_000
 
+function safePathSegment(value: unknown, fallback: string): string {
+  const segment = String(value ?? '').trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .slice(0, 80)
+  return segment && segment !== '.' && segment !== '..' ? segment : fallback
+}
+
 /** 输入行：product_id 或 product_id:commodity_id（冒号分隔） */
 interface BatchItemInput {
   productId: string
@@ -449,7 +457,7 @@ async function runCartVideoDownload(accountId: number, productId: string, commod
       const videos = Array.isArray(found.videos) ? found.videos : []
       availableCount = Math.max(videos.length, Number(found.available ?? videos.length))
       sourceExhausted = availableCount <= candidateLimit || videos.length < candidateLimit
-      const accountRoot = account.downloadPath || join(getDownloadDir(), `账号-${accountId}`)
+      const accountRoot = account.downloadPath || join(getDownloadDir(), safePathSegment(account.name, `账号-${accountId}`))
       const folder = join(accountRoot, cartDownloadDate(), productId)
       for (const [index, video] of videos.entries()) {
         if (uniqueCount >= target) break
