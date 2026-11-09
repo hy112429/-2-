@@ -3,7 +3,7 @@ import type { Cookie } from 'electron'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { attachProbe } from './probe'
-import { closeAutomationLaunchedBrowser, commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
+import { closeAutomationLaunchedBrowser, closeManagedAccountBrowser, commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
 import { getClientPaths } from './app-dirs'
 import {
   beginRegistryReservation,
@@ -664,6 +664,17 @@ export function registerLoginIpc(): void {
       profileKey: `account-${params.accountId}`,
       profilePath: params.profilePath
     })
+  })
+
+  ipcMain.handle('browser:closeAccount', async (_e, params: { accountId: number; profilePath?: string }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('关闭账号浏览器的账号 ID 无效')
+    }
+    const closed = await closeManagedAccountBrowser({
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    })
+    return { ok: true, closed }
   })
 
   ipcMain.handle('browser:runBaiyingSelection', async (event, params: {

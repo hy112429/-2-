@@ -1991,7 +1991,8 @@ async function prepareBatchCandidatePlans(
   reviewedAccountId?: number | null,
   reviewedProducts?: ReadonlySet<string>,
   accountSwitchFailures?: Map<number, AccountSwitchFailure>,
-  seededPreviewPlans?: ReadonlyMap<number, AccountCandidatePlan>
+  seededPreviewPlans?: ReadonlyMap<number, AccountCandidatePlan>,
+  keepBrowserOpen = false
 ): Promise<Map<number, AccountCandidatePlan>> {
   const poolRows = new Map<number, SelectionCandidate[]>()
   const sourceIdsByAccount = new Map<number, Map<string, Set<string>>>()
@@ -2049,7 +2050,7 @@ async function prepareBatchCandidatePlans(
             accountId: account.id,
             downloadPath: context.downloadPath,
             previewOnly: true,
-            closeAfterAutomation: true
+            closeAfterAutomation: !keepBrowserOpen
           }))
       preview = await previewRequest
     } catch (cause) {
@@ -2253,16 +2254,6 @@ function reusablePreviewCandidatePlans(
   const context = contexts.get(cache.accountId)
   if (!context || cache.fingerprint !== previewPoolFingerprint(cache.accountId, context)) return new Map()
   return new Map([[cache.accountId, cache.plan]])
-}
-
-function candidatePlansForBatchPayload(
-  plans: ReadonlyMap<number, AccountCandidatePlan>
-): Record<string, AccountCandidatePlan> {
-  return Object.fromEntries([...plans].map(([accountId, plan]) => {
-    const persistedPlan = { ...plan }
-    delete persistedPlan.candidatePool
-    return [String(accountId), persistedPlan]
-  }))
 }
 
 async function prepareAccountRunContext(
@@ -2660,7 +2651,7 @@ async function executeAccountSelection(
             }
           : await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
               ...profile, settings: candidateQuerySettings, accountId: targetAccountId,
-              downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: true
+              downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: !recovery
             }))
         if (preview.ok !== true) throw new Error(String(preview.error ?? '百应候选获取失败'))
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
@@ -2922,7 +2913,7 @@ async function executeAccountSelection(
           analyzeBeforeCart: !resumeAfterCart,
           maxSelectedProducts,
           previewOnly: false,
-          closeAfterAutomation: true
+          closeAfterAutomation: !recovery
         }))
         if (result.ok !== true) throw new Error(String(result.error ?? '百应选品执行失败'))
 
@@ -3275,7 +3266,7 @@ async function executeAccountSelection(
             recoverExistingCart: true,
             refreshCandidatesById: true,
             previewOnly: false,
-            closeAfterAutomation: true
+            closeAfterAutomation: !recovery
           }))
           if (detail.ok !== true) throw new Error(String(detail.error ?? '百应商品详情采集失败'))
           const returned = Array.isArray(detail.completed) ? detail.completed as Array<Record<string, unknown>> : []
@@ -3794,7 +3785,10 @@ function appendUncheckedLoginTargets(
   }
 }
 
-async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<LoginPreflightAccount[]> {
+async function checkLoginTargets(
+  targets: LoginPreflightTarget[],
+  closeAfterAutomation = true
+): Promise<LoginPreflightAccount[]> {
   const results: LoginPreflightAccount[] = []
   for (const [targetIndex, target] of targets.entries()) {
     reportSelectionProgress(target.accountId, '检查百应与创作者中心登录态', {
@@ -3833,7 +3827,7 @@ async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<Login
         const response = await window.api.browser.checkAccountLogins({
           accountId: target.accountId,
           profilePath: target.profilePath,
-          closeAfterAutomation: true
+          closeAfterAutomation
         })
         if (response.ok !== true) {
           const message = typeof response.error === 'string' ? response.error : '登录状态检查失败，无法确认。'
@@ -3966,7 +3960,9 @@ function getAccountSwitchFailure(result: LoginPreflightAccount[]): AccountSwitch
 async function collectAccountSwitchFailures(
   targets: LoginPreflightTarget[],
   batchId: string | null,
-  scopeFingerprint?: string
+  scopeFingerprint?: string,
+  closeAfterAutomation = true,
+  batchAlreadyCreated = false
 ): Promise<Map<number, AccountSwitchFailure>> {
   const fingerprint = loginPreflightFingerprint(batchId, targets)
   if (verifiedLoginPreflight?.fingerprint === fingerprint && verifiedLoginPreflight.expiresAt > Date.now()) {
@@ -3974,7 +3970,7 @@ async function collectAccountSwitchFailures(
     return new Map()
   }
   verifiedLoginPreflight = null
-  const results = await checkLoginTargets(targets)
+  const results = await checkLoginTargets(targets, closeAfterAutomation)
   if (scopeFingerprint && results.some((item) => isUnconfirmedLoginFalseNegative(item))) {
     loginPreflight.value = {
       batchId,
@@ -3991,7 +3987,9 @@ async function collectAccountSwitchFailures(
         ...selectionProgress.value,
         state: 'finished',
         stage: '等待确认账号登录状态',
-        message: `账号「${unconfirmed}」页面已打开但工作台未能确认；请在账号专属浏览器核实后重新检查或手动确认。尚未创建或修改批次。`,
+        message: batchAlreadyCreated
+          ? `账号「${unconfirmed}」的登录状态暂时无法确认；批次已保存，当前账号暂停，后续账号未启动。请处理后重新检查。`
+          : `账号「${unconfirmed}」页面已打开但工作台未能确认；请在账号专属浏览器核实后重新检查或手动确认。尚未创建或修改批次。`,
         percent: null
       }
     }
@@ -4018,7 +4016,9 @@ async function collectAccountSwitchFailures(
         ...selectionProgress.value,
         state: 'finished',
         stage: '等待账号登录或验证',
-        message: `账号「${blockedAccounts}」的百应或创作者中心需要登录/验证；尚未创建或修改批次。请先处理后重新检查。`,
+        message: batchAlreadyCreated
+          ? `账号「${blockedAccounts}」的百应或创作者中心需要登录/验证；批次已保存，当前账号暂停，后续账号未启动。请先处理后重新检查。`
+          : `账号「${blockedAccounts}」的百应或创作者中心需要登录/验证；尚未创建或修改批次。请先处理后重新检查。`,
         percent: null
       }
     }
@@ -4089,7 +4089,9 @@ async function recheckSelectionLogins(): Promise<void> {
           percent: 100
         }
       }
-      notice.value = '所选账号的百应和创作者中心均已确认登录。请点击「继续选品」重新开始；客户端会再次展示账号范围确认。'
+      notice.value = current.batchId
+        ? '当前账号的百应和创作者中心均已确认登录。点击「继续选品」后会从该账号继续，其他账号仍按顺序等待。'
+        : '所选账号的百应和创作者中心均已确认登录。请点击「继续选品」重新开始；客户端会再次展示账号范围确认。'
     } else if (selectionProgress.value) {
       selectionProgress.value = {
         ...selectionProgress.value,
@@ -4436,39 +4438,6 @@ async function runSelectionBatch(): Promise<void> {
           '）；本次没有恢复或修改批次。'
         )
       }
-      let validationBatch = batch
-      if (Object.keys(recoveryDownloadPathUpdates).length) {
-        const validationContexts = {
-          ...((batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>)
-        }
-        for (const [accountId, downloadPath] of Object.entries(recoveryDownloadPathUpdates)) {
-          const context = validationContexts[accountId]
-          if (context) validationContexts[accountId] = { ...context, downloadPath }
-        }
-        validationBatch = {
-          ...batch,
-          payload: { ...batch.payload, accountContexts: validationContexts }
-        }
-      }
-      const storedValidation = refreshableUpdate ? null : await validateRecoveryContexts(validationBatch)
-      const storedContexts = (batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>
-      const preflightTargets = selectedPendingAccounts.map((item) => {
-        const currentAccount = currentById.get(item.accountId)
-        const context = refreshableUpdate?.freshContexts[String(item.accountId)] ?? storedValidation?.contexts.get(item.accountId) ?? storedContexts[String(item.accountId)]
-        return {
-          accountId: item.accountId,
-          accountName: currentAccount?.name ?? item.accountName,
-          profilePath: context?.profilePath,
-          resolvedProfilePath: context?.resolvedProfilePath,
-          contextError: storedValidation?.errors.get(item.accountId) ?? (!context ? '恢复批次缺少账号浏览器配置快照。' : undefined)
-        }
-      })
-      for (const [accountId, failure] of await collectAccountSwitchFailures(
-        preflightTargets, batch.batchId, recoveryScopeFingerprint
-      )) {
-        accountSwitchFailures.set(accountId, failure)
-      }
-      if (loginPreflight.value) return
       if (Object.keys(recoveryDownloadPathUpdates).length) {
         const updated = await runRecovery([
           'batch', 'update-download-paths', '--batch-id', batch.batchId
@@ -4477,72 +4446,22 @@ async function runSelectionBatch(): Promise<void> {
         recoveryBatch.value = batch
         notice.value = '已将所选待恢复账号的详情图补采和新视频输出目录更新为当前设置；已有素材文件保留原位。'
       }
-      const existingCandidatePlan = batch.payload.candidatePlan as Record<string, AccountCandidatePlan> | undefined
-      const candidatePlanAccounts = selectedPendingAccounts.filter((item) => !accountSwitchFailures.has(item.accountId))
-      const selectedPlanMissing = candidatePlanAccounts.some((item) =>
-        !existingCandidatePlan || !Object.prototype.hasOwnProperty.call(existingCandidatePlan, String(item.accountId))
-      )
-      const shouldRefreshCandidatePlan = Boolean(candidatePlanAccounts.length > 0 && refreshableUpdate &&
-        (refreshableUpdate.settingsChanged || selectedPlanMissing))
-      if (shouldRefreshCandidatePlan && refreshableUpdate) {
-        const pendingRows = candidatePlanAccounts.map((item) => {
-          const current = accounts.value.find((account) => account.id === item.accountId)
-          return { id: item.accountId, name: current?.name ?? item.accountName, status: 'active' }
-        })
-        const freshContextMap = new Map<number, AccountRunContext>(pendingRows.flatMap((account) => {
-          const context = refreshableUpdate.freshContexts[String(account.id)]
-          return context ? [[account.id, context] as const] : []
-        }))
-        let candidatePlans: Map<number, AccountCandidatePlan>
-        let reusedPreviewPool = false
-        try {
-          const reusablePlans = reusablePreviewCandidatePlans(pendingRows, freshContextMap)
-          reusedPreviewPool = reusablePlans.size > 0
-          candidatePlans = await prepareBatchCandidatePlans(
-            pendingRows, freshContextMap, undefined, undefined, accountSwitchFailures, reusablePlans
-          )
-        } catch (cause) {
-          if (toUserSelectionError(cause).classification === 'BAIYING_RATE_LIMIT') {
-            const reason = String(cause instanceof Error ? cause.message : cause)
-            const retryableCandidateAccounts = candidatePlanAccounts.filter((item) => !accountSwitchFailures.has(item.accountId))
-            const reportedAccountId = selectionProgress.value?.accountId
-            const failedAccountId = retryableCandidateAccounts.find((item) => item.accountId === reportedAccountId)?.accountId ??
-              retryableCandidateAccounts[0]?.accountId
-            if (failedAccountId !== undefined && retryableCandidateAccounts.length) {
-              await saveCandidateFetchRateLimitCheckpoint(
-                batch.batchId,
-                retryableCandidateAccounts.map((item) => ({ accountId: item.accountId, accountName: item.accountName })),
-                failedAccountId,
-                reason
-              )
-            }
-          }
-          throw cause
-        }
+      if (refreshableUpdate?.settingsChanged) {
         const payload = {
           ...batch.payload,
-          ...(refreshableUpdate.settingsChanged ? {
-            settingsSnapshot: refreshableUpdate.currentSnapshot,
-            accountContexts: refreshableUpdate.freshContexts,
-            reviewedAccountId: null,
-            reviewedProductIds: null
-          } : {}),
-          candidatePlan: {
-            ...(existingCandidatePlan ?? {}),
-            ...candidatePlansForBatchPayload(candidatePlans)
-          }
+          settingsSnapshot: refreshableUpdate.currentSnapshot,
+          accountContexts: refreshableUpdate.freshContexts,
+          reviewedAccountId: null,
+          reviewedProductIds: null,
+          candidatePlan: {}
         }
         const refreshed = await runRecovery([
           'batch', 'refresh-candidates', '--batch-id', batch.batchId
         ], payload)
         batch = refreshed.batch as SelectionRecoveryBatch
-        if (reusedPreviewPool) {
-          previewCandidatePool.value = null
-          previewCandidatePoolCount.value = 0
-        }
-        notice.value = refreshableUpdate.settingsChanged
-          ? '上次失败发生在候选查询，尚未加车；已按当前设置刷新检查点、候选计划和下载路径。'
-          : '旧批次尚未保存统一候选计划；已只读采集候选并写入跨账号互斥计划。'
+        previewCandidatePool.value = null
+        previewCandidatePoolCount.value = 0
+        notice.value = '上次失败发生在候选查询，尚未加车；已按当前设置刷新检查点。账号浏览器会在轮到该账号时再打开。'
       }
       snapshot = batch.payload.settingsSnapshot as Record<string, unknown>
       if (!snapshot || typeof snapshot !== 'object') throw new Error('恢复批次缺少设置快照，任务已保留。')
@@ -4599,7 +4518,7 @@ async function runSelectionBatch(): Promise<void> {
       if (!confirmSelectionScope(newBatchScopeFingerprint,
         `本批次将依次运行以下全部启用账号：\n\n${batchAccountSummary}\n\n` +
         `素材保存根目录（每账号独立，后续按日期和商品名称分层）：\n${batchPathSummary}\n\n` +
-        '请确认账号登录态和保存路径。重点类目将由系统按百应当前可见商品数据自动推荐。'
+        '每次只启动当前账号的浏览器；登录状态将在轮到该账号时检查，完成选品和发布处理并关闭浏览器后才会启动下一个账号。重点类目将由系统按百应当前可见商品数据自动推荐。'
       )) {
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '已取消启动',
@@ -4607,22 +4526,6 @@ async function runSelectionBatch(): Promise<void> {
         }
         return
       }
-      const preflightTargets = enabled.map((account) => {
-        const context = contexts.get(account.id)
-        return {
-          accountId: account.id,
-          accountName: account.name,
-          profilePath: context?.profilePath,
-          resolvedProfilePath: context?.resolvedProfilePath,
-          contextError: context ? undefined : '未能解析该账号专属浏览器配置。'
-        }
-      })
-      for (const [accountId, failure] of await collectAccountSwitchFailures(
-        preflightTargets, null, newBatchScopeFingerprint
-      )) {
-        accountSwitchFailures.set(accountId, failure)
-      }
-      if (loginPreflight.value) return
       reviewedAccountId = candidateSelectionCustomized.value &&
         previewAccountId.value !== null && previewAccountId.value === accountId.value
         ? previewAccountId.value : null
@@ -4635,60 +4538,16 @@ async function runSelectionBatch(): Promise<void> {
         accountContexts: Object.fromEntries([...contexts].map(([id, context]) => [String(id), context])),
         reviewedAccountId,
         reviewedProductIds: reviewedProducts ? [...reviewedProducts] : null,
-        candidatePlan: null,
+        candidatePlan: {},
         accounts: enabled.map((account) => ({ id: account.id, name: account.name }))
       }
-      let candidatePlans: Map<number, AccountCandidatePlan>
-      const candidatePlanAccounts = enabled.filter((account) => !accountSwitchFailures.has(account.id))
-      try {
-        const reusablePlans = reusablePreviewCandidatePlans(candidatePlanAccounts, contexts)
-        candidatePlans = candidatePlanAccounts.length
-          ? await prepareBatchCandidatePlans(
-            candidatePlanAccounts, contexts, reviewedAccountId, reviewedProducts, accountSwitchFailures, reusablePlans
-          )
-          : new Map()
-      } catch (cause) {
-        if (toUserSelectionError(cause).classification === 'BAIYING_RATE_LIMIT') {
-          const reason = String(cause instanceof Error ? cause.message : cause)
-          const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
-          batch = created.batch as SelectionRecoveryBatch
-          const retryableCandidateAccounts = candidatePlanAccounts.filter((account) => !accountSwitchFailures.has(account.id))
-          const reportedAccountId = selectionProgress.value?.accountId
-          const failedAccountId = retryableCandidateAccounts.find((account) => account.id === reportedAccountId)?.id ??
-            retryableCandidateAccounts[0]?.id
-          if (failedAccountId !== undefined && retryableCandidateAccounts.length) {
-            await saveCandidateFetchRateLimitCheckpoint(
-              batchId,
-              retryableCandidateAccounts.map((account) => ({ accountId: account.id, accountName: account.name })),
-              failedAccountId,
-              reason
-            )
-          }
-          for (const [accountId, failure] of accountSwitchFailures) {
-            await runRecovery(['account', 'update', '--batch-id', batchId, '--account-id', String(accountId)], {
-              state: 'failed', stage: 'account_preflight', error: failure.reason
-            })
-            await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', String(accountId)], {
-              stage: failure.stage, code: failure.classification,
-              message: failure.message, detail: failure.detail
-            })
-          }
-        }
-        throw cause
-      }
-      preparedCandidatePlans = candidatePlansForBatchPayload(candidatePlans)
-      payload.candidatePlan = preparedCandidatePlans
       selectionProgress.value = {
         ...selectionProgress.value!,
         stage: '保存选品批次',
-        message: '候选计划已整理，正在写入本机批次记录。'
+        message: '账号和资源配置已核对；候选查询将在轮到每个账号时进行。'
       }
       const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
       batch = created.batch as SelectionRecoveryBatch
-      if (previewCandidatePool.value && candidatePlanAccounts.some((account) => account.id === previewCandidatePool.value?.accountId)) {
-        previewCandidatePool.value = null
-        previewCandidatePoolCount.value = 0
-      }
       recoveryBatch.value = batch
     }
 
@@ -4721,7 +4580,7 @@ async function runSelectionBatch(): Promise<void> {
       accountTotal: activeTaskAccounts.length,
       completedAccounts: 0,
       stage: '开始顺序处理账号',
-      message: `本轮将${resumePriorityAccountId !== null ? '优先恢复限流账号、再按账号 ID 顺序处理' : '按账号 ID 顺序处理'} ${activeTaskAccounts.length} 个启用账号。`,
+      message: `本轮将${resumePriorityAccountId !== null ? '优先恢复限流账号、再按账号 ID 顺序处理' : '按账号 ID 顺序处理'} ${activeTaskAccounts.length} 个启用账号；只启动当前账号浏览器，完成选品发布并关闭后再切换。`,
       itemIndex: null,
       itemTotal: null,
       percent: null
@@ -4776,7 +4635,6 @@ async function runSelectionBatch(): Promise<void> {
       async (account) => {
         const task = persistedAccounts.find((item) => item.accountId === account.id)
         if (!task) throw new Error('恢复批次中找不到该账号任务。')
-        if (task.state === 'completed') return { status: '完成' as const, message: '已完成，跳过重复执行' }
         const persist = async (patch: Record<string, unknown>): Promise<void> => {
           const saved = await runRecovery([
             'account', 'update', '--batch-id', batchId, '--account-id', String(account.id)
@@ -4793,17 +4651,6 @@ async function runSelectionBatch(): Promise<void> {
           }
         }
         const logFailure = appendAccountLog
-        const switchFailure = accountSwitchFailures.get(account.id)
-        if (switchFailure) {
-          await logFailure({
-            stage: switchFailure.stage,
-            code: switchFailure.classification,
-            message: switchFailure.message,
-            detail: switchFailure.detail
-          })
-          await persist({ state: 'failed', stage: 'account_preflight', error: switchFailure.reason })
-          throw new Error(switchFailure.reason)
-        }
         const contextError = contextErrors.get(account.id)
         if (contextError) {
           await logFailure({
@@ -4820,40 +4667,177 @@ async function runSelectionBatch(): Promise<void> {
           await persist({ state: 'needs_retry', stage: task.stage || 'profile_check', error: reason })
           throw new Error(reason)
         }
+        if (task.state === 'completed') {
+          try {
+            await window.api.browser.closeAccount({ accountId: account.id, profilePath: context.profilePath })
+          } catch (cause) {
+            const reason = String(cause instanceof Error ? cause.message : cause)
+            await appendAccountLog({
+              stage: '关闭账号浏览器', code: 'ACCOUNT_BROWSER_CLOSE_FAILED',
+              message: '已完成账号的专属浏览器未能关闭；为避免同时打开多个账号窗口，批次已暂停。',
+              detail: reason
+            })
+            return {
+              status: '部分完成' as const,
+              message: '已完成账号的浏览器未能关闭；后续账号尚未启动。',
+              continueBatch: false
+            }
+          }
+          return { status: '完成' as const, message: '已完成，跳过重复执行' }
+        }
+
+        let keepBrowserOpenForLogin = false
+        let accountOutcome: { status: '完成' | '部分完成'; message?: string; continueBatch?: boolean } | null = null
+        let accountFailure: unknown = null
+        let browserCloseFailure = ''
+        let pauseAfterAccount = false
         try {
-          await appendAccountLog({
-            stage: '账号选品', code: 'INFO_ACCOUNT_STARTED',
-            message: `开始处理账号「${account.name}」。`
+          await persist({ state: 'in_progress', stage: 'account_preflight', error: '' })
+          const target: LoginPreflightTarget = {
+            accountId: account.id,
+            accountName: account.name,
+            profilePath: context.profilePath,
+            resolvedProfilePath: context.resolvedProfilePath,
+            contextError: undefined
+          }
+          const accountScopeFingerprint = stableJson({
+            kind: 'batch-account-login',
+            batchId,
+            accountId: account.id,
+            profilePath: context.resolvedProfilePath ?? context.profilePath
           })
-          await persist({ state: 'in_progress', error: '' })
-          const outcome = await executeAccountSelection(
-            account.id,
-            false,
-            batchPayload.settingsSnapshot as Record<string, unknown>,
-            account.id === persistedReviewedAccountId ? persistedReviewedProducts : undefined,
-            context,
-            { batchId, state: task, persist, logFailure, logEvent: appendAccountLog },
-            persistedReviewedAccountId,
-            batchCandidatePlans[String(account.id)]
+          const loginFailures = await collectAccountSwitchFailures(
+            [target], batchId, accountScopeFingerprint, false, true
           )
-          await appendAccountLog({
-            stage: '账号选品',
-            code: outcome.status === '完成' ? 'SUCCESS_ACCOUNT_COMPLETED' : 'WARNING_ACCOUNT_PARTIAL',
-            message: `账号处理${outcome.status}。${outcome.message ? conciseFailureMessage(outcome.message) : ''}`,
-            detail: outcome.message ?? ''
-          })
-          return outcome
+          const waitingForLogin = loginPreflight.value?.batchId === batchId &&
+            loginPreflight.value.accounts.some((item) => item.accountId === account.id)
+          if (waitingForLogin) {
+            const reason = '当前账号需要完成登录或安全验证；批次已保存，后续账号尚未启动。'
+            await appendAccountLog({
+              stage: '账号登录预检', code: 'ACCOUNT_LOGIN_CONFIRMATION_REQUIRED',
+              message: reason, detail: reason
+            })
+            await persist({ state: 'needs_retry', stage: 'queued', error: reason })
+            keepBrowserOpenForLogin = true
+            accountOutcome = { status: '部分完成', message: reason, continueBatch: false }
+          } else {
+            const switchFailure = loginFailures.get(account.id) ?? accountSwitchFailures.get(account.id)
+            if (switchFailure) {
+              await logFailure({
+                stage: switchFailure.stage,
+                code: switchFailure.classification,
+                message: switchFailure.message,
+                detail: switchFailure.detail
+              })
+              await persist({ state: 'failed', stage: 'account_preflight', error: switchFailure.reason })
+              throw new Error(switchFailure.reason)
+            }
+            await appendAccountLog({
+              stage: '账号选品', code: 'INFO_ACCOUNT_STARTED',
+              message: `开始处理账号「${account.name}」；此前未启动其他账号浏览器。`
+            })
+            await persist({ state: 'in_progress', error: '' })
+            let candidatePlan: AccountCandidatePlan | undefined = batchCandidatePlans[String(account.id)]
+            if (!candidatePlan && !task.candidates?.length && !task.selectedIndexes?.length) {
+              await persist({ state: 'in_progress', stage: 'candidate_fetch', error: '' })
+              const reusablePlans = reusablePreviewCandidatePlans([account], contexts)
+              const plans = await prepareBatchCandidatePlans(
+                [account],
+                contexts,
+                account.id === persistedReviewedAccountId ? persistedReviewedAccountId : undefined,
+                account.id === persistedReviewedAccountId ? persistedReviewedProducts : undefined,
+                undefined,
+                reusablePlans,
+                true
+              )
+              candidatePlan = plans.get(account.id)
+              if (previewCandidatePool.value?.accountId === account.id && reusablePlans.size) {
+                previewCandidatePool.value = null
+                previewCandidatePoolCount.value = 0
+              }
+            }
+            const executed = await executeAccountSelection(
+              account.id,
+              false,
+              batchPayload.settingsSnapshot as Record<string, unknown>,
+              account.id === persistedReviewedAccountId ? persistedReviewedProducts : undefined,
+              context,
+              { batchId, state: task, persist, logFailure, logEvent: appendAccountLog },
+              persistedReviewedAccountId,
+              candidatePlan
+            )
+            // 某个商品需要后续重试时，当前账号仍已处理完并关闭窗口；继续处理下一个账号。
+            accountOutcome = { ...executed, continueBatch: true }
+            await appendAccountLog({
+              stage: '账号选品',
+              code: accountOutcome.status === '完成' ? 'SUCCESS_ACCOUNT_COMPLETED' : 'WARNING_ACCOUNT_PARTIAL',
+              message: `账号处理${accountOutcome.status}。${accountOutcome.message ? conciseFailureMessage(accountOutcome.message) : ''}`,
+              detail: accountOutcome.message ?? ''
+            })
+          }
         } catch (cause) {
           const reason = String(cause instanceof Error ? cause.message : cause)
+          accountFailure = cause
+          const classification = toUserSelectionError(cause).classification
+          pauseAfterAccount = classification === 'BAIYING_RATE_LIMIT'
           if (task.state !== 'failed' && task.state !== 'needs_retry') {
-            await logFailure({
-              stage: task.stage || '账号任务', code: 'ACCOUNT_TASK_FAILED',
-              message: '账号任务失败：' + conciseFailureMessage(reason), detail: reason
-            })
-            await persist({ state: 'failed', stage: task.stage || 'account_run', error: reason })
+            if (classification === 'BAIYING_RATE_LIMIT') {
+              await logFailure({
+                stage: '获取候选', code: 'BAIYING_RATE_LIMIT',
+                message: toUserSelectionMessage(reason), detail: reason
+              })
+              await persist({ state: 'needs_retry', stage: task.stage || 'candidate_fetch', error: reason })
+            } else {
+              await logFailure({
+                stage: task.stage || '账号任务', code: 'ACCOUNT_TASK_FAILED',
+                message: '账号任务失败：' + conciseFailureMessage(reason), detail: reason
+              })
+              await persist({ state: 'failed', stage: task.stage || 'account_run', error: reason })
+            }
           }
-          throw cause
         }
+        if (!keepBrowserOpenForLogin) {
+          try {
+            const closed = await window.api.browser.closeAccount({ accountId: account.id, profilePath: context.profilePath })
+            if (closed.ok !== true) throw new Error('客户端没有确认账号专属浏览器关闭')
+          } catch (cause) {
+            browserCloseFailure = String(cause instanceof Error ? cause.message : cause)
+            await appendAccountLog({
+              stage: '关闭账号浏览器', code: 'ACCOUNT_BROWSER_CLOSE_FAILED',
+              message: '当前账号的专属浏览器未能关闭；为避免同时打开多个账号窗口，批次已暂停。',
+              detail: browserCloseFailure
+            })
+          }
+        }
+        if (browserCloseFailure) {
+          const primaryFailure = accountFailure
+            ? String(accountFailure instanceof Error ? accountFailure.message : accountFailure)
+            : ''
+          if (task.state !== 'completed') {
+            await persist({
+              state: 'needs_retry',
+              stage: task.stage || 'queued',
+              error: [primaryFailure, '账号浏览器关闭失败：' + browserCloseFailure].filter(Boolean).join('；')
+            })
+          }
+          return {
+            status: accountFailure ? '失败' as const : '部分完成' as const,
+            message: [primaryFailure, '账号浏览器关闭失败：' + browserCloseFailure, '后续账号尚未启动。']
+              .filter(Boolean).join('；'),
+            continueBatch: false
+          }
+        }
+        if (accountFailure) {
+          if (pauseAfterAccount) {
+            return {
+              status: '失败',
+              message: String(accountFailure instanceof Error ? accountFailure.message : accountFailure),
+              continueBatch: false
+            }
+          }
+          throw accountFailure
+        }
+        return accountOutcome ?? { status: '部分完成' as const, message: '当前账号没有返回处理结果。' }
       },
       (account, status) => {
         accountStatuses[account.id] = status
@@ -6002,13 +5986,14 @@ onUnmounted(() => {
           <header class="login-preflight-head">
             <div>
               <h2 id="login-preflight-title">选品前请确认账号登录</h2>
-              <p>每个执行账号都需要分别登录百应和抖音创作者中心。两站任一未确认时，不会创建或恢复选品批次。</p>
+              <p v-if="loginPreflight.batchId">先处理当前账号的登录状态；批次已保存，其他账号浏览器不会提前启动。</p>
+              <p v-else>每个执行账号都需要分别登录百应和抖音创作者中心。两站任一未确认时，不会创建或恢复选品批次。</p>
             </div>
             <button class="btn" type="button" aria-label="关闭登录检查" :disabled="loginPreflight.checking" @click="loginPreflight = null">×</button>
           </header>
-          <p v-if="loginPreflight.checking" class="login-preflight-progress">正在逐个检查账号的两站登录状态，请稍候。</p>
-          <p v-else-if="loginPreflightReady(loginPreflight.accounts)" class="login-preflight-success">每个账号的百应和创作者中心均已自动或手动确认。点击「继续选品」后将进入选品流程。</p>
-          <p v-else class="login-preflight-warning">尚未创建或修改批次。请先打开未登录的平台完成登录/验证，再点击「重新检查登录状态」；显示“需要登录”或“需要人工验证”时必须重新检查通过，不能跳过。</p>
+          <p v-if="loginPreflight.checking" class="login-preflight-progress">{{ loginPreflight.batchId ? '正在检查当前账号的百应和创作者中心登录状态，请稍候。' : '正在逐个检查账号的两站登录状态，请稍候。' }}</p>
+          <p v-else-if="loginPreflightReady(loginPreflight.accounts)" class="login-preflight-success">{{ loginPreflight.batchId ? '当前账号的百应和创作者中心均已确认。点击「继续选品」后会从当前账号继续。' : '每个账号的百应和创作者中心均已自动或手动确认。点击「继续选品」后将进入选品流程。' }}</p>
+          <p v-else class="login-preflight-warning">{{ loginPreflight.batchId ? '批次已保存，当前账号尚未执行选品，后续账号也未启动。请先打开未登录的平台完成登录/验证，再点击「重新检查登录状态」。' : '尚未创建或修改批次。请先打开未登录的平台完成登录/验证，再点击「重新检查登录状态」。' }}显示“需要登录”或“需要人工验证”时必须重新检查通过，不能跳过。</p>
           <div class="login-preflight-list">
             <article v-for="item in loginPreflight.accounts" :key="item.accountId" class="login-preflight-account">
               <strong>{{ item.accountName }}（ID {{ item.accountId }}）</strong>

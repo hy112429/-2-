@@ -62,6 +62,10 @@ const browser = {
     creatorCenterOpen: boolean
   }> => ipcRenderer.invoke('browser:inspectAccountPages', toPlainIpcPayload(params)),
 
+  /** 关闭当前账号的客户端专属 Chrome 窗口，保留 profile 与登录态。 */
+  closeAccount: (params: { accountId: number; profilePath?: string }): Promise<{ ok: boolean; closed: boolean }> =>
+    ipcRenderer.invoke('browser:closeAccount', toPlainIpcPayload(params)),
+
   /** 只解析 profile 并校验自定义目录含 Default，不会启动 Chrome。 */
   validateProfilePath: (options: { profileKey: string; profilePath?: string }): Promise<{ ok: boolean; path?: string; error?: string }> =>
     ipcRenderer.invoke('browser:validateProfilePath', options),
