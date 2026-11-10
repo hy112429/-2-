@@ -276,8 +276,12 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
     has_baiying_products = db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='baiying_products'"
     ).fetchone() is not None
+    if has_baiying_products:
+        columns = {str(column["name"]) for column in db.execute("PRAGMA table_info(baiying_products)")}
+        has_baiying_products = {"product_id", "account_id", "cos_ratio"}.issubset(columns)
     commission_column = "b.cos_ratio" if has_baiying_products else "NULL"
-    commission_join = "LEFT JOIN baiying_products b ON b.product_id=p.product_id" if has_baiying_products else ""
+    commission_join = ("LEFT JOIN baiying_products b ON b.product_id=p.product_id "
+                       "AND b.account_id=p.account_id") if has_baiying_products else ""
     candidates = db.execute(f"""SELECT p.id publish_queue_id,p.account_id,p.product_id,
         p.product_name,p.title,q.id qianchuan_account_id,q.qc_id advertiser_id,
         s.video_source,{commission_column} commission_rate FROM publish_queue p
@@ -331,9 +335,10 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
                     AND status IN ('ready','blocked') AND submit_attempted=0""",
                     (commission_rate, roi_target, now_text(), account_id, qc_id, product_id))
             else:
-                db.execute("""UPDATE qianchuan_plan_jobs SET status='blocked',reason=?,updated_at=?
+                db.execute("""UPDATE qianchuan_plan_jobs SET commission_rate=0,roi_target=0,
+                    status='blocked',reason=?,updated_at=?
                     WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
-                    AND status='ready' AND roi_target<=0 AND submit_attempted=0""",
+                    AND status='ready' AND submit_attempted=0""",
                     (reason, now_text(), account_id, qc_id, product_id))
     return {"ok": True, "created": created}
 
@@ -350,6 +355,21 @@ def claim(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
             raise ValueError("该千川账户未启用自动发布或未配置预算")
         if float(row["roi_target"] or 0) <= 0 or float(row["commission_rate"] or 0) <= 0:
             raise ValueError("商品佣金率未就绪，无法计算控成本投放保本 ROI")
+        cache_columns = ({str(column["name"]) for column in db.execute("PRAGMA table_info(baiying_products)")}
+                         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='baiying_products'").fetchone()
+                         else set())
+        if not {"product_id", "account_id", "cos_ratio"}.issubset(cache_columns):
+            raise ValueError("百应佣金率缓存不可用，请先同步商品数据")
+        cached = db.execute("SELECT cos_ratio FROM baiying_products WHERE product_id=? AND account_id=?",
+                            (row["product_id"], row["account_id"])).fetchone()
+        try:
+            current_rate = float(cached["cos_ratio"]) if cached else 0
+        except (TypeError, ValueError):
+            current_rate = 0
+        if not 0 < current_rate <= 100:
+            raise ValueError("该账号商品佣金率已失效，请先同步计划任务")
+        if current_rate != float(row["commission_rate"]) or round(100 / current_rate, 2) != float(row["roi_target"]):
+            raise ValueError("商品佣金率已变化，请先同步计划任务和保本 ROI")
         published = db.execute("SELECT platform_status FROM publish_queue WHERE id=?", (row["publish_queue_id"],)).fetchone()
         if not published or published["platform_status"] != "published":
             raise ValueError("抖音作品未确认发布")
@@ -413,6 +433,8 @@ def main() -> int:
     parser.add_argument("--aigc-enabled", type=int, choices=[0, 1], default=0)
     parser.add_argument("--id", type=int, default=0)
     parser.add_argument("--status", default="")
+    parser.add_argument("--due-only", action="store_true")
+    parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--submit-attempted", type=int, choices=[0, 1], default=0)
     parser.add_argument("--remote-plan-id", default="")
     parser.add_argument("--reason", default="")
@@ -420,6 +442,8 @@ def main() -> int:
     parser.add_argument("--selected-material-ids-json", default="[]")
     args = parser.parse_args()
     try:
+        if args.offset < 0:
+            raise ValueError("任务列表偏移量无效")
         with connect(args.db) as db:
             ensure_schema(db)
             if args.command == "settings":
@@ -435,16 +459,43 @@ def main() -> int:
             elif args.command == "jobs":
                 query = "SELECT * FROM qianchuan_plan_jobs"
                 filters: list[Any] = []
+                conditions: list[str] = []
                 if args.qianchuan_account_id:
-                    query += " WHERE qianchuan_account_id=?"
+                    conditions.append("qianchuan_account_id=?")
                     filters.append(args.qianchuan_account_id)
-                result = {"ok": True, "rows": [dict(r) for r in db.execute(query + " ORDER BY id DESC LIMIT 200", filters)]}
+                if args.id:
+                    conditions.append("id=?")
+                    filters.append(args.id)
+                if args.status:
+                    conditions.append("status=?")
+                    filters.append(args.status)
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+                order = "ASC" if args.status == "ready" else "DESC"
+                result = {"ok": True, "rows": [dict(r) for r in db.execute(
+                    query + f" ORDER BY id {order} LIMIT 200 OFFSET ?", [*filters, args.offset])]}
             elif args.command == "supplement-jobs":
-                result = {"ok": True, "rows": [dict(r) for r in db.execute("""
+                query = """
                     SELECT s.*,p.account_id,p.qianchuan_account_id,p.advertiser_id,
                     p.product_id,p.plan_name,p.remote_plan_id FROM qianchuan_plan_supplements s
                     JOIN qianchuan_plan_jobs p ON p.id=s.plan_job_id
-                    ORDER BY s.id DESC LIMIT 200""")]}
+                """
+                conditions = []
+                filters = []
+                if args.id:
+                    conditions.append("s.id=?")
+                    filters.append(args.id)
+                if args.status:
+                    conditions.append("s.status=?")
+                    filters.append(args.status)
+                if args.due_only:
+                    conditions.append("s.scheduled_at<=?")
+                    filters.append(now_text())
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+                query += (" ORDER BY s.scheduled_at ASC,s.id ASC LIMIT 200 OFFSET ?" if args.due_only
+                          else " ORDER BY s.id DESC LIMIT 200 OFFSET ?")
+                result = {"ok": True, "rows": [dict(r) for r in db.execute(query, [*filters, args.offset])]}
             elif args.command == "claim":
                 result = claim(db, args.id)
             elif args.command == "claim-supplement":

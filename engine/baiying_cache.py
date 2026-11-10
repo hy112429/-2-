@@ -210,7 +210,11 @@ def upsert_product(
             "account_id = COALESCE(excluded.account_id, baiying_products.account_id), "
             "commodity_id = COALESCE(excluded.commodity_id, baiying_products.commodity_id), "
             "title = excluded.title, cover_url = excluded.cover_url, "
-            "cos_ratio = excluded.cos_ratio, video_url = COALESCE(excluded.video_url, baiying_products.video_url), "
+            "cos_ratio = CASE "
+            "WHEN excluded.account_id IS NULL AND baiying_products.account_id IS NOT NULL THEN baiying_products.cos_ratio "
+            "WHEN excluded.account_id IS NOT baiying_products.account_id THEN excluded.cos_ratio "
+            "ELSE COALESCE(excluded.cos_ratio, baiying_products.cos_ratio) END, "
+            "video_url = COALESCE(excluded.video_url, baiying_products.video_url), "
             "video_urls_json = COALESCE(excluded.video_urls_json, baiying_products.video_urls_json), "
             "gallery_json = COALESCE(excluded.gallery_json, baiying_products.gallery_json), "
             "captured_at = excluded.captured_at",
@@ -238,8 +242,9 @@ def set_commodity(db_path: Path, product_id: str, commodity_id: str, account_id:
         else:
             connection.execute(
                 "UPDATE baiying_products SET commodity_id = ?, "
+                "cos_ratio = CASE WHEN ? IS NOT NULL AND account_id IS NOT ? THEN NULL ELSE cos_ratio END, "
                 "account_id = COALESCE(?, account_id), captured_at = ? WHERE product_id = ?",
-                (commodity_id, account_id, now_text(), product_id),
+                (commodity_id, account_id, account_id, account_id, now_text(), product_id),
             )
         row = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
