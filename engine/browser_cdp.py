@@ -1597,9 +1597,10 @@ def _baiying_row_snapshot(page: Page, max_rows: int = 2) -> str:
 
 
 def _locate_baiying_product_row(page: Page, product_id: str, product_title: str) -> tuple[Any, str]:
-    """只在命中当前商品 ID/标题的百应结果行内定位操作，绝不全页点同名入口。"""
+    """百应已按商品 ID 查询；优先识别 ID/标题行，页面身份线索缺失时信任查询结果行。"""
     diagnostics: list[str] = []
     sampled_visible_rows = False
+    fallback_row: Optional[Dict[str, Any]] = None
     for selector in BAIYING_CART_ROW_SELECTORS:
         rows = page.locator(selector)
         visible_rows: list[Dict[str, Any]] = []
@@ -1616,8 +1617,13 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
                 if len(row_read_errors) < 3:
                     row_read_errors.append(f"第{index + 1}行:{type(error).__name__}")
                 continue
+            candidate_row = {"index": index, "locator": row, **metadata}
             if metadata.get("matchesProductId") or metadata.get("matchesProductTitle"):
-                visible_rows.append({"index": index, "locator": row, **metadata})
+                visible_rows.append(candidate_row)
+            elif fallback_row is None and len(_visible_exact_text(row, "去带货")) == 1:
+                # 百应搜索框已提交完整商品 ID。部分页面版本没有把行内商品 ID
+                # 暴露给 DOM/React；这种情况下以查询返回的首个可操作结果行继续。
+                fallback_row = candidate_row
 
         if not visible_rows:
             samples = []
@@ -1650,7 +1656,9 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
                 sampled_visible_rows = True
                 skip_reason = _baiying_row_skip_reason(product_id, samples)
                 if skip_reason:
-                    raise _baiying_row_skip_exception(product_id, skip_reason)
+                    skip_exception = _baiying_row_skip_exception(product_id, skip_reason)
+                    if not isinstance(skip_exception, WrongBaiyingProductRow):
+                        raise skip_exception
             if row_read_errors:
                 diagnostics[-1] += f",读取错误={row_read_errors}"
             continue
@@ -1658,6 +1666,20 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
         try:
             selected = _select_baiying_product_row(visible_rows)
         except RuntimeError as error:
+            if not any(row.get("matchesProductId") for row in visible_rows):
+                actionable_rows = [row for row in visible_rows
+                                   if len(_visible_exact_text(row["locator"], "去带货")) == 1]
+                if actionable_rows:
+                    selected = actionable_rows[0]
+                else:
+                    selected = None
+            else:
+                selected = None
+            if selected is not None:
+                row_key = str(selected.get("rowKey") or "未提供")[:48]
+                return selected["locator"], (
+                    f"百应已按商品 ID 查询；沿用当前可操作结果行，不再要求行身份唯一匹配；rowKey={row_key}"
+                )
             row_samples = [
                 {
                     "rowKey": str(row.get("rowKey") or "无")[:32],
@@ -1680,9 +1702,9 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
             selected.get("domIdentityHints") if "domIdentityHints" in selected else selected.get("identityHints")
         )
         if selected.get("matchesProductTitle") and not selected.get("matchesProductId") and selected_ids and product_id not in selected_ids:
-            raise WrongBaiyingProductRow(
-                product_id,
-                "标题命中行的商品 ID 为 " + "、".join(sorted(selected_ids)[:5]) + "，与目标 ID 不符",
+            row_key = str(selected.get("rowKey") or "未提供")[:48]
+            return selected["locator"], (
+                f"百应已按商品 ID 查询；沿用当前标题结果行，不再重复核对行内 DOM ID；rowKey={row_key}"
             )
         unavailable_reason = _baiying_row_unavailable_reason(selected)
         if unavailable_reason:
@@ -1691,7 +1713,12 @@ def _locate_baiying_product_row(page: Page, product_id: str, product_title: str)
         row_key = str(selected.get("rowKey") or "未提供")[:48]
         return selected["locator"], f"按{identity}命中 1 行；候选行数 {len(visible_rows)}；rowKey={row_key}"
 
-    raise RuntimeError("百应查询后未识别到包含目标商品 ID/标题的可见商品行；诊断：" + "；".join(diagnostics[:3]))
+    if fallback_row is not None:
+        row_key = str(fallback_row.get("rowKey") or "未提供")[:48]
+        return fallback_row["locator"], (
+            f"按商品 ID 查询后采用百应当前结果行；不再要求页面重复暴露商品 ID；rowKey={row_key}"
+        )
+    raise RuntimeError("百应按商品 ID 查询后没有可操作的结果行；诊断：" + "；".join(diagnostics[:3]))
 
 
 def _copy_baiying_product_link(
