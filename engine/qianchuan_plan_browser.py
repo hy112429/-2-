@@ -17,7 +17,8 @@ from qianchuan_browser import read_verified_port, UploadStopped
 CREATE_PATH = "/uni-creation/product"
 
 
-def plan_id_in_list_text(body: str, plan_name: str, budget: int) -> str:
+def plan_id_in_list_text(body: str, plan_name: str, budget: int,
+                         delivery_mode: str = "控成本投放") -> str:
     """只接受列表里唯一的同名计划，并核对投放方式和日预算。"""
     lines = [line.strip() for line in body.splitlines() if line.strip()]
     matches = [index for index, line in enumerate(lines) if line == plan_name]
@@ -28,7 +29,7 @@ def plan_id_in_list_text(body: str, plan_name: str, budget: int) -> str:
     if len(segment) < 12:
         return ""
     found = re.fullmatch(r"ID[：:]\s*(\d{8,20})", segment[1])
-    if not found or "放量投放" not in segment:
+    if not found or delivery_mode not in segment:
         return ""
     if not any(re.fullmatch(rf"{budget}\s*元", line) for line in segment):
         return ""
@@ -129,6 +130,21 @@ def fill_budget(page, budget: int):
     field.press("Tab")
     if field.input_value() != str(budget):
         raise UploadStopped("平台日预算回显与账户配置不一致", stage="budget")
+
+
+def fill_roi_target(page, roi_target: float):
+    label = one(page.get_by_text("净成交ROI目标", exact=True), "净成交 ROI 目标标签")
+    section = label.locator("xpath=ancestor::*[.//input][1]")
+    field = one(section.locator("input"), "净成交 ROI 目标输入框")
+    expected = f"{roi_target:.2f}".rstrip("0").rstrip(".")
+    field.fill(expected)
+    field.press("Tab")
+    try:
+        matched = abs(float(field.input_value()) - roi_target) < 0.005
+    except (TypeError, ValueError):
+        matched = False
+    if not matched:
+        raise UploadStopped("平台净成交 ROI 目标回显与本机计算值不一致", stage="roi")
 
 
 def select_radio(page, label: str):
@@ -373,8 +389,10 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
         stage = "product"
         select_product(page, str(job["product_id"]))
         stage = "budget"
-        select_radio(page, "放量投放")
+        select_radio(page, "控成本投放")
         fill_budget(page, int(settings["daily_budget_yuan"]))
+        stage = "roi"
+        fill_roi_target(page, float(job["roi_target"]))
         if settings["long_running"]:
             select_radio(page, "从今天起长期投放")
         stage = "settings"
@@ -430,7 +448,7 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
         if str(job["product_id"]) not in page.locator("body").inner_text():
             raise UploadStopped("提交前商品 ID 不在计划页", stage=stage)
         stage = "submit"
-        # 放量预算触发的智能升额介绍会浮在表单上；先关闭一次性提示，
+        # 平台介绍提示可能浮在表单上；先关闭一次性提示，
         # 否则第一次点击“发布计划”可能仅触发介绍而没有提交计划。
         acknowledgement = page.get_by_text("我知道了", exact=True)
         if acknowledgement.count() and acknowledgement.first.is_visible():

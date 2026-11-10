@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS qianchuan_plan_settings (
   enabled INTEGER NOT NULL DEFAULT 0,
   daily_budget_yuan INTEGER NOT NULL DEFAULT 0,
   video_source TEXT NOT NULL DEFAULT 'both',
-  delivery_mode TEXT NOT NULL DEFAULT '放量投放',
+  delivery_mode TEXT NOT NULL DEFAULT '控成本投放',
   long_running INTEGER NOT NULL DEFAULT 1,
   smart_coupon INTEGER NOT NULL DEFAULT 1,
   aigc_enabled INTEGER NOT NULL DEFAULT 0,
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS qianchuan_plan_jobs (
   product_name TEXT NOT NULL DEFAULT '',
   published_video_title TEXT NOT NULL DEFAULT '',
   plan_name TEXT NOT NULL,
+  commission_rate REAL NOT NULL DEFAULT 0,
+  roi_target REAL NOT NULL DEFAULT 0,
   material_ids_json TEXT NOT NULL DEFAULT '[]',
   selected_material_ids_json TEXT NOT NULL DEFAULT '[]',
   applied_material_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -79,6 +81,12 @@ def ensure_schema(db: sqlite3.Connection) -> None:
     for name in ("selected_material_ids_json", "applied_material_ids_json"):
         if name not in plan_columns:
             db.execute(f"ALTER TABLE qianchuan_plan_jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT '[]'")
+    if "commission_rate" not in plan_columns:
+        db.execute("ALTER TABLE qianchuan_plan_jobs ADD COLUMN commission_rate REAL NOT NULL DEFAULT 0")
+    if "roi_target" not in plan_columns:
+        db.execute("ALTER TABLE qianchuan_plan_jobs ADD COLUMN roi_target REAL NOT NULL DEFAULT 0")
+    # 新流程统一使用控成本投放；保留已创建的远端计划状态，不回写历史任务。
+    db.execute("UPDATE qianchuan_plan_settings SET delivery_mode='控成本投放' WHERE delivery_mode<>'控成本投放'")
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -90,7 +98,7 @@ def _settings(db: sqlite3.Connection, qc_id: int) -> dict[str, Any]:
         raise ValueError("千川账户不存在")
     row = _row(db.execute("SELECT * FROM qianchuan_plan_settings WHERE qianchuan_account_id=?", (qc_id,)).fetchone())
     return row or {"qianchuan_account_id": qc_id, "enabled": 0, "daily_budget_yuan": 0,
-                   "video_source": "both", "delivery_mode": "放量投放", "long_running": 1,
+                   "video_source": "both", "delivery_mode": "控成本投放", "long_running": 1,
                    "smart_coupon": 1, "aigc_enabled": 0, "activated_at": ""}
 
 
@@ -116,7 +124,7 @@ def save_settings(db: sqlite3.Connection, qc_id: int, budget: int, source: str,
             long_running=excluded.long_running,smart_coupon=excluded.smart_coupon,
             aigc_enabled=excluded.aigc_enabled,activated_at=excluded.activated_at,
             updated_at=excluded.updated_at""",
-            (qc_id, int(enabled), budget, source, "放量投放", int(long_running),
+            (qc_id, int(enabled), budget, source, "控成本投放", int(long_running),
              int(coupon), int(aigc), activated_at, now_text()))
     return _settings(db, qc_id)
 
@@ -265,13 +273,19 @@ def finish_supplement(db: sqlite3.Connection, supplement_id: int, status: str,
 
 def sync(db: sqlite3.Connection) -> dict[str, Any]:
     """仅为已发布作品、已配置预算且有可识别素材的商品生成一个任务。"""
-    candidates = db.execute("""SELECT p.id publish_queue_id,p.account_id,p.product_id,
+    has_baiying_products = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='baiying_products'"
+    ).fetchone() is not None
+    commission_column = "b.cos_ratio" if has_baiying_products else "NULL"
+    commission_join = "LEFT JOIN baiying_products b ON b.product_id=p.product_id" if has_baiying_products else ""
+    candidates = db.execute(f"""SELECT p.id publish_queue_id,p.account_id,p.product_id,
         p.product_name,p.title,q.id qianchuan_account_id,q.qc_id advertiser_id,
-        s.video_source FROM publish_queue p
+        s.video_source,{commission_column} commission_rate FROM publish_queue p
         JOIN accounts a ON a.id=p.account_id
         JOIN account_qianchuan aq ON aq.account_row_id=p.account_id
         JOIN qianchuan_accounts q ON q.id=aq.qianchuan_row_id
         JOIN qianchuan_plan_settings s ON s.qianchuan_account_id=q.id
+        {commission_join}
         WHERE p.platform_status='published' AND a.status='active' AND s.enabled=1 AND s.daily_budget_yuan>=50
         AND s.activated_at<>'' AND p.published_at>s.activated_at
         AND p.product_id<>'' ORDER BY p.id""").fetchall()
@@ -291,15 +305,36 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
             continue
         if row["video_source"] == "my_video" and not str(row["title"] or "").strip():
             continue
+        try:
+            commission_rate = float(row["commission_rate"])
+        except (TypeError, ValueError):
+            commission_rate = 0
+        roi_target = round(100 / commission_rate, 2) if 0 < commission_rate <= 100 else 0
         name = f"{date.today().isoformat()}_商品全域投放_{product_id}"[:50]
+        status = "ready" if roi_target > 0 else "blocked"
+        reason = "" if roi_target > 0 else "无法计算保本 ROI：百应商品佣金率缺失或无效，请先同步商品数据。"
         with db:
             cursor = db.execute("""INSERT OR IGNORE INTO qianchuan_plan_jobs
                 (publish_queue_id,account_id,qianchuan_account_id,advertiser_id,product_id,
-                 product_name,published_video_title,plan_name,material_ids_json,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                 product_name,published_video_title,plan_name,commission_rate,roi_target,
+                 material_ids_json,status,reason,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (row["publish_queue_id"], account_id, qc_id, advertiser_id, product_id,
-                 row["product_name"], row["title"], name, json.dumps(ids), now_text(), now_text()))
+                 row["product_name"], row["title"], name, commission_rate, roi_target,
+                 json.dumps(ids), status, reason, now_text(), now_text()))
             created += int(cursor.rowcount > 0)
+            if roi_target > 0:
+                db.execute("""UPDATE qianchuan_plan_jobs SET commission_rate=?,roi_target=?,
+                    status=CASE WHEN status='blocked' AND reason LIKE '无法计算保本 ROI：%' THEN 'ready' ELSE status END,
+                    reason=CASE WHEN status='blocked' AND reason LIKE '无法计算保本 ROI：%' THEN '' ELSE reason END,
+                    updated_at=? WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
+                    AND status IN ('ready','blocked') AND submit_attempted=0""",
+                    (commission_rate, roi_target, now_text(), account_id, qc_id, product_id))
+            else:
+                db.execute("""UPDATE qianchuan_plan_jobs SET status='blocked',reason=?,updated_at=?
+                    WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
+                    AND status='ready' AND roi_target<=0 AND submit_attempted=0""",
+                    (reason, now_text(), account_id, qc_id, product_id))
     return {"ok": True, "created": created}
 
 
@@ -313,6 +348,8 @@ def claim(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
         settings = _settings(db, int(row["qianchuan_account_id"]))
         if not settings["enabled"] or int(settings["daily_budget_yuan"]) < 50:
             raise ValueError("该千川账户未启用自动发布或未配置预算")
+        if float(row["roi_target"] or 0) <= 0 or float(row["commission_rate"] or 0) <= 0:
+            raise ValueError("商品佣金率未就绪，无法计算控成本投放保本 ROI")
         published = db.execute("SELECT platform_status FROM publish_queue WHERE id=?", (row["publish_queue_id"],)).fetchone()
         if not published or published["platform_status"] != "published":
             raise ValueError("抖音作品未确认发布")
@@ -429,6 +466,8 @@ def main() -> int:
                     if args.command == "retry-blocked":
                         if row["status"] != "blocked" or row["submit_attempted"]:
                             raise ValueError("只有发布前停止的计划可直接重试")
+                        if float(row["roi_target"] or 0) <= 0:
+                            raise ValueError("商品佣金率未同步，暂时无法计算 ROI；同步百应商品数据后再试")
                         status, remote_id = "ready", ""
                     else:
                         if row["status"] != "needs_review":

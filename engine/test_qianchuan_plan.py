@@ -25,6 +25,7 @@ class QianchuanPlanTests(unittest.TestCase):
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("CREATE TABLE baiying_products(product_id TEXT PRIMARY KEY, cos_ratio REAL)")
         self.addCleanup(self.connection.close)
         self.account_id = int(db.add_account(self.connection, "隔离账号", "douyin", None)["account"]["id"])
         publish_queue.ensure_schema(self.connection)
@@ -41,6 +42,10 @@ class QianchuanPlanTests(unittest.TestCase):
         self.connection.commit()
 
     def add_published(self, product_id: str, published_at: str) -> int:
+        self.connection.execute(
+            "INSERT OR REPLACE INTO baiying_products(product_id,cos_ratio) VALUES (?,?)",
+            (product_id, 20.0),
+        )
         cursor = self.connection.execute(
             "INSERT INTO publish_queue(account_id,product_id,product_name,video_path,video_key,"
             "title,schedule_at,platform_status,published_at,created_at,updated_at) "
@@ -131,7 +136,7 @@ class QianchuanPlanTests(unittest.TestCase):
     def test_created_plan_list_requires_exact_name_and_budget(self) -> None:
         name = "2026-11-08_商品全域投放_3745547582882054358"
         body = "\n".join(["商品全域投放", name, "ID：1881291633037435", "1", "商品",
-                          "素材", "投放中", "每日预算", "50元", "放量投放", "编辑",
+                          "素材", "投放中", "每日预算", "50元", "控成本投放", "编辑",
                           "诊断", "更多"])
         self.assertEqual(plan_id_in_list_text(body, name, 50), "1881291633037435")
         self.assertEqual(plan_id_in_list_text(body, name, 100), "")
