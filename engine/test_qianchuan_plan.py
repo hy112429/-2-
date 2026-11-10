@@ -179,6 +179,8 @@ class QianchuanPlanTests(unittest.TestCase):
         plan.finish(self.connection, job_id, "needs_review", True, reason="平台回执不明确")
         with self.assertRaisesRegex(ValueError, "不会重复发布"):
             plan.claim(self.connection, job_id)
+        with patch.object(plan, "usable_material_ids", side_effect=AssertionError("终态计划不应反复扫描素材")):
+            self.assertEqual(plan.sync(self.connection)["created"], 0)
 
     def test_next_day_material_is_added_to_original_plan_once(self) -> None:
         plan.save_settings(self.connection, self.qc_id, 50, "uploaded", True, True, True, False)

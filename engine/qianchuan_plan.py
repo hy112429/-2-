@@ -290,9 +290,13 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
         JOIN qianchuan_accounts q ON q.id=aq.qianchuan_row_id
         JOIN qianchuan_plan_settings s ON s.qianchuan_account_id=q.id
         {commission_join}
+        LEFT JOIN qianchuan_plan_jobs existing ON existing.account_id=p.account_id
+        AND existing.qianchuan_account_id=q.id AND existing.product_id=p.product_id
         WHERE p.platform_status='published' AND a.status='active' AND s.enabled=1 AND s.daily_budget_yuan>=50
         AND s.activated_at<>'' AND p.published_at>s.activated_at
-        AND p.product_id<>'' ORDER BY p.id""").fetchall()
+        AND p.product_id<>'' AND (existing.id IS NULL OR
+            (existing.status IN ('ready','blocked') AND existing.submit_attempted=0))
+        ORDER BY p.id""").fetchall()
     created = 0
     for row in candidates:
         account_id, qc_id, product_id = int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"])

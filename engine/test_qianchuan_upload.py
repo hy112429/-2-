@@ -91,6 +91,82 @@ class QianchuanUploadTests(unittest.TestCase):
         self.connection.commit()
         return asset_id
 
+    def test_large_due_queue_rotates_and_review_accounts_survive_restart(self) -> None:
+        second_account = self.add_account("账号B")
+        second_qc = self.add_qc(second_account)
+        group_id = int(self.connection.execute(
+            "INSERT INTO qianchuan_quota_groups(name,created_at) VALUES (?,?)",
+            ("大批量隔离额度组", db.now_text()),
+        ).lastrowid)
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        timestamp = db.now_text()
+        self.connection.executemany("""INSERT INTO qianchuan_upload_jobs
+            (asset_id,account_id,qianchuan_account_id,quota_group_id,product_id,file_path,
+             material_name,status,scheduled_date,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""", [
+            (10000 + index, self.account_id if index < 500 else second_account,
+             self.qc_id if index < 500 else second_qc, group_id, "9999999999999999999",
+             f"D:/isolated/{index}.mp4", f"{index}.mp4", "queued", yesterday,
+             timestamp, timestamp)
+            for index in range(505)
+        ])
+        self.connection.commit()
+        first = qc.list_jobs(self.connection, status="queued", limit=500, due_only=True)["rows"]
+        self.assertEqual(len(first), 500)
+        self.assertEqual(first[0]["id"], 1)
+        later = qc.list_jobs(self.connection, status="queued", limit=500,
+                             due_only=True, after_id=first[-1]["id"])["rows"]
+        self.assertEqual(len(later), 5)
+        self.assertEqual(later[0]["accountId"], second_account)
+        future = (datetime.now() + timedelta(hours=1)).isoformat(timespec="seconds")
+        self.connection.execute("UPDATE qianchuan_upload_jobs SET next_retry_at=? WHERE id=2", (future,))
+        self.connection.execute("UPDATE qianchuan_upload_jobs SET scheduled_date=? WHERE id=3",
+                                ((date.today() + timedelta(days=1)).isoformat(),))
+        self.connection.commit()
+        self.assertEqual(len(qc.list_jobs(self.connection, status="queued", due_only=True, limit=500)["rows"]), 500)
+        self.assertEqual(len(qc.list_jobs(self.connection, status="queued", due_only=True,
+                                          after_id=500)["rows"]), 5)
+        self.connection.execute("UPDATE qianchuan_upload_jobs SET status='needs_review' WHERE id=1")
+        self.connection.commit()
+        self.assertEqual(qc.review_accounts(self.connection)["qianchuanAccountIds"], [self.qc_id])
+        self.assertEqual(len(qc.list_jobs(self.connection, status="needs_review", limit=1,
+                                          qianchuan_account_id=self.qc_id)["rows"]), 1)
+        self.assertEqual(qc.list_jobs(self.connection, status="needs_review", limit=1,
+                                      qianchuan_account_id=second_qc)["rows"], [])
+        with self.assertRaisesRegex(ValueError, "游标"):
+            qc.list_jobs(self.connection, after_id=-1)
+        parsed = qc.build_parser().parse_args(["jobs", "--due-only", "--after-id", "500",
+                                               "--qianchuan-account-id", str(second_qc)])
+        self.assertTrue(parsed.due_only)
+        self.assertEqual(parsed.qianchuan_account_id, second_qc)
+
+    def test_evaluation_due_filters_before_paging(self) -> None:
+        group_id = int(self.connection.execute(
+            "INSERT INTO qianchuan_quota_groups(name,created_at) VALUES (?,?)",
+            ("素材判定隔离额度组", db.now_text()),
+        ).lastrowid)
+        timestamp = db.now_text()
+        for index, checked_at in enumerate(("", (datetime.now() - timedelta(days=2)).isoformat(timespec="seconds"),
+                                            (datetime.now() - timedelta(minutes=5)).isoformat(timespec="seconds")), start=1):
+            self.connection.execute("""INSERT INTO qianchuan_upload_jobs
+                (asset_id,account_id,qianchuan_account_id,quota_group_id,product_id,file_path,
+                 material_name,status,scheduled_date,remote_material_id,review_status,
+                 material_evaluation,evaluation_checked_at,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (20000 + index, self.account_id, self.qc_id, group_id, "8888888888888888888",
+                 f"D:/isolated/{index}.mp4", f"{index}.mp4", "succeeded", date.today().isoformat(),
+                 str(7000000000000000000 + index), "approved", "qualified", checked_at,
+                 timestamp, timestamp))
+        self.connection.commit()
+        due = qc.list_jobs(self.connection, evaluation_due=True, limit=1)["rows"]
+        self.assertEqual(len(due), 1)
+        remaining = qc.list_jobs(self.connection, evaluation_due=True, after_id=due[-1]["id"])["rows"]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(len(qc.list_jobs(self.connection, evaluation_due=True,
+                                          evaluation_kind="new")["rows"]), 1)
+        self.assertEqual(len(qc.list_jobs(self.connection, evaluation_due=True,
+                                          evaluation_kind="recheck")["rows"]), 1)
+
     def test_requires_confirmed_web_asset_same_account_and_published_product(self) -> None:
         good = self.add_asset("p-good")
         unknown = self.add_asset("p-unknown", source_type="unknown")

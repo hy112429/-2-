@@ -18,6 +18,7 @@ function reply(result) { return { promise: Promise.resolve({ ok: true, result })
 
 const stubs = {
   electron: { clipboard: { readText: () => '' }, ipcMain: { handle(name, handler) { handlers.set(name, handler) } } },
+  './cart_download_slots': { withCartDownloadSlot: (work) => work() },
   './probe': { onProductCaptured() {} },
   './external_browser': {
     validateManagedProfilePath: (key) => `D:\\profiles\\${key}`,

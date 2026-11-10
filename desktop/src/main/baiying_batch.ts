@@ -6,6 +6,7 @@ import { onProductCaptured } from './probe'
 import { runEngineCommand, runScript } from './engine'
 import { commandManagedBrowser, validateManagedProfilePath } from './external_browser'
 import { getClientPaths, getDownloadDir } from './app-dirs'
+import { withCartDownloadSlot } from './cart_download_slots'
 
 /**
  * 百应「半自动批量浏览」驱动（T-15）
@@ -505,7 +506,8 @@ export function fireCartVideoDownload(accountId: number, productId: string, comm
   if (CART_DOWNLOAD_ACTIVE.has(key)) return
   CART_DOWNLOAD_ACTIVE.add(key)
   const previous = CART_DOWNLOAD_TAILS.get(accountId) ?? Promise.resolve()
-  const current = previous.then(() => runCartVideoDownload(accountId, productId, commodityId, minimumUniqueCount))
+  const current = previous.then(() => withCartDownloadSlot(
+    () => runCartVideoDownload(accountId, productId, commodityId, minimumUniqueCount)))
     .catch((error) => console.error(`[加车后视频] 账号 ${accountId} 商品 ${productId}：${error instanceof Error ? error.message : String(error)}`))
     .finally(() => {
       CART_DOWNLOAD_ACTIVE.delete(key)

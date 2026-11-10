@@ -19,6 +19,9 @@ let schedulerRunning = false
 let statusTimer: ReturnType<typeof setInterval> | null = null
 let statusRunning = false
 const statusRetryAt = new Map<number, number>()
+let uploadScanAfterId = 0
+let statusNewScanAfterId = 0
+let statusRecheckScanAfterId = 0
 
 function positiveId(value: unknown, label: string): number {
   const id = Number(value)
@@ -119,7 +122,9 @@ async function readJob(id: number): Promise<Json> {
 /** 人工核清该账户全部待核查任务后，恢复本进程的自动上传。 */
 async function unblockAfterManualReview(qianchuanAccountId: number): Promise<void> {
   try {
-    const result = await queueCommand('jobs', ['--status', 'needs_review', '--limit', '500'])
+    const result = await queueCommand('jobs', [
+      '--status', 'needs_review', '--qianchuan-account-id', String(qianchuanAccountId), '--limit', '1'
+    ])
     const rows = Array.isArray(result['rows']) ? result['rows'] as Json[] : []
     if (!rows.some((row) => Number(row['qianchuanAccountId'] ?? row['qianchuan_account_id']) === qianchuanAccountId)) {
       schedulerBlockedQianchuanAccounts.delete(qianchuanAccountId)
@@ -570,11 +575,32 @@ async function schedulerTick(): Promise<void> {
   schedulerRunning = true
   try {
     await queueCommand('recover-interrupted', ['--older-than-minutes', '30'])
-    const result = await queueCommand('jobs', ['--status', 'queued', '--limit', '500'])
-    const rows = Array.isArray(result['rows']) ? result['rows'] as Json[] : []
+    const review = await queueCommand('review-accounts')
+    const reviewBlocked = new Set((Array.isArray(review['qianchuanAccountIds'])
+      ? review['qianchuanAccountIds'] as unknown[] : []).map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))
+    const duePage = async (afterId: number): Promise<Json[]> => {
+      const result = await queueCommand('jobs', [
+        '--status', 'queued', '--due-only', '--after-id', String(afterId), '--limit', '500'
+      ])
+      return Array.isArray(result['rows']) ? result['rows'] as Json[] : []
+    }
+    let rows = await duePage(uploadScanAfterId)
+    if (!rows.length && uploadScanAfterId) {
+      uploadScanAfterId = 0
+      rows = await duePage(0)
+    }
+    if (rows.length) uploadScanAfterId = rows.length < 500 ? 0 : jobIdFrom(rows[rows.length - 1]['id'])
     const today = new Date().toLocaleDateString('sv-SE')
-    const ordered = rows.reverse()
+    const ordered = rows
     const processed = new Set<number>()
+    let targetRows: Json[] | null = null
+    const browserAvailability = new Map<string, boolean>()
+    const hasBrowser = async (key: string): Promise<boolean> => {
+      if (!browserAvailability.has(key)) {
+        browserAvailability.set(key, Boolean(await existingManagedBrowserConnection(key)))
+      }
+      return browserAvailability.get(key) === true
+    }
     for (const job of ordered) {
       const jobId = jobIdFrom(job['id'])
       if (processed.has(jobId)) continue
@@ -582,23 +608,25 @@ async function schedulerTick(): Promise<void> {
       const retryAt = stringValue(job['nextRetryAt'])
       if (retryAt && retryAt > new Date().toLocaleString('sv-SE').replace(' ', 'T')) continue
       const qcId = numericField(job, 'qianchuanAccountId', 'qianchuan_account_id')
-      if (schedulerBlockedQianchuanAccounts.has(qcId)) continue
-      let connection = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
-      if (!connection) {
+      if (schedulerBlockedQianchuanAccounts.has(qcId) || reviewBlocked.has(qcId)) continue
+      let available = await hasBrowser(`qianchuan-${qcId}`)
+      if (!available) {
         const accountId = numericField(job, 'accountId', 'account_id')
-        const targets = await queueCommand('targets')
-        const targetRows = Array.isArray(targets['rows']) ? targets['rows'] as Json[] : []
+        if (!targetRows) {
+          const targets = await queueCommand('targets')
+          targetRows = Array.isArray(targets['rows']) ? targets['rows'] as Json[] : []
+        }
         const binding = targetRows.find((row) => Number(row['account_id']) === accountId &&
           Number(row['qianchuan_account_id']) === qcId)
         if (/^\d{8,20}$/.test(stringValue(binding?.['qc_id']))) {
-          connection = await existingManagedBrowserConnection(`account-${accountId}`)
+          available = await hasBrowser(`account-${accountId}`)
         }
       }
-      if (!connection) continue
+      if (!available) continue
       const group = ordered.filter((candidate) =>
         !processed.has(jobIdFrom(candidate['id'])) &&
         candidate['status'] === 'queued' &&
-        stringValue(candidate['scheduledDate']) === today &&
+        stringValue(candidate['scheduledDate']) <= today &&
         Number(candidate['accountId']) === Number(job['accountId']) &&
         Number(candidate['qianchuanAccountId']) === qcId &&
         stringValue(candidate['productId']) === stringValue(job['productId']) &&
@@ -637,34 +665,60 @@ async function schedulerTick(): Promise<void> {
 }
 
 async function materialStatusTick(): Promise<void> {
-  if (statusRunning || activeCount > 0 || schedulerRunning) return
+  if (statusRunning) return
   statusRunning = true
   try {
-    const result = await queueCommand('jobs', ['--status', 'succeeded', '--limit', '1000'])
-    const jobs = Array.isArray(result['rows']) ? result['rows'] as Json[] : []
     const now = Date.now()
-    // 新上传且未判定的素材优先查询，避免旧任务占满轮询窗口。
-    const candidate = jobs.find((job) => {
-      const id = Number(job['id'])
-      if (!Number.isSafeInteger(id) || (statusRetryAt.get(id) ?? 0) > now) return false
-      const checkedAt = stringValue(job['evaluationCheckedAt'])
-      const evaluation = stringValue(job['materialEvaluation'])
-      const review = stringValue(job['reviewStatus'])
-      if (!checkedAt) return true
-      const elapsed = now - new Date(checkedAt).getTime()
-      if (!Number.isFinite(elapsed)) return true
-      // 平台判定可能在初次审核后改变；已给出完整结果的素材每天复核一次。
-      if (evaluation && evaluation !== '-' && review && review !== '-') return elapsed >= 24 * 60 * 60_000
-      return elapsed >= 30 * 60_000
-    })
-    if (!candidate) return
-    const id = Number(candidate['id'])
-    statusRetryAt.set(id, now + 15 * 60_000)
-    try {
-      await refreshMaterialStatusCore(id)
-    } catch (error) {
-      console.info(`[千川素材判定] 任务 #${id} 稍后再查：${error instanceof Error ? error.message : String(error)}`)
+    for (const [id, retryAt] of statusRetryAt) if (retryAt <= now) statusRetryAt.delete(id)
+    const duePage = async (kind: 'new' | 'recheck', afterId: number): Promise<Json[]> => {
+      const result = await queueCommand('jobs', [
+        '--status', 'succeeded', '--evaluation-due', '--evaluation-kind', kind,
+        '--after-id', String(afterId), '--limit', '200'
+      ])
+      return Array.isArray(result['rows']) ? result['rows'] as Json[] : []
     }
+    const cursors = { new: statusNewScanAfterId, recheck: statusRecheckScanAfterId }
+    const loadPage = async (kind: 'new' | 'recheck'): Promise<Json[]> => {
+      let jobs = await duePage(kind, cursors[kind])
+      if (!jobs.length && cursors[kind]) {
+        cursors[kind] = 0
+        jobs = await duePage(kind, 0)
+      }
+      return jobs
+    }
+    const newJobs = await loadPage('new')
+    const recheckJobs = await loadPage('recheck')
+    const eligible = (jobs: Json[]): Json[] => jobs.filter((job) => {
+      const id = Number(job['id'])
+      const qcId = Number(job['qianchuanAccountId'] ?? job['qianchuan_account_id'])
+      return Number.isSafeInteger(id) && (statusRetryAt.get(id) ?? 0) <= now &&
+        !activeQianchuanAccounts.has(qcId) && !preflightQianchuanAccounts.has(qcId)
+    })
+    const newCandidates = eligible(newJobs)
+    const recheckCandidates = eligible(recheckJobs)
+    const selectedNew = newCandidates.slice(0, Math.min(10, Math.max(5, 10 - recheckCandidates.length)))
+    const selectedRecheck = recheckCandidates.slice(0, 10 - selectedNew.length)
+    const check = async (kind: 'new' | 'recheck', jobs: Json[], candidates: Json[]): Promise<void> => {
+      if (!candidates.length) {
+        cursors[kind] = jobs.length < 200 ? 0 : jobIdFrom(jobs[jobs.length - 1]['id'])
+        return
+      }
+      for (const candidate of candidates) {
+        const id = Number(candidate['id'])
+        cursors[kind] = id
+        statusRetryAt.set(id, now + 15 * 60_000)
+        try {
+          await refreshMaterialStatusCore(id)
+          statusRetryAt.delete(id)
+        } catch (error) {
+          console.info(`[千川素材判定] 任务 #${id} 稍后再查：${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
+    }
+    await check('new', newJobs, selectedNew)
+    await check('recheck', recheckJobs, selectedRecheck)
+    statusNewScanAfterId = cursors.new
+    statusRecheckScanAfterId = cursors.recheck
   } catch (error) {
     console.warn(`[千川素材判定] 自动读取失败：${error instanceof Error ? error.message : String(error)}`)
   } finally {

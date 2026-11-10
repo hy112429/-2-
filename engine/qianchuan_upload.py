@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS qianchuan_upload_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_qc_jobs_schedule
     ON qianchuan_upload_jobs(status, scheduled_date, account_id);
+CREATE INDEX IF NOT EXISTS idx_qc_jobs_status_id
+    ON qianchuan_upload_jobs(status, id);
+CREATE INDEX IF NOT EXISTS idx_qc_jobs_review_account
+    ON qianchuan_upload_jobs(status, qianchuan_account_id);
 CREATE INDEX IF NOT EXISTS idx_qc_jobs_quota
     ON qianchuan_upload_jobs(quota_group_id, scheduled_date, product_id);
 CREATE TABLE IF NOT EXISTS qianchuan_upload_events (
@@ -150,6 +154,10 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     ):
         if column not in job_columns:
             connection.execute(f"ALTER TABLE qianchuan_upload_jobs ADD COLUMN {column} {ddl}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qc_jobs_evaluation "
+        "ON qianchuan_upload_jobs(status, evaluation_checked_at, id)"
+    )
     connection.execute(
         "INSERT OR IGNORE INTO qianchuan_upload_preferences (id, auto_retry_enabled, updated_at) "
         "VALUES (1, 1, ?)", (now_text(),),
@@ -1164,7 +1172,11 @@ def resolve_review_absent(
 def list_jobs(
     connection: sqlite3.Connection, account_id: Optional[int] = None,
     status: Optional[str] = None, limit: int = 200, product_id: Optional[str] = None,
+    qianchuan_account_id: Optional[int] = None, due_only: bool = False,
+    evaluation_due: bool = False, after_id: int = 0, evaluation_kind: str = "all",
 ) -> Dict[str, Any]:
+    if after_id < 0:
+        raise ValueError("任务游标无效")
     where: List[str] = []
     params: List[Any] = []
     if account_id is not None:
@@ -1173,6 +1185,30 @@ def list_jobs(
     if status:
         where.append("status = ?")
         params.append(status)
+    if qianchuan_account_id is not None:
+        where.append("qianchuan_account_id = ?")
+        params.append(qianchuan_account_id)
+    if after_id:
+        where.append("id > ?")
+        params.append(after_id)
+    if due_only:
+        where.extend(("status = 'queued'", "scheduled_date <= ?",
+                      "(next_retry_at IS NULL OR next_retry_at <= ?)"))
+        params.extend((date.today().isoformat(), now_text()))
+    if evaluation_due:
+        now = datetime.now()
+        where.extend(("status = 'succeeded'", "remote_material_id <> ''", "("
+            "COALESCE(evaluation_checked_at, '') = '' OR "
+            "(material_evaluation <> '' AND material_evaluation <> '-' "
+            "AND review_status <> '' AND review_status <> '-' AND evaluation_checked_at <= ?) OR "
+            "((material_evaluation = '' OR material_evaluation = '-' OR review_status = '' OR review_status = '-') "
+            "AND evaluation_checked_at <= ?))"))
+        params.extend(((now - timedelta(days=1)).isoformat(timespec="seconds"),
+                       (now - timedelta(minutes=30)).isoformat(timespec="seconds")))
+        if evaluation_kind == "new":
+            where.append("COALESCE(evaluation_checked_at, '') = ''")
+        elif evaluation_kind == "recheck":
+            where.append("COALESCE(evaluation_checked_at, '') <> ''")
     if product_id is not None:
         if not product_id.isdigit() or len(product_id) > 30:
             raise ValueError("商品 ID 无效")
@@ -1181,9 +1217,16 @@ def list_jobs(
     sql = "SELECT * FROM qianchuan_upload_jobs"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql += " ORDER BY id ASC LIMIT ?" if due_only or evaluation_due or after_id else " ORDER BY id DESC LIMIT ?"
     rows = connection.execute(sql, (*params, min(max(limit, 1), 1000))).fetchall()
     return {"ok": True, "rows": [_job_payload(row) for row in rows]}
+
+
+def review_accounts(connection: sqlite3.Connection) -> Dict[str, Any]:
+    rows = connection.execute(
+        "SELECT DISTINCT qianchuan_account_id FROM qianchuan_upload_jobs WHERE status='needs_review'"
+    ).fetchall()
+    return {"ok": True, "qianchuanAccountIds": [int(row[0]) for row in rows]}
 
 
 def list_events(connection: sqlite3.Connection, job_id: int) -> Dict[str, Any]:
@@ -1251,6 +1294,12 @@ def build_parser() -> argparse.ArgumentParser:
     jobs.add_argument("--product-id")
     jobs.add_argument("--status")
     jobs.add_argument("--limit", type=int, default=200)
+    jobs.add_argument("--qianchuan-account-id", type=int)
+    jobs.add_argument("--due-only", action="store_true")
+    jobs.add_argument("--evaluation-due", action="store_true")
+    jobs.add_argument("--evaluation-kind", choices=("all", "new", "recheck"), default="all")
+    jobs.add_argument("--after-id", type=int, default=0)
+    commands.add_parser("review-accounts", help="列出仍有待人工核查任务的千川账户")
     events = commands.add_parser("events", help="查看单条任务的 Step 14 过程日志")
     events.add_argument("--id", type=int, required=True)
     event = commands.add_parser("event", help="记录浏览器步骤和截图证据")
@@ -1313,7 +1362,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             elif args.command == "resolve-review-absent":
                 result = resolve_review_absent(connection, args.id, args.note)
             elif args.command == "jobs":
-                result = list_jobs(connection, args.account_id, args.status, args.limit, args.product_id)
+                result = list_jobs(connection, args.account_id, args.status, args.limit, args.product_id,
+                                   args.qianchuan_account_id, args.due_only, args.evaluation_due,
+                                   args.after_id, args.evaluation_kind)
+            elif args.command == "review-accounts":
+                result = review_accounts(connection)
             elif args.command == "events":
                 result = list_events(connection, args.id)
             elif args.command == "event":
