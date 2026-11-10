@@ -14,6 +14,7 @@ import {
 } from './selection_registry'
 import { randomUUID } from 'crypto'
 import { fireCartVideoDownload } from './baiying_batch'
+import { runScript } from './engine'
 
 /**
  * 抖音 / 百应 登录态管理与后台探针视图
@@ -594,6 +595,39 @@ async function clearLoginState(): Promise<void> {
 
 // ---------------------------------------------------------------- IPC 注册
 
+async function cacheVerifiedCartCommissions(
+  accountId: number,
+  completed: Array<Record<string, unknown>>
+): Promise<string[]> {
+  const warnings: string[] = []
+  for (const item of completed) {
+    const productId = String(item.productId ?? '').trim()
+    const sources = item.metricSources as Record<string, unknown> | undefined
+    const metrics = item.dataMetrics as Record<string, unknown> | undefined
+    const rate = metrics?.commissionRate
+    if (item.cartAdded !== true || !/^\d{8,20}$/.test(productId) ||
+        sources?.commissionRate !== '商品详情' || typeof rate !== 'number' ||
+        !Number.isFinite(rate) || rate <= 0 || rate > 100) continue
+    try {
+      const outcome = await runScript('baiying_cache.py', {
+        internal: true,
+        args: [
+          '--db', getClientPaths().databasePath, 'upsert',
+          '--product-id', productId, '--account-id', String(accountId),
+          '--cos-ratio', String(rate)
+        ],
+        onEvent: () => undefined
+      }).promise
+      if (!outcome.ok) throw new Error(outcome.error ?? '佣金率缓存失败')
+    } catch (error) {
+      const warning = `${productId}的佣金率未能保存：${error instanceof Error ? error.message : String(error)}`
+      warnings.push(warning)
+      console.warn(`[自动选品] ${warning}`)
+    }
+  }
+  return warnings
+}
+
 export function registerLoginIpc(): void {
   registerSelectionRegistryIpc()
   // 登录目标清单（渲染进程用它渲染下拉框，避免两边各写一份导致漂移）
@@ -743,7 +777,9 @@ export function registerLoginIpc(): void {
         throw new Error('详情恢复只允许读取一个已确认加车的原商品；本次未执行加车。')
       }
       // 商品已在前序阶段确认加车；这里只恢复详情素材，不重新占用登记或发起第二次加车。
-      return runManagedSelection(params)
+      const result = await runManagedSelection(params)
+      const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
+      return { ...result, commissionCacheWarnings: await cacheVerifiedCartCommissions(params.accountId, completed) }
     }
     const maxSelected = Number(params.maxSelectedProducts)
     const fallbackRows = params.allowCandidateFallback === true
@@ -904,6 +940,7 @@ export function registerLoginIpc(): void {
       for (const item of confirmedDownloads) {
         fireCartVideoDownload(params.accountId, item.productId, item.commodityId)
       }
+      const commissionCacheWarnings = await cacheVerifiedCartCommissions(params.accountId, completed)
       const rejected = reservationResult.rejected.map((item) => ({ ...item }))
       return {
         ...result,
@@ -913,6 +950,7 @@ export function registerLoginIpc(): void {
           !selectedProductIds.has(String(candidate.productId ?? '').trim())
         ).length,
         registrySettlementWarnings: settlementWarnings,
+        commissionCacheWarnings,
         registryReleaseEvents
       }
     } catch (error) {

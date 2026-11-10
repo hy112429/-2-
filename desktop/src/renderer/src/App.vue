@@ -133,10 +133,9 @@ onMounted(async () => {
     const paths = await window.api.appPaths.get()
     databasePath = paths.databasePath
     downloadDir.value = await window.api.dir.getDownloadDir()
-    // 仅新安装时创建空库；已存在的开发库不在启动时迁移或改写。
-    if (!paths.databaseExists) {
-      await runEngineOnce('db.py', ['--db', databasePath, 'init'])
-    }
+    // 每次启动执行幂等初始化，修复旧版本或后台模块先创建的半初始化数据库。
+    // db.py init 只创建缺失表并运行增量迁移，不删除用户数据。
+    await runEngineOnce('db.py', ['--db', databasePath, 'init'])
     startupReady.value = true
     void refreshAssetCount()
   } catch (error) {

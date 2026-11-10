@@ -8168,14 +8168,16 @@ def _visible_source_candidate_result(
             rejected.append(candidate)
             category_filtered_ids.add(str(candidate.get("productId") or ""))
         candidates = [candidate for candidate in candidates if _candidate_matches_manual_categories(candidate, selected_category_ids)]
-    excluded_category_ids = _excluded_category_selection_ids(settings) if not category_logic_enabled else set()
+    # 排除类目是当前账号最终生效设置的一部分；通用模式和品类模式都先应用它，
+    # 这样账号个性化选品可以在手动/自动品类范围上继续排除不需要的类目。
+    excluded_category_ids = _excluded_category_selection_ids(settings)
     excluded_by_category = [
         candidate for candidate in candidates
         if excluded_category_ids and _candidate_matches_manual_categories(candidate, excluded_category_ids)
     ]
     for candidate in excluded_by_category:
         candidate["analysisRejected"] = True
-        candidate["thresholdReasons"] = ["命中通用设置中排除的类目"]
+        candidate["thresholdReasons"] = ["命中当前设置中排除的类目"]
         candidate["status"] = candidate["thresholdReasons"][0]
         candidate["cartAdded"] = False
         candidate["skipped"] = True

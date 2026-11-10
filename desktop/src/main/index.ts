@@ -1,9 +1,9 @@
-import { app, shell, BrowserWindow, ipcMain, protocol } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, protocol, screen } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { registerLoginIpc, disposeLogin } from './login'
-import { registerEngineIpc, disposeEngine } from './engine'
-import { getIsolatedTestRoot, registerAppDirsIpc } from './app-dirs'
+import { registerEngineIpc, disposeEngine, runEngineCommand } from './engine'
+import { getClientPaths, getIsolatedTestRoot, registerAppDirsIpc } from './app-dirs'
 import { registerAssetsIpc } from './assets'
 import { registerBaiyingBatchIpc, disposeBaiyingBatch, startCartVideoDownloadScheduler } from './baiying_batch'
 import { registerToutiaoBatchIpc, disposeToutiaoBatch } from './toutiao_batch'
@@ -61,12 +61,19 @@ if (!hasSingleInstanceLock) {
 
 /** 创建主窗口 */
 function createWindow(): void {
+  // 在 1366×768 等常见屏幕上，固定 1280×800 会让非最大化窗口超出工作区，
+  // 用户看到的就是底部按钮和状态栏被截断。按当前工作区夹出安全尺寸，
+  // 仍保留足够宽度给主导航和内容区。
+  const workArea = screen.getPrimaryDisplay().workAreaSize
+  const width = Math.min(WINDOW_WIDTH, Math.max(960, workArea.width - 40))
+  const height = Math.min(WINDOW_HEIGHT, Math.max(600, workArea.height - 40))
   const mainWindow = new BrowserWindow({
-    width: WINDOW_WIDTH,
-    height: WINDOW_HEIGHT,
+    width,
+    height,
     // 最小尺寸：比默认尺寸小一圈，保证布局不被压塌
-    minWidth: 1024,
-    minHeight: 640,
+    minWidth: Math.min(1024, width),
+    minHeight: Math.min(640, height),
+    center: true,
     title: WINDOW_TITLE,
     // show: false + ready-to-show 再显示：避免先闪一个白屏再出现内容
     show: false,
@@ -105,7 +112,15 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+async function ensureDatabaseSchema(): Promise<void> {
+  const paths = getClientPaths()
+  const outcome = await runEngineCommand('db.py', ['--db', paths.databasePath, 'init'])
+  if (!outcome.ok) {
+    throw new Error(outcome.error ?? '本地数据库初始化失败')
+  }
+}
+
+app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
   // 让 Windows 任务栏正确识别本应用（通知、任务栏分组都依赖它）
   electronApp.setAppUserModelId('com.touguang.client')
@@ -138,6 +153,16 @@ app.whenReady().then(() => {
   // 注册素材库辅助 IPC（缩略图读取 / 打开所在文件夹）
   registerAssetsIpc()
 
+  // 数据库文件可能由旧版本或某个后台模块先创建，但只包含部分业务表。
+  // 启动后台调度器前总是执行幂等初始化，补齐核心表并运行增量迁移。
+  let databaseReady = false
+  try {
+    await ensureDatabaseSchema()
+    databaseReady = true
+  } catch (error) {
+    console.error('[数据库] 启动初始化失败：', error)
+  }
+
   // 注册百应批量抓取 IPC（T-15：按商品ID列表驱动登录视图逐页抓取）
   registerBaiyingBatchIpc()
 
@@ -153,12 +178,12 @@ app.whenReady().then(() => {
   registerFrameProtocol()
 
   // 全自动发布仅处理用户已启用且到达本地计划时间的新任务。
-  if (!isolatedTestRoot) startAutoPublisher()
-  if (!isolatedTestRoot) startQianchuanUploadScheduler()
-  if (!isolatedTestRoot) startQianchuanPlanScheduler()
-  if (!isolatedTestRoot) startCartVideoDownloadScheduler()
-  if (!isolatedTestRoot) startPostPublishReconcileScheduler()
-  if (!isolatedTestRoot) startSelectionScheduleScheduler()
+  if (!isolatedTestRoot && databaseReady) startAutoPublisher()
+  if (!isolatedTestRoot && databaseReady) startQianchuanUploadScheduler()
+  if (!isolatedTestRoot && databaseReady) startQianchuanPlanScheduler()
+  if (!isolatedTestRoot && databaseReady) startCartVideoDownloadScheduler()
+  if (!isolatedTestRoot && databaseReady) startPostPublishReconcileScheduler()
+  if (!isolatedTestRoot && databaseReady) startSelectionScheduleScheduler()
 
   // 开发时保留 F12 开发者工具、Ctrl+R 刷新等快捷键；生产环境自动禁用
   app.on('browser-window-created', (_, window) => {

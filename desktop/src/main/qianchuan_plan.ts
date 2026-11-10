@@ -27,7 +27,7 @@ async function command(action: string, args: string[] = []): Promise<Json> {
 
 async function runOne(jobId: number): Promise<Json> {
   if (running) return { ok: false, error: '已有千川计划正在处理' }
-  const all = await command('jobs')
+  const all = await command('jobs', ['--id', String(jobId)])
   const job = (Array.isArray(all['rows']) ? all['rows'] as Json[] : []).find((row) => Number(row['id']) === jobId)
   if (!job || job['status'] !== 'ready') return { ok: false, error: '任务已经处理或待核查，不能重复发布' }
   const qcId = validId(job['qianchuan_account_id'])
@@ -79,7 +79,7 @@ async function runOne(jobId: number): Promise<Json> {
 
 async function runSupplement(id: number): Promise<Json> {
   if (running) return { ok: false, error: '已有千川计划正在处理' }
-  const all = await command('supplement-jobs')
+  const all = await command('supplement-jobs', ['--id', String(id)])
   const job = (Array.isArray(all['rows']) ? all['rows'] as Json[] : [])
     .find((row) => Number(row['id']) === id)
   if (!job || job['status'] !== 'scheduled') return { ok: false, error: '追加任务状态已改变' }
@@ -145,24 +145,28 @@ async function tick(): Promise<void> {
   try {
     await command('sync')
     await command('sync-supplements')
-    const jobs = await command('jobs')
-    const ready = (Array.isArray(jobs['rows']) ? jobs['rows'] as Json[] : [])
-      .filter((job) => job['status'] === 'ready').reverse()
-    for (const job of ready) {
-      const qcId = validId(job['qianchuan_account_id'])
-      if (await existingManagedBrowserConnection(`qianchuan-${qcId}`) ||
-          await existingManagedBrowserConnection(`account-${validId(job['account_id'])}`)) {
-        await runOne(validId(job['id']))
-        return // 一个调度轮次只处理一个账户，避免打开多个平台页面。
+    for (let offset = 0; ; offset += 200) {
+      const jobs = await command('jobs', ['--status', 'ready', '--offset', String(offset)])
+      const ready = Array.isArray(jobs['rows']) ? jobs['rows'] as Json[] : []
+      for (const job of ready) {
+        const qcId = validId(job['qianchuan_account_id'])
+        if (await existingManagedBrowserConnection(`qianchuan-${qcId}`) ||
+            await existingManagedBrowserConnection(`account-${validId(job['account_id'])}`)) {
+          const result = await runOne(validId(job['id']))
+          if (result['ok'] !== false) return // 一个轮次只提交一条计划。
+          console.warn(`[千川计划] 任务 #${value(job['id'])} 暂未执行：${value(result['error'])}`)
+        }
       }
+      if (ready.length < 200) break
     }
-    const supplements = await command('supplement-jobs')
-    const due = (Array.isArray(supplements['rows']) ? supplements['rows'] as Json[] : [])
-      .filter((job) => job['status'] === 'scheduled' &&
-        new Date(value(job['scheduled_at'])).getTime() <= Date.now()).reverse()
-    for (const job of due) {
-      const result = await runSupplement(validId(job['id']))
-      if (result['ok'] !== false) return // 一个轮次只处理一个原计划。
+    for (let offset = 0; ; offset += 200) {
+      const supplements = await command('supplement-jobs', ['--status', 'scheduled', '--due-only', '--offset', String(offset)])
+      const due = Array.isArray(supplements['rows']) ? supplements['rows'] as Json[] : []
+      for (const job of due) {
+        const result = await runSupplement(validId(job['id']))
+        if (result['ok'] !== false) return // 一个轮次只处理一个原计划。
+      }
+      if (due.length < 200) break
     }
   } catch (error) {
     console.warn(`[千川计划] 后台检查失败：${String(error)}`)

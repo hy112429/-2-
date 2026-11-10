@@ -287,6 +287,14 @@ def _file_input(page: Any) -> Any | None:
     return candidates[0] if candidates else None
 
 
+def _supports_multiple_files(control: Any) -> bool:
+    """优先使用 Playwright 的布尔属性回读，兼容隔离测试中的轻量控件。"""
+    try:
+        return bool(control.is_multiple())
+    except (AttributeError, TypeError):
+        return control.get_attribute("multiple") is not None
+
+
 def _choose_file(page: Any, options: UploadOptions, mark_selection_started: Callable[[], None]) -> None:
     file_timeout_ms = options.upload_timeout_s * 1_000
     file_input = _file_input(page)
@@ -633,7 +641,7 @@ def _choose_files(page: Any, options: UploadOptions, paths: list[Path],
             mark_selection_started()
             chooser.value.set_files([str(path) for path in paths], timeout=timeout)
             return
-    if file_input is None or file_input.get_attribute("multiple") is None:
+    if file_input is None or not _supports_multiple_files(file_input):
         raise UploadStopped("千川当前视频文件控件不支持多选", stage="file_input")
     mark_selection_started()
     file_input.set_input_files([str(path) for path in paths], timeout=timeout)
@@ -666,6 +674,7 @@ def upload_material_batch(options_list: list[UploadOptions]) -> dict[str, Any]:
     submitted = False
     manual_action_required = False
     confirmed: dict[str, str] = {}
+    preexisting: set[str] = set()
     names = [option.asset_name for option in options_list]
     try:
         if not 2 <= len(options_list) <= 10:
@@ -700,6 +709,7 @@ def upload_material_batch(options_list: list[UploadOptions]) -> dict[str, Any]:
                 remote_id = _search_material_id(page, option.asset_name)
                 if remote_id:
                     confirmed[option.asset_name] = remote_id
+                    preexisting.add(option.asset_name)
             pending = [option for option in options_list if option.asset_name not in confirmed]
             if pending:
                 stage = "file_input"
@@ -744,7 +754,7 @@ def upload_material_batch(options_list: list[UploadOptions]) -> dict[str, Any]:
         item = _save_evidence(page, option, _result(
             status, reason if remote_id else
             f"{reason}；该文件未回读到唯一素材 ID，请核查远端后处理", stage,
-            submitted and option.asset_name not in confirmed, remote_id))
+            submitted and option.asset_name not in preexisting, remote_id))
         item["manualActionRequired"] = manual_action_required
         items.append({"assetName": option.asset_name, **item})
     return {"ok": True, "status": "succeeded" if all(i["status"] == "succeeded" for i in items)

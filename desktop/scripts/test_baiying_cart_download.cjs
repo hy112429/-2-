@@ -28,6 +28,7 @@ let finishDownload
 const downloadStarted = new Promise((resolve) => { finishDownload = resolve })
 const stubs = {
   electron: { clipboard: { readText: async () => '' }, ipcMain: { handle() {} } },
+  './cart_download_slots': { withCartDownloadSlot: (work) => work() },
   './probe': { onProductCaptured() {} },
   './external_browser': {
     validateManagedProfilePath: () => 'D:\\profiles\\account-6',

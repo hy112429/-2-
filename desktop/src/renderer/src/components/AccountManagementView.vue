@@ -1564,7 +1564,7 @@ function toggleSelectBind(id: number): void {
 
 @media (max-width: 2400px) {
   .account-table-wrap, .qc-table-wrap { display: none; }
-  .compact-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 8px; flex: none; }
+  .compact-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 8px; flex: none; }
 }
 @media (max-width: 1200px) {
   .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -1683,7 +1683,8 @@ function toggleSelectBind(id: number): void {
   background: #fff;
   border-radius: var(--radius);
   padding: 16px;
-  min-width: 420px;
+  width: min(560px, calc(100vw - 32px));
+  min-width: 0;
   max-width: 560px;
   box-shadow: 0 8px 30px rgba(0, 0, 0, 0.15);
 }
