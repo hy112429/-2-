@@ -12,7 +12,7 @@ import sqlite3
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
 from db import DEFAULT_DB_PATH, connect, emit, now_text
@@ -166,6 +166,14 @@ def ensure_schema(connection: sqlite3.Connection, *, initialize_auto_publish_def
                 # 两个客户端命令可能并发完成相同的增量迁移；只吞掉已被另一进程添加的列。
                 if "duplicate column name" not in str(error).lower():
                     raise
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_publish_queue_account_product_lock "
+        "ON publish_queue(account_id, product_id, status, platform_status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_publish_queue_product_lock "
+        "ON publish_queue(product_id, status, platform_status, account_id)"
+    )
 
 
 def selected_product_options(connection: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -214,16 +222,38 @@ def selected_product_options(connection: sqlite3.Connection) -> List[Dict[str, A
     )
 
 
-def product_publish_locks(connection: sqlite3.Connection, account_id: int) -> Dict[str, Any]:
+def product_publish_locks(
+    connection: sqlite3.Connection,
+    account_id: int,
+    product_ids: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
     """返回该账号已有的未取消商品发布任务，供选品阶段提前跳过。"""
     require_active_account(connection, account_id)
-    rows = connection.execute(
-        "SELECT product_id, product_name, id, status, platform_status, updated_at "
-        "FROM publish_queue WHERE account_id = ? "
-        "AND (status <> 'cancelled' OR platform_status NOT IN ('not_uploaded', 'isolated')) "
-        "ORDER BY updated_at DESC, id DESC",
-        (account_id,),
-    ).fetchall()
+    if product_ids is None:
+        rows = connection.execute(
+            "SELECT product_id, product_name, id, status, platform_status, updated_at "
+            "FROM publish_queue WHERE account_id = ? "
+            "AND (status <> 'cancelled' OR platform_status NOT IN ('not_uploaded', 'isolated')) "
+            "ORDER BY updated_at DESC, id DESC",
+            (account_id,),
+        ).fetchall()
+    else:
+        candidate_ids = sorted({str(value).strip() for value in product_ids if str(value).strip()})
+        if not candidate_ids:
+            return {"ok": True, "accountId": account_id, "locks": []}
+        matched_rows = []
+        for offset in range(0, len(candidate_ids), 500):
+            chunk = candidate_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            matched_rows.extend(connection.execute(
+                "SELECT product_id, product_name, id, status, platform_status, updated_at "
+                "FROM publish_queue WHERE account_id = ? "
+                f"AND product_id IN ({placeholders}) "
+                "AND (status <> 'cancelled' OR platform_status NOT IN ('not_uploaded', 'isolated')) "
+                "ORDER BY updated_at DESC, id DESC",
+                [account_id, *chunk],
+            ).fetchall())
+        rows = sorted(matched_rows, key=lambda row: (str(row["updated_at"] or ""), int(row["id"])), reverse=True)
     locks: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         product_id = str(row["product_id"] or "").strip()
@@ -846,16 +876,17 @@ def start_immediate_auto_publish_task(connection: sqlite3.Connection, task_id: i
         blockers = connection.execute(
             "SELECT id, product_name, platform_status FROM publish_queue "
             "WHERE auto_publish = 1 AND id <> ? "
+            "AND account_id = ? AND product_id = ? "
             "AND platform_status IN ('uploading', 'uploaded_waiting_publish', 'needs_review', 'submitting', 'submission_uncertain') "
             "ORDER BY schedule_at, id LIMIT 5",
-            (task_id,),
+            (task_id, int(row["account_id"]), str(row["product_id"])),
         ).fetchall()
         if blockers:
             summary = "、".join(
                 f"#{int(item['id'])} {str(item['product_name'] or '任务')}（{str(item['platform_status'])}）"
                 for item in blockers
             )
-            raise ValueError(f"有全自动发布任务尚待核查：{summary}。请先处理后再马上发布")
+            raise ValueError(f"同账号同商品已有发布任务尚待核查：{summary}。请先核对该商品后再马上发布")
 
         settings = connection.execute(
             "SELECT auto_publish_activated_at, auto_publish_queue_start_id "
@@ -1544,6 +1575,7 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("--limit", type=int, default=300, help="最多返回的队列行数（上限 1000）")
     product_locks = commands.add_parser("product-locks", help="读取该账号已排队或已发布商品的防重锁定状态")
     product_locks.add_argument("--account-id", type=int, required=True)
+    product_locks.add_argument("--product-ids-json", help="仅读取指定商品 ID 的锁定状态")
     add = commands.add_parser("add", help="登记一个本地视频发布计划")
     add.add_argument("--account-id", type=int, required=True)
     add.add_argument("--product-id", required=True)
@@ -1635,7 +1667,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.command == "list":
                 result = queue_list(connection, args.limit)
             elif args.command == "product-locks":
-                result = product_publish_locks(connection, args.account_id)
+                product_ids = None
+                if args.product_ids_json is not None:
+                    try:
+                        product_ids = json.loads(args.product_ids_json)
+                    except json.JSONDecodeError as error:
+                        raise ValueError("商品 ID 列表不是有效 JSON") from error
+                    if not isinstance(product_ids, list) or any(not isinstance(item, (str, int)) for item in product_ids):
+                        raise ValueError("商品 ID 列表必须是字符串或数字数组")
+                result = product_publish_locks(connection, args.account_id, product_ids)
             elif args.command == "add":
                 result = add_task(
                     connection, args.account_id, args.product_id, args.video_path,

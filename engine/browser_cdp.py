@@ -12976,6 +12976,129 @@ def _candidate_card_is_available(page: Page, candidate: Dict[str, Any]) -> bool:
             page.wait_for_timeout(200)
 
 
+def _scroll_priority_source_once(page: Page, source_key: str, reset: bool = False) -> Dict[str, Any]:
+    """向来源页的真实滚动容器移动一次；虚拟列表不会同时渲染整个候选池。"""
+    row_selector = (
+        BAIYING_PRIORITY_ALLIANCE_ROW_SELECTOR
+        if source_key == "allianceRank" else BAIYING_PRIORITY_ROOT_SELECTOR
+    )
+    container_selector = (
+        BAIYING_PRIORITY_SOURCE_LIST_SELECTORS.get(source_key)
+        if source_key == "hotSpot" else
+        '[class*="infinite-scroller"], [class*="virtual-list"], [class*="virtualList"], '
+        '[class*="scroll-container"], [class*="table-body"], [role="grid"], tbody'
+    )
+    try:
+        value = page.evaluate(
+            r"""({ containerSelector, rowSelector, reset }) => {
+              const visible = (element) => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 &&
+                  style.display !== 'none' && style.visibility !== 'hidden';
+              };
+              const canScroll = (element) => element && visible(element) &&
+                element.scrollHeight > element.clientHeight + 20;
+              let container = Array.from(document.querySelectorAll(containerSelector))
+                .find(canScroll);
+              if (!container) {
+                const rows = Array.from(document.querySelectorAll(rowSelector)).filter(visible);
+                for (const row of rows) {
+                  for (let node = row.parentElement, level = 0; node && level < 8; node = node.parentElement, level += 1) {
+                    if (canScroll(node)) { container = node; break; }
+                  }
+                  if (container) break;
+                }
+              }
+              if (!container) return { moved: false, atEnd: true, found: false };
+              const before = Number(container.scrollTop || 0);
+              const maxTop = Math.max(0, Number(container.scrollHeight || 0) - Number(container.clientHeight || 0));
+              if (reset) container.scrollTop = 0;
+              else {
+                const step = Math.max(240, Math.floor(Number(container.clientHeight || 480) * 0.85));
+                container.scrollTop = Math.min(maxTop, before + step);
+              }
+              try { container.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+              const after = Number(container.scrollTop || 0);
+              return { moved: after !== before, atEnd: after >= maxTop - 2, found: true, top: after, maxTop };
+            }""",
+            {"containerSelector": container_selector, "rowSelector": row_selector, "reset": reset},
+        )
+        return value if isinstance(value, dict) else {"moved": False, "atEnd": True, "found": False}
+    except Exception:
+        return {"moved": False, "atEnd": True, "found": False}
+
+
+def _visible_source_candidate_skip(
+    candidate: Dict[str, Any], label: str, reason: str
+) -> Dict[str, Any]:
+    product_id = str(candidate.get("productId") or "")
+    title = str(candidate.get("title") or product_id)
+    return {
+        "productId": product_id,
+        "commodityId": candidate.get("commodityId"),
+        "title": title,
+        "cartAdded": False,
+        "cartAttempted": False,
+        "skipped": True,
+        "cartStatus": "来源页未渲染，未点击加车",
+        "status": f"百应{label}当前滚动区未渲染商品 ID {product_id}；{reason}，未点击加车，已跳过并继续后续候选",
+    }
+
+
+def _ensure_priority_source_candidate_visible(
+    page: Page,
+    source_key: str,
+    candidate: Dict[str, Any],
+    timeout_ms: int = 12_000,
+) -> bool:
+    """把一个候选滚动到当前 DOM，再交给精确商品 ID 定位器。"""
+    product_id = str(candidate.get("productId") or "").strip()
+    if not product_id:
+        return False
+    row_selector = (
+        BAIYING_PRIORITY_ALLIANCE_ROW_SELECTOR
+        if source_key == "allianceRank" else BAIYING_PRIORITY_ROOT_SELECTOR
+    )
+
+    def visible_match() -> bool:
+        try:
+            rows = page.locator(row_selector)
+            for index in range(min(rows.count(), 250)):
+                card = rows.nth(index)
+                try:
+                    if not card.is_visible() or product_id not in _candidate_card_product_ids(card):
+                        continue
+                    _locate_candidate_card(page, candidate)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    if visible_match():
+        return True
+    deadline = time.monotonic() + max(1_000, timeout_ms) / 1000
+    reset_done = False
+    stalled = 0
+    for _ in range(100):
+        if time.monotonic() >= deadline:
+            break
+        state = _scroll_priority_source_once(page, source_key, reset=not reset_done)
+        reset_done = True
+        page.wait_for_timeout(250)
+        if visible_match():
+            return True
+        if not state.get("moved"):
+            stalled += 1
+            if stalled >= 3:
+                break
+        else:
+            stalled = 0
+    return False
+
+
 def _exclude_unrendered_selected_candidates(
     page: Page,
     candidates: Sequence[Dict[str, Any]],
@@ -13077,31 +13200,39 @@ def _execute_visible_source_candidates(
                 query_settings["_candidatePoolLimit"] = 200
                 query_settings["candidateLimit"] = 200
                 _apply_one_category_and_collect_candidates(source_page, query_settings, force_refresh=True)
-            else:
-                _wait_for_priority_source_candidates_ready(source_page, source_key, group)
-            group_indexes = [int(row["cardIndex"]) for row in group]
+            # 来源页使用虚拟滚动列表时，不要求备用候选同时出现在 DOM。
+            # 每个候选单独滚动到可见位置，再按商品 ID 复核和处理。
             for candidate in group:
-                if not _candidate_card_is_available(source_page, candidate):
-                    raise RuntimeError(
-                        f"百应{label}当前可见列表无法唯一定位商品 ID {candidate.get('productId')}；已停止加车。"
+                remaining = max(0, target - sum(1 for row in completed if row.get("cartAdded") is True))
+                if remaining <= 0:
+                    break
+                product_id = str(candidate.get("productId") or "")
+                if not _ensure_priority_source_candidate_visible(source_page, source_key, candidate):
+                    completed.append(_visible_source_candidate_skip(
+                        candidate, label, "当前页面未能在有限滚动窗口内唯一复核"
+                    ))
+                    continue
+                try:
+                    group_result = execute_selected_candidates(
+                        source_page,
+                        context,
+                        candidates,
+                        [int(candidate["cardIndex"])],
+                        download_root,
+                        settings,
+                        progress=progress,
+                        analyze_before_cart=not candidate.get("cartAdded") is True,
+                        max_selected_products=1,
                     )
-            remaining = max(0, target - sum(1 for row in completed if row.get("cartAdded") is True))
-            if remaining <= 0:
-                break
-            group_result = execute_selected_candidates(
-                source_page,
-                context,
-                candidates,
-                group_indexes,
-                download_root,
-                settings,
-                progress=progress,
-                analyze_before_cart=not all(candidate.get("cartAdded") is True for candidate in group),
-                max_selected_products=remaining,
-            )
-            completed.extend(group_result)
-            if sum(1 for row in completed if row.get("cartAdded") is True) >= target:
-                break
+                except Exception as error:
+                    # 单个候选的来源页渲染/控件问题只跳过当前商品；
+                    # 只有已发出平台请求或账号/页面状态异常才由下层保留待核查并中止。
+                    if _selection_error_requires_pause(error):
+                        raise
+                    group_result = [_visible_source_candidate_skip(
+                        candidate, label, f"当前商品处理异常（{_safe_diagnostic_text(error, 240)}）"
+                    )]
+                completed.extend(group_result)
         finally:
             try:
                 source_page.close()

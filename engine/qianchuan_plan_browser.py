@@ -79,8 +79,9 @@ def form_job(db_path: Path, job_id: int):
             raise UploadStopped("本机计划任务未取得执行锁", stage="input")
         settings = db.execute("SELECT * FROM qianchuan_plan_settings WHERE qianchuan_account_id=?",
                               (job["qianchuan_account_id"],)).fetchone()
-        if not settings or not settings["enabled"]:
-            raise UploadStopped("千川账户未启用计划自动发布", stage="input")
+        if (not settings or int(job["daily_budget_yuan"] or 0) < 50 or
+                (not settings["enabled"] and str(job["creation_source"] or "auto") != "manual")):
+            raise UploadStopped("千川账户未启用自动计划，或未配置至少 50 元日预算", stage="input")
         rows = db.execute("""SELECT DISTINCT remote_material_id,material_name
             FROM qianchuan_upload_jobs WHERE account_id=? AND qianchuan_account_id=?
             AND product_id=? AND status='succeeded' AND remote_material_id<>''""",
@@ -88,7 +89,10 @@ def form_job(db_path: Path, job_id: int):
         requested = set(json.loads(job["material_ids_json"]))
         materials = [(str(row["remote_material_id"]), str(row["material_name"]))
                      for row in rows if str(row["remote_material_id"]) in requested]
-        return dict(job), dict(settings), materials
+        settings = dict(settings)
+        # 预算在原子 claim 时写入任务快照，表单与结果回查都使用同一数值。
+        settings["daily_budget_yuan"] = int(job["daily_budget_yuan"])
+        return dict(job), settings, materials
 
 
 def check_account(page, advertiser_id: str):
@@ -103,6 +107,18 @@ def check_account(page, advertiser_id: str):
         raise UploadStopped("页面没有显示目标千川广告主 ID；仅修改网址不能证明已切换账号", stage="account", manual=True)
     if re.search("请登录|立即登录|人机验证|滑动验证|安全验证|无访问权限", body):
         raise UploadStopped("千川页面需要登录、验证或账户权限", stage="account", manual=True)
+
+
+def check_global_delivery(page):
+    """确认当前创建页属于视频中展示的“商品全域投放”入口。"""
+    try:
+        page.get_by_text(re.compile(r"商品全域投放|全域投放")).first.wait_for(
+            state="visible", timeout=10_000)
+    except PlaywrightTimeoutError as error:
+        raise UploadStopped("当前页面不是商品全域投放创建页", stage="navigate") from error
+    body = page.locator("body").inner_text(timeout=10_000)
+    if not re.search(r"商品全域投放|全域投放", body):
+        raise UploadStopped("当前页面不是商品全域投放创建页", stage="navigate")
 
 
 def select_product(page, product_id: str):
@@ -382,6 +398,7 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
                   urlencode({"aavid": advertiser}), wait_until="domcontentloaded", timeout=30_000)
         page.get_by_text(advertiser, exact=False).first.wait_for(state="visible", timeout=15_000)
         check_account(page, advertiser)
+        check_global_delivery(page)
         if urlparse(page.url).path != CREATE_PATH:
             raise UploadStopped("没有进入商品全域投放创建页", stage=stage)
         exact(page, "添加商品").wait_for(state="visible", timeout=10_000)

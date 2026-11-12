@@ -18,6 +18,7 @@ import db
 import baiying_cache
 import publish_queue
 import qianchuan_plan as plan
+import qianchuan_upload
 from qianchuan_plan_browser import plan_id_in_list_text
 
 
@@ -181,6 +182,46 @@ class QianchuanPlanTests(unittest.TestCase):
             plan.claim(self.connection, job_id)
         with patch.object(plan, "usable_material_ids", side_effect=AssertionError("终态计划不应反复扫描素材")):
             self.assertEqual(plan.sync(self.connection)["created"], 0)
+
+    def test_plan_logs_include_upload_summary_and_remote_material_ids(self) -> None:
+        qianchuan_upload.ensure_schema(self.connection)
+        plan.save_settings(self.connection, self.qc_id, 100, "uploaded", True, True, True, False)
+        product_id = "3888888888888888888"
+        queue_id = self.add_published(product_id, "2099-01-01T00:00:00")
+        group = self.connection.execute(
+            "INSERT INTO qianchuan_quota_groups(name,created_at) VALUES (?,?)",
+            ("日志隔离组", db.now_text()),
+        )
+        group_id = int(group.lastrowid)
+        timestamp = db.now_text()
+        self.connection.execute("""INSERT INTO qianchuan_upload_jobs
+            (asset_id,account_id,qianchuan_account_id,quota_group_id,product_id,file_path,material_name,
+             status,scheduled_date,remote_material_id,created_at,completed_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (1, self.account_id, self.qc_id, group_id, product_id, "D:/isolated/ok.mp4", "ok.mp4",
+             "succeeded", "2099-01-01", "1888888888888001", timestamp, timestamp, timestamp),
+        )
+        self.connection.commit()
+        self.assertEqual(plan.sync(self.connection)["created"], 1)
+        job_id = int(self.connection.execute(
+            "SELECT id FROM qianchuan_plan_jobs WHERE product_id=?", (product_id,)
+        ).fetchone()[0])
+        self.connection.execute("""INSERT INTO qianchuan_upload_jobs
+            (asset_id,account_id,qianchuan_account_id,quota_group_id,product_id,file_path,material_name,
+             status,scheduled_date,remote_material_id,error_message,failure_stage,created_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (2, self.account_id, self.qc_id, group_id, product_id, "D:/isolated/review.mp4", "review.mp4",
+             "needs_review", "2099-01-01", "", "提交结果不明确", "file_input", timestamp, timestamp),
+        )
+        self.connection.commit()
+        summary = plan.list_plan_logs(self.connection)["items"][0]["upload_summary"]
+        self.assertEqual((summary["total"], summary["succeeded"], summary["needsReview"]), (2, 1, 1))
+        self.assertEqual(summary["remoteMaterialIds"], ["1888888888888001"])
+        self.assertIn("素材上传结果=已确认 1 条", self.connection.execute(
+            "SELECT detail FROM qianchuan_plan_events WHERE plan_job_id=?", (job_id,)
+        ).fetchone()[0])
+        details = plan.plan_log_details(self.connection, job_id)
+        self.assertEqual(details["job"]["upload_summary"]["lastFailure"], "file_input: 提交结果不明确")
 
     def test_next_day_material_is_added_to_original_plan_once(self) -> None:
         plan.save_settings(self.connection, self.qc_id, 50, "uploaded", True, True, True, False)

@@ -6,6 +6,7 @@ export interface SelectionCandidateRankInput {
   analysisScore?: number | null
   analysisRawScore?: number | null
   poolRank?: number
+  batchRandomKey?: number
   selected?: boolean
 }
 
@@ -250,6 +251,37 @@ export function scoreUnifiedCandidatePools<T extends UnifiedCandidateScoreInput>
   return result
 }
 
+function stableRandomUnit(value: string): number {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return ((hash >>> 0) + 1) / 4294967297
+}
+
+/**
+ * 按批次 ID 为已通过硬筛选的候选生成稳定加权随机顺序。
+ * 分数提高抽中概率，但不会让每轮都固定从最高分商品开始。
+ */
+export function rankCandidatesForBatch<T extends UnifiedCandidateScoreInput>(
+  rows: readonly T[],
+  batchSeed: string
+): T[] {
+  const seed = batchSeed.trim() || 'selection-batch'
+  return rows.map((candidate) => {
+    const score = finiteMetric(candidate.unifiedScore) ?? finiteMetric(candidate.analysisScore) ?? 0
+    const normalizedScore = Math.max(0, Math.min(100, score))
+    const weight = 0.75 + normalizedScore / 100 * 1.5
+    const random = stableRandomUnit(`${seed}\u0000${candidate.productId}`)
+    return { ...candidate, batchRandomKey: -Math.log(random) / weight }
+  }).sort((left, right) =>
+    (finiteMetric(left.batchRandomKey) ?? Number.POSITIVE_INFINITY) -
+      (finiteMetric(right.batchRandomKey) ?? Number.POSITIVE_INFINITY) ||
+    left.productId.localeCompare(right.productId)
+  )
+}
+
 export interface ExclusiveCandidatePool<T extends UnifiedCandidateScoreInput> {
   accountId: number
   accountName: string
@@ -262,7 +294,7 @@ export interface ExclusiveCandidateAllocation<T extends UnifiedCandidateScoreInp
   skipped: Array<T & { mutualExclusionReason: string; mutualExclusionWinnerAccountId: number }>
 }
 
-/** 全批次先比较统一分；同分按账号 ID（执行顺序）先占用，同一商品只分配一次。 */
+/** 全批次按批次随机权重分配；同一商品只分给一个账号。未指定随机顺序时兼容原统一分排序。 */
 export function allocateExclusiveCandidates<T extends UnifiedCandidateScoreInput>(
   pools: readonly ExclusiveCandidatePool<T>[]
 ): Map<number, ExclusiveCandidateAllocation<T>> {
@@ -274,11 +306,17 @@ export function allocateExclusiveCandidates<T extends UnifiedCandidateScoreInput
     pool,
     candidate,
     candidateIndex,
+    randomKey: finiteMetric(candidate.batchRandomKey),
     score: finiteMetric(candidate.unifiedScore) ?? finiteMetric(candidate.analysisScore) ?? 0
-  }))).sort((left, right) => right.score - left.score ||
-    (accountOrder.get(left.pool.accountId) ?? 0) - (accountOrder.get(right.pool.accountId) ?? 0) ||
-    left.candidateIndex - right.candidateIndex ||
-    left.candidate.productId.localeCompare(right.candidate.productId))
+  }))).sort((left, right) => {
+    const candidateOrder = left.randomKey !== null && right.randomKey !== null
+      ? left.randomKey - right.randomKey
+      : right.score - left.score
+    return candidateOrder ||
+      (accountOrder.get(left.pool.accountId) ?? 0) - (accountOrder.get(right.pool.accountId) ?? 0) ||
+      left.candidateIndex - right.candidateIndex ||
+      left.candidate.productId.localeCompare(right.candidate.productId)
+  })
   const winnerByProduct = new Map<string, { accountId: number; accountName: string; score: number }>()
   const countByAccount = new Map<number, number>()
   for (const pair of pairs) {
@@ -300,10 +338,14 @@ export function allocateExclusiveCandidates<T extends UnifiedCandidateScoreInput
     allocations.get(pool.accountId)?.candidates.push({ ...candidate, selected: true })
   }
   for (const allocation of allocations.values()) {
-    allocation.candidates.sort((left, right) =>
-      (finiteMetric(right.unifiedScore) ?? 0) - (finiteMetric(left.unifiedScore) ?? 0) ||
-      left.productId.localeCompare(right.productId)
-    )
+    allocation.candidates.sort((left, right) => {
+      const leftRandomKey = finiteMetric(left.batchRandomKey)
+      const rightRandomKey = finiteMetric(right.batchRandomKey)
+      const candidateOrder = leftRandomKey !== null && rightRandomKey !== null
+        ? leftRandomKey - rightRandomKey
+        : (finiteMetric(right.unifiedScore) ?? 0) - (finiteMetric(left.unifiedScore) ?? 0)
+      return candidateOrder || left.productId.localeCompare(right.productId)
+    })
   }
   return allocations
 }

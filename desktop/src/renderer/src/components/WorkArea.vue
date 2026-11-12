@@ -9,7 +9,8 @@ import SelectionSettingsView from './SelectionSettingsView.vue'
 import SelectionLogsView from './SelectionLogsView.vue'
 import PublishQueueView from './PublishQueueView.vue'
 import DashboardView from './DashboardView.vue'
-import QianchuanOverviewView from './QianchuanOverviewView.vue'
+import QianchuanWorkflowView from './QianchuanWorkflowView.vue'
+import QianchuanPublishLogsView from './QianchuanPublishLogsView.vue'
 import ProductListView from './ProductListView.vue'
 
 const props = defineProps<{
@@ -96,8 +97,8 @@ watch(
     <main class="work" :class="{ 'work--focused': focusedSection }">
       <div class="crumb">
         <span>{{ props.top === '商品查询' ? '商品查询' : `${props.top} / ${props.nav}` }}</span>
-        <button class="focus-button" type="button" :aria-label="focusedSection ? '还原当前板块' : '单独显示当前板块'" @click="toggleFocusedSection">
-          {{ focusedSection ? '还原板块' : '单独显示' }}
+        <button class="focus-button" type="button" :aria-label="focusedSection ? '还原当前板块' : '在客户端内聚焦当前板块'" title="在当前客户端窗口内放大当前板块" @click="toggleFocusedSection">
+          {{ focusedSection ? '还原板块' : '聚焦板块' }}
         </button>
       </div>
 
@@ -144,9 +145,9 @@ watch(
       </div>
     </template>
 
-    <template v-else-if="props.nav === '千川管理'">
+    <template v-else-if="props.nav === '千川计划' || props.nav === '千川管理'">
       <div class="query-body">
-        <QianchuanOverviewView @navigate="emit('navigate', $event)" @open-qianchuan-accounts="openQianchuanAccounts" />
+        <QianchuanWorkflowView @navigate="emit('navigate', $event)" @open-qianchuan-accounts="openQianchuanAccounts" />
       </div>
     </template>
 
@@ -154,6 +155,12 @@ watch(
     <template v-else-if="props.nav === '选品日志'">
       <div class="query-body">
         <SelectionLogsView />
+      </div>
+    </template>
+
+    <template v-else-if="props.nav === '千川日志'">
+      <div class="query-body">
+        <QianchuanPublishLogsView />
       </div>
     </template>
 
@@ -196,7 +203,9 @@ watch(
 
 .work {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
+  width: 100%;
   min-width: 0;
   min-height: 0;
   background: radial-gradient(circle at 94% -10%, #e8efff 0, transparent 34%), var(--bg-app);

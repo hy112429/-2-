@@ -205,6 +205,7 @@ async function runOneUploadCore(rawJobId: unknown): Promise<Json> {
       '--qianchuan-account-id', String(qcId),
       '--asset-path', filePath,
       '--asset-name', materialName,
+      '--product-id', String(job['productId'] ?? job['product_id'] ?? ''),
       '--diagnostics-dir', diagnosticsDir,
       '--min-delay-ms', String(limits['minStepDelayMs'] ?? 800),
       '--max-delay-ms', String(limits['maxStepDelayMs'] ?? 2000)
@@ -326,7 +327,8 @@ async function runBatchUpload(jobs: Json[]): Promise<Json> {
     const claimedJobs = Array.isArray(response['jobs']) ? response['jobs'] as Json[] : []
     if (claimedJobs.length !== ids.length) throw new Error('批量领取结果与请求数量不一致')
     const assets = claimedJobs.map((job) => ({
-      filePath: stringValue(job['filePath']), materialName: stringValue(job['materialName'])
+      filePath: stringValue(job['filePath']), materialName: stringValue(job['materialName']),
+      productId: stringValue(job['productId'] ?? job['product_id'])
     }))
     if (assets.some((asset) => !asset.filePath || !asset.materialName)) {
       throw new Error('批量任务缺少本地文件路径或素材名')

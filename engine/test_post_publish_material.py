@@ -95,9 +95,24 @@ class PostPublishMaterialTests(unittest.TestCase):
     def test_partial_upload_run_is_reconciled_until_remote_target_complete(self) -> None:
         material.begin(self.connection, self.published_id, "mark-published")
         material.update_run(self.connection, self.published_id, "awaiting_upload", "已入队 3 条")
+        duplicate_notification = material.begin(self.connection, self.published_id, "upload-finish")
+        self.assertTrue(duplicate_notification["alreadyStarted"])
+        self.assertEqual(duplicate_notification["run"]["attemptCount"], 1)
         self.connection.execute(
             "UPDATE post_publish_material_runs SET updated_at='2000-01-01T00:00:00' "
             "WHERE publish_queue_id=?", (self.published_id,),
+        )
+        self.connection.commit()
+        # 等待态本身不构成重试原因；没有上传任务变化时不能反复增加 attempt_count。
+        self.assertEqual(material.due_runs(self.connection)["rows"], [])
+        self.connection.execute(
+            "CREATE TABLE qianchuan_upload_jobs "
+            "(id INTEGER PRIMARY KEY, account_id INTEGER, product_id TEXT, updated_at TEXT)"
+        )
+        self.connection.execute(
+            "INSERT INTO qianchuan_upload_jobs (account_id, product_id, updated_at) "
+            "VALUES (?, ?, '2026-11-07T20:00:00')",
+            (self.account_id, "1234567890123456789"),
         )
         self.connection.commit()
         self.assertEqual(len(material.due_runs(self.connection)["rows"]), 1)
@@ -107,6 +122,31 @@ class PostPublishMaterialTests(unittest.TestCase):
         material.update_run(self.connection, self.published_id, "completed", "不同素材达标")
         self.assertEqual(material.due_runs(self.connection)["rows"], [])
         self.assertFalse(material.begin(self.connection, self.published_id, "reconcile")["shouldRun"])
+
+    def test_needs_fill_waits_for_cart_or_upload_progress(self) -> None:
+        material.begin(self.connection, self.published_id, "mark-published")
+        material.update_run(self.connection, self.published_id, "needs_fill", "等待百应补位")
+        self.connection.execute(
+            "UPDATE post_publish_material_runs SET updated_at='2000-01-01T00:00:00' "
+            "WHERE publish_queue_id=?", (self.published_id,),
+        )
+        self.connection.execute("""
+            CREATE TABLE baiying_cart_video_downloads (
+                account_id INTEGER, product_id TEXT, status TEXT,
+                updated_at TEXT
+            )
+        """)
+        self.connection.execute(
+            "INSERT INTO baiying_cart_video_downloads(account_id,product_id,status,updated_at) "
+            "VALUES (?,?,?,?)", (self.account_id, "1234567890123456789", "partial", "2026-11-07T20:00:00")
+        )
+        self.connection.commit()
+        self.assertEqual(len(material.due_runs(self.connection)["rows"]), 1)
+        resumed = material.begin(self.connection, self.published_id, "reconcile")
+        self.assertTrue(resumed["shouldRun"])
+        self.assertEqual(resumed["run"]["attemptCount"], 2)
+        # reconcile 后没有新下载/上传进展时保持等待，不再被每分钟选中。
+        self.assertEqual(material.due_runs(self.connection)["rows"], [])
 
     def test_exhausted_run_reconciles_only_after_upload_job_changes(self) -> None:
         material.begin(self.connection, self.published_id, "mark-published")
@@ -128,7 +168,7 @@ class PostPublishMaterialTests(unittest.TestCase):
         )
         self.connection.commit()
         self.assertEqual(len(material.due_runs(self.connection)["rows"]), 1)
-        resumed = material.begin(self.connection, self.published_id, "remote-progress-changed")
+        resumed = material.begin(self.connection, self.published_id, "reconcile")
         self.assertTrue(resumed["shouldRun"])
         self.assertEqual(resumed["run"]["attemptCount"], 2)
 

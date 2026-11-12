@@ -12,11 +12,12 @@ const MAIN_ITEMS = [
   { value: '投放看板', label: '工作概览', icon: '▦' },
   { value: '选品设置', label: '开始选品', icon: '◇' },
   { value: '发布队列', label: '发布进度', icon: '▷' },
-  { value: '千川管理', label: '千川素材', icon: '▤' }
+  { value: '千川计划', label: '千川投放', icon: '▣' }
 ]
 const MORE_ITEMS = [
   { value: '商品列表', label: '商品列表', icon: '▤' },
   { value: '选品日志', label: '选品记录', icon: '≡' },
+  { value: '千川日志', label: '千川发布日志', icon: '◷' },
   { value: '素材与工具', label: '素材库', icon: '▧' },
   { value: '账号管理', label: '账号管理', icon: '♙' },
   { value: '连接与工具', label: '连接与工具', icon: '⌘' }

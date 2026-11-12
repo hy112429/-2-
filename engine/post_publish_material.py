@@ -151,7 +151,12 @@ def begin(connection: sqlite3.Connection, queue_id: int, trigger_source: str) ->
         ).fetchone()
         if existing:
             status = str(existing["status"])
-            resumable = status in {"enqueued", "awaiting_upload", "needs_fill", "candidate_exhausted"}
+            # 等待上传/补位/候选耗尽只能由 reconcile 在检测到外部进展后恢复；
+            # 重复的发布成功通知必须保持幂等，不能再次增加 attempt_count。
+            resumable = status == "enqueued" or (
+                trigger_source == "reconcile" and
+                status in {"awaiting_upload", "needs_fill", "candidate_exhausted"}
+            )
             if status == "running":
                 resumable = datetime.now() - datetime.fromisoformat(existing["updated_at"]) >= timedelta(minutes=30)
             if resumable:
@@ -311,23 +316,55 @@ def list_runs(connection: sqlite3.Connection, limit: int = 30) -> Dict[str, Any]
 
 
 def due_runs(connection: sqlite3.Connection, limit: int = 30) -> Dict[str, Any]:
-    """只恢复已确认发布、尚未达到不同远端素材目标的编排。"""
+    """只恢复确实有外部进展的发布后素材编排。
+
+    ``awaiting_upload`` 和 ``needs_fill`` 是等待态，不是失败态。旧逻辑只要
+    状态超过一分钟就再次调用 ``begin``，导致每分钟把 ``attempt_count`` 加一，
+    即使上传队列和百应下载都没有任何变化也会形成重试风暴。这里要求对应的
+    上传任务或百应下载状态在本次编排之后有更新，才把任务交给 reconcile。
+    """
     cutoff = (datetime.now() - timedelta(seconds=60)).isoformat(timespec="seconds")
+    settings = _settings(connection)
+    # 绑定修复后自动恢复一次之前被挡住的任务。必须是启用账号、唯一关联、
+    # 广告主 ID 为 8-20 位纯数字；自动下载总开关关闭时绝不触发。
+    valid_binding = (
+        "EXISTS (SELECT 1 FROM accounts a "
+        "JOIN account_qianchuan aq ON aq.account_row_id=a.id "
+        "JOIN qianchuan_accounts q ON q.id=aq.qianchuan_row_id "
+        "WHERE a.id=r.account_id AND a.status='active' "
+        "AND length(trim(coalesce(q.qc_id,''))) BETWEEN 8 AND 20 "
+        "AND trim(q.qc_id) NOT GLOB '*[^0-9]*' "
+        "AND NOT EXISTS (SELECT 1 FROM account_qianchuan aq2 "
+        "WHERE aq2.account_row_id=a.id AND aq2.id<>aq.id))"
+    )
+    has_upload_jobs = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='qianchuan_upload_jobs'"
+    ).fetchone() is not None
     upload_changed = (
         "EXISTS (SELECT 1 FROM qianchuan_upload_jobs j "
         "WHERE j.account_id=r.account_id AND j.product_id=r.product_id "
         "AND j.updated_at>r.updated_at)"
-        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
-                              "AND name='qianchuan_upload_jobs'").fetchone() else "0"
+        if has_upload_jobs else "0"
+    )
+    has_cart_downloads = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='baiying_cart_video_downloads'"
+    ).fetchone() is not None
+    cart_changed = (
+        "EXISTS (SELECT 1 FROM baiying_cart_video_downloads d "
+        "WHERE d.account_id=r.account_id AND d.product_id=r.product_id "
+        "AND d.updated_at>r.updated_at)"
+        if has_cart_downloads else "0"
     )
     rows = connection.execute(
         "SELECT r.*, p.product_name FROM post_publish_material_runs r "
         "JOIN publish_queue p ON p.id=r.publish_queue_id "
-        "WHERE p.platform_status='published' "
-        "AND (r.status IN ('enqueued','awaiting_upload','needs_fill') "
-        f"OR (r.status='candidate_exhausted' AND {upload_changed})) "
+        "WHERE p.platform_status='published' AND ((r.status IN ('enqueued','awaiting_upload') "
+        f"AND {upload_changed}) "
+        f"OR (r.status='needs_fill' AND ({upload_changed} OR {cart_changed})) "
+        f"OR (r.status='candidate_exhausted' AND {upload_changed}) "
+        f"OR (r.status='blocked_binding' AND r.attempt_count < 2 AND {valid_binding} AND ?=1)) "
         "AND r.updated_at<=? ORDER BY r.updated_at LIMIT ?",
-        (cutoff, min(max(limit, 1), 100)),
+        (int(settings["enabled"]), cutoff, min(max(limit, 1), 100)),
     ).fetchall()
     return {"ok": True, "rows": [_payload(row) for row in rows]}
 

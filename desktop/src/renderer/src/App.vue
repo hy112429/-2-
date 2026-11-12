@@ -151,13 +151,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <!--
-    整体骨架：三行网格
-      第 1 行 顶部菜单
-      第 2 行 左侧导航 + 中部工作区（两列网格）
-      第 3 行 底部状态栏（横跨整宽）
-  -->
   <div class="shell">
+    <!--
+      整体骨架：三行网格
+        第 1 行 顶部菜单
+        第 2 行 左侧导航 + 中部工作区（两列网格）
+        第 3 行 底部状态栏（横跨整宽）
+    -->
     <TopMenu v-model:active="activeTop" />
 
     <div class="body">

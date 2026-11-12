@@ -84,7 +84,7 @@ function classify(input: unknown, raw: string, explicitClassification: string): 
     return 'ACCOUNT_SWITCH_DISCONNECT'
   }
   if (
-    /ACCOUNT_SWITCH_LOGIN|LOGIN REQUIRED|NOT LOGGED IN|UNAUTHORIZED|AUTHENTICATION REQUIRED|需登录|需要登录|尚未登录|未登录|登录失效|登录态.{0,10}(?:失效|无法确认|未确认)|登录状态.{0,10}(?:无法确认|失效)/i.test(combined)
+    /ACCOUNT_SWITCH_LOGIN|LOGIN REQUIRED|NOT LOGGED IN|UNAUTHORIZED|AUTHENTICATION REQUIRED|需登录|需要登录|尚未登录|未登录|未登陆|登录失效|登陆失效|登录态.{0,10}(?:失效|无法确认|未确认)|登陆态.{0,10}(?:失效|无法确认|未确认)|登录状态.{0,10}(?:无法确认|失效)|登陆状态.{0,10}(?:无法确认|失效)/i.test(combined)
   ) {
     return 'ACCOUNT_SWITCH_LOGIN'
   }

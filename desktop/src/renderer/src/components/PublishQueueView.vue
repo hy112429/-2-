@@ -75,6 +75,7 @@ const noticeError = ref(false)
 const activeAccountId = ref(0)
 const autoPublishEnabled = ref(false)
 const manualReviewActive = ref(false)
+const autoPublishToggleSaving = ref(false)
 const createFormOpen = ref(false)
 const formCardRef = ref<HTMLElement | null>(null)
 const schedulerDetails = ref<HTMLDetailsElement | null>(null)
@@ -149,6 +150,11 @@ const quarantinedAutoTasks = computed(() => rows.value.filter((row) =>
   Boolean(row.auto_publish) &&
   ['uploading', 'uploaded_waiting_publish', 'needs_review', 'submitting', 'submission_uncertain'].includes(row.platform_status)
 ))
+function conflictingPublishTask(row: QueueRow): QueueRow | undefined {
+  return rows.value.find((other) => other.id !== row.id &&
+    other.account_id === row.account_id && other.product_id === row.product_id &&
+    (other.status !== 'cancelled' || !['not_uploaded', 'isolated'].includes(other.platform_status)))
+}
 const activeCount = computed(() => accountRows.value.filter((row) => row.status !== 'cancelled').length)
 const pendingCount = computed(() => accountRows.value.filter((row) => row.status === 'awaiting_confirmation').length)
 const videoName = computed(() => form.value.videoPath.split(/[\\/]/).filter(Boolean).pop() ?? '')
@@ -300,16 +306,50 @@ async function refresh(): Promise<void> {
 }
 
 async function resumeAutoPublishIfClear(): Promise<string> {
-  if (autoPublishEnabled.value || quarantinedAutoTasks.value.length > 0) return ''
+  if (autoPublishEnabled.value) return ''
   try {
     const result = await runCli(['auto-settings', 'set', '--enabled', 'true'])
     if (result.ok !== true) {
-      return `自动发布暂未恢复：${String(result.error ?? '仍有任务需要核查')}`
+      return `自动发布暂未恢复：${String(result.error ?? '设置未能保存')}`
     }
     autoPublishEnabled.value = result.autoPublishEnabled === true
-    return autoPublishEnabled.value ? '全自动发布已恢复，新任务将继续按队列执行。' : ''
+    return autoPublishEnabled.value
+      ? `全自动发布已恢复；${quarantinedAutoTasks.value.length ? `${quarantinedAutoTasks.value.length} 条待核查任务继续隔离，` : ''}其他可执行任务按队列继续。`
+      : ''
   } catch (error) {
     return `自动发布暂未恢复：${String(error)}`
+  }
+}
+
+async function toggleAutoPublish(): Promise<void> {
+  if (autoPublishToggleSaving.value) return
+  const next = !autoPublishEnabled.value
+  const actionText = next
+    ? manualReviewActive.value
+      ? '到期的自动任务将继续上传，并停在最终发布前，等待你手动点击“发布”。'
+      : '到期的自动任务将按计划自动上传并提交发布。'
+    : '全自动调度将暂停，已保存任务会留在队列中；你仍可使用手动计划和手动发布。正在执行的任务不会被强制中断。'
+  const quarantineText = next && quarantinedAutoTasks.value.length
+    ? `\n另有 ${quarantinedAutoTasks.value.length} 条待核查任务会继续单独隔离，不会自动重试；其他可执行任务不受影响。`
+    : ''
+  if (!window.confirm(`${actionText}${quarantineText}\n确认${next ? '开启' : '暂停'}全自动发布？`)) return
+  autoPublishToggleSaving.value = true
+  try {
+    const result = await runCli(['auto-settings', 'set', '--enabled', String(next)])
+    if (result.ok !== true) throw new Error(String(result.error ?? '全自动设置未保存'))
+    autoPublishEnabled.value = result.autoPublishEnabled === true
+    noticeError.value = false
+    notice.value = autoPublishEnabled.value
+      ? manualReviewActive.value
+        ? `全自动已开启；人工复核仍开启，最终发布需要你手动确认。${quarantinedAutoTasks.value.length ? ` ${quarantinedAutoTasks.value.length} 条待核查任务仍隔离，其他任务继续。` : ''}`
+        : `全自动已开启；到期自动任务将按队列执行。${quarantinedAutoTasks.value.length ? ` ${quarantinedAutoTasks.value.length} 条待核查任务仍隔离，其他任务继续。` : ''}手动计划仍可单独创建。`
+      : '全自动已暂停；队列任务保留，手动发布入口仍可使用。'
+    await refresh()
+  } catch (error) {
+    noticeError.value = true
+    notice.value = `更新全自动状态失败：${String(error)}`
+  } finally {
+    autoPublishToggleSaving.value = false
   }
 }
 
@@ -400,13 +440,14 @@ async function publishImmediately(row: QueueRow): Promise<void> {
     notice.value = '请先启用此任务所属账号，再马上发布。'
     return
   }
-  if (quarantinedAutoTasks.value.length > 0) {
+  const conflict = conflictingPublishTask(row)
+  if (conflict) {
     noticeError.value = true
-    notice.value = '还有自动发布任务处于待核查或提交中状态；先处理待核查任务，避免重复发布。'
+    notice.value = `同账号的同一商品已有任务 #${conflict.id} 处于“${conflict.platform_status}”；先核对该商品，避免重复发布。`
     return
   }
   if (!window.confirm(
-    `将立即把“${row.product_name}”的计划时间调整为现在，并按${row.account_name}今日配额重新校验；随后上传视频、关联商品并提交抖音发布。若存在待核查任务，系统会拒绝执行。确认马上发布？`
+    `将立即把“${row.product_name}”的计划时间调整为现在，并按${row.account_name}今日配额重新校验；随后上传视频、关联商品并提交抖音发布。同账号其他商品的待核查任务会保持隔离，不阻止本条。确认马上发布？`
   )) return
 
   busyId.value = row.id
@@ -1110,8 +1151,15 @@ onUnmounted(() => {
 
     <div class="auto-publish-state" :class="{ paused: !autoPublishEnabled }">
       <strong>{{ autoPublishEnabled ? '全自动发布已开启' : '全自动发布当前已暂停' }}</strong>
-      <span v-if="quarantinedAutoTasks.length > 0">{{ quarantinedAutoTasks.length }} 条待核查任务已隔离</span>
+      <span v-if="quarantinedAutoTasks.length > 0">
+        {{ quarantinedAutoTasks.length }} 条待核查任务已隔离；{{ autoPublishEnabled ? '其他可执行任务继续排队' : '可恢复全自动继续处理其他任务' }}
+      </span>
       <span v-if="manualReviewActive">自动任务停在最终发布前</span>
+      <span>自动选品任务默认进入全自动队列；手动计划与人工发布入口保留。</span>
+      <button class="button auto-publish-toggle" :disabled="autoPublishToggleSaving || loading"
+        @click="toggleAutoPublish">
+        {{ autoPublishToggleSaving ? '保存中…' : autoPublishEnabled ? '暂停全自动' : '恢复全自动' }}
+      </button>
     </div>
 
     <details ref="schedulerDetails" class="scheduler-settings">
@@ -1261,8 +1309,8 @@ onUnmounted(() => {
                   <div v-else-if="row.status === 'scheduled' && row.platform_status === 'not_uploaded' && row.auto_publish" class="immediate-actions">
                     <button
                       class="text-button publish-action"
-                      :disabled="busyId === row.id || busyId === -row.account_id || quarantinedAutoTasks.length > 0 || accounts.find((item) => item.id === row.account_id)?.status !== 'active'"
-                      :title="quarantinedAutoTasks.length > 0 ? '存在自动发布待核查任务；马上发布仍要求先完成核查' : ''"
+                      :disabled="busyId === row.id || busyId === -row.account_id || Boolean(conflictingPublishTask(row)) || accounts.find((item) => item.id === row.account_id)?.status !== 'active'"
+                      :title="conflictingPublishTask(row) ? `同账号同商品存在任务 #${conflictingPublishTask(row)?.id} 待核查` : ''"
                       @click="publishImmediately(row)"
                     >{{ busyId === row.id ? '发布中…' : '马上发布' }}</button>
                   </div>
@@ -1327,6 +1375,7 @@ onUnmounted(() => {
 .auto-publish-state { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; margin-bottom: 9px; padding: 9px 12px; border: 1px solid #86efac; border-radius: var(--radius); background: #f0fdf4; color: #166534; font-size: 12px; line-height: 1.5; }
 .auto-publish-state.paused { border-color: #fcd34d; background: #fffbeb; color: #92400e; }
 .auto-publish-state span { overflow-wrap: anywhere; }
+.auto-publish-toggle { margin-left: auto; flex: 0 0 auto; }
 .scheduler-settings { margin: 0 0 7px; padding: 7px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); font-size: 12px; scroll-margin-top: 70px; }
 .scheduler-settings summary { cursor: pointer; color: var(--text); font-weight: 600; }
 .scheduler-settings-body { display: grid; grid-template-columns: repeat(3, minmax(130px, 1fr)) auto; align-items: end; gap: 10px; margin-top: 10px; }

@@ -447,7 +447,10 @@ async function reconcileTick(): Promise<void> {
     for (const row of rows(due['rows'])) {
       const queueId = Number(row['publishQueueId'])
       if (Number.isSafeInteger(queueId) && queueId > 0 && !activeQueueIds.has(queueId)) {
-        await runPostPublishQianchuanMaterialForQueue(queueId, 'reconcile')
+        // 只有状态库已复核为唯一有效绑定的旧阻塞记录，才走显式重试路径。
+        // 普通素材补位仍使用可幂等恢复的 begin，避免重复下载或重复入队。
+        const retryBinding = row['status'] === 'blocked_binding'
+        await runPostPublishQianchuanMaterialForQueue(queueId, 'reconcile', retryBinding)
       }
     }
   } catch (error) {

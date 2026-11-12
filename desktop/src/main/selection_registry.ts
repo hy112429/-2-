@@ -35,11 +35,11 @@ function normalizeLocalAccountKey(value: string): string {
   return key
 }
 
-async function runLocalRegistry<T extends RegistryPayload>(args: string[]): Promise<T> {
+async function runLocalRegistry<T extends RegistryPayload>(args: string[], stdinJson?: unknown): Promise<T> {
   const outcome = await runEngineCommand('selection_registry_local.py', [
     '--db', getClientPaths().databasePath,
     ...args
-  ])
+  ], stdinJson)
   if (!outcome.ok) {
     throw new Error(outcome.error || '本机选品登记失败；本次未执行加车。')
   }
@@ -53,11 +53,15 @@ async function runLocalRegistry<T extends RegistryPayload>(args: string[]): Prom
   return result
 }
 
-export async function getRegistrySnapshot(accountKey: string, _candidates: RegistryCandidate[]): Promise<RegistrySnapshot> {
+export async function getRegistrySnapshot(accountKey: string, candidates: RegistryCandidate[]): Promise<RegistrySnapshot> {
   const localAccountKey = normalizeLocalAccountKey(accountKey)
   const result = await runLocalRegistry<RegistryPayload & RegistrySnapshot>([
     'snapshot', '--account-key', localAccountKey
-  ])
+  ], candidates)
+  if (!Array.isArray(result.usedProductIds) || !Array.isArray(result.accountUsedCategoryIds) ||
+      !result.categoryUsage || typeof result.categoryUsage !== 'object' || Array.isArray(result.categoryUsage)) {
+    throw new Error('本机选品查重结果不完整；本次已停止，未执行加车。')
+  }
   return {
     usedProductIds: Array.isArray(result.usedProductIds) ? result.usedProductIds.map(String) : [],
     accountUsedCategoryIds: Array.isArray(result.accountUsedCategoryIds) ? result.accountUsedCategoryIds.map(String) : [],
@@ -66,6 +70,41 @@ export async function getRegistrySnapshot(accountKey: string, _candidates: Regis
       : {},
     mode: 'local'
   }
+}
+
+export async function getRegistryBatchSnapshots(
+  entries: Array<{ accountKey: string; candidates: RegistryCandidate[] }>
+): Promise<Record<string, RegistrySnapshot>> {
+  const normalized = entries.map((entry) => ({
+    accountKey: normalizeLocalAccountKey(entry.accountKey),
+    candidates: Array.isArray(entry.candidates) ? entry.candidates.map((candidate) => ({
+      productId: String(candidate.productId ?? ''),
+      leafCategoryId: String(candidate.leafCategoryId ?? '')
+    })) : []
+  }))
+  if (!normalized.length) return {}
+  const result = await runLocalRegistry<RegistryPayload & { snapshots?: Record<string, Partial<RegistrySnapshot>> }>(
+    ['snapshot-batch'], { entries: normalized }
+  )
+  const rawSnapshots = result.snapshots
+  if (!rawSnapshots || typeof rawSnapshots !== 'object' || Array.isArray(rawSnapshots)) {
+    throw new Error('本机批量选品查重结果不完整；本次已停止，未执行加车。')
+  }
+  return Object.fromEntries(normalized.map(({ accountKey }) => {
+    const snapshot = rawSnapshots[accountKey]
+    if (!snapshot || !Array.isArray(snapshot.usedProductIds) || !Array.isArray(snapshot.accountUsedCategoryIds) ||
+        !snapshot.categoryUsage || typeof snapshot.categoryUsage !== 'object' || Array.isArray(snapshot.categoryUsage)) {
+      throw new Error(`账号 ${accountKey} 的本机选品查重结果不完整；本次已停止，未执行加车。`)
+    }
+    return [accountKey, {
+      usedProductIds: Array.isArray(snapshot.usedProductIds) ? snapshot.usedProductIds.map(String) : [],
+      accountUsedCategoryIds: Array.isArray(snapshot.accountUsedCategoryIds)
+        ? snapshot.accountUsedCategoryIds.map(String) : [],
+      categoryUsage: snapshot.categoryUsage && typeof snapshot.categoryUsage === 'object'
+        ? snapshot.categoryUsage as Record<string, number> : {},
+      mode: 'local' as const
+    }]
+  }))
 }
 
 export async function reserveRegistryCandidates(
@@ -109,5 +148,10 @@ export function registerSelectionRegistryIpc(): void {
     getRegistrySnapshot(String(accountKey ?? ''), Array.isArray(candidates) ? candidates.map((candidate) => ({
       productId: String(candidate?.productId ?? ''),
       leafCategoryId: String(candidate?.leafCategoryId ?? '')
+    })) : []))
+  ipcMain.handle('selection-registry:snapshot-batch', (_event, entries: Array<{ accountKey: string; candidates: RegistryCandidate[] }>) =>
+    getRegistryBatchSnapshots(Array.isArray(entries) ? entries.map((entry) => ({
+      accountKey: String(entry?.accountKey ?? ''),
+      candidates: Array.isArray(entry?.candidates) ? entry.candidates : []
     })) : []))
 }

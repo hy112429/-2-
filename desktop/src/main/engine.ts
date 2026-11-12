@@ -390,8 +390,8 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
 }
 
 /** 主进程后台服务执行白名单引擎命令，不依赖某个渲染窗口存活。 */
-export async function runEngineCommand(script: string, args: string[] = []): Promise<ScriptOutcome> {
-  const handle = runScript(script, { args, internal: true, onEvent: () => undefined })
+export async function runEngineCommand(script: string, args: string[] = [], stdinJson?: unknown): Promise<ScriptOutcome> {
+  const handle = runScript(script, { args, stdinJson, internal: true, onEvent: () => undefined })
   return handle.promise
 }
 

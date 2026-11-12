@@ -9,7 +9,7 @@ import { notifyGlobal } from '../utils/notifications'
  * 数据链路：
  *  - CRUD/统计/分组/千川 → engine:run 拉起 engine/account_manager.py
  *  - 账号级浏览器/登录态 → window.api.account.*（一账号一分区 + 指纹 + 加密备份）
- *  - 千川登录态 → window.api.qianchuan.*（独立分区，多开隔离）
+ *  - 千川登录态 → 账号绑定页复用抖音账号的托管 Chrome profile，其他入口保留千川独立 profile
  */
 
 // ---------------------------------------------------------------- 类型
@@ -85,6 +85,7 @@ const stats = ref<StatsRow | null>(null)
 const accounts = ref<AccountRow[]>([])
 const groups = ref<GroupRow[]>([])
 const qcs = ref<QcRow[]>([])
+const qcBrowserAccountSelections = reactive<Record<number, number>>({})
 const selected = ref<Set<number>>(new Set())
 const accountPage = ref(1)
 const accountPageSize = ref(20)
@@ -138,8 +139,10 @@ const visibleAccountsSelected = computed(() =>
   visibleAccounts.value.length > 0 && visibleAccounts.value.every((account) => selected.value.has(account.id))
 )
 const accountsWithUnlinkedQianchuanId = computed(() => accounts.value.filter((account) =>
-  Boolean(account.qianchuan_id?.trim()) &&
-  !qcs.value.some((qc) => qc.bound_account_ids?.includes(account.id))
+  Boolean(account.qianchuan_id?.trim()) && (() => {
+    const bound = qcs.value.filter((qc) => qc.bound_account_ids?.includes(account.id))
+    return bound.length !== 1 || bound[0]?.qc_id?.trim() !== account.qianchuan_id?.trim()
+  })()
 ))
 
 watch([() => accounts.value.length, accountPageSize], () => {
@@ -231,7 +234,14 @@ async function loadGroups(): Promise<void> {
 
 async function loadQcs(): Promise<void> {
   const data = await runCli(['--db', DB_PATH, 'qianchuan-list'])
-  qcs.value = (data.qianchuan_accounts ?? []) as QcRow[]
+  const rows = (data.qianchuan_accounts ?? []) as QcRow[]
+  for (const row of rows) {
+    const boundIds = row.bound_account_ids ?? []
+    if (!boundIds.includes(qcBrowserAccountSelections[row.id])) {
+      qcBrowserAccountSelections[row.id] = boundIds[0] ?? 0
+    }
+  }
+  qcs.value = rows
 }
 
 async function loadAll(): Promise<void> {
@@ -509,17 +519,22 @@ async function assignToGroup(accountId: number, groupId: number | null): Promise
 // ---------------------------------------------------------------- 千川账户
 
 async function saveQc(): Promise<void> {
+  const advertiserId = qcForm.qc_id.trim()
+  if (advertiserId && !/^\d{8,20}$/.test(advertiserId)) {
+    errorMsg.value = '千川广告主 ID 需为 8–20 位数字。'
+    return
+  }
   await withBusy(async () => {
     if (qcForm.id === 0) {
       await runCli([
         '--db', DB_PATH, 'qianchuan-add',
-        '--name', qcForm.qc_name, '--qc-id', qcForm.qc_id,
+        '--name', qcForm.qc_name, '--qc-id', advertiserId,
         '--subject', qcForm.subject, '--remark', qcForm.remark
       ])
     } else {
       const args = ['--db', DB_PATH, 'qianchuan-update', '--id', String(qcForm.id)]
       if (qcForm.qc_name) args.push('--name', qcForm.qc_name)
-      if (qcForm.qc_id) args.push('--qc-id', qcForm.qc_id)
+      if (advertiserId) args.push('--qc-id', advertiserId)
       if (qcForm.subject) args.push('--subject', qcForm.subject)
       if (qcForm.remark) args.push('--remark', qcForm.remark)
       await runCli(args)
@@ -574,9 +589,10 @@ async function linkSavedQianchuanIds(): Promise<void> {
   }))
   if (!pending.length) return
   const summary = pending.map((item) => `${item.accountName} → ${item.qcId}`).join('\n')
-  if (!window.confirm(`将按账号里已填写的千川 ID 建立或复用千川档案，并绑定对应账号：\n\n${summary}\n\n请先核对每个 ID。此操作只整理本机绑定，不会登录或上传素材。`)) return
+  if (!window.confirm(`将核对账号里已填写的千川 ID：补全唯一绑定且 ID 为空的档案，或建立/复用档案并绑定账号。已有不同 ID 的档案不会自动覆盖。\n\n${summary}\n\n请先核对每个 ID。此操作只更新本机账户档案，不会登录或上传素材。`)) return
   await withBusy(async () => {
     await loadQcs()
+    await loadAccounts()
     const existingById = new Map<string, QcRow[]>()
     for (const qc of qcs.value) {
       const id = qc.qc_id?.trim()
@@ -588,9 +604,33 @@ async function linkSavedQianchuanIds(): Promise<void> {
       }
     }
     let linked = 0
+    let updatedProfiles = 0
     try {
       for (const item of pending) {
-        if (qcs.value.some((qc) => qc.bound_account_ids?.includes(item.accountId))) continue
+        if (!/^\d{8,20}$/.test(item.qcId)) {
+          throw new Error(`账号「${item.accountName}」填写的千川广告主 ID 无效；请填写 8–20 位数字。`)
+        }
+        const boundProfiles = qcs.value.filter((qc) => qc.bound_account_ids?.includes(item.accountId))
+        if (boundProfiles.length > 1) {
+          throw new Error(`账号「${item.accountName}」绑定了多个千川档案，请先核对绑定关系，未自动同步。`)
+        }
+        if (boundProfiles.length === 1) {
+          const boundProfile = boundProfiles[0]
+          const savedId = boundProfile.qc_id?.trim() ?? ''
+          if (savedId === item.qcId) continue
+          if (savedId) {
+            throw new Error(`账号「${item.accountName}」填写的 ID 与已绑定千川档案不一致；请在“千川账户 → 编辑”中核对后再同步。`)
+          }
+          await runCli([
+            '--db', DB_PATH, 'qianchuan-update', '--id', String(boundProfile.id), '--qc-id', item.qcId
+          ])
+          boundProfile.qc_id = item.qcId
+          const sameId = existingById.get(item.qcId) ?? []
+          if (!sameId.some((qc) => qc.id === boundProfile.id)) sameId.push(boundProfile)
+          existingById.set(item.qcId, sameId)
+          updatedProfiles++
+          continue
+        }
         let qc = existingById.get(item.qcId)?.[0]
         if (!qc) {
           const created = await runCli([
@@ -616,7 +656,7 @@ async function linkSavedQianchuanIds(): Promise<void> {
     } finally {
       await Promise.all([loadQcs(), loadAccounts(), loadStats()])
     }
-    setNotice(`已关联 ${linked} 个抖音账号与千川档案；登录前请在千川网页右上角核对广告主 ID。`)
+    setNotice(`已同步 ${updatedProfiles} 个已绑定档案 ID，并新关联 ${linked} 个抖音账号；请刷新千川计划页查看状态。`)
   })
 }
 
@@ -627,21 +667,41 @@ function copyText(text: string): void {
   )
 }
 
-/** 在千川专属托管 Chrome profile 打开登录页；Electron 缓存状态仍单独显示。 */
-async function openQcLogin(row: QcRow): Promise<void> {
+/** 从绑定页按抖音账号 profile 打开千川，与该账号的百应共用同一 Chrome 窗口和登录资料。 */
+async function openQcLogin(row: QcRow, requestedAccountId?: number): Promise<void> {
   await withBusy(async () => {
-    const r = await window.api.qianchuan.openLogin(row.id)
+    const boundAccountIds = row.bound_account_ids ?? []
+    const accountId = requestedAccountId ?? qcBrowserAccountSelections[row.id] ?? boundAccountIds[0]
+    if (!accountId || !boundAccountIds.includes(accountId)) {
+      throw new Error('请先把千川账户绑定到抖音账号，再从账号绑定页打开千川。')
+    }
+    const account = accounts.value.find((item) => item.id === accountId)
+    if (!account) throw new Error('找不到绑定的抖音账号，请刷新账号绑定页面后重试。')
+    const profilePath = await getAccountBrowserProfilePath(accountId)
+    const r = await window.api.qianchuan.openLogin(row.id, { accountId, profilePath })
     if (!r.ok) throw new Error(r.error ?? '打开千川登录失败')
     const name = row.qc_name || row.qc_id || `档案 #${row.id}`
-    setNotice(`已打开「${name}」的专属浏览器。请在网页完成登录，并确认右上角广告主 ID 是 ${row.qc_id || '目标账户'}。登录状态会留在这个浏览器里；本页“登录未核实”不表示登录失败。`)
+    setNotice(`已在「${account.name}」的百应浏览器中打开千川「${name}」。两者共用同一个浏览器窗口和登录资料；请在网页确认右上角广告主 ID 是 ${row.qc_id || '目标账户'}。`)
   })
+}
+
+function boundAccountsForQc(row: QcRow): AccountRow[] {
+  return (row.bound_account_ids ?? [])
+    .map((id) => accounts.value.find((account) => account.id === id))
+    .filter((account): account is AccountRow => Boolean(account))
+}
+
+function qcBrowserAccountId(row: QcRow): number | undefined {
+  const bound = boundAccountsForQc(row)
+  const selectedId = qcBrowserAccountSelections[row.id]
+  return bound.some((account) => account.id === selectedId) ? selectedId : bound[0]?.id
 }
 
 async function checkQcLogin(row: QcRow): Promise<void> {
   await withBusy(async () => {
     const state = await window.api.qianchuan.checkLogin(row.id)
     qcLoginMap[row.id] = state
-    setNotice(`内置缓存${state.loggedIn ? '有' : '没有'}记录；它与专属浏览器分开，不能用来判断千川网页是否已登录。`)
+    setNotice(`内置缓存${state.loggedIn ? '有' : '没有'}记录；它与 Chrome 网页登录状态分开，不能用来判断千川网页是否已登录。`)
   })
 }
 
@@ -947,7 +1007,7 @@ function toggleSelectBind(id: number): void {
               </td>
               <td class="ops">
                 <button type="button" class="btn mini" :disabled="busy" @click="openJingxuan(row)">打开百应</button>
-                <button v-for="qc in boundQianchuanAccounts(row)" :key="qc.id" type="button" class="btn mini" :disabled="busy" :title="`千川广告主 ID：${qc.qc_id || '未填写'}`" @click="openQcLogin(qc)">打开千川·{{ qc.qc_name || qc.qc_id || `档案 #${qc.id}` }}</button>
+                <button v-for="qc in boundQianchuanAccounts(row)" :key="qc.id" type="button" class="btn mini" :disabled="busy" :title="`千川广告主 ID：${qc.qc_id || '未填写'}；使用「${row.name}」的百应浏览器`" @click="openQcLogin(qc, row.id)">打开千川·{{ qc.qc_name || qc.qc_id || `档案 #${qc.id}` }}</button>
                 <button v-if="boundQianchuanAccounts(row).length === 0" type="button" class="btn mini" @click="openQianchuanBindings">绑定千川</button>
                 <button type="button" class="btn mini" :disabled="busy" @click="openBrowser(row)">抖音主站</button>
                 <button type="button" class="btn mini" :disabled="busy" @click="openCreatorCenter(row)">打开创作者中心</button>
@@ -994,7 +1054,7 @@ function toggleSelectBind(id: number): void {
               <template v-if="boundQianchuanAccounts(row).length">
                 <div v-for="qc in boundQianchuanAccounts(row)" :key="qc.id" class="account-qc-entry">
                   <span :title="`千川广告主 ID：${qc.qc_id || '未填写'}`">{{ qc.qc_name || qc.qc_id || `档案 #${qc.id}` }} · {{ qcLoginLabel(qc) }}</span>
-                  <button type="button" class="btn mini" :disabled="busy" @click="openQcLogin(qc)">打开千川</button>
+                  <button type="button" class="btn mini" :disabled="busy" @click="openQcLogin(qc, row.id)">打开千川</button>
                 </div>
               </template>
               <template v-else>
@@ -1090,12 +1150,12 @@ function toggleSelectBind(id: number): void {
     <template v-else>
       <div class="batch-bar">
         <button type="button" class="btn mini" @click="qcForm.id = 0; qcForm.qc_name = ''; qcForm.qc_id = ''; qcForm.subject = ''; qcForm.remark = ''; showQcForm = true">新增千川账户</button>
-        <button v-if="accountsWithUnlinkedQianchuanId.length" type="button" class="btn mini primary" :disabled="busy" @click="linkSavedQianchuanIds">核对并关联已填千川 ID（{{ accountsWithUnlinkedQianchuanId.length }}）</button>
+        <button v-if="accountsWithUnlinkedQianchuanId.length" type="button" class="btn mini primary" :disabled="busy" @click="linkSavedQianchuanIds">核对并同步已填千川 ID（{{ accountsWithUnlinkedQianchuanId.length }}）</button>
       </div>
-      <p v-if="qcs.length === 0" class="qc-login-guide">账号卡片中的千川 ID 只是已填写的号码，尚未建立可登录的千川档案。{{ accountsWithUnlinkedQianchuanId.length ? '请先核对上方待关联账号和 ID，再点击“核对并关联已填千川 ID”。' : '请点击“新增千川账户”，然后绑定对应抖音账号。' }}</p>
-      <p v-else class="qc-login-guide">打开已绑定账户的专属浏览器后，请在千川网页右上角确认广告主 ID；本页暂不自动判断网页是否已登录。</p>
+      <p v-if="qcs.length === 0" class="qc-login-guide">账号卡片中的千川 ID 只是已填写的号码，尚未建立可登录的千川档案。{{ accountsWithUnlinkedQianchuanId.length ? '请先核对上方账号和 ID，再点击“核对并同步已填千川 ID”。' : '请点击“新增千川账户”，然后绑定对应抖音账号。' }}</p>
+      <p v-else class="qc-login-guide">账号绑定页的千川登录会复用对应抖音账号的百应浏览器。同一千川绑定多个账号时，可先选择要共用的账号；打开后请在千川网页右上角确认广告主 ID。</p>
       <div v-if="accountsWithUnlinkedQianchuanId.length" class="unlinked-qc-list">
-        <strong>账号中已填写、尚未关联的千川 ID</strong>
+        <strong>账号中已填写、需要同步或核对的千川 ID</strong>
         <span v-for="account in accountsWithUnlinkedQianchuanId" :key="account.id">{{ account.name }}：{{ account.qianchuan_id }}</span>
       </div>
       <div v-if="!compactLayout" class="table-wrap qc-table-wrap">
@@ -1106,7 +1166,7 @@ function toggleSelectBind(id: number): void {
               <th>千川ID</th>
               <th>所属主体</th>
               <th>登录记录</th>
-              <th>内置缓存（与专属浏览器分开）</th>
+              <th>内置缓存（与网页登录分开）</th>
               <th>绑定账号数</th>
               <th>最近校验</th>
               <th>备注</th>
@@ -1133,7 +1193,10 @@ function toggleSelectBind(id: number): void {
               <td class="muted">{{ row.last_check ? new Date(row.last_check).toLocaleString('zh-CN') : '—' }}</td>
               <td>{{ row.remark ?? '—' }}</td>
               <td class="ops">
-                <button type="button" class="btn mini" @click="openQcLogin(row)">打开专属浏览器</button>
+                <select v-if="boundAccountsForQc(row).length > 1" v-model.number="qcBrowserAccountSelections[row.id]" class="mini-select" :disabled="busy" aria-label="选择共用百应浏览器的抖音账号">
+                  <option v-for="account in boundAccountsForQc(row)" :key="account.id" :value="account.id">共用：{{ account.name }}</option>
+                </select>
+                <button type="button" class="btn mini" :disabled="busy || !qcBrowserAccountId(row)" :title="qcBrowserAccountId(row) ? '在所选抖音账号的百应浏览器中打开千川' : '请先绑定抖音账号'" @click="openQcLogin(row, qcBrowserAccountId(row))">{{ qcBrowserAccountId(row) ? '在百应浏览器打开' : '先绑定抖音账号' }}</button>
                 <button type="button" class="btn mini" @click="checkQcLogin(row)">查内置缓存</button>
                 <button type="button" class="btn mini" @click="openBindPanel(row)">绑定账号</button>
                 <button type="button" class="btn mini" @click="qcForm.id = row.id; qcForm.qc_name = row.qc_name ?? ''; qcForm.qc_id = row.qc_id ?? ''; qcForm.subject = row.subject ?? ''; qcForm.remark = row.remark ?? ''; showQcForm = true">编辑</button>
@@ -1151,12 +1214,18 @@ function toggleSelectBind(id: number): void {
           <div class="compact-head"><strong>{{ row.qc_name || '未命名千川账户' }}</strong><span class="tag" :class="qcLoginConfirmed(row) ? 'ok' : 'muted'">{{ qcLoginLabel(row) }}</span></div>
           <div class="compact-summary"><span>千川 ID：{{ row.qc_id || '—' }}</span><span>绑定 {{ row.bind_count }} 个账号</span><span>{{ row.subject || '未填写主体' }}</span></div>
           <div class="compact-actions">
-            <button type="button" class="btn mini primary" @click="openQcLogin(row)">打开专属浏览器</button>
+            <label v-if="boundAccountsForQc(row).length > 1" class="qc-browser-account-picker">
+              <span>共用百应账号</span>
+              <select v-model.number="qcBrowserAccountSelections[row.id]" class="mini-select" :disabled="busy">
+                <option v-for="account in boundAccountsForQc(row)" :key="account.id" :value="account.id">{{ account.name }}</option>
+              </select>
+            </label>
+            <button type="button" class="btn mini primary" :disabled="busy || !qcBrowserAccountId(row)" @click="openQcLogin(row, qcBrowserAccountId(row))">{{ qcBrowserAccountId(row) ? '在百应浏览器打开千川' : '先绑定抖音账号' }}</button>
             <button type="button" class="btn mini" @click="openBindPanel(row)">绑定账号</button>
             <button type="button" class="btn mini" @click="qcForm.id = row.id; qcForm.qc_name = row.qc_name ?? ''; qcForm.qc_id = row.qc_id ?? ''; qcForm.subject = row.subject ?? ''; qcForm.remark = row.remark ?? ''; showQcForm = true">编辑</button>
           </div>
           <details class="compact-details"><summary>详细信息与更多操作</summary>
-            <div class="compact-fields"><span>内置缓存（非专属浏览器）：{{ qcLoginMap[row.id] ? (qcLoginMap[row.id]!.loggedIn ? '有记录' : '无记录') : '未检查' }}</span><span>最近登录记录：{{ row.last_check ? new Date(row.last_check).toLocaleString('zh-CN') : '—' }}</span><span>备注：{{ row.remark || '—' }}</span></div>
+            <div class="compact-fields"><span>内置缓存（与网页登录分开）：{{ qcLoginMap[row.id] ? (qcLoginMap[row.id]!.loggedIn ? '有记录' : '无记录') : '未检查' }}</span><span>最近登录记录：{{ row.last_check ? new Date(row.last_check).toLocaleString('zh-CN') : '—' }}</span><span>备注：{{ row.remark || '—' }}</span></div>
             <div class="compact-actions"><button v-if="row.qc_id" type="button" class="btn mini" @click="copyText(row.qc_id!)">复制 ID</button><button type="button" class="btn mini" @click="checkQcLogin(row)">查内置缓存</button><button type="button" class="btn mini danger" @click="deleteQc(row)">删除</button></div>
           </details>
         </article>
@@ -1211,10 +1280,11 @@ function toggleSelectBind(id: number): void {
         <h3>{{ qcForm.id === 0 ? '新增千川账户' : '编辑千川账户' }}</h3>
         <div class="form-grid">
           <label>千川账户名<input v-model="qcForm.qc_name" /></label>
-          <label>千川ID<input v-model="qcForm.qc_id" /></label>
+          <label>千川广告主 ID<input v-model="qcForm.qc_id" inputmode="numeric" maxlength="20" placeholder="8–20 位数字，计划页使用此 ID" /></label>
           <label>所属主体<input v-model="qcForm.subject" /></label>
           <label>备注<input v-model="qcForm.remark" /></label>
         </div>
+        <p class="qc-login-guide">千川计划页读取这里保存的广告主 ID。账号卡片里单独填写的千川 ID，需要在账户列表点击“核对并同步已填千川 ID”。</p>
         <div class="modal-ops">
           <button type="button" class="btn" @click="showQcForm = false">取消</button>
           <button type="button" class="btn primary" :disabled="busy" @click="saveQc">保存</button>
@@ -1556,6 +1626,7 @@ function toggleSelectBind(id: number): void {
 .account-login-entry > span, .account-qc-entry span { overflow-wrap: anywhere; }
 .account-qc-entry { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 5px; width: 100%; }
 .account-qc-entry + .account-qc-entry { border-top: 1px solid var(--border); padding-top: 6px; }
+.qc-browser-account-picker { display: inline-flex; align-items: center; gap: 4px; color: var(--text-muted); font-size: 12px; }
 .compact-actions { flex-wrap: wrap; }
 .compact-details { margin-top: 9px; border-top: 1px solid var(--border); padding-top: 8px; }
 .compact-details summary { color: var(--brand); cursor: pointer; font-size: 12px; }
