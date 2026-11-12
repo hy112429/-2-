@@ -32,7 +32,7 @@ const emit = defineEmits<{
 
 const sections = computed(() => [
   { title: '带货情况', fields: props.filterGroups['带货情况'] ?? [] },
-  { title: '商品信息', fields: (props.filterGroups['商品信息'] ?? []).filter((field) => field.label !== '佣金区间') }
+  { title: '商品信息', fields: props.filterGroups['商品信息'] ?? [] }
 ])
 
 function update(change: (value: SelectionFilterSettings) => void): void {
@@ -135,6 +135,7 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
       <label>销量阈值<input :value="modelValue.thresholds.salesCount ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('salesCount', ($event.target as HTMLInputElement).value)"></label>
       <label>转化率阈值（%）<input :value="modelValue.thresholds.conversionRate ?? ''" type="number" min="0" step="0.1" placeholder="不限制" :disabled="disabled" @input="setThreshold('conversionRate', ($event.target as HTMLInputElement).value)"></label>
       <label>浏览量阈值<input :value="modelValue.thresholds.views ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('views', ($event.target as HTMLInputElement).value)"></label>
+      <label>最低佣金率（%）<input :value="modelValue.thresholds.commissionRate ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最低佣金率百分比" :disabled="disabled" @input="setThreshold('commissionRate', ($event.target as HTMLInputElement).value)"></label>
     </div>
     <label class="check-row"><input type="checkbox" :checked="modelValue.poolFallback" :disabled="disabled" @change="setPoolFallback(($event.target as HTMLInputElement).checked)">四池不足时从池外兜底补足</label>
     <p class="hint">
@@ -160,25 +161,6 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
     <section v-for="section in sections" :key="section.title" class="platform-filter-section">
       <h3>{{ section.title }}</h3>
       <div class="platform-filter-grid">
-        <div v-if="section.title === '商品信息'" class="platform-filter-field commission-threshold-field">
-          <span>最低佣金率（%）</span>
-          <div class="commission-threshold-input">
-            <span>≥</span>
-            <input
-              :value="modelValue.thresholds.commissionRate ?? ''"
-              type="number"
-              min="0"
-              max="100"
-              step="0.1"
-              placeholder="不限"
-              aria-label="最低佣金率百分比"
-              :disabled="disabled"
-              @input="setThreshold('commissionRate', ($event.target as HTMLInputElement).value)"
-            >
-            <span>%</span>
-          </div>
-          <small>按百应返回的商品佣金率筛选；留空时不限。</small>
-        </div>
         <div v-if="section.title === '商品信息'" class="platform-filter-field commission-threshold-field">
           <span>最低体验分</span>
           <div class="commission-threshold-input">

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import QianchuanOverviewView from './QianchuanOverviewView.vue'
 import QianchuanPlansView from './QianchuanPlansView.vue'
 
@@ -61,6 +61,8 @@ const workflowBusy = ref(false)
 const workflowProgress = ref('')
 const workflowMessage = ref('')
 const productSearch = ref('')
+const bindingReady = ref(false)
+const bindingMessage = ref('正在检查千川 ID 绑定…')
 
 function checked(data: Record<string, unknown>): Record<string, unknown> {
   if (data.ok === false) throw new Error(String(data.error ?? '操作失败'))
@@ -82,6 +84,23 @@ function matchesProduct(candidate: WorkflowCandidate): boolean {
   return !query || candidate.productId.includes(query) || candidate.productName.includes(query)
 }
 
+async function refreshBindingGate(): Promise<void> {
+  try {
+    const result = checked(await window.api.qianchuan.uploadTargets())
+    const valid = rows<WorkflowBinding>(result).filter((row) =>
+      row.account_status === 'active' && Number(row.qianchuan_account_id) > 0 &&
+      /^\d{8,20}$/.test(String(row.qc_id ?? '').trim())
+    )
+    bindingReady.value = valid.length > 0
+    bindingMessage.value = valid.length
+      ? `已绑定 ${valid.length} 个有效千川广告主 ID，可进入千川发布。`
+      : '必须先绑定有效千川广告主 ID，选品发布成功后才能进入千川素材和计划发布。'
+  } catch (error) {
+    bindingReady.value = false
+    bindingMessage.value = `无法确认千川 ID 绑定状态：${error instanceof Error ? error.message : String(error)}`
+  }
+}
+
 const retryableDownloadStatuses = new Set([
   'disabled', 'blocked_auth', 'blocked_binding', 'skipped_no_video', 'skipped_quota',
   'failed_query', 'failed_download', 'needs_review', 'needs_fill', 'candidate_exhausted'
@@ -89,6 +108,11 @@ const retryableDownloadStatuses = new Set([
 
 async function runWorkflow(): Promise<void> {
   if (workflowBusy.value) return
+  await refreshBindingGate()
+  if (!bindingReady.value) {
+    workflowMessage.value = bindingMessage.value
+    return
+  }
   workflowBusy.value = true
   workflowMessage.value = ''
   const queryLabel = productSearch.value.trim() ? `，按商品 ID ${productSearch.value.trim()} 搜索` : ''
@@ -250,6 +274,7 @@ async function runWorkflow(): Promise<void> {
     workflowBusy.value = false
   }
 }
+onMounted(() => { void refreshBindingGate() })
 </script>
 
 <template>
@@ -261,11 +286,17 @@ async function runWorkflow(): Promise<void> {
       </div>
       <div class="workflow-actions">
         <label class="product-search">商品 ID 搜索<input v-model="productSearch" inputmode="numeric" maxlength="30" placeholder="输入商品 ID" @input="productSearch = productSearch.replace(/\D/g, '').slice(0, 30)" /></label>
-        <button class="btn primary" type="button" :disabled="workflowBusy" @click="runWorkflow">{{ workflowBusy ? '流程执行中…' : '一键执行千川全流程' }}</button>
+        <button class="btn primary" type="button" :disabled="workflowBusy || !bindingReady" @click="runWorkflow">{{ workflowBusy ? '流程执行中…' : '一键执行千川全流程' }}</button>
         <button class="btn" type="button" @click="emit('navigate', '千川日志')">发布日志</button>
         <button class="btn" type="button" @click="emit('open-qianchuan-accounts')">账号与登录</button>
       </div>
     </header>
+
+    <div class="binding-gate" :class="{ ready: bindingReady }">
+      <strong>{{ bindingReady ? '千川 ID 已绑定' : '必须先绑定千川 ID' }}</strong>
+      <span>{{ bindingMessage }}</span>
+      <button v-if="!bindingReady" class="btn" type="button" @click="emit('open-qianchuan-accounts')">去绑定千川 ID</button>
+    </div>
 
     <div v-if="workflowProgress || workflowMessage" class="workflow-feedback" :class="{ error: workflowMessage && !workflowProgress }">
       <strong v-if="workflowProgress">{{ workflowProgress }}</strong>
@@ -305,6 +336,9 @@ async function runWorkflow(): Promise<void> {
 .product-search { display:flex; align-items:center; gap:6px; color:#536078; font-size:12px; }
 .product-search input { width:170px; min-height:30px; border:1px solid #d8dee8; border-radius:5px; padding:4px 8px; color:#263249; background:#fff; }
 .workflow-feedback { display:flex; flex-direction:column; gap:4px; flex:0 0 auto; padding:9px 11px; border:1px solid #c9dcff; border-radius:7px; background:#f3f7ff; color:#285bad; font-size:12px; line-height:1.45; }
+.binding-gate { display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:9px 11px; border:1px solid #f0c5c0; border-radius:7px; background:#fff4f2; color:#a23d35; font-size:12px; line-height:1.45; }
+.binding-gate.ready { border-color:#bfe3ce; background:#f1fbf5; color:#197044; }
+.binding-gate span { color:inherit; opacity:.9; }
 .workflow-feedback.error { border-color:#f3c2bd; background:#fff2f0; color:#b54743; }
 .platform-flow { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:6px; margin:0; padding:0; list-style:none; }
 .platform-flow li { display:flex; align-items:flex-start; gap:6px; min-width:0; padding:8px 7px; border:1px solid #e1e8f3; border-radius:7px; background:#f8fbff; color:#33415a; font-size:11px; line-height:1.35; }

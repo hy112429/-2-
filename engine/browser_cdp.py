@@ -6583,10 +6583,6 @@ def _candidate_rows(
 
 def _selection_filter_signature(settings: Dict[str, Any]) -> str:
     filters = copy.deepcopy(settings.get("filters") if isinstance(settings.get("filters"), dict) else {})
-    product_filters = filters.get("product") if isinstance(filters.get("product"), dict) else None
-    if product_filters is not None:
-        # 旧版本把佣金作为百应固定区间保存；其运行口径已改为客户端数值阈值。
-        product_filters.pop("佣金区间", None)
     desired_settings = {
         "categorySelection": settings.get("categorySelection", {}),
         "filters": filters,
@@ -9426,13 +9422,6 @@ def apply_filter_settings(
     replace_category_selection: bool = False,
 ) -> list[str]:
     values = settings.get("filters") if isinstance(settings.get("filters"), dict) else {}
-    has_legacy_commission_filter = any(
-        isinstance(group, dict) and bool(group.get("佣金区间"))
-        for group in values.values()
-    )
-    if has_legacy_commission_filter:
-        # 旧档位在新口径下无效；重置一次百应页面，防止先前选中的固定区间残留。
-        preserve_other_filters = False
     warnings: list[str] = []
     group_values: Dict[str, Any] = {}
     for value in values.values() if isinstance(values, dict) else []:
@@ -9440,7 +9429,7 @@ def apply_filter_settings(
             group_values.update(value)
     configured_fields = {
         label: configured for label, configured in group_values.items()
-        if label != "佣金区间" and ((isinstance(configured, list) and any(str(item) for item in configured)) or (configured and not isinstance(configured, list)))
+        if ((isinstance(configured, list) and any(str(item) for item in configured)) or (configured and not isinstance(configured, list)))
     }
     raw_features = values.get("features", []) if isinstance(values, dict) else []
     selected_features = set(str(item) for item in raw_features) if isinstance(raw_features, list) else {

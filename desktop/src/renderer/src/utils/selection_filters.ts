@@ -72,8 +72,6 @@ export function createSelectionFilterSettings(
   const fallbackSources = fallback.sources
   const candidateLimit = Number(source.candidateLimit)
   const productFilters = normalizeFilterGroup(sourceFilters.product, fallbackFilters.product)
-  // 旧版本保存的是百应固定区间；新版本改为本地数值阈值，避免旧档位继续限制候选。
-  delete productFilters['佣金区间']
   const sourceSources = asRecord(source.sources)
   const sourcePriority = Array.isArray(sourceSources.priority)
     ? sourceSources.priority.map(String).filter((item): item is 'hotSpot' | 'allianceRank' => item === 'hotSpot' || item === 'allianceRank')
