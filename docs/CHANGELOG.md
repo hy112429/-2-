@@ -4,6 +4,7 @@
 
 - 基于 B 最新已推送提交 `e19d3027cacdef437d996abc42c0562ecb0da8f3`，包含千川计划工作区、计划发布日志及批量选择素材；并包含 A 提交 `fc66dc60d031483fbe1bda8ae6fbf3fd471479dd` 的自动计划串行队列、已有登录资料复用和待核查隔离修复。
 - `npm run pack` 已完成，内置类型检查、Electron 构建、Python staging 校验，并产出 Windows x64 NSIS 安装包与 ZIP 便携包。SHA256：安装包 `2053BA65CB82F7149ACB7B0612C3FBCDBC71BBD4F5AE513229B7219AB011E94A`；便携包 `C5871D1826E0AF6275864C952BA6C54FD13D6F539042E7791228D58D33797FB7`。
+- 打包目录运行烟测中，Electron 主窗口正常显示；随包 Python 依赖可导入，FFmpeg/FFprobe 可运行，隔离数据库初始化成功且 `quick_check=ok`。不过本机启动时 Electron 仍解析到当前 Windows 账户的 AppData，未能隔离用户数据；测试时间段内计划/上传/发布/选品事件及队列状态没有新增记录，测试进程已退出。由于本机已有客户端安装登记，未运行 NSIS 安装器，以免改写现有安装登记或快捷方式；干净用户环境的实际安装与首次启动仍待验证。
 - 本次未执行独立测试套件或真实千川平台操作；未创建/发布投放计划，未发布 GitHub Release。客户环境仍需用专用账号验收。
 
 ## 未发布变更
