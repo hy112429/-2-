@@ -378,7 +378,7 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
       </section>
 
       <section class="card">
-        <div class="section-head"><div><h2>计划列表 · {{ selectedAccountName }}</h2><p>发布计划前会再次显示预算并要求确认；提交结果不明时会进入待核查，不自动重复提交。</p></div><div class="plan-filters"><label>状态<select v-model="planStatus"><option value="">全部状态</option><option value="ready">待发布</option><option value="submitting">发布中</option><option value="published">已发布</option><option value="blocked">发布前停止</option><option value="needs_review">待核查</option></select></label><button class="btn" :disabled="loading || busy" @click="refreshPlanData(false)">刷新计划</button></div></div>
+        <div class="section-head"><div><h2>计划列表 · {{ selectedAccountName }}</h2><p>已开启账户自动发布时，自动任务会按队列依次处理；手动任务仍需你确认预算。提交结果不明会暂停同一千川账户的后续自动计划，核实前不会重复发布。</p></div><div class="plan-filters"><label>状态<select v-model="planStatus"><option value="">全部状态</option><option value="ready">待发布</option><option value="submitting">发布中</option><option value="published">已发布</option><option value="blocked">发布前停止</option><option value="needs_review">待核查</option></select></label><button class="btn" :disabled="loading || busy" @click="refreshPlanData(false)">刷新计划</button></div></div>
         <div v-if="!visiblePlans.length" class="empty-state">暂无计划任务。</div>
         <div v-else class="plan-list">
           <article v-for="plan in visiblePlans" :key="plan.id" class="plan-row">

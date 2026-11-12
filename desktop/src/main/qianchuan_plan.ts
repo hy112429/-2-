@@ -3,7 +3,12 @@ import { existsSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { getClientPaths } from './app-dirs'
 import { runEngineCommand } from './engine'
-import { existingManagedBrowserConnection, openManagedBrowser, validateManagedProfilePath } from './external_browser'
+import {
+  closeAutomationLaunchedBrowser,
+  commandManagedBrowser,
+  existingManagedBrowserConnection,
+  validateManagedProfilePath
+} from './external_browser'
 import { reserveQianchuanAccount, releaseQianchuanAccount } from './qianchuan_account_lock'
 
 type Json = Record<string, unknown>
@@ -25,20 +30,73 @@ async function command(action: string, args: string[] = []): Promise<Json> {
   return result
 }
 
+interface PlanBrowserLease {
+  profileKey: string
+  profilePath: string
+  port: number
+  dedicated: boolean
+  automationOpened: boolean
+}
+
+async function ensurePlanBrowser(job: Json): Promise<{ lease?: PlanBrowserLease; error?: string }> {
+  const qcId = validId(job['qianchuan_account_id'])
+  const accountId = validId(job['account_id'])
+  const advertiserId = value(job['advertiser_id']).trim()
+  if (!/^\d{8,20}$/.test(advertiserId)) return { error: '计划的千川广告主 ID 无效，请检查账号绑定。' }
+  const profiles = [
+    { profileKey: `qianchuan-${qcId}`, dedicated: true },
+    { profileKey: `account-${accountId}`, dedicated: false }
+  ]
+
+  for (const profile of profiles) {
+    const connection = await existingManagedBrowserConnection(profile.profileKey)
+    if (connection) return { lease: { ...connection, ...profile, automationOpened: false } }
+  }
+
+  const failures: string[] = []
+  for (const profile of profiles) {
+    try {
+      const profilePath = validateManagedProfilePath(profile.profileKey)
+      if (!existsSync(join(profilePath, 'Default'))) continue
+      const opened = await commandManagedBrowser('open', {
+        url: `https://qianchuan.jinritemai.com/home?aavid=${encodeURIComponent(advertiserId)}`
+      }, { profileKey: profile.profileKey })
+      if (opened['ok'] !== true) throw new Error(value(opened['error']) || '浏览器未确认打开')
+      const connection = await existingManagedBrowserConnection(profile.profileKey)
+      if (connection) return { lease: { ...connection, ...profile, automationOpened: true } }
+      throw new Error('浏览器已启动，但未取得本机调试连接')
+    } catch (error) {
+      // 只关闭本客户端这次自动启动的窗口；手动打开的浏览器不会被触碰。
+      try { await closeAutomationLaunchedBrowser({ profileKey: profile.profileKey }) } catch { /* 保留启动错误 */ }
+      failures.push(`${profile.profileKey}: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  if (failures.length) {
+    return { error: `已有登录资料但无法启动千川计划浏览器；请检查浏览器状态后重试。${failures.join('；')}` }
+  }
+  return { error: '没有可复用的千川或抖音账号登录资料。请先在账号管理打开对应专属浏览器并完成登录；自动流程不会创建空白登录态。' }
+}
+
 async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<Json> {
   if (running) return { ok: false, error: '已有千川计划正在处理' }
   const all = await command('jobs', ['--id', String(jobId)])
   const job = (Array.isArray(all['rows']) ? all['rows'] as Json[] : []).find((row) => Number(row['id']) === jobId)
   if (!job || job['status'] !== 'ready') return { ok: false, error: '任务已经处理或待核查，不能重复发布' }
   const qcId = validId(job['qianchuan_account_id'])
-  const accountId = validId(job['account_id'])
-  const dedicated = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
-  const connection = dedicated ?? await existingManagedBrowserConnection(`account-${accountId}`)
-  if (!connection) return { ok: false, error: `千川账户 ${qcId} 或抖音账号 ${accountId} 的专属浏览器未打开，请在账号与登录中打开后再试` }
   if (!reserveQianchuanAccount(qcId)) return { ok: false, error: '该千川账户正在上传或读取素材' }
   running = true
   let claimed = false
+  let lease: PlanBrowserLease | undefined
+  let keepAutomationBrowserOpen = false
   try {
+    const prepared = await ensurePlanBrowser(job)
+    if (!prepared.lease) {
+      const reason = prepared.error || '等待千川账号浏览器就绪'
+      await command('defer', ['--id', String(jobId), '--reason', reason])
+      return { ok: false, error: reason }
+    }
+    const activeLease = prepared.lease
+    lease = activeLease
     await command('claim', [
       '--id', String(jobId),
       ...(expectedDailyBudgetYuan == null ? [] : ['--expected-daily-budget-yuan', String(expectedDailyBudgetYuan)])
@@ -48,26 +106,31 @@ async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<
     mkdirSync(diagnosticsDir, { recursive: true })
     const outcome = await runEngineCommand('qianchuan_plan_browser.py', [
       '--db', getClientPaths().databasePath, '--job-id', String(jobId),
-      '--profile-path', connection.profilePath, '--cdp-port', String(connection.port),
-      '--douyin-account-id', dedicated ? '0' : String(accountId),
+      '--profile-path', activeLease.profilePath, '--cdp-port', String(activeLease.port),
+      '--douyin-account-id', activeLease.dedicated ? '0' : String(job['account_id']),
       '--diagnostics-dir', diagnosticsDir
     ])
-    const browser = object(outcome.result)
-    const status = outcome.ok && ['published', 'needs_review', 'blocked'].includes(value(browser['status']))
-      ? value(browser['status']) : 'needs_review'
-    const submitted = status === 'needs_review' || browser['submitAttempted'] === true
+    const browserResult = object(outcome.result)
+    const status = outcome.ok && ['published', 'needs_review', 'blocked'].includes(value(browserResult['status']))
+      ? value(browserResult['status']) : 'needs_review'
+    const submitted = status === 'needs_review' || browserResult['submitAttempted'] === true
     const result = await command('finish', [
       '--id', String(jobId), '--status', status,
       '--submit-attempted', submitted ? '1' : '0',
-      '--remote-plan-id', value(browser['remotePlanId']),
-      '--reason', value(browser['reason']) || outcome.error || '浏览器执行器未返回可信结果，需人工核查',
-      '--screenshot-path', value(browser['screenshotPath']),
-      '--selected-material-ids-json', JSON.stringify(Array.isArray(browser['selectedMaterialIds'])
-        ? browser['selectedMaterialIds'] : [])
+      '--remote-plan-id', value(browserResult['remotePlanId']),
+      '--reason', value(browserResult['reason']) || outcome.error || '浏览器执行器未返回可信结果，需人工核查',
+      '--screenshot-path', value(browserResult['screenshotPath']),
+      '--selected-material-ids-json', JSON.stringify(Array.isArray(browserResult['selectedMaterialIds'])
+        ? browserResult['selectedMaterialIds'] : [])
     ])
+    if (status === 'needs_review' || (status === 'blocked' && /登录|验证|访问权限|广告主/.test(value(browserResult['reason'])))) {
+      // 需要登录/人工核对的页面留给操作员，避免关窗后增加恢复成本。
+      keepAutomationBrowserOpen = true
+    }
     return result
   } catch (error) {
     if (claimed) {
+      keepAutomationBrowserOpen = true
       try {
         await command('finish', ['--id', String(jobId), '--status', 'needs_review',
           '--submit-attempted', '1', '--reason', `计划执行中断，需先在千川核查：${String(error)}`])
@@ -75,6 +138,10 @@ async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<
     }
     return { ok: false, error: String(error) }
   } finally {
+    if (lease?.automationOpened && !keepAutomationBrowserOpen) {
+      try { await closeAutomationLaunchedBrowser({ profileKey: lease.profileKey }) }
+      catch (error) { console.warn(`[千川计划] 自动启动的浏览器未能关闭：${String(error)}`) }
+    }
     running = false
     releaseQianchuanAccount(qcId)
   }
@@ -88,49 +155,42 @@ async function runSupplement(id: number): Promise<Json> {
   if (!job || job['status'] !== 'scheduled') return { ok: false, error: '追加任务状态已改变' }
   const qcId = validId(job['qianchuan_account_id'])
   const accountId = validId(job['account_id'])
-  const dedicated = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
-  let connection = dedicated ?? await existingManagedBrowserConnection(`account-${accountId}`)
-  if (!connection) {
-    // 次日任务沿用原抖音账号的持久 Chrome 资料，最多只打开这一个账号。
-    const profileKey = `account-${accountId}`
-    const profilePath = validateManagedProfilePath(profileKey)
-    if (!existsSync(join(profilePath, 'Default'))) {
-      return { ok: false, error: '原账号没有已建立的专属浏览器资料，等待登录' }
-    }
-    const advertiser = value(job['advertiser_id'])
-    if (!/^\d{8,20}$/.test(advertiser)) return { ok: false, error: '原千川广告主 ID 无效' }
-    const opened = await openManagedBrowser(`https://qianchuan.jinritemai.com/uni-prom?aavid=${advertiser}`,
-      { profileKey })
-    if (!opened.ok || !opened.profilePath || !opened.port) {
-      return { ok: false, error: opened.error || '无法打开原账号专属浏览器' }
-    }
-    connection = { profilePath: opened.profilePath, port: opened.port }
-  }
   if (!reserveQianchuanAccount(qcId)) return { ok: false, error: '该千川账户正在执行其他任务' }
   running = true
   let claimed = false
+  let lease: PlanBrowserLease | undefined
+  let keepAutomationBrowserOpen = false
   try {
+    const prepared = await ensurePlanBrowser(job)
+    if (!prepared.lease) return { ok: false, error: prepared.error || '等待千川账号浏览器就绪' }
+    const activeLease = prepared.lease
+    lease = activeLease
     await command('claim-supplement', ['--id', String(id)])
     claimed = true
     const diagnosticsDir = join(getClientPaths().dataDir, 'diagnostics', 'qianchuan-plan')
     mkdirSync(diagnosticsDir, { recursive: true })
     const outcome = await runEngineCommand('qianchuan_plan_supplement_browser.py', [
       '--db', getClientPaths().databasePath, '--supplement-id', String(id),
-      '--profile-path', connection.profilePath, '--cdp-port', String(connection.port),
-      '--douyin-account-id', dedicated ? '0' : String(accountId),
+      '--profile-path', activeLease.profilePath, '--cdp-port', String(activeLease.port),
+      '--douyin-account-id', activeLease.dedicated ? '0' : String(accountId),
       '--diagnostics-dir', diagnosticsDir
     ])
     const browser = object(outcome.result)
     const status = outcome.ok && ['applied', 'already_present', 'waiting', 'needs_review', 'blocked']
       .includes(value(browser['status'])) ? value(browser['status']) : 'needs_review'
     const submitted = status === 'needs_review' || browser['submitAttempted'] === true
-    return command('finish-supplement', [
+    const result = await command('finish-supplement', [
       '--id', String(id), '--status', status, '--submit-attempted', submitted ? '1' : '0',
       '--reason', value(browser['reason']) || outcome.error || '追加结果不明确，需核查原计划',
       '--screenshot-path', value(browser['screenshotPath'])
     ])
+    if (status === 'needs_review' || (status === 'blocked' && /登录|验证|访问权限|广告主/.test(value(browser['reason'])))) {
+      keepAutomationBrowserOpen = true
+    }
+    return result
   } catch (error) {
     if (claimed) {
+      keepAutomationBrowserOpen = true
       try {
         await command('finish-supplement', ['--id', String(id), '--status', 'needs_review',
           '--submit-attempted', '1', '--reason', `追加执行中断，需核查原计划：${String(error)}`])
@@ -138,6 +198,10 @@ async function runSupplement(id: number): Promise<Json> {
     }
     return { ok: false, error: String(error) }
   } finally {
+    if (lease?.automationOpened && !keepAutomationBrowserOpen) {
+      try { await closeAutomationLaunchedBrowser({ profileKey: lease.profileKey }) }
+      catch (error) { console.warn(`[千川计划] 自动补素材后浏览器未能关闭：${String(error)}`) }
+    }
     running = false
     releaseQianchuanAccount(qcId)
   }
@@ -148,29 +212,79 @@ async function tick(): Promise<void> {
   try {
     await command('sync')
     await command('sync-supplements')
+    const pausedAccounts = new Set<number>()
+    const attemptedJobs = new Set<number>()
     for (let offset = 0; ; offset += 200) {
-      const jobs = await command('jobs', ['--status', 'ready', '--offset', String(offset)])
-      const page = Array.isArray(jobs['rows']) ? jobs['rows'] as Json[] : []
-      const ready = page.filter((job) => value(job['creation_source'] ?? 'auto') === 'auto')
-      for (const job of ready) {
-        const qcId = validId(job['qianchuan_account_id'])
-        if (await existingManagedBrowserConnection(`qianchuan-${qcId}`) ||
-            await existingManagedBrowserConnection(`account-${validId(job['account_id'])}`)) {
-          const result = await runOne(validId(job['id']))
-          if (result['ok'] !== false) return // 一个轮次只提交一条计划。
-          console.warn(`[千川计划] 任务 #${value(job['id'])} 暂未执行：${value(result['error'])}`)
-        }
-      }
+      const reviews = await command('jobs', ['--status', 'needs_review', '--offset', String(offset)])
+      const page = Array.isArray(reviews['rows']) ? reviews['rows'] as Json[] : []
+      for (const review of page) pausedAccounts.add(validId(review['qianchuan_account_id']))
       if (page.length < 200) break
     }
-    for (let offset = 0; ; offset += 200) {
-      const supplements = await command('supplement-jobs', ['--status', 'scheduled', '--due-only', '--offset', String(offset)])
-      const due = Array.isArray(supplements['rows']) ? supplements['rows'] as Json[] : []
-      for (const job of due) {
-        const result = await runSupplement(validId(job['id']))
-        if (result['ok'] !== false) return // 一个轮次只处理一个原计划。
+
+    // 始终从队首重新找一条本轮未尝试的任务；已完成任务会离开 ready 集合，
+    // 因而不会在分页偏移变化时漏掉 200 条之后的商品，也不会被无登录态任务卡住。
+    while (true) {
+      let next: Json | undefined
+      for (let offset = 0; ; offset += 200) {
+        const jobs = await command('jobs', ['--status', 'ready', '--offset', String(offset)])
+        const page = Array.isArray(jobs['rows']) ? jobs['rows'] as Json[] : []
+        next = page.find((job) => {
+          const id = Number(job['id'])
+          const qcId = Number(job['qianchuan_account_id'])
+          return value(job['creation_source'] ?? 'auto') === 'auto' &&
+            Number.isSafeInteger(id) && !attemptedJobs.has(id) &&
+            Number.isSafeInteger(qcId)
+        })
+        if (next || page.length < 200) break
       }
-      if (due.length < 200) break
+      if (!next) break
+      const id = validId(next['id'])
+      const qcId = validId(next['qianchuan_account_id'])
+      attemptedJobs.add(id)
+      if (pausedAccounts.has(qcId)) {
+        const reason = '同一千川广告主有计划提交结果待核查；核实前暂停后续自动发布。'
+        await command('defer', ['--id', String(id), '--reason', reason])
+        continue
+      }
+      const result = await runOne(id)
+      if (result['ok'] === false) {
+        console.warn(`[千川计划] 任务 #${id} 暂未执行：${value(result['error'])}`)
+      }
+      const latest = await command('jobs', ['--id', String(id)])
+      const latestJob = (Array.isArray(latest['rows']) ? latest['rows'] as Json[] : [])
+        .find((job) => Number(job['id']) === id)
+      if (latestJob?.['status'] === 'needs_review') pausedAccounts.add(qcId)
+    }
+
+    const attemptedSupplements = new Set<number>()
+    while (true) {
+      let next: Json | undefined
+      for (let offset = 0; ; offset += 200) {
+        const supplements = await command('supplement-jobs', [
+          '--status', 'scheduled', '--due-only', '--offset', String(offset)
+        ])
+        const page = Array.isArray(supplements['rows']) ? supplements['rows'] as Json[] : []
+        next = page.find((job) => {
+          const id = Number(job['id'])
+          const qcId = Number(job['qianchuan_account_id'])
+          return Number.isSafeInteger(id) && !attemptedSupplements.has(id) &&
+            Number.isSafeInteger(qcId) && !pausedAccounts.has(qcId)
+        })
+        if (next || page.length < 200) break
+      }
+      if (!next) break
+      const id = validId(next['id'])
+      attemptedSupplements.add(id)
+      const result = await runSupplement(id)
+      if (result['ok'] === false) {
+        console.warn(`[千川计划] 原计划补素材任务 #${id} 暂未执行：${value(result['error'])}`)
+      }
+      const refreshed = await command('supplement-jobs', ['--id', String(id)])
+      const supplement = (Array.isArray(refreshed['rows']) ? refreshed['rows'] as Json[] : [])
+        .find((job) => Number(job['id']) === id)
+      if (supplement?.['status'] === 'needs_review') {
+        pausedAccounts.add(validId(supplement['qianchuan_account_id']))
+      }
     }
   } catch (error) {
     console.warn(`[千川计划] 后台检查失败：${String(error)}`)
