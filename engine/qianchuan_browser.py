@@ -47,6 +47,7 @@ class UploadOptions:
     result_timeout_s: int = 120
     advertiser_id: str = ""
     douyin_account_id: int = 0
+    product_id: str = ""
 
 
 class UploadStopped(RuntimeError):
@@ -118,6 +119,8 @@ def _validate(options: UploadOptions) -> None:
         raise UploadStopped("千川账户 ID 无效", stage="input")
     if options.advertiser_id and not re.fullmatch(r"\d{8,20}", options.advertiser_id):
         raise UploadStopped("千川广告主 ID 无效", stage="input")
+    if options.product_id and not re.fullmatch(r"\d{1,30}", options.product_id):
+        raise UploadStopped("商品 ID 无效", stage="input")
     if options.douyin_account_id and (options.douyin_account_id <= 0 or not options.advertiser_id):
         raise UploadStopped("复用抖音账号浏览器时必须指定账号和千川广告主 ID", stage="input")
     if not options.asset_name.strip():
@@ -287,6 +290,85 @@ def _file_input(page: Any) -> Any | None:
     return candidates[0] if candidates else None
 
 
+def _is_large_file_transfer_error(error: BaseException) -> bool:
+    return bool(re.search(
+        r"cannot transfer files larger than 50\s*mb|larger than 50\s*mb",
+        str(error),
+        flags=re.IGNORECASE,
+    ))
+
+
+def _set_files_via_local_cdp(page: Any, element_handle: Any, paths: list[Path]) -> None:
+    """在本机浏览器上通过 CDP 设置文件，绕过 Playwright 远程传输 50 MB 限制。
+
+    仅在浏览器和客户端位于同一台电脑时可用；远程浏览器会抛出原始异常，
+    由上层把任务保留为待核查，避免把传输失败误记成上传成功。
+    """
+    marker = f"touguang-file-input-{uuid.uuid4().hex}"
+    element_handle.evaluate(
+        "(element, value) => element.setAttribute('data-touguang-file-input', value)",
+        marker,
+    )
+    session = None
+    try:
+        session = page.context.new_cdp_session(page)
+        document = session.send("DOM.getDocument", {"depth": -1, "pierce": True})
+        root_node_id = int(document["root"]["nodeId"])
+        selector = f'[data-touguang-file-input="{marker}"]'
+        match = session.send("DOM.querySelector", {"nodeId": root_node_id, "selector": selector})
+        node_id = int(match.get("nodeId") or 0)
+        if node_id <= 0:
+            raise RuntimeError("CDP 未找到千川视频文件控件")
+        session.send("DOM.setFileInputFiles", {
+            "nodeId": node_id,
+            "files": [str(path) for path in paths],
+        })
+    finally:
+        try:
+            element_handle.evaluate(
+                "element => element.removeAttribute('data-touguang-file-input')"
+            )
+        except Exception:
+            pass
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+
+
+def _set_file_input_files(page: Any, file_input: Any, paths: list[Path], timeout: int) -> None:
+    try:
+        file_input.set_input_files(
+            [str(path) for path in paths] if len(paths) > 1 else str(paths[0]),
+            timeout=timeout,
+        )
+        return
+    except Exception as error:
+        if not _is_large_file_transfer_error(error):
+            raise
+        element_handle = file_input.element_handle()
+        if element_handle is None:
+            raise
+        _set_files_via_local_cdp(page, element_handle, paths)
+
+
+def _set_file_chooser_files(page: Any, chooser: Any, paths: list[Path], timeout: int) -> None:
+    try:
+        chooser.set_files(
+            [str(path) for path in paths] if len(paths) > 1 else str(paths[0]),
+            timeout=timeout,
+        )
+        return
+    except Exception as error:
+        if not _is_large_file_transfer_error(error):
+            raise
+        element_handle = getattr(chooser, "element", None)
+        if element_handle is None:
+            raise
+        _set_files_via_local_cdp(page, element_handle, paths)
+
+
 def _supports_multiple_files(control: Any) -> bool:
     """优先使用 Playwright 的布尔属性回读，兼容隔离测试中的轻量控件。"""
     try:
@@ -300,7 +382,7 @@ def _choose_file(page: Any, options: UploadOptions, mark_selection_started: Call
     file_input = _file_input(page)
     if file_input is not None:
         mark_selection_started()
-        file_input.set_input_files(str(options.asset_path), timeout=file_timeout_ms)
+        _set_file_input_files(page, file_input, [options.asset_path], file_timeout_ms)
         return
     # 千川视频库先弹上传窗口，窗口内的“点击上传”才打开原生文件选择器。
     trigger = (_named_control(page, "点击上传") or
@@ -318,7 +400,7 @@ def _choose_file(page: Any, options: UploadOptions, mark_selection_started: Call
         file_input = _file_input(page)
         if file_input is not None:
             mark_selection_started()
-            file_input.set_input_files(str(options.asset_path), timeout=file_timeout_ms)
+            _set_file_input_files(page, file_input, [options.asset_path], file_timeout_ms)
             return
         inner_trigger = _named_control(page, "点击上传")
         if inner_trigger is None or trigger.inner_text().strip() == "点击上传":
@@ -329,11 +411,11 @@ def _choose_file(page: Any, options: UploadOptions, mark_selection_started: Call
         except PlaywrightTimeoutError as nested_error:
             raise UploadStopped(f"上传弹窗未打开文件选择器：{nested_error}", stage="file_input") from nested_error
         mark_selection_started()
-        chooser.value.set_files(str(options.asset_path), timeout=file_timeout_ms)
+        _set_file_chooser_files(page, chooser.value, [options.asset_path], file_timeout_ms)
         return
     # 已收到文件选择事件后若设置文件失败，不再尝试第二次，避免重复上传。
     mark_selection_started()
-    chooser.value.set_files(str(options.asset_path), timeout=file_timeout_ms)
+    _set_file_chooser_files(page, chooser.value, [options.asset_path], file_timeout_ms)
 
 
 def _upload_ready(page: Any, asset_path: Path) -> tuple[bool, str]:
@@ -455,19 +537,25 @@ def _dom_remote_id(page: Any, name: str) -> str | None:
     }""", name)
 
 
-def _search_material_id(page: Any, name: str) -> str | None:
-    """按完整文件名刷新视频库，只接受同一行显示的素材 ID。"""
+def _search_material_id(page: Any, name: str, product_id: str = "") -> str | None:
+    """先按商品 ID 定位视频库，再按完整文件名核对素材 ID。
+
+    千川视频库的实页搜索框支持“视频名称/ID搜索”，商品 ID 是更稳定的
+    第一检索条件；旧页面不支持商品 ID 时再回退到完整文件名。
+    """
     search = _one_visible(page.locator('input[placeholder*="视频名称/ID搜索"]'))
     if search is None or not search.is_enabled():
         return _dom_remote_id(page, name)
-    search.fill(name, timeout=5_000)
-    search.press("Enter", timeout=5_000)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        remote_id = _dom_remote_id(page, name)
-        if remote_id:
-            return remote_id
-        time.sleep(0.5)
+    terms = list(dict.fromkeys(term for term in (product_id.strip(), name.strip()) if term))
+    for term in terms:
+        search.fill(term, timeout=5_000)
+        search.press("Enter", timeout=5_000)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            remote_id = _dom_remote_id(page, name)
+            if remote_id:
+                return remote_id
+            time.sleep(0.5)
     return None
 
 
@@ -492,7 +580,7 @@ def _wait_confirmation(page: Any, responses: list[Any], options: UploadOptions,
         if time.monotonic() >= next_search_at:
             next_search_at = time.monotonic() + 10
             try:
-                remote_id = _search_material_id(page, options.asset_name)
+                remote_id = _search_material_id(page, options.asset_name, options.product_id)
             except Exception:
                 remote_id = None  # 弹窗关闭和列表刷新期间允许下轮重试。
             if remote_id and remote_id != prior_remote_id:
@@ -517,6 +605,7 @@ def _save_evidence(page: Any | None, options: UploadOptions, result: dict[str, A
         details: dict[str, Any] = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "qianchuanAccountId": options.qianchuan_account_id,
+            "productId": options.product_id,
             "assetFileName": options.asset_path.name,
             "assetName": options.asset_name,
             "responseEndpoint": endpoint,
@@ -567,7 +656,7 @@ def upload_material(options: UploadOptions) -> dict[str, Any]:
                 raise UploadStopped("素材页未显示目标千川广告主，已停止文件选择", stage="navigate")
             page.on("response", lambda response: responses.append(response))
             _delay(options)
-            prior_remote_id = _search_material_id(page, options.asset_name)
+            prior_remote_id = _search_material_id(page, options.asset_name, options.product_id)
             if prior_remote_id:
                 return _save_evidence(page, options,
                                       _result("succeeded", "千川已有同名素材，已回读远端 ID", "verify",
@@ -633,18 +722,18 @@ def _choose_files(page: Any, options: UploadOptions, paths: list[Path],
                 if not chooser.value.is_multiple():
                     raise UploadStopped("千川当前上传窗口不支持多选", stage="file_input")
                 mark_selection_started()
-                chooser.value.set_files([str(path) for path in paths], timeout=timeout)
+                _set_file_chooser_files(page, chooser.value, paths, timeout)
                 return
         else:
             if not chooser.value.is_multiple():
                 raise UploadStopped("千川当前上传窗口不支持多选", stage="file_input")
             mark_selection_started()
-            chooser.value.set_files([str(path) for path in paths], timeout=timeout)
+            _set_file_chooser_files(page, chooser.value, paths, timeout)
             return
     if file_input is None or not _supports_multiple_files(file_input):
         raise UploadStopped("千川当前视频文件控件不支持多选", stage="file_input")
     mark_selection_started()
-    file_input.set_input_files([str(path) for path in paths], timeout=timeout)
+    _set_file_input_files(page, file_input, paths, timeout)
 
 
 def _wait_batch_ready(page: Any, options: UploadOptions, names: list[str]) -> None:
@@ -706,7 +795,7 @@ def upload_material_batch(options_list: list[UploadOptions]) -> dict[str, Any]:
             _delay(first)
             # 已存在的同名素材直接回读，不再重复上传。
             for option in options_list:
-                remote_id = _search_material_id(page, option.asset_name)
+                remote_id = _search_material_id(page, option.asset_name, option.product_id)
                 if remote_id:
                     confirmed[option.asset_name] = remote_id
                     preexisting.add(option.asset_name)
@@ -731,7 +820,7 @@ def upload_material_batch(options_list: list[UploadOptions]) -> dict[str, Any]:
                     for option in pending:
                         if option.asset_name in confirmed:
                             continue
-                        remote_id = _search_material_id(page, option.asset_name)
+                        remote_id = _search_material_id(page, option.asset_name, option.product_id)
                         if remote_id:
                             confirmed[option.asset_name] = remote_id
                     if len(confirmed) < len(options_list):
@@ -771,6 +860,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--douyin-account-id", type=int, default=0)
     parser.add_argument("--asset-path", type=Path)
     parser.add_argument("--asset-name", default="")
+    parser.add_argument("--product-id", default="")
     parser.add_argument("--batch-assets-json", default="[]")
     parser.add_argument("--diagnostics-dir", type=Path, required=True)
     parser.add_argument("--min-delay-ms", type=int, default=800)
@@ -792,7 +882,8 @@ def main(argv: list[str] | None = None) -> int:
                 diagnostics_dir=args.diagnostics_dir, min_delay_ms=args.min_delay_ms,
                 max_delay_ms=args.max_delay_ms, upload_timeout_s=args.upload_timeout_s,
                 result_timeout_s=args.result_timeout_s, advertiser_id=args.advertiser_id,
-                douyin_account_id=args.douyin_account_id) for item in assets]
+                douyin_account_id=args.douyin_account_id,
+                product_id=str(item.get("productId", args.product_id))) for item in assets]
         except (ValueError, TypeError, KeyError) as error:
             parser.error(f"批量素材参数无效：{error}")
         print(json.dumps(upload_material_batch(options_list), ensure_ascii=False), flush=True)
@@ -805,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         min_delay_ms=args.min_delay_ms, max_delay_ms=args.max_delay_ms,
         upload_timeout_s=args.upload_timeout_s, result_timeout_s=args.result_timeout_s,
         advertiser_id=args.advertiser_id, douyin_account_id=args.douyin_account_id,
+        product_id=args.product_id,
     )
     result = upload_material(options)
     print(json.dumps(result, ensure_ascii=False), flush=True)

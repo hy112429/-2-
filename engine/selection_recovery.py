@@ -215,6 +215,68 @@ def append_run_log(
     return run_log_dict(row) if row else {}
 
 
+def append_run_logs(
+    connection: sqlite3.Connection, batch_id: str, account_id: int, values: Any
+) -> int:
+    """在一个事务中批量追加同一批次、同一账号的过程日志。"""
+    if not isinstance(values, list) or any(not isinstance(value, dict) for value in values):
+        raise ValueError("过程日志批量内容必须是对象列表")
+    if len(values) > 2000:
+        raise ValueError("单次过程日志最多写入 2000 条")
+    if not values:
+        return 0
+    owned_transaction = not connection.in_transaction
+    if owned_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        batch = connection.execute(
+            "SELECT batch_id FROM selection_run_batches WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if not batch:
+            raise ValueError("找不到过程日志所属的选品批次")
+        if account_id == 0:
+            account_name = "选品批次"
+        else:
+            account = connection.execute(
+                "SELECT account_name FROM selection_run_accounts WHERE batch_id = ? AND account_id = ?",
+                (batch_id, account_id),
+            ).fetchone()
+            if not account:
+                raise ValueError("找不到过程日志所属的批次账号")
+            account_name = str(account["account_name"])
+        rows = []
+        for value in values:
+            stage = sanitize_log_text(value.get("stage"), 80).strip()
+            code = sanitize_log_text(value.get("code") or "SELECTION_EVENT", 80).strip()
+            message = sanitize_log_text(value.get("message"), 1000).strip()
+            if not stage or not message:
+                raise ValueError("过程日志必须包含阶段和说明")
+            rows.append((
+                batch_id,
+                account_id,
+                account_name,
+                sanitize_log_text(value.get("productId"), 120),
+                sanitize_log_text(value.get("productTitle"), 300),
+                stage,
+                code,
+                message,
+                sanitize_log_text(value.get("detail"), 8000),
+                now_text(),
+            ))
+        connection.executemany(
+            "INSERT INTO selection_run_logs(batch_id, account_id, account_name, product_id, product_title, "
+            "stage, code, message, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        if owned_transaction:
+            connection.commit()
+        return len(rows)
+    except Exception:
+        if owned_transaction:
+            connection.rollback()
+        raise
+
+
 # 保留旧函数名，兼容已有脚本和测试调用。
 append_failure_log = append_run_log
 
@@ -1255,6 +1317,9 @@ def build_parser() -> argparse.ArgumentParser:
     append_log = log_sub.add_parser("append")
     append_log.add_argument("--batch-id", required=True)
     append_log.add_argument("--account-id", type=int, required=True)
+    append_logs = log_sub.add_parser("append-batch")
+    append_logs.add_argument("--batch-id", required=True)
+    append_logs.add_argument("--account-id", type=int, required=True)
 
     product = commands.add_parser("product")
     product_sub = product.add_subparsers(dest="action", required=True)
@@ -1327,6 +1392,9 @@ def main() -> int:
             if args.command == "log" and args.action == "append":
                 value = json.load(sys.stdin)
                 return emit({"log": append_run_log(connection, args.batch_id, args.account_id, value)})
+            if args.command == "log" and args.action == "append-batch":
+                values = json.load(sys.stdin)
+                return emit({"count": append_run_logs(connection, args.batch_id, args.account_id, values)})
             if args.command == "quota-record-once":
                 return emit(record_quota_once(connection, args.batch_id, args.account_id,
                                               args.product_id, args.event, args.videos))

@@ -25,7 +25,7 @@ async function command(action: string, args: string[] = []): Promise<Json> {
   return result
 }
 
-async function runOne(jobId: number): Promise<Json> {
+async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<Json> {
   if (running) return { ok: false, error: '已有千川计划正在处理' }
   const all = await command('jobs', ['--id', String(jobId)])
   const job = (Array.isArray(all['rows']) ? all['rows'] as Json[] : []).find((row) => Number(row['id']) === jobId)
@@ -39,7 +39,10 @@ async function runOne(jobId: number): Promise<Json> {
   running = true
   let claimed = false
   try {
-    await command('claim', ['--id', String(jobId)])
+    await command('claim', [
+      '--id', String(jobId),
+      ...(expectedDailyBudgetYuan == null ? [] : ['--expected-daily-budget-yuan', String(expectedDailyBudgetYuan)])
+    ])
     claimed = true
     const diagnosticsDir = join(getClientPaths().dataDir, 'diagnostics', 'qianchuan-plan')
     mkdirSync(diagnosticsDir, { recursive: true })
@@ -147,7 +150,8 @@ async function tick(): Promise<void> {
     await command('sync-supplements')
     for (let offset = 0; ; offset += 200) {
       const jobs = await command('jobs', ['--status', 'ready', '--offset', String(offset)])
-      const ready = Array.isArray(jobs['rows']) ? jobs['rows'] as Json[] : []
+      const page = Array.isArray(jobs['rows']) ? jobs['rows'] as Json[] : []
+      const ready = page.filter((job) => value(job['creation_source'] ?? 'auto') === 'auto')
       for (const job of ready) {
         const qcId = validId(job['qianchuan_account_id'])
         if (await existingManagedBrowserConnection(`qianchuan-${qcId}`) ||
@@ -157,7 +161,7 @@ async function tick(): Promise<void> {
           console.warn(`[千川计划] 任务 #${value(job['id'])} 暂未执行：${value(result['error'])}`)
         }
       }
-      if (ready.length < 200) break
+      if (page.length < 200) break
     }
     for (let offset = 0; ; offset += 200) {
       const supplements = await command('supplement-jobs', ['--status', 'scheduled', '--due-only', '--offset', String(offset)])
@@ -195,10 +199,58 @@ export function registerQianchuanPlanIpc(): void {
       '--aigc-enabled', params['aigcEnabled'] === true ? '1' : '0'
     ])
   }))
-  ipcMain.handle('qianchuan:plan:jobs', (_event, qcId?: unknown) => reply(() =>
-    command('jobs', qcId == null ? [] : ['--qianchuan-account-id', String(validId(qcId))])))
+  ipcMain.handle('qianchuan:plan:jobs', (_event, raw?: unknown) => reply(() => {
+    const params = typeof raw === 'number' ? { qianchuanAccountId: raw } : object(raw)
+    const args = ['--offset', String(Math.max(0, Number(params['offset'] ?? 0))),
+      '--limit', String(Math.min(200, Math.max(1, Number(params['limit'] ?? 20))))]
+    if (params['qianchuanAccountId'] != null) args.push('--qianchuan-account-id', String(validId(params['qianchuanAccountId'])))
+    if (params['accountId'] != null) args.push('--account-id', String(validId(params['accountId'])))
+    const status = value(params['status']).trim()
+    if (status) {
+      if (!['ready', 'submitting', 'published', 'blocked', 'needs_review'].includes(status)) throw new Error('计划状态筛选值无效')
+      args.push('--status', status)
+    }
+    return command('jobs', args)
+  }))
+  ipcMain.handle('qianchuan:plan:logs', (_event, raw?: unknown) => reply(() => {
+    const params = object(raw)
+    const args = ['--offset', String(Math.max(0, Number(params['offset'] ?? 0))),
+      '--limit', String(Math.min(200, Math.max(1, Number(params['limit'] ?? 25))))]
+    if (params['id'] != null && Number(params['id']) > 0) args.push('--id', String(validId(params['id'])))
+    if (params['qianchuanAccountId'] != null) args.push('--qianchuan-account-id', String(validId(params['qianchuanAccountId'])))
+    if (params['accountId'] != null) args.push('--account-id', String(validId(params['accountId'])))
+    const status = value(params['status']).trim()
+    if (status) {
+      if (!['ready', 'submitting', 'published', 'blocked', 'needs_review'].includes(status)) throw new Error('计划日志状态筛选值无效')
+      args.push('--status', status)
+    }
+    const startDate = value(params['startDate']).trim()
+    const endDate = value(params['endDate']).trim()
+    if (startDate) args.push('--start-date', startDate)
+    if (endDate) args.push('--end-date', endDate)
+    return command('logs', args)
+  }))
+  ipcMain.handle('qianchuan:plan:candidates', (_event, raw: unknown) => reply(() => {
+    const params = object(raw)
+    return command('candidates', [
+      '--account-id', String(validId(params['accountId'])),
+      '--qianchuan-account-id', String(validId(params['qianchuanAccountId']))
+    ])
+  }))
+  ipcMain.handle('qianchuan:plan:createManual', (_event, raw: unknown) => reply(() => {
+    const params = object(raw)
+    return command('create-manual', [
+      '--publish-queue-id', String(validId(params['publishQueueId'])),
+      '--qianchuan-account-id', String(validId(params['qianchuanAccountId']))
+    ])
+  }))
   ipcMain.handle('qianchuan:plan:supplements', () => reply(() => command('supplement-jobs')))
-  ipcMain.handle('qianchuan:plan:run', (_event, id: unknown) => reply(() => runOne(validId(id))))
+  ipcMain.handle('qianchuan:plan:run', (_event, id: unknown, expectedBudget: unknown) => reply(() => {
+    if (expectedBudget == null) return runOne(validId(id))
+    const budget = Number(expectedBudget)
+    if (!Number.isSafeInteger(budget) || budget < 50) throw new Error('发布前确认的日预算须为至少 50 元的整数')
+    return runOne(validId(id), budget)
+  }))
   ipcMain.handle('qianchuan:plan:retryBlocked', (_event, id: unknown) => reply(() =>
     command('retry-blocked', ['--id', String(validId(id))])))
   ipcMain.handle('qianchuan:plan:resolve', (_event, raw: unknown) => reply(() => {

@@ -342,14 +342,33 @@ async function startBridge(profilePath: string, port: number): Promise<BridgeSes
   })
   try {
     return await readyPromise
+  } catch (error) {
+    // CDP 握手超时或失败时，不能把失效的桥接进程留在后台占用 profile。
+    terminateBridgeProcessTree(child)
+    throw error
   } finally {
     clearTimeout(readyTimer)
   }
 }
 
+function isCdpConnectionRefusedError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase()
+  return message.includes('econnrefused') && message.includes('127.0.0.1')
+}
+
 async function createSession(profilePath: string): Promise<BridgeSession> {
-  const port = await launchChrome(profilePath)
-  return startBridge(profilePath, port)
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const port = await launchChrome(profilePath)
+    try {
+      return await startBridge(profilePath, port)
+    } catch (error) {
+      if (attempt > 0 || !isCdpConnectionRefusedError(error)) throw error
+      // Chrome 启动期间 DevToolsActivePort 可能刚可读、但调试端口尚未稳定；
+      // 仅对明确的本机连接拒绝重建一次桥接，不重放任何业务操作。
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 400))
+    }
+  }
+  throw new Error('Chrome CDP 连接未能建立，请从客户端重新打开账号浏览器。')
 }
 
 function retireSession(profilePath: string, session: BridgeSession): void {

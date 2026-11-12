@@ -139,6 +139,54 @@ class QianchuanBrowserTests(unittest.TestCase):
             self.assertTrue(result["submitAttempted"])
             self.assertIsNone(result["remoteMaterialId"])
 
+    def test_large_file_input_uses_local_cdp_fallback(self):
+        calls = []
+
+        class Element:
+            def evaluate(self, expression, *args):
+                calls.append(("evaluate", expression, args))
+
+        element = Element()
+
+        class Input:
+            def set_input_files(self, *_args, **_kwargs):
+                raise RuntimeError("Cannot transfer files larger than 50Mb to a browser not co-located with the server")
+
+            def element_handle(self):
+                return element
+
+        class Session:
+            def send(self, method, params):
+                calls.append((method, params))
+                if method == "DOM.getDocument":
+                    return {"root": {"nodeId": 1}}
+                if method == "DOM.querySelector":
+                    return {"nodeId": 7}
+                return {}
+
+            def detach(self):
+                calls.append(("detach",))
+
+        page = types.SimpleNamespace(
+            context=types.SimpleNamespace(new_cdp_session=lambda _page: Session())
+        )
+        qc._set_file_input_files(page, Input(), [Path("D:/video-large.mp4")], 5_000)
+        methods = [call[0] for call in calls]
+        self.assertIn("DOM.setFileInputFiles", methods)
+        set_call = next(call for call in calls if call[0] == "DOM.setFileInputFiles")
+        self.assertEqual(set_call[1]["nodeId"], 7)
+        self.assertEqual(set_call[1]["files"], ["D:\\video-large.mp4"])
+
+    def test_large_file_chooser_without_local_cdp_stays_uncertain(self):
+        class Chooser:
+            element = None
+
+            def set_files(self, *_args, **_kwargs):
+                raise RuntimeError("Cannot transfer files larger than 50Mb to a browser not co-located with the server")
+
+        with self.assertRaisesRegex(RuntimeError, "50Mb"):
+            qc._set_file_chooser_files(object(), Chooser(), [Path("D:/video-large.mp4")], 5_000)
+
     def test_upload_wait_recovers_from_one_transient_page_timeout(self):
         class FakePlaywrightTimeout(Exception):
             pass

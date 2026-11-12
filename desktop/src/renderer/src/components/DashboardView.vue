@@ -257,9 +257,9 @@ onMounted(() => void refresh())
           <span class="step-copy"><b>查看发布</b><small>{{ activeRows.length }} 条发布任务</small></span>
           <span class="step-arrow">›</span>
         </button>
-        <button type="button" class="workflow-step" @click="emit('navigate', '千川管理')">
+        <button type="button" class="workflow-step" @click="emit('navigate', '千川计划')">
           <span class="step-icon step-green">03</span>
-          <span class="step-copy"><b>查看千川素材</b><small>上传和审核状态</small></span>
+          <span class="step-copy"><b>千川投放</b><small>自动下载、上传并创建计划</small></span>
           <span class="step-arrow">›</span>
         </button>
       </div>

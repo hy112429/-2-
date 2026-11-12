@@ -9,8 +9,6 @@ interface Asset { assetId: number; fileName: string; productId: string; eligible
 interface Job { id: number; materialName: string; productId: string; status: string; scheduledDate: string; remoteMaterialId?: string; reviewStatus?: string; materialEvaluation?: string; evaluationCheckedAt?: string; reason?: string; screenshotPath?: string; autoRetryCount?: number; nextRetryAt?: string | null }
 interface PostPublishRun { publishQueueId: number; accountId: number; productId: string; productName: string; status: string; reason: string; attemptCount: number; videoCount: number; assetIds: number[]; uploadJobIds: number[]; updatedAt: string; canRetry: boolean; cartDownload?: { status: string; targetCount: number; uniqueCount: number; availableCount: number; error: string; nextRetryAt: string } }
 interface Limits { perProductVideos: number; perAccountProducts: number; perAccountVideos: number; perGroupProducts: number; perGroupVideos: number; maxConcurrentUploads: number; minStepDelayMs: number; maxStepDelayMs: number }
-interface PlanJob { id: number; product_id: string; plan_name: string; status: string; remote_plan_id: string; reason: string; screenshot_path: string; commission_rate?: number; roi_target?: number }
-interface PlanSupplement { id: number; plan_job_id: number; qianchuan_account_id: number; status: string; scheduled_at: string; reason: string }
 
 const emit = defineEmits<{
   (event: 'navigate', value: string): void
@@ -31,10 +29,6 @@ const progress = ref('')
 const retryEnabled = ref(true)
 const postPublishEnabled = ref(true)
 const postPublishRuns = ref<PostPublishRun[]>([])
-const planJobs = ref<PlanJob[]>([])
-const planSupplements = ref<PlanSupplement[]>([])
-const planBusy = ref(false)
-const planSettings = reactive({ enabled: false, dailyBudgetYuan: 0, videoSource: 'both', longRunning: true, smartCoupon: true, aigcEnabled: false })
 const limits = reactive<Limits>({ perProductVideos: 10, perAccountProducts: 5, perAccountVideos: 50, perGroupProducts: 25, perGroupVideos: 250, maxConcurrentUploads: 1, minStepDelayMs: 800, maxStepDelayMs: 2000 })
 const accounts = computed(() => [...new Map(targets.value.map(row => [row.account_id, { id: row.account_id, name: row.account_name }])).values()])
 const linked = computed(() => targets.value.filter(row => row.account_id === accountId.value && row.qianchuan_account_id != null))
@@ -84,9 +78,6 @@ function runAccountCli(args: string[]): Promise<Record<string, unknown>> {
   })
 }
 function statusText(job: Job): string { if (job.status === 'queued' && job.nextRetryAt) return '重试等待'; return ({ queued: '待上传', uploading: '上传中', succeeded: '已上传', failed: '失败', needs_review: '待核查', rejected_quality: '劣质·已拦截' } as Record<string, string>)[job.status] ?? job.status }
-function planStatusText(status: string): string { return ({ ready: '待发布', submitting: '发布中', published: '已发布', blocked: '发布前停止', needs_review: '待核查' } as Record<string, string>)[status] ?? status }
-function supplementStatusText(status: string): string { return ({ scheduled: '等待次日补入原计划', appending: '正在补入原计划', applied: '已补入原计划', already_present: '原计划已包含', blocked: '补入暂停', needs_review: '保存结果待核查' } as Record<string, string>)[status] ?? status }
-function supplementsForPlan(planId: number): PlanSupplement[] { return planSupplements.value.filter(row => row.plan_job_id === planId) }
 function platformStatusText(value: string | undefined, checkedAt: string | undefined): string {
   if (!checkedAt) return '未获取'
   return value && value !== '-' ? value : '平台未显示'
@@ -101,53 +92,6 @@ async function loadQianchuanAccounts(): Promise<void> {
   qianchuanAccounts.value = Array.isArray(data.qianchuan_accounts) ? data.qianchuan_accounts as QianchuanAccount[] : []
 }
 async function loadJobs(): Promise<void> { jobs.value = rows<Job>(checked(await window.api.qianchuan.uploadJobs(accountId.value))) }
-async function loadPlan(): Promise<void> {
-  if (!qcId.value) { planJobs.value = []; planSupplements.value = []; return }
-  const [config, history, supplements] = await Promise.all([window.api.qianchuan.planSettings(qcId.value), window.api.qianchuan.planJobs(qcId.value), window.api.qianchuan.planSupplements()])
-  const saved = checked(config).settings as Record<string, unknown>
-  checked(history)
-  planSettings.enabled = saved.enabled === 1
-  planSettings.dailyBudgetYuan = Number(saved.daily_budget_yuan ?? 0)
-  planSettings.videoSource = String(saved.video_source ?? 'both')
-  planSettings.longRunning = saved.long_running !== 0
-  planSettings.smartCoupon = saved.smart_coupon !== 0
-  planSettings.aigcEnabled = saved.aigc_enabled === 1
-  planJobs.value = rows<PlanJob>(history)
-  planSupplements.value = rows<PlanSupplement>(checked(supplements)).filter(row => row.qianchuan_account_id === qcId.value)
-}
-async function savePlan(): Promise<void> {
-  if (!qcId.value || planBusy.value) return
-  planBusy.value = true
-  try {
-    checked(await window.api.qianchuan.savePlanSettings({ qianchuanAccountId: qcId.value, ...planSettings }))
-    message.value = planSettings.enabled ? '该千川账户的商品全域投放已开启；素材就绪后会自动创建计划。' : '该千川账户的自动创建计划已关闭。'
-    await loadPlan()
-  } catch (error) { message.value = String(error) }
-  finally { planBusy.value = false }
-}
-async function executePlan(id: number): Promise<void> {
-  if (planBusy.value) return
-  planBusy.value = true
-  try {
-    const result = checked(await window.api.qianchuan.runPlan(id))
-    const job = result.job as Record<string, unknown> | undefined
-    message.value = job?.status === 'published' ? `计划 #${id} 已发布，千川计划 ID：${job.remote_plan_id}` : `计划 #${id} 已处理，请查看下方状态。`
-    await loadPlan()
-  } catch (error) { message.value = String(error) }
-  finally { planBusy.value = false }
-}
-async function retryPlan(id: number): Promise<void> {
-  try { checked(await window.api.qianchuan.retryBlockedPlan(id)); await loadPlan(); message.value = `计划 #${id} 已重新排队。` }
-  catch (error) { message.value = String(error) }
-}
-async function resolvePlan(id: number, present: boolean): Promise<void> {
-  const remotePlanId = present ? window.prompt('请填写千川页面核实的计划 ID：') : ''
-  if (remotePlanId === null) return
-  const note = window.prompt(present ? '请写明已在千川核实此计划的依据（至少 6 字）：' : '请写明已在千川核实不存在此计划的依据（至少 6 字）：')
-  if (note === null) return
-  try { checked(await window.api.qianchuan.resolvePlan({ id, present, note, remotePlanId: remotePlanId || undefined })); await loadPlan(); message.value = `计划 #${id} 核查结论已保存。` }
-  catch (error) { message.value = String(error) }
-}
 async function loadAccount(): Promise<void> {
   selected.value = new Set()
   const selectedQcBound = linked.value.some(row => row.qianchuan_account_id === qcId.value)
@@ -176,11 +120,9 @@ async function refresh(): Promise<void> {
     }
     if (!linked.value.some(row => row.qianchuan_account_id === qcId.value)) qcId.value = linked.value[0]?.qianchuan_account_id ?? qianchuanAccounts.value[0]?.id ?? 0
     if (previous === accountId.value) await loadAccount()
-    await loadPlan()
   } catch (error) { message.value = String(error) }
 }
 watch(accountId, () => { void loadAccount() })
-watch(qcId, () => { void loadPlan().catch((error) => { message.value = String(error) }) })
 function toggle(row: Asset): void { if (!row.eligible) return; const next = new Set(selected.value); if (next.has(row.assetId)) next.delete(row.assetId); else next.add(row.assetId); selected.value = next }
 function selectAll(): void { selected.value = selected.value.size === eligible.value.length ? new Set() : new Set(eligible.value.map(row => row.assetId)) }
 async function openBrowser(): Promise<void> {
@@ -315,7 +257,6 @@ onMounted(() => {
     if (!busy.value) {
       void loadPostPublishRuns().catch(() => undefined)
       if (accountId.value) void loadJobs().catch(() => undefined)
-      if (qcId.value && !planBusy.value) void loadPlan().catch(() => undefined)
     }
   }, 10_000)
 })
@@ -363,14 +304,6 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
         <footer class="panel-actions"><span>已选 {{ selected.size }} 条</span><button class="btn primary" :disabled="busy || !selected.size || !qcBoundToSelectedAccount" @click="enqueue">{{ busy ? '处理中…' : '入队并上传今日额度' }}</button></footer>
       </section>
     </div>
-    </details>
-    <details class="settings"><summary>商品全域投放计划</summary>
-      <p class="explainer">按所选千川账户配置。开启后新发布的商品在素材就绪时顺序创建计划；页面回执无法确认时会停在待核查。千川自选素材要求至少一条非主页视频。</p>
-      <div class="settings-grid"><label>自动发布 <input v-model="planSettings.enabled" type="checkbox" /></label><label>日预算（元，甲方可调整）<input v-model.number="planSettings.dailyBudgetYuan" type="number" min="50" /></label><label>视频来源 <select v-model="planSettings.videoSource"><option value="both">已上传素材，兼容我的视频</option><option value="uploaded">仅已上传素材</option></select></label><label>投放时间 <span>从今天起长期投放</span></label><label>智能优惠券 <input v-model="planSettings.smartCoupon" type="checkbox" /></label><label>AIGC 动态创意 <input v-model="planSettings.aigcEnabled" type="checkbox" /></label></div>
-      <p class="scope-note">计划使用控成本投放。每个商品按百应佣金率自动计算保本 ROI：100 ÷ 佣金率（%）；例如佣金率 20% 时 ROI 为 5。该值只按佣金估算，不含其他成本。</p>
-      <button class="btn primary" :disabled="!qcId || planBusy" @click="savePlan">保存该千川账户配置</button>
-      <div v-if="!planJobs.length" class="empty">暂无计划记录；自动发布默认关闭。</div>
-      <div v-else class="list"><article v-for="plan in planJobs" :key="plan.id" class="job"><div class="job-title"><strong>{{ plan.plan_name }}</strong><span class="status">{{ planStatusText(plan.status) }}</span></div><small>商品 {{ plan.product_id }} · 控成本投放<template v-if="plan.commission_rate && plan.roi_target"> · 佣金率 {{ plan.commission_rate }}% · 保本 ROI {{ Number(plan.roi_target).toFixed(2) }}</template> · 任务 #{{ plan.id }}<template v-if="plan.remote_plan_id"> · 千川计划 ID {{ plan.remote_plan_id }}</template></small><small v-for="supplement in supplementsForPlan(plan.id)" :key="supplement.id" :class="{ reason: ['blocked', 'needs_review'].includes(supplement.status) }">{{ supplementStatusText(supplement.status) }}<template v-if="supplement.status === 'scheduled'"> · 预计 {{ supplement.scheduled_at.replace('T', ' ') }}</template><template v-if="supplement.reason"> · {{ supplement.reason }}</template></small><small v-if="plan.reason" class="reason">{{ plan.reason }}</small><button v-if="plan.status === 'ready'" class="btn" :disabled="planBusy" @click="executePlan(plan.id)">立即发布</button><button v-if="plan.status === 'blocked'" class="btn" @click="retryPlan(plan.id)">重新排队</button><template v-if="plan.status === 'needs_review'"><button class="btn" @click="resolvePlan(plan.id, true)">平台已发布</button><button class="btn" @click="resolvePlan(plan.id, false)">核实未发布</button></template><button v-if="plan.screenshot_path" class="btn" @click="openScreenshot(plan.screenshot_path)">查看截图</button></article></div>
     </details>
     <details class="settings"><summary>上传额度与执行间隔</summary><div class="settings-grid"><label>每品条数<input v-model.number="limits.perProductVideos" type="number" min="1" /></label><label>账号每日品数<input v-model.number="limits.perAccountProducts" type="number" min="1" /></label><label>账号每日条数<input v-model.number="limits.perAccountVideos" type="number" min="1" /></label><label>五账号组每日品数<input v-model.number="limits.perGroupProducts" type="number" min="1" /></label><label>五账号组每日条数<input v-model.number="limits.perGroupVideos" type="number" min="1" /></label><label>最大并发<input v-model.number="limits.maxConcurrentUploads" type="number" min="1" /></label><label>最小间隔（毫秒）<input v-model.number="limits.minStepDelayMs" type="number" min="1" /></label><label>最大间隔（毫秒）<input v-model.number="limits.maxStepDelayMs" type="number" min="1" /></label></div><button class="btn primary" :disabled="!accountId || busy" @click="saveLimits">保存该账号配置</button></details>
   </section>

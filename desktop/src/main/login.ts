@@ -16,6 +16,8 @@ import { randomUUID } from 'crypto'
 import { fireCartVideoDownload } from './baiying_batch'
 import { runScript } from './engine'
 
+const MAX_SELECTION_CANDIDATE_FALLBACKS = 50
+
 /**
  * 抖音 / 百应 登录态管理与后台探针视图
  *
@@ -789,7 +791,7 @@ export function registerLoginIpc(): void {
         candidate.skipped !== true && candidate.analysisRejected !== true
       )
       : []
-    const orderedRows = [...selectedRows, ...fallbackRows].slice(0, 30)
+    const orderedRows = [...selectedRows, ...fallbackRows].slice(0, MAX_SELECTION_CANDIDATE_FALLBACKS)
     const reservationLimit = Number.isFinite(maxSelected) && maxSelected > 0
       ? Math.min(orderedRows.length, Math.max(1, Math.ceil(maxSelected * 3)))
       : Math.min(orderedRows.length, selectedRows.length)

@@ -454,9 +454,9 @@ export function getSelectionRecoveryMode(
   }
 }
 
-/** 只有百应限流沿用冷却重试；验证码、登录和断连都停本账号并交给下一账号。 */
+/** 百应限流和登录失效保留检查点；验证码、断连等人工闸门仍停止本账号。 */
 export function getSelectionErrorRecoveryState(reason: string): 'needs_retry' | 'failed' {
-  return classifySelectionError(reason) === 'BAIYING_RATE_LIMIT'
+  return ['BAIYING_RATE_LIMIT', 'ACCOUNT_SWITCH_LOGIN'].includes(classifySelectionError(reason) ?? '')
     ? 'needs_retry'
     : 'failed'
 }
