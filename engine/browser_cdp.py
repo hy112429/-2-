@@ -31,9 +31,9 @@ except ImportError:
     jieba_posseg = None
 
 try:
-    from selection_settings import DEFAULT_BANNED_WORDS
+    from selection_settings import DEFAULT_BANNED_WORDS, SUPERSTITION_BANNED_WORDS
 except ImportError:  # 支持以 engine.browser_cdp 形式从项目根目录导入
-    from .selection_settings import DEFAULT_BANNED_WORDS
+    from .selection_settings import DEFAULT_BANNED_WORDS, SUPERSTITION_BANNED_WORDS
 
 try:
     from image_to_video import build_product_cover, resolve_ffmpeg
@@ -6333,6 +6333,50 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
     return bool(expected_ids.intersection(category_values))
 
 
+def _title_banned_word(title: Any, settings: Optional[Dict[str, Any]]) -> str:
+    """返回标题命中的屏蔽词；封建迷信词作为系统规则始终生效。"""
+    configured_words = settings.get("bannedWords", []) if isinstance(settings, dict) else []
+    if not isinstance(configured_words, list):
+        configured_words = []
+    words = dict.fromkeys(
+        str(word).strip()
+        for word in [*configured_words, *SUPERSTITION_BANNED_WORDS]
+        if str(word).strip()
+    )
+    normalized_title = str(title or "").casefold()
+    return next((word for word in words if word.casefold() in normalized_title), "")
+
+
+def _screen_candidate_titles(
+    candidates: Sequence[Dict[str, Any]], settings: Optional[Dict[str, Any]]
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    """过滤实时结果或旧检查点中的屏蔽标题，并保留可审计的命中记录。"""
+    eligible: list[Dict[str, Any]] = []
+    rejected: list[Dict[str, Any]] = []
+    for candidate in candidates:
+        matched_word = _title_banned_word(candidate.get("title"), settings)
+        if not matched_word:
+            eligible.append(candidate)
+            continue
+        reason = f"商品标题命中屏蔽词「{matched_word}」"
+        existing_reasons = candidate.get("thresholdReasons")
+        reasons = [str(value) for value in existing_reasons if str(value)] if isinstance(existing_reasons, list) else []
+        rejected.append({
+            **candidate,
+            "titleBannedWord": matched_word,
+            "titleFilterExcluded": True,
+            "titleFilterWasSelected": candidate.get("selected") is True,
+            "analysisStatus": "商品标题命中屏蔽词",
+            "thresholdReasons": list(dict.fromkeys([*reasons, reason])),
+            "eligible": False,
+            "cartAdded": candidate.get("cartAdded") is True,
+            "skipped": True,
+            "status": reason + "；已排除，未执行加车。",
+            "selected": False,
+        })
+    return eligible, rejected
+
+
 def _candidate_rows(
     payload: Any,
     settings: Dict[str, Any],
@@ -6342,7 +6386,6 @@ def _candidate_rows(
     raw_rows = _promotion_items(payload)
     filters = settings.get("filters", {}) if isinstance(settings.get("filters"), dict) else {}
     thresholds = settings.get("thresholds", {}) if isinstance(settings.get("thresholds"), dict) else {}
-    banned = [str(word).casefold() for word in settings.get("bannedWords", []) if str(word)]
     pool_priority = [str(pool) for pool in settings.get("poolPriority", []) if str(pool)]
     fallback = settings.get("poolFallback", True) is not False
     source_membership = settings.get("_sourceMembership") if isinstance(settings.get("_sourceMembership"), dict) else {}
@@ -6361,8 +6404,21 @@ def _candidate_rows(
         commodity_id = str(row.get("promotion_id") or row.get("commodity_id") or "").strip()
         if not product_id or not name:
             continue
-        matched_word = next((word for word in banned if word in name.casefold()), None)
+        matched_word = _title_banned_word(name, settings)
         if matched_word:
+            rejected.append({
+                "cardIndex": card_index,
+                "productId": product_id,
+                "commodityId": commodity_id,
+                "title": name,
+                "titleBannedWord": matched_word,
+                "titleFilterExcluded": True,
+                "titleFilterWasSelected": False,
+                "thresholdReasons": [f"商品标题命中屏蔽词「{matched_word}」"],
+                "eligible": False,
+                "analysisStatus": "商品标题命中屏蔽词",
+                "selected": False,
+            })
             continue
 
         month_sales = _find_metric(
@@ -11484,6 +11540,35 @@ def execute_selected_candidates(
         for card_index in selected_indexes
     ]
     selected_candidates = [row for row in selected_candidates if row is not None]
+    safe_selected_candidates: list[Dict[str, Any]] = []
+    for candidate in selected_candidates:
+        matched_word = _title_banned_word(candidate.get("title"), settings)
+        if not matched_word:
+            safe_selected_candidates.append(candidate)
+            continue
+        reason = f"商品标题命中屏蔽词「{matched_word}」"
+        raw_reasons = candidate.get("thresholdReasons")
+        existing_reasons = [str(value) for value in raw_reasons if str(value)] if isinstance(raw_reasons, list) else []
+        candidate.update({
+            "titleBannedWord": matched_word,
+            "titleFilterExcluded": True,
+            "analysisStatus": "商品标题命中屏蔽词",
+            "thresholdReasons": list(dict.fromkeys([*existing_reasons, reason])),
+            "cartAdded": candidate.get("cartAdded") is True,
+            "skipped": True,
+            "status": reason + "；已停止当前商品的加车及后续处理。",
+        })
+        completed.append(dict(candidate))
+        _report_operation_progress(
+            progress, "商品标题屏蔽", index=len(completed), total=len(selected_candidates),
+            message=f"{candidate.get('title') or candidate.get('productId')}：{reason}，已跳过。",
+            product_id=str(candidate.get("productId") or ""),
+            product_title=str(candidate.get("title") or ""),
+        )
+    selected_candidates = safe_selected_candidates
+    selected_indexes = [int(candidate["cardIndex"]) for candidate in selected_candidates]
+    if not selected_candidates:
+        return completed
 
     if (
         analyze_before_cart
@@ -13331,6 +13416,54 @@ def run_selection_command(
             result = apply_settings_and_collect_candidates(page, settings, progress=progress)
         except Exception as error:
             raise RuntimeError(f"应用筛选并获取百应候选失败：{error}") from error
+
+    # 页面缓存和历史检查点可能来自旧版规则；在预览展示及所有执行路径前统一复核标题。
+    current_candidates = result.get("candidates", [])
+    if not isinstance(current_candidates, list):
+        current_candidates = []
+    candidates, newly_rejected = _screen_candidate_titles(
+        [candidate for candidate in current_candidates if isinstance(candidate, dict)], settings
+    )
+    existing_rejected = result.get("rejectedCandidates", [])
+    if not isinstance(existing_rejected, list):
+        existing_rejected = []
+    rejected_by_id = {
+        str(item.get("productId") or ""): item
+        for item in existing_rejected if isinstance(item, dict) and str(item.get("productId") or "")
+    }
+    blocked_indexes: set[int] = set()
+    for candidate in newly_rejected:
+        card_index = candidate.get("cardIndex")
+        if isinstance(card_index, int):
+            blocked_indexes.add(card_index)
+        product_id = str(candidate.get("productId") or "")
+        if product_id and product_id in rejected_by_id:
+            rejected_by_id[product_id].update(candidate)
+        elif product_id:
+            rejected_by_id[product_id] = candidate
+        else:
+            existing_rejected.append(candidate)
+    result["candidates"] = candidates
+    result["candidateCount"] = len(candidates)
+    result["rejectedCandidates"] = list(rejected_by_id.values())
+    title_rejections = [item for item in result["rejectedCandidates"] if item.get("titleFilterExcluded") is True]
+    provided = command.get("selectedIndexes")
+    requested_indexes = (
+        [int(index) for index in provided if isinstance(index, (int, float))]
+        if isinstance(provided, list) else None
+    )
+    requested_index_set = set(requested_indexes or [])
+    for item in newly_rejected:
+        card_index = item.get("cardIndex")
+        if isinstance(card_index, int) and card_index in requested_index_set:
+            item["titleFilterWasSelected"] = True
+    # Keep the merged rejection objects in sync with the selection marker above.
+    for item in title_rejections:
+        if item.get("titleFilterWasSelected") is not True:
+            item["titleFilterWasSelected"] = any(
+                candidate.get("productId") == item.get("productId") and candidate.get("titleFilterWasSelected") is True
+                for candidate in newly_rejected
+            )
     if command.get("previewOnly") is True:
         _report_operation_progress(
             progress, "候选预览完成", index=len(result.get("candidates", [])),
@@ -13339,12 +13472,22 @@ def run_selection_command(
         )
         return result
 
-    candidates = result.get("candidates", [])
-    provided = command.get("selectedIndexes")
-    if isinstance(provided, list):
-        selected = [int(index) for index in provided if isinstance(index, (int, float))]
+    if requested_indexes is not None:
+        selected = [index for index in requested_indexes if index not in blocked_indexes]
+        selected_title_rejections = [item for item in title_rejections if item.get("titleFilterWasSelected") is True]
     else:
         selected = [int(row["cardIndex"]) for row in candidates if row.get("selected") is True]
+        selected_title_rejections = [item for item in title_rejections if item.get("titleFilterWasSelected") is True]
+    if not selected and selected_title_rejections:
+        result["completed"] = selected_title_rejections
+        result["analysisAttemptedCount"] = 0
+        result["completionCount"] = len(selected_title_rejections)
+        return result
+    if not selected and not candidates and title_rejections:
+        result["completed"] = title_rejections
+        result["analysisAttemptedCount"] = 0
+        result["completionCount"] = len(title_rejections)
+        return result
     if not selected and candidates:
         raise RuntimeError("没有选择候选商品")
     if command.get("recoverExistingCart") is True:
@@ -13492,12 +13635,12 @@ def run_selection_command(
         )
     except Exception as error:
         raise RuntimeError(f"加入选品车或回收商品详情失败：{error}") from error
-    result["completed"] = completed
+    result["completed"] = [*selected_title_rejections, *completed]
     analysis_attempted_count = sum(
         1 for candidate in candidates if candidate.get("analysisAttempted") is True
     )
     result["analysisAttemptedCount"] = analysis_attempted_count
-    result["completionCount"] = len(completed)
+    result["completionCount"] = len(result["completed"])
     _report_operation_progress(
         progress,
         "选中商品处理结果已返回",

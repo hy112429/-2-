@@ -264,6 +264,8 @@ interface SelectionCandidate {
   analysisError?: string
   analysisRejected?: boolean
   thresholdReasons?: string[]
+  titleBannedWord?: string
+  titleFilterExcluded?: boolean
   status?: string
   selected: boolean
   sourceCategorySelection?: { level1: string[]; level2: string[]; level3: string[] }
@@ -296,8 +298,27 @@ const PROTOTYPE_BANNED_WORDS = [
   '毛毛和爷爷的小店', '小勇在努力', '黄家敏', '匡赐有好物', '与辉同行', '汉森', '罗总', '郝邵文', '交个朋友', '博学罗交个朋友',
   '亮哥', '罗罗', '亮亮', '安安', '唐梦琪', '三公主', '唐三妹', '一路向前', '一颗小小草'
 ]
+const SUPERSTITION_BANNED_WORDS = [
+  '封建迷信', '迷信用品', '算命', '算卦', '占卜', '占星', '看相', '看手相', '手相', '面相',
+  '命理', '星座运势', '生肖运势', '风水', '玄学', '运势预测', '改命', '改运', '转运', '开运',
+  '招财', '旺财', '旺运', '催财', '聚财', '招桃花', '催姻缘', '旺姻缘', '辟邪', '驱邪',
+  '镇宅', '化煞', '消灾', '消灾解难', '符咒', '灵符', '护身符', '平安符', '招财符', '太岁符',
+  '五帝钱', '八卦镜', '转运珠', '本命佛', '佛牌', '开光', '法器', '开运摆件', '招财摆件', '风水摆件'
+]
 const OPTIONAL_MALL_TITLE_BANNED_WORDS = ['编码', '过号', '集合', '随机', '测试', '勿拍', '链接', '补差价']
-const DEFAULT_BANNED_WORDS = Array.from(new Set([...COMPLIANCE_DEFAULT_BANNED_WORDS, ...PROTOTYPE_BANNED_WORDS]))
+const DEFAULT_BANNED_WORDS = Array.from(new Set([
+  ...COMPLIANCE_DEFAULT_BANNED_WORDS, ...PROTOTYPE_BANNED_WORDS, ...SUPERSTITION_BANNED_WORDS
+]))
+
+function matchedSelectionTitleBannedWord(title: unknown, settings: Record<string, unknown>): string {
+  const configured = Array.isArray(settings.bannedWords) ? settings.bannedWords : []
+  const words = Array.from(new Set([
+    ...configured.map((word) => String(word).trim()).filter(Boolean),
+    ...SUPERSTITION_BANNED_WORDS
+  ]))
+  const normalizedTitle = String(title ?? '').toLocaleLowerCase()
+  return words.find((word) => normalizedTitle.includes(word.toLocaleLowerCase())) ?? ''
+}
 
 const DEFAULTS = {
   candidateLimit: 5,
@@ -312,7 +333,7 @@ const DEFAULTS = {
   thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, experienceScore: null as number | null },
   trendPreference: '上升优先',
   bannedWords: [...DEFAULT_BANNED_WORDS],
-  bannedWordsSeedVersion: 1,
+  bannedWordsSeedVersion: 2,
   execution: { publishMode: '自动', pinTime: '', randomIntervalMin: 1, randomIntervalMax: 5 },
   quota: { perProductVideos: 10, perAccountProducts: 5, perAccountVideos: 50 }
 }
@@ -1426,7 +1447,10 @@ async function loadGlobal(): Promise<void> {
   }
   global.poolPriority = [...((settings.poolPriority as string[] | undefined) ?? cloneDefault().poolPriority)]
   global.sources = createSelectionFilterSettings(settings).sources
-  global.bannedWords = [...((settings.bannedWords as string[] | undefined) ?? DEFAULT_BANNED_WORDS)]
+  global.bannedWords = Array.from(new Set([
+    ...((settings.bannedWords as string[] | undefined) ?? DEFAULT_BANNED_WORDS),
+    ...SUPERSTITION_BANNED_WORDS
+  ]))
   bannedWordsText.value = global.bannedWords.join('\n')
   categories.value = mergeCategoryTrees(normalizeCategories(result.categories), [])
   normalizeCurrentCategorySelections()
@@ -1732,7 +1756,12 @@ async function saveGlobal(): Promise<void> {
       if (!Number.isInteger(value) || value < 1) throw new Error(`${label}必须是大于 0 的整数。`)
     }
     global.execution.publishMode = '自动'
-    global.bannedWords = Array.from(new Set(bannedWordsText.value.split(/\r?\n/).map((word) => word.trim()).filter(Boolean)))
+    global.bannedWords = Array.from(new Set([
+      ...bannedWordsText.value.split(/\r?\n/).map((word) => word.trim()).filter(Boolean),
+      ...SUPERSTITION_BANNED_WORDS
+    ]))
+    global.bannedWordsSeedVersion = 2
+    bannedWordsText.value = global.bannedWords.join('\n')
     await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify(global)))
     notice.value = '通用选品设置已保存；账号未单独配置的条件会继承此设置。'
   } catch (cause) {
@@ -2589,6 +2618,69 @@ async function executeAccountSelection(
       ? settingsForRecoveryCheckpoint(context.settings, recovery.state, accountLabel)
       : context.settings
     settings = { ...settings, _visibleSourcesOnly: true }
+    if (!previewOnly) {
+      const blockedCardIndexes = new Set<number>()
+      const loggedTitleIds = new Set<string>()
+      const newlyBlockedCompleted: Array<{ item: Record<string, unknown>; word: string }> = []
+      completed = completed.map((item) => {
+        const word = matchedSelectionTitleBannedWord(item.title, settings)
+        if (!word) return item
+        const productId = String(item.productId ?? '')
+        if (item.titleFilterExcluded !== true) newlyBlockedCompleted.push({ item, word })
+        return {
+          ...item,
+          titleBannedWord: word,
+          titleFilterExcluded: true,
+          cartAdded: item.cartAdded === true,
+          skipped: true,
+          status: `商品标题命中屏蔽词「${word}」；已停止本轮商品恢复处理。`
+        }
+      })
+      for (const { item, word } of newlyBlockedCompleted) {
+        const productId = String(item.productId ?? '')
+        loggedTitleIds.add(productId)
+        await recovery?.logEvent({
+          stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+          message: `${String(item.title ?? productId)}：商品标题命中屏蔽词「${word}」，已跳过。`,
+          detail: word, productId, productTitle: String(item.title ?? '')
+        })
+      }
+      const allowedCandidates: SelectionCandidate[] = []
+      for (const candidate of fetched) {
+        const word = matchedSelectionTitleBannedWord(candidate.title, settings)
+        if (!word) {
+          allowedCandidates.push(candidate)
+          continue
+        }
+        if (Number.isInteger(candidate.cardIndex)) blockedCardIndexes.add(candidate.cardIndex)
+        const productId = String(candidate.productId ?? '')
+        const prior = completed.find((item) => String(item.productId ?? '') === productId)
+        const blocked = {
+          ...prior,
+          ...candidate,
+          titleBannedWord: word,
+          titleFilterExcluded: true,
+          cartAdded: prior?.cartAdded === true || candidate.cartAdded === true,
+          skipped: true,
+          status: `商品标题命中屏蔽词「${word}」；已停止本轮商品处理。`
+        }
+        if (prior) {
+          completed = completed.map((item) => String(item.productId ?? '') === productId ? blocked : item)
+        } else {
+          completed.push(blocked)
+        }
+        if (!loggedTitleIds.has(productId)) {
+          loggedTitleIds.add(productId)
+          await recovery?.logEvent({
+            stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+            message: `${String(candidate.title ?? productId)}：商品标题命中屏蔽词「${word}」，已跳过。`,
+            detail: word, productId, productTitle: String(candidate.title ?? '')
+          })
+        }
+      }
+      fetched = allowedCandidates
+      selectedIndexes = selectedIndexes.filter((index) => !blockedCardIndexes.has(index))
+    }
     notice.value = settings.selectionMode === 'category' && settings.categoryMode === 'manual'
       ? '选品仍只读取百应当前可见商品，并按手动选择的类目范围筛选。'
       : settings.selectionMode === 'category'
@@ -2641,11 +2733,21 @@ async function executeAccountSelection(
       const excludedByCategoryCount = rejected.filter((candidate) =>
         candidate.thresholdReasons?.includes('命中当前设置中排除的类目')
       ).length
-      const thresholdRejectedCount = Math.max(0, rejected.length - excludedByCategoryCount)
+      const titleFilteredCount = rejected.filter((candidate) =>
+        candidate.titleFilterExcluded === true || Boolean(candidate.titleBannedWord)
+      ).length
+      const thresholdRejectedCount = Math.max(0, rejected.length - excludedByCategoryCount - titleFilteredCount)
       const firstThresholdReason = rejected.find((candidate) =>
-        !candidate.thresholdReasons?.includes('命中当前设置中排除的类目')
+        !candidate.thresholdReasons?.includes('命中当前设置中排除的类目') &&
+        candidate.titleFilterExcluded !== true && !candidate.titleBannedWord
       )?.thresholdReasons?.[0]
+      const firstTitleFilter = rejected.find((candidate) =>
+        candidate.titleFilterExcluded === true || Boolean(candidate.titleBannedWord)
+      )
       const rejectionSummary = [
+        titleFilteredCount
+          ? `标题屏蔽排除 ${titleFilteredCount} 个候选${firstTitleFilter?.titleBannedWord ? `，示例命中词：${firstTitleFilter.titleBannedWord}` : ''}`
+          : '',
         thresholdRejectedCount
           ? `另有 ${thresholdRejectedCount} 个候选因列表实测数据未达阈值被排除${firstThresholdReason ? `，示例：${firstThresholdReason}` : ''}`
           : '',
@@ -2728,7 +2830,7 @@ async function executeAccountSelection(
           quotaSettings.perAccountProducts - (accountUsage.products ?? 0),
           quotaSettings.perAccountVideos - (accountUsage.videos ?? 0)
         ))
-        const alreadyAddedCount = completed.filter((item) => item.cartAdded === true).length
+        const alreadyAddedCount = completed.filter((item) => item.cartAdded === true && item.skipped !== true).length
         const remainingBatchTarget = Math.max(0, candidateLimit - alreadyAddedCount)
         if (remainingBatchTarget > 0 && remainingAccountQuota <= 0 && remainingCandidates.length) {
           throw new Error('该账号当前剩余商品或视频配额为 0；恢复检查点已保留，配额恢复后再继续。')
@@ -2901,6 +3003,25 @@ async function executeAccountSelection(
           if (!productId || completed.some((item) => String(item.productId ?? '') === productId)) continue
           const thresholdReasons = Array.isArray(candidate.thresholdReasons)
             ? candidate.thresholdReasons.map(String) : []
+          const titleBannedWord = String(candidate.titleBannedWord ?? '').trim()
+          if (titleBannedWord) {
+            const reason = `商品标题命中屏蔽词「${titleBannedWord}」`
+            completed.push({
+              ...candidate,
+              titleFilterExcluded: true,
+              analysisStatus: '商品标题命中屏蔽词',
+              thresholdReasons,
+              cartAdded: false,
+              skipped: true,
+              status: reason
+            })
+            await recovery?.logEvent({
+              stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+              message: `${String(candidate.title ?? productId)}：${reason}，已排除且未加车。`,
+              detail: reason, productId, productTitle: String(candidate.title ?? '')
+            })
+            continue
+          }
           const reason = thresholdReasons.join('；') || '候选列表实测数据未达到已设置阈值'
           completed.push({
             ...candidate,
@@ -2946,6 +3067,17 @@ async function executeAccountSelection(
             const examples = duplicateSkips.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
             const skippedSummary = `本账号已有 ${duplicateSkips.length} 个已排队或已发布商品，已阻止重复选品${examples ? `，例如：${examples}${duplicateSkips.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志。`
             accountStatuses[targetAccountId] = '已跳过账号内重复商品'
+            await recovery?.persist({
+              state: 'completed', stage: 'completed', error: '', candidates: fetched,
+              selectedIndexes: [], completed
+            })
+            return { status: '部分完成', message: skippedSummary, continueBatch: true }
+          }
+          const titleFilterSkipped = completed.filter((item) => item.titleFilterExcluded === true)
+          if (titleFilterSkipped.length) {
+            const examples = titleFilterSkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
+            const skippedSummary = `商品标题屏蔽排除 ${titleFilterSkipped.length} 个候选，未执行加车${examples ? `；例如：${examples}${titleFilterSkipped.length > 3 ? '等' : ''}` : ''}；命中词和商品明细已记入选品日志。`
+            accountStatuses[targetAccountId] = '部分完成（标题屏蔽）'
             await recovery?.persist({
               state: 'completed', stage: 'completed', error: '', candidates: fetched,
               selectedIndexes: [], completed
@@ -3111,9 +3243,18 @@ async function executeAccountSelection(
         for (const item of returned) {
           const status = String(item.status ?? '')
           const analysisRejected = item.analysisRejected === true
+          const titleFilterExcluded = item.titleFilterExcluded === true
           const productId = String(item.productId ?? '')
           const productTitle = String(item.title ?? '')
-          if (analysisRejected) {
+          if (titleFilterExcluded) {
+            const reason = String(item.status || `商品标题命中屏蔽词「${String(item.titleBannedWord ?? '')}」`)
+            await recovery?.logEvent({
+              stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+              message: `${productTitle || productId}：${reason}`,
+              detail: Array.isArray(item.thresholdReasons) ? item.thresholdReasons.map(String).join('\n') : reason,
+              productId, productTitle
+            })
+          } else if (analysisRejected) {
             const reasons = Array.isArray(item.thresholdReasons) ? item.thresholdReasons.map(String) : []
             await recovery?.logEvent({
               stage: '商品数据分析', code: 'WARNING_PRODUCT_ANALYSIS_FILTERED',
@@ -6232,7 +6373,7 @@ onUnmounted(() => {
             <h2 id="banned-words-title">屏蔽词</h2>
             <button class="btn" type="button" aria-label="关闭屏蔽词" @click="bannedWordsDialogOpen = false">×</button>
           </header>
-          <p class="hint">商品名称包含任一词即排除；每行一个词，可增删。屏蔽词全局生效。</p>
+          <p class="hint">商品名称包含任一词即排除；屏蔽词全局生效。封建迷信相关词由系统强制保留，其他屏蔽词可编辑。</p>
           <p class="hint">原型中的达人、账号和店铺名称已加入默认词表。当前按名称包含匹配；「小明、与辉、朱朱、亮亮、安安」等短词可能误排正常商品，可在列表中删除。</p>
           <textarea v-model="bannedWordsText" class="ban-words" spellcheck="false" aria-label="全局屏蔽词列表" :disabled="busy"></textarea>
           <section class="banned-words-suggestions" aria-label="商城推荐标题候选词">
