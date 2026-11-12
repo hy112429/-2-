@@ -88,7 +88,7 @@ const qcs = ref<QcRow[]>([])
 const qcBrowserAccountSelections = reactive<Record<number, number>>({})
 const selected = ref<Set<number>>(new Set())
 const accountPage = ref(1)
-const accountPageSize = ref(20)
+const accountPageSize = ref(10)
 const compactLayout = ref(window.innerWidth <= 2400)
 function updateCompactLayout(): void { compactLayout.value = window.innerWidth <= 2400 }
 const busy = ref(false)
@@ -135,6 +135,9 @@ const visibleAccounts = computed(() => {
   const start = (accountPage.value - 1) * accountPageSize.value
   return accounts.value.slice(start, start + accountPageSize.value)
 })
+const accountRangeStart = computed(() => accounts.value.length ? (accountPage.value - 1) * accountPageSize.value + 1 : 0)
+const accountRangeEnd = computed(() => Math.min(accountPage.value * accountPageSize.value, accounts.value.length))
+const accountListViewport = ref<HTMLDivElement | null>(null)
 const visibleAccountsSelected = computed(() =>
   visibleAccounts.value.length > 0 && visibleAccounts.value.every((account) => selected.value.has(account.id))
 )
@@ -147,6 +150,9 @@ const accountsWithUnlinkedQianchuanId = computed(() => accounts.value.filter((ac
 
 watch([() => accounts.value.length, accountPageSize], () => {
   accountPage.value = Math.min(accountPage.value, accountPageCount.value)
+})
+watch(accountPage, () => {
+  if (accountListViewport.value) accountListViewport.value.scrollTop = 0
 })
 
 // 浏览器视图宿主 + 账号级登录态
@@ -905,7 +911,7 @@ function toggleSelectBind(id: number): void {
     <div v-if="notice" class="notice-bar">{{ notice }}</div>
 
     <!-- ==================== 账号列表 Tab ==================== -->
-    <template v-if="activeTab === '账号列表'">
+    <div v-if="activeTab === '账号列表'" class="account-tab-content">
       <!-- 批量控制条（FR-G6-01） -->
       <div class="batch-bar">
         <label class="check-all">
@@ -925,8 +931,22 @@ function toggleSelectBind(id: number): void {
         <span class="batch-info">已选 {{ selected.size }} 个</span>
       </div>
 
-      <!-- 账号表格 -->
-      <div v-if="!compactLayout" class="table-wrap account-table-wrap">
+      <div class="pagination-bar">
+        <span>共 {{ accounts.length }} 个账号，当前显示 {{ accountRangeStart }}–{{ accountRangeEnd }}，已选 {{ selected.size }} 个</span>
+        <label>每页
+          <select v-model.number="accountPageSize" @change="accountPage = 1">
+            <option v-for="size in [10, 20, 30, 40, 50, 80, 100]" :key="size" :value="size">{{ size }}</option>
+          </select>
+          条
+        </label>
+        <button type="button" class="btn mini" :disabled="accountPage <= 1" @click="accountPage--">上一页</button>
+        <span>{{ accountPage }} / {{ accountPageCount }}</span>
+        <button type="button" class="btn mini" :disabled="accountPage >= accountPageCount" @click="accountPage++">下一页</button>
+      </div>
+
+      <div ref="accountListViewport" class="account-list-viewport" @scroll="onScroll">
+        <!-- 账号表格 -->
+        <div v-if="!compactLayout" class="table-wrap account-table-wrap">
         <table class="grid">
           <thead>
             <tr>
@@ -1025,10 +1045,10 @@ function toggleSelectBind(id: number): void {
             </tr>
           </tbody>
         </table>
-      </div>
+        </div>
 
-      <!-- 普通窗口宽度下把操作放在账号信息旁，避免横向滚动才能找到按钮。 -->
-      <div v-if="compactLayout" class="compact-list account-card-list">
+        <!-- 普通窗口宽度下把操作放在账号信息旁，避免横向滚动才能找到按钮。 -->
+        <div v-if="compactLayout" class="compact-list account-card-list">
         <article v-for="(row, index) in visibleAccounts" :key="row.id" class="compact-card">
           <div class="compact-head">
             <label class="compact-identity">
@@ -1091,29 +1111,17 @@ function toggleSelectBind(id: number): void {
           </details>
         </article>
         <p v-if="accounts.length === 0" class="empty">暂无账号，点「新建账号」开始</p>
-      </div>
+        </div>
 
-      <div class="pagination-bar">
-        <span>共 {{ accounts.length }} 个账号，已选 {{ selected.size }} 个</span>
-        <label>每页
-          <select v-model.number="accountPageSize" @change="accountPage = 1">
-            <option v-for="size in [10, 20, 30, 40, 50, 80, 100]" :key="size" :value="size">{{ size }}</option>
-          </select>
-          条
-        </label>
-        <button type="button" class="btn mini" :disabled="accountPage <= 1" @click="accountPage--">上一页</button>
-        <span>{{ accountPage }} / {{ accountPageCount }}</span>
-        <button type="button" class="btn mini" :disabled="accountPage >= accountPageCount" @click="accountPage++">下一页</button>
-      </div>
-
-      <!-- 浏览器视图宿主（覆盖图层，位置由本容器上报） -->
-      <div v-if="viewState.open" class="browser-host" ref="browserHost">
-        <div class="browser-bar">
-          <span class="browser-title">{{ viewState.title || viewState.url }}</span>
-          <button type="button" class="btn mini" @click="closeBrowser">关闭浏览器</button>
+        <!-- 浏览器视图宿主（覆盖图层，位置由本容器上报） -->
+        <div v-if="viewState.open" class="browser-host" ref="browserHost">
+          <div class="browser-bar">
+            <span class="browser-title">{{ viewState.title || viewState.url }}</span>
+            <button type="button" class="btn mini" @click="closeBrowser">关闭浏览器</button>
+          </div>
         </div>
       </div>
-    </template>
+    </div>
 
     <!-- ==================== 账号分组 Tab ==================== -->
     <template v-else-if="activeTab === '账号分组'">
@@ -1410,6 +1418,22 @@ function toggleSelectBind(id: number): void {
   box-shadow: var(--shadow-card);
 }
 
+.account-tab-content {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  gap: 8px;
+}
+
+.account-list-viewport {
+  flex: 1 1 auto;
+  min-height: 160px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--radius);
+}
+
 .qc-login-guide {
   flex-shrink: 0;
   margin: 0;
@@ -1552,6 +1576,7 @@ function toggleSelectBind(id: number): void {
   justify-content: flex-end;
   gap: 10px;
   flex-wrap: wrap;
+  flex-shrink: 0;
   padding: 10px 2px;
   color: var(--text-muted);
   font-size: 12px;
