@@ -11360,20 +11360,6 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
     return reasons
 
 
-def _candidate_needs_detail_enrichment(candidate: Dict[str, Any], settings: Dict[str, Any]) -> bool:
-    """联盟行仅在详情可补齐当前决策必需字段时才开详情；详情不是加车动作。"""
-    data = candidate.get("dataMetrics") if isinstance(candidate.get("dataMetrics"), dict) else {}
-    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
-    for metric, threshold in thresholds.items():
-        if threshold is None or threshold == "":
-            continue
-        if _number(data.get(metric)) is None:
-            return True
-    if settings.get("trendPreference") == "上升优先" and candidate.get("trendKnown") is not True:
-        return True
-    return False
-
-
 def _is_alliance_direct_cart_row(candidate: Dict[str, Any], card_locator: Any) -> bool:
     """联盟榜候选在表格/行容器中时使用同一 productId 行的直接加车语义。"""
     if str(candidate.get("sourceKey") or "") != "allianceRank":
@@ -11594,29 +11580,23 @@ def execute_selected_candidates(
             candidate["analysisAttempted"] = True
             product_id = str(candidate.get("productId") or "")
             title = str(candidate.get("title") or product_id)
-            alliance_direct_cart = str(candidate.get("sourceKey") or "") == "allianceRank"
             _report_operation_progress(
                 progress,
                 "商品数据分析",
                 index=position,
                 total=len(selected_candidates),
                 percent=int((position - 1) * 100 / len(selected_candidates)),
-                message=f"逐个检查候选数据 {position}/{len(selected_candidates)}：{title}",
+                message=f"打开商品详情核验数据与趋势 {position}/{len(selected_candidates)}：{title}",
                 product_id=product_id,
                 product_title=title,
             )
             if position > 1:
                 page.wait_for_timeout(DETAIL_ANALYSIS_INTERVAL_MS)
             try:
-                if alliance_direct_cart and not _candidate_needs_detail_enrichment(candidate, settings):
-                    # 联盟榜标题直接加车；列表数据已覆盖当前门槛时，不把开详情作为加车前置动作。
-                    candidate["analysisStatus"] = "联盟榜列表数据已满足当前门槛；无需预先打开详情"
-                    candidate["analysisError"] = ""
-                else:
-                    payload, detail_error = _capture_candidate_detail(
-                        page, context, candidate, settings, progress
-                    )
-                    _apply_detail_metrics(candidate, payload, detail_error)
+                payload, detail_error = _capture_candidate_detail(
+                    page, context, candidate, settings, progress
+                )
+                _apply_detail_metrics(candidate, payload, detail_error)
             except CandidateCartSkip as error:
                 skipped = _candidate_skip_result(candidate, error)
                 candidate.update(skipped)
