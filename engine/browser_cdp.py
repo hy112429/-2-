@@ -4812,30 +4812,34 @@ def _create_background_page(context: BrowserContext, browser: Browser) -> Page:
             pass
 
 
-def _login_preflight_page(context: BrowserContext, browser: Browser, marker: str) -> Page:
-    page = None
-    marker_already_set = False
+def _login_preflight_page(context: BrowserContext, browser: Browser, account_id: int) -> Page:
+    """每个账号只保留一个客户端专用登录检查页，依次检查百应和创作者中心。"""
+    marker = f"__touguangLoginPreflight__account_{account_id}"
+    legacy_markers = {
+        f"__touguangLoginPreflight__baiying_{account_id}",
+        f"__touguangLoginPreflight__creator_{account_id}",
+    }
+    matches: list[tuple[int, Page]] = []
     for candidate in reversed(context.pages):
         try:
             if candidate.is_closed():
                 continue
             candidate_marker = getattr(candidate, "_touguang_login_preflight_marker", None)
+            if not isinstance(candidate_marker, str):
+                candidate_marker = candidate.evaluate("() => window.name")
             if candidate_marker == marker:
-                page = candidate
-                marker_already_set = True
-                break
-            if candidate.evaluate("() => window.name") == marker:
-                page = candidate
-                marker_already_set = True
-                break
+                matches.append((0, candidate))
+            elif candidate_marker in legacy_markers:
+                # 兼容旧版留下的两个检查页，优先复用百应页，其余稍后关闭。
+                priority = 1 if candidate_marker.endswith(f"baiying_{account_id}") else 2
+                matches.append((priority, candidate))
         except Exception:
             continue
-    if page is None:
-        page = _create_background_page(context, browser)
+
+    matches.sort(key=lambda item: item[0])
+    page = matches[0][1] if matches else _create_background_page(context, browser)
     setattr(page, "_touguang_login_preflight_marker", marker)
     setattr(page, "_touguang_skip_baiying_capture", True)
-    if marker_already_set:
-        return page
     last_error: Optional[Exception] = None
     for attempt in range(3):
         try:
@@ -4851,6 +4855,14 @@ def _login_preflight_page(context: BrowserContext, browser: Browser, marker: str
     else:
         if last_error:
             raise last_error
+
+    # 只关闭旧版由客户端打过标记的登录检查页，不碰用户自己的标签页。
+    for _, duplicate in matches[1:]:
+        try:
+            if not duplicate.is_closed():
+                duplicate.close()
+        except Exception:
+            pass
     return page
 
 
@@ -5064,10 +5076,11 @@ def check_account_login_states(
     browser: Browser,
     account_id: int,
 ) -> Dict[str, Any]:
-    """用账号专属 profile 的后台页面分别核验百应和创作者中心。"""
+    """复用单个账号专属后台页，依次核验百应和创作者中心。"""
+    login_page: Optional[Page] = None
     try:
-        baiying_page = _login_preflight_page(context, browser, f"__touguangLoginPreflight__baiying_{account_id}")
-        baiying = _check_baiying_login(baiying_page)
+        login_page = _login_preflight_page(context, browser, account_id)
+        baiying = _check_baiying_login(login_page)
     except Exception as error:
         message = (
             "百应页面正在跳转，暂时无法读取登录状态；请等页面加载稳定后重新检查。"
@@ -5076,8 +5089,9 @@ def check_account_login_states(
         )
         baiying = {"state": "unknown", "message": message}
     try:
-        creator_page = _login_preflight_page(context, browser, f"__touguangLoginPreflight__creator_{account_id}")
-        creator = _check_creator_login(creator_page)
+        if login_page is None:
+            login_page = _login_preflight_page(context, browser, account_id)
+        creator = _check_creator_login(login_page)
     except Exception as error:
         message = (
             "创作者中心页面正在跳转，暂时无法读取登录状态；请等页面加载稳定后重新检查。"
@@ -5085,6 +5099,25 @@ def check_account_login_states(
             else f"创作者中心登录状态检查失败，无法确认（{type(error).__name__}）。"
         )
         creator = {"state": "unknown", "message": message}
+
+    if login_page is not None:
+        if baiying["state"] == "logged_in" and creator["state"] == "logged_in":
+            # 登录确认后移除客户端的临时检查页；已有手动标签和 Cookie 均保留。
+            try:
+                login_page.close()
+            except Exception:
+                pass
+        else:
+            # 暂停时只把一页留给用户处理，并显示优先需要登录的站点。
+            if baiying["state"] != "logged_in":
+                try:
+                    login_page.goto(BAIYING_LOGIN_CHECK_URL, wait_until="commit", timeout=12_000)
+                except Exception:
+                    pass
+            try:
+                login_page.bring_to_front()
+            except Exception:
+                pass
     return {
         "ok": True,
         "accountId": account_id,
