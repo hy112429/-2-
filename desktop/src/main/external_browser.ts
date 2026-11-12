@@ -574,12 +574,16 @@ export async function commandManagedBrowser(
  * 只关闭本客户端进程为自动化启动的 Chrome。手动打开或其他进程已有的 Chrome 保持原样，
  * profile 目录和平台 Cookie 不删除，下一次仍可复用登录态。
  */
-export async function closeAutomationLaunchedBrowser(options: OpenManagedBrowserOptions): Promise<boolean> {
+async function closeManagedBrowserProfile(
+  options: OpenManagedBrowserOptions,
+  allowClientOpenedProfile: boolean
+): Promise<boolean> {
   const profilePath = resolveProfilePath(options, false)
   const key = canonicalProfilePath(profilePath)
-  if (!automationLaunchedProfiles.has(key) || userOpenedProfiles.has(key)) return false
+  if (!allowClientOpenedProfile && (!automationLaunchedProfiles.has(key) || userOpenedProfiles.has(key))) return false
   if (await readActivePort(profilePath) === null) {
     automationLaunchedProfiles.delete(key)
+    userOpenedProfiles.delete(key)
     const staleSession = bridgeSessions.get(key)
     if (staleSession) retireSession(profilePath, staleSession)
     return true
@@ -592,17 +596,29 @@ export async function closeAutomationLaunchedBrowser(options: OpenManagedBrowser
     if (result['ok'] !== true) throw new Error(String(result['error'] ?? 'Chrome 未确认关闭'))
     if (!await waitForBrowserClosed(profilePath)) throw new Error('Chrome 收到关闭命令后仍保持运行。')
     automationLaunchedProfiles.delete(key)
+    userOpenedProfiles.delete(key)
     retireSession(profilePath, session)
     return true
   } catch (error) {
     if (await readActivePort(profilePath) === null) {
       automationLaunchedProfiles.delete(key)
+      userOpenedProfiles.delete(key)
       const session = bridgeSessions.get(key)
       if (session) retireSession(profilePath, session)
       return true
     }
     throw error
   }
+}
+
+/** 只关闭客户端管理的账号专属 Chrome；保留 profile、Cookie 和登录态。 */
+export async function closeManagedAccountBrowser(options: OpenManagedBrowserOptions): Promise<boolean> {
+  return closeManagedBrowserProfile(options, true)
+}
+
+/** 仅关闭本客户端自动启动的 Chrome；供单次自动化命令做轻量清理。 */
+export async function closeAutomationLaunchedBrowser(options: OpenManagedBrowserOptions): Promise<boolean> {
+  return closeManagedBrowserProfile(options, false)
 }
 
 export async function openManagedBrowser(

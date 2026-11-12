@@ -9,9 +9,9 @@ export interface SelectionBatchAccount {
 export type SelectionAccountState = '排队中' | '执行中' | '完成' | '部分完成' | '失败' | '未执行'
 
 export interface SelectionAccountResult {
-  status: '完成' | '部分完成'
+  status: '完成' | '部分完成' | '失败'
   message?: string
-  /** 兼容现有调用方的单账号结果标记；账号间调度不依赖此字段停止。 */
+  /** 当前账号需人工处理或浏览器未能关闭时，保留后续账号并暂停本轮。 */
   continueBatch?: boolean
 }
 
@@ -543,7 +543,7 @@ export async function runSequentialSelectionBatch<TAccount extends SelectionBatc
         status,
         message: result?.message
       })
-      if (stopAfterIncomplete && status !== '完成') {
+      if ((stopAfterIncomplete && status !== '完成') || result?.continueBatch === false) {
         for (const remaining of ordered.slice(index + 1)) {
           onStatus(remaining, '未执行')
           outcomes.push({

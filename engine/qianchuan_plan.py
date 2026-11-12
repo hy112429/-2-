@@ -689,7 +689,7 @@ def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int =
                 db, int(row["account_id"]), int(row["qianchuan_account_id"]),
                 str(row["product_id"]), int(row["publish_queue_id"])):
             raise ValueError("该商品上传或自动补位仍在进行")
-        db.execute("UPDATE qianchuan_plan_jobs SET status='submitting',daily_budget_yuan=?,material_ids_json=?,updated_at=? WHERE id=?",
+        db.execute("UPDATE qianchuan_plan_jobs SET status='submitting',daily_budget_yuan=?,material_ids_json=?,reason='',updated_at=? WHERE id=?",
                    (current_budget, json.dumps(ids), now_text(), job_id))
         record_event(db, job_id, "PLAN_SUBMIT_STARTED", "submit", "submitting",
                      "已通过发布前校验，开始进入千川计划提交页面",
@@ -702,6 +702,25 @@ def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int =
     except Exception:
         db.rollback()
         raise
+
+
+def defer(db: sqlite3.Connection, job_id: int, reason: str) -> dict[str, Any]:
+    """记录可自动恢复的本地前置等待，不把未提交任务误标成发布失败。"""
+    message = reason.strip()[:2000] or "等待千川账号浏览器就绪"
+    row = db.execute("SELECT status,submit_attempted,reason FROM qianchuan_plan_jobs WHERE id=?",
+                     (job_id,)).fetchone()
+    if not row or row["status"] != "ready" or row["submit_attempted"]:
+        raise ValueError("只有尚未提交的待发布计划可以记录等待原因")
+    if str(row["reason"] or "") != message:
+        with db:
+            updated = db.execute("UPDATE qianchuan_plan_jobs SET reason=?,updated_at=? WHERE id=? AND status='ready' AND submit_attempted=0",
+                                 (message, now_text(), job_id))
+            if updated.rowcount != 1:
+                raise ValueError("计划任务已变化，不能覆盖当前状态")
+            record_event(db, job_id, "PLAN_DEFERRED", "automatic_preflight", "ready",
+                         "计划暂缓执行并保留在队列中", message)
+    return {"ok": True, "job": _row(db.execute(
+        "SELECT * FROM qianchuan_plan_jobs WHERE id=?", (job_id,)).fetchone())}
 
 
 def finish(db: sqlite3.Connection, job_id: int, status: str, submitted: bool,
@@ -813,7 +832,7 @@ def plan_log_details(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path(DEFAULT_DB_PATH))
-    parser.add_argument("command", choices=["settings", "set-settings", "sync", "candidates", "create-manual", "jobs", "logs", "claim", "finish", "recover", "retry-blocked", "resolve-present", "resolve-absent", "sync-supplements", "supplement-jobs", "claim-supplement", "finish-supplement"])
+    parser.add_argument("command", choices=["settings", "set-settings", "sync", "candidates", "create-manual", "jobs", "logs", "claim", "finish", "defer", "recover", "retry-blocked", "resolve-present", "resolve-absent", "sync-supplements", "supplement-jobs", "claim-supplement", "finish-supplement"])
     parser.add_argument("--account-id", type=int, default=0)
     parser.add_argument("--publish-queue-id", type=int, default=0)
     parser.add_argument("--qianchuan-account-id", type=int, default=0)
@@ -913,6 +932,8 @@ def main() -> int:
                 result = {"ok": True, "rows": [dict(r) for r in db.execute(query, [*filters, args.offset])]}
             elif args.command == "claim":
                 result = claim(db, args.id, args.expected_daily_budget_yuan)
+            elif args.command == "defer":
+                result = defer(db, args.id, args.reason)
             elif args.command == "claim-supplement":
                 result = claim_supplement(db, args.id)
             elif args.command == "recover":

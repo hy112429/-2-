@@ -341,6 +341,7 @@ declare global {
           baiyingOpen: boolean
           creatorCenterOpen: boolean
         }>
+        closeAccount(params: { accountId: number; profilePath?: string }): Promise<{ ok: boolean; closed: boolean }>
         validateProfilePath(options: { profileKey: string; profilePath?: string }): Promise<{ ok: boolean; path?: string; error?: string }>
         runBaiyingSelection(params: {
           profileKey: string
