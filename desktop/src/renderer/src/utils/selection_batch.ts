@@ -514,7 +514,8 @@ export async function runSequentialSelectionBatch<TAccount extends SelectionBatc
   accounts: readonly TAccount[],
   runAccount: (account: TAccount) => Promise<SelectionAccountResult | void>,
   onStatus: (account: TAccount, status: SelectionAccountState) => void,
-  priorityAccountId?: number | null
+  priorityAccountId?: number | null,
+  stopAfterIncomplete = false
 ): Promise<SelectionBatchOutcome[]> {
   const ordered = [...accounts]
     .filter((account) => account.status === 'active')
@@ -530,7 +531,7 @@ export async function runSequentialSelectionBatch<TAccount extends SelectionBatc
   for (const account of ordered) onStatus(account, '排队中')
 
   const outcomes: SelectionBatchOutcome[] = []
-  for (const account of ordered) {
+  for (const [index, account] of ordered.entries()) {
     onStatus(account, '执行中')
     try {
       const result = await runAccount(account)
@@ -542,6 +543,18 @@ export async function runSequentialSelectionBatch<TAccount extends SelectionBatc
         status,
         message: result?.message
       })
+      if (stopAfterIncomplete && status !== '完成') {
+        for (const remaining of ordered.slice(index + 1)) {
+          onStatus(remaining, '未执行')
+          outcomes.push({
+            accountId: remaining.id,
+            accountName: remaining.name,
+            status: '未执行',
+            message: `前序账号「${account.name}」尚未达到选品目标，已保留本账号检查点。`
+          })
+        }
+        break
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       onStatus(account, '失败')
@@ -551,6 +564,18 @@ export async function runSequentialSelectionBatch<TAccount extends SelectionBatc
         status: '失败',
         message
       })
+      if (stopAfterIncomplete) {
+        for (const remaining of ordered.slice(index + 1)) {
+          onStatus(remaining, '未执行')
+          outcomes.push({
+            accountId: remaining.id,
+            accountName: remaining.name,
+            status: '未执行',
+            message: `前序账号「${account.name}」执行失败，已保留本账号检查点。`
+          })
+        }
+        break
+      }
     }
   }
   return outcomes

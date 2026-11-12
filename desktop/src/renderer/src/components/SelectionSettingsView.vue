@@ -2738,7 +2738,9 @@ async function executeAccountSelection(
           quotaSettings.perAccountVideos - (accountUsage.videos ?? 0)
         ))
         const alreadyAddedCount = completed.filter((item) => item.cartAdded === true).length
-        const remainingBatchTarget = Math.max(0, candidateLimit - alreadyAddedCount)
+        // candidateLimit controls candidate discovery; an account task must drain
+        // its complete remaining snapshot before the batch advances to the next account.
+        const remainingBatchTarget = Math.max(0, remainingAccountQuota)
         if (remainingBatchTarget > 0 && remainingAccountQuota <= 0 && remainingCandidates.length) {
           throw new Error('该账号当前剩余商品或视频配额为 0；恢复检查点已保留，配额恢复后再继续。')
         }
@@ -2945,7 +2947,10 @@ async function executeAccountSelection(
         completed = [...completed.filter((item) =>
           !duplicateSkips.some((skipped) => String(item.productId ?? '') === skipped.productId)
         ), ...duplicateSkips]
-        maxSelectedProducts = Math.min(candidateLimit, maxProducts)
+        // Run every eligible product for this account in one account task. The
+        // account quota remains the hard upper bound; candidateLimit only limits
+        // how many candidates are discovered upstream.
+        maxSelectedProducts = maxProducts
         eligible = fetched.filter((candidate) =>
           chosenProducts.has(candidate.productId) && !productLocks.has(candidate.productId) &&
           (usage[candidate.productId] ?? 0) < quotaSettings.perProductVideos
@@ -3001,11 +3006,7 @@ async function executeAccountSelection(
             : '已查询全部已启用来源与选品广场兜底，仍没有符合条件的商品。')
         }
         selectedIndexes = eligible.map((candidate) => candidate.cardIndex)
-        const maxIndexesToSend = hasExplicitPreviewSelection ? candidateLimit * 3 : candidateLimit
-        selectedIndexesToExecute = selectedIndexes.slice(0, Math.min(
-          selectedIndexes.length,
-          maxIndexesToSend
-        ))
+        selectedIndexesToExecute = selectedIndexes
         reportSelectionProgress(targetAccountId, '准备逐个处理选中商品', {
           itemIndex: 0,
           itemTotal: selectedIndexesToExecute.length,
@@ -5091,7 +5092,8 @@ async function runSelectionBatch(): Promise<void> {
           percent: stagePercent
         }
       },
-      resumePriorityAccountId
+      resumePriorityAccountId,
+      true
     )
     const finalBatchState = getSelectionBatchFinalState(persistedAccounts)
     const allComplete = finalBatchState === 'completed'

@@ -317,11 +317,15 @@ export function allocateExclusiveCandidates<T extends UnifiedCandidateScoreInput
       left.candidateIndex - right.candidateIndex ||
       left.candidate.productId.localeCompare(right.candidate.productId)
   })
+  // 商品 ID 来自页面文本，偶尔会带空白；批次互斥必须按规范化 ID 判断，
+  // 否则同一个商品可能以两个字符串形式分配给不同账号。
   const winnerByProduct = new Map<string, { accountId: number; accountName: string; score: number }>()
   const countByAccount = new Map<number, number>()
   for (const pair of pairs) {
     const { pool, candidate, score } = pair
-    const existing = winnerByProduct.get(candidate.productId)
+    const productKey = String(candidate.productId ?? '').trim()
+    if (!productKey) continue
+    const existing = winnerByProduct.get(productKey)
     if (existing) {
       if (existing.accountId !== pool.accountId) {
         allocations.get(pool.accountId)?.skipped.push({
@@ -333,7 +337,7 @@ export function allocateExclusiveCandidates<T extends UnifiedCandidateScoreInput
       continue
     }
     if ((countByAccount.get(pool.accountId) ?? 0) >= Math.max(0, pool.capacity)) continue
-    winnerByProduct.set(candidate.productId, { accountId: pool.accountId, accountName: pool.accountName, score })
+    winnerByProduct.set(productKey, { accountId: pool.accountId, accountName: pool.accountName, score })
     countByAccount.set(pool.accountId, (countByAccount.get(pool.accountId) ?? 0) + 1)
     allocations.get(pool.accountId)?.candidates.push({ ...candidate, selected: true })
   }

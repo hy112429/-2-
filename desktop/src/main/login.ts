@@ -903,7 +903,11 @@ export function registerLoginIpc(): void {
         const token = tokenByProduct.get(productId)
         if (!token) continue
         const item = completedById.get(productId)
-        const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' && item.cartAttempted !== true
+        // 只有明确标记为“点击前控件未命中”才允许释放预留。任何结果不明
+        // 都必须保留为 UNCERTAIN，避免实际已加车后被下一账号再次选中。
+        const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' &&
+          item.cartAttempted !== true && item.skipped === true &&
+          /加车前控件定位失败|未点击加车/.test(String(item.status ?? ''))
         const outcome = item?.cartAdded === true
           ? 'ADDED'
           : controlFailure || item?.cartAttempted !== true
