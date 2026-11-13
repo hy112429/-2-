@@ -22,6 +22,7 @@ let listener: Server | null = null
 let pendingState: string | null = null
 let pendingUntil = 0
 let authTimer: NodeJS.Timeout | null = null
+let exchangeInProgress = false
 let authorizationRevision = 0
 
 function vaultPath(): string { return join(app.getPath('userData'), 'qianchuan-openapi.bin') }
@@ -276,7 +277,7 @@ export async function queryPlayableVideos(
 }
 function status(): Record<string, unknown> {
   const current = load()
-  return { configured: Boolean(current), authorized: Boolean(current?.accessToken), appId: current?.appId ?? '', advertiserIds: current?.advertiserIds ?? [], callback: CALLBACK, expiresAt: current?.accessExpiresAt ?? null, authorizationRevision }
+  return { configured: Boolean(current), authorized: Boolean(current?.accessToken), appId: current?.appId ?? '', advertiserIds: current?.advertiserIds ?? [], callback: CALLBACK, expiresAt: current?.accessExpiresAt ?? null, authorizationRevision, authorizationPending: Boolean(listener?.listening && (exchangeInProgress || (pendingState && Date.now() <= pendingUntil))) }
 }
 function sameState(received: string): boolean {
   if (!pendingState || Date.now() > pendingUntil) return false
@@ -291,6 +292,7 @@ async function exchange(authCode: string): Promise<void> {
   authorizationRevision += 1
 }
 async function beginAuth(authUrl: string): Promise<{ ok: boolean; callback: string; profilePath: string }> {
+  if (exchangeInProgress) throw new Error('正在接收授权并换取 Token，请稍候再试。')
   const current = load()
   if (!current) throw new Error('请先保存 App ID 与 App Secret。')
   const url = new URL(authUrl.trim())
@@ -308,17 +310,24 @@ async function beginAuth(authUrl: string): Promise<{ ok: boolean; callback: stri
     const incoming = new URL(req.url, CALLBACK)
     if (incoming.pathname !== '/callback') { res.writeHead(404).end(); return }
     const code = incoming.searchParams.get('auth_code') ?? incoming.searchParams.get('code')
-    if (!sameState(incoming.searchParams.get('state') ?? '') || !code) {
-      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end('授权验证失败：state 不匹配、已超时或缺少授权码。')
+    const receivedState = incoming.searchParams.get('state') ?? ''
+    if (!code || !sameState(receivedState)) {
+      const reason = !code ? '回调缺少授权码，请在官方授权页点击「确认授权」。'
+        : !pendingState ? '当前客户端没有等待这次授权结果，请从客户端重新打开授权页。'
+        : Date.now() > pendingUntil ? '本次授权已超过 15 分钟，请从客户端重新打开授权页。'
+        : receivedState === 'your_custom_params' ? '平台返回了授权链接中的示例 state。请关闭旧授权页，并只在客户端本次新开的授权页确认。'
+        : 'state 与本次客户端授权请求不一致。请关闭旧授权页，并从客户端重新发起。'
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end(`授权验证失败：${reason}`)
       return
     }
     pendingState = null
+    exchangeInProgress = true
     try {
       await exchange(code)
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }).end('千川授权成功，Token 已在本机加密保存。可以关闭此页。')
     } catch (error) {
       res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' }).end(`千川授权失败：${safeMessage((error as Error).message)}`)
-    } finally { listener?.close(); listener = null; if (authTimer) clearTimeout(authTimer); authTimer = null }
+    } finally { exchangeInProgress = false; listener?.close(); listener = null; if (authTimer) clearTimeout(authTimer); authTimer = null }
   })
   try {
     await new Promise<void>((resolve, reject) => { listener!.once('error', reject); listener!.listen(8899, '127.0.0.1', resolve) })
@@ -373,7 +382,9 @@ export function registerQianchuanApiIpc(): void {
     const appId = decimal(input.appId, 'App ID')
     if (!Number.isSafeInteger(Number(appId))) throw new Error('App ID 超出 JavaScript 安全整数范围，无法按接口要求准确提交。')
     if (!input.secret?.trim()) throw new Error('请输入 App Secret。')
-    save({ appId, secret: input.secret.trim() })
+    const secret = input.secret.trim()
+    const current = load()
+    save(current?.appId === appId && current.secret === secret ? current : { appId, secret })
     return status()
   })
   ipcMain.handle('qianchuan:api:authorize', (_event, url: string) => beginAuth(url))
