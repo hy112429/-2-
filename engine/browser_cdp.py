@@ -240,6 +240,43 @@ _OUTPUT_LOCK = threading.Lock()
 _RATE_LIMIT_LOCK = threading.Lock()
 _MATERIAL_LIST_CACHE: Dict[tuple[int, str], tuple[float, Any]] = {}
 _DETAIL_PAYLOAD_CACHE: Dict[tuple[int, str], tuple[float, Any]] = {}
+_PAGE_LIFECYCLE_STATS: Dict[int, Dict[str, Any]] = {}
+
+
+def _page_lifecycle_stats(context: BrowserContext) -> Dict[str, Any]:
+    return _PAGE_LIFECYCLE_STATS.setdefault(id(context), {
+        "browserStarts": 0,
+        "newPages": 0,
+        "reusedPages": 0,
+        "navigations": 0,
+        "stageDurationsMs": {},
+    })
+
+
+def _tracked_new_page(context: BrowserContext, purpose: str) -> Page:
+    stats = _page_lifecycle_stats(context)
+    stats["newPages"] = int(stats.get("newPages", 0)) + 1
+    by_stage = stats.setdefault("newPagesByPurpose", {})
+    by_stage[purpose] = int(by_stage.get(purpose, 0)) + 1
+    return context.new_page()
+
+
+def _track_reused_page(context: BrowserContext, purpose: str) -> None:
+    stats = _page_lifecycle_stats(context)
+    stats["reusedPages"] = int(stats.get("reusedPages", 0)) + 1
+    by_stage = stats.setdefault("reusedPagesByPurpose", {})
+    by_stage[purpose] = int(by_stage.get(purpose, 0)) + 1
+
+
+def _record_page_navigation(context: BrowserContext, purpose: str, elapsed_ms: float) -> None:
+    stats = _page_lifecycle_stats(context)
+    stats["navigations"] = int(stats.get("navigations", 0)) + 1
+    durations = stats.setdefault("stageDurationsMs", {})
+    durations[purpose] = round(float(durations.get(purpose, 0)) + max(0.0, elapsed_ms), 1)
+
+
+def page_lifecycle_stats(context: BrowserContext) -> Dict[str, Any]:
+    return json.loads(json.dumps(_page_lifecycle_stats(context), ensure_ascii=False))
 _PAGE_RATE_LIMIT_UNTIL: Dict[int, float] = {}
 _RATE_LIMIT_STATE_PATH: Optional[Path] = None
 _PROFILE_RATE_LIMIT_UNTIL = 0.0
@@ -695,8 +732,10 @@ def _creator_page(context: BrowserContext) -> Page:
         and _is_creator_publish_page(candidate.url)
     ), None)
     if page is None:
-        page = context.new_page()
+        page = _tracked_new_page(context, "creator")
         page.goto(DOUYIN_CREATOR_UPLOAD_URL, wait_until="domcontentloaded", timeout=60_000)
+    else:
+        _track_reused_page(context, "creator")
     page.bring_to_front()
     return page
 
@@ -1433,8 +1472,10 @@ def _baiying_cart_page(context: BrowserContext) -> Page:
         and urlparse(candidate.url).path.rstrip("/") == "/dashboard/merch-picking-cart"
     ), None)
     if page is None:
-        page = context.new_page()
+        page = _tracked_new_page(context, "baiying_cart")
         page.goto(BAIYING_SELECTION_CART_URL, wait_until="domcontentloaded", timeout=60_000)
+    else:
+        _track_reused_page(context, "baiying_cart")
     page.bring_to_front()
     try:
         body = page.locator("body").inner_text(timeout=5_000)
@@ -4088,7 +4129,13 @@ def prepare_douyin_publish(
     expected_product_short_title = _creator_product_short_title(product_name, description, 10, banned_words)
     if not _product_url_matches_product(product_url, product_id):
         raise RuntimeError("商品链接域名或商品 ID 与当前选品记录不匹配，未执行上传")
-    auto_publish = command.get("autoPublish") is True
+    publish_mode = str(command.get("publishMode") or "").strip().lower()
+    if publish_mode not in {"", "prepare", "submit"}:
+        raise RuntimeError("创作者中心发布模式无效")
+    # PostFlow 的准备阶段永远不能点击最终发布；未传模式时保留旧调用兼容性。
+    auto_publish = publish_mode == "submit" or (not publish_mode and command.get("autoPublish") is True)
+    if publish_mode == "prepare":
+        auto_publish = False
     video_path = Path(str(command.get("videoPath") or "")).expanduser().resolve(strict=True)
     if not video_path.is_file() or video_path.suffix.lower() != ".mp4":
         raise RuntimeError("视频路径不是有效的 MP4 文件，未执行上传")
@@ -4330,6 +4377,9 @@ def prepare_douyin_publish(
             "url": publish_page_url,
             "pageTitle": publish_page_title,
             "manualPublishRequired": False,
+            "prepareOnly": False,
+            "submissionAttempted": True,
+            "publishMode": "submit",
             "platformSnapshot": publish_snapshot,
             "message": "已自动提交最终发布；状态以创作者中心回执为准。",
         }
@@ -4351,6 +4401,9 @@ def prepare_douyin_publish(
         "url": page.url,
         "pageTitle": page.title(),
         "manualPublishRequired": True,
+        "prepareOnly": True,
+        "submissionAttempted": False,
+        "publishMode": "prepare",
         "message": "视频与商品链接已准备完成；流程停在最终发布前，请在创作者中心人工检查并发布。",
     }
 
@@ -4457,6 +4510,8 @@ def submit_douyin_publish(
         "coverSelection": cover_selection,
         "platformStatus": return_status,
         "submissionAttempted": True,
+        "prepareOnly": False,
+        "publishMode": "submit",
         "platformSnapshot": snapshot,
         "url": publish_page_url,
         "pageTitle": publish_page_title,
@@ -6523,8 +6578,11 @@ def _candidate_rows(
                 "trendPoints": int(trend.get("points") or 0),
                 "dataMetrics": metrics,
                 "metricSources": {
-                    key: "来源商品行" for key, value in metrics.items() if value is not None
+                    key: ("商品详情" if key in row.get("_detailMetricKeys", []) else "来源商品行")
+                    for key, value in metrics.items() if value is not None
                 },
+                "detailMetricCapturedAt": str(row.get("_detailMetricCapturedAt") or ""),
+                "detailMetricError": str(row.get("_detailMetricError") or ""),
                 "pendingThresholds": pending_thresholds,
                 "thresholdReasons": known_rejection_reasons,
                 "eligible": not known_rejection_reasons,
@@ -6579,6 +6637,95 @@ def _candidate_rows(
     for candidate in candidates:
         candidate["selected"] = True
     return candidates, list(dict.fromkeys(messages)), rejected
+
+
+def _enabled_threshold_names(settings: Dict[str, Any]) -> list[str]:
+    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    return [
+        str(name) for name, value in thresholds.items()
+        if value is not None and value != "" and str(name)
+    ]
+
+
+def _promotion_row_metric_values(row: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """读取来源候选行已有的统一指标；详情补核验前只用于判断缺口。"""
+    base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+    info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+    promotion = base.get("promotion_info") if isinstance(base.get("promotion_info"), dict) else {}
+    shop = base.get("shop_info") if isinstance(base.get("shop_info"), dict) else {}
+    cos_info = promotion.get("cos_info") if isinstance(promotion.get("cos_info"), dict) else {}
+    return {
+        "salesAmount": _find_metric(row, ("sale_amount", "sales_amount", "month_gmv", "gmv", "total_sales_amount")),
+        "salesCount": _find_metric([info, row], ("month_sale", "month_sales", "sales_count", "sale_count", "total_sales_count")),
+        "conversionRate": _find_metric(row, ("conversion_rate", "convert_rate", "conversion_ratio")),
+        "views": _find_metric(row, ("view_count", "views", "browse_count", "browse_num")),
+        "commissionRate": _find_metric([cos_info, promotion, row], ("cos_ratio_text", "commission_rate", "commission_ratio", "cos_ratio")),
+        "experienceScore": _find_metric(shop, ("experience_score", "experienceScore", "shop_score", "shopScore", "score")),
+    }
+
+
+def _promotion_row_category_ids(row: Dict[str, Any]) -> list[str]:
+    base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+    info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+    category = info.get("category") if isinstance(info.get("category"), dict) else {}
+    return [
+        str(category.get(key)).strip()
+        for key in ("first", "second", "third")
+        if category.get(key) is not None and str(category.get(key)).strip()
+    ]
+
+
+def _merge_detail_metrics_into_promotion_row(
+    row: Dict[str, Any],
+    payload: Optional[Dict[str, Any]],
+    product_id: str,
+) -> Dict[str, Any]:
+    """将已核对商品详情的指标回填到来源行，供三来源统一解析器复用。"""
+    if not isinstance(payload, dict):
+        return row
+    detail = _detail_metrics(payload, product_id)
+    if detail.get("error") or detail.get("productId") != product_id:
+        row["_detailMetricError"] = str(detail.get("error") or "详情商品 ID 未能核对")
+        return row
+    metrics = detail.get("metrics") if isinstance(detail.get("metrics"), dict) else {}
+    base = row.setdefault("base_model", {})
+    if not isinstance(base, dict):
+        base = {}
+        row["base_model"] = base
+    info = base.setdefault("product_info", {})
+    if not isinstance(info, dict):
+        info = {}
+        base["product_info"] = info
+    promotion = base.setdefault("promotion_info", {})
+    if not isinstance(promotion, dict):
+        promotion = {}
+        base["promotion_info"] = promotion
+    cos_info = promotion.setdefault("cos_info", {})
+    if not isinstance(cos_info, dict):
+        cos_info = {}
+        promotion["cos_info"] = cos_info
+    shop = base.setdefault("shop_info", {})
+    if not isinstance(shop, dict):
+        shop = {}
+        base["shop_info"] = shop
+    field_map: Dict[str, tuple[Dict[str, Any], str]] = {
+        "salesAmount": (row, "sale_amount"),
+        "salesCount": (info, "month_sale"),
+        "conversionRate": (row, "conversion_rate"),
+        "views": (row, "view_count"),
+        "commissionRate": (cos_info, "cos_ratio_text"),
+        "experienceScore": (shop, "experience_score"),
+    }
+    detail_keys: list[str] = []
+    for metric_name, value in metrics.items():
+        if value is None or metric_name not in field_map:
+            continue
+        target, key = field_map[metric_name]
+        target[key] = value
+        detail_keys.append(metric_name)
+    row["_detailMetricKeys"] = detail_keys
+    row["_detailMetricCapturedAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    return row
 
 
 def _selection_filter_signature(settings: Dict[str, Any]) -> str:
@@ -7097,7 +7244,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             return
 
     try:
-        source_page = page.context.new_page()
+        source_page = _tracked_new_page(page.context, f"source:{source_key}")
         source_page.on("response", observe_rate_limit)
         # SPA 页面可能迟迟不触发 DOMContentLoaded；先等首个响应提交，再按真实列表/空状态判断就绪。
         response = source_page.goto(url, wait_until="commit", timeout=45_000)
@@ -8095,6 +8242,9 @@ def _visible_source_candidate_result(
     source_labels["selectionSquare"] = BAIYING_SELECTION_SQUARE_SOURCE[0]
     source_urls = {key: value[1] for key, value in BAIYING_PRIORITY_SOURCES.items()}
     source_urls["selectionSquare"] = BAIYING_SELECTION_SQUARE_SOURCE[1]
+    excluded_category_ids = _excluded_category_selection_ids(settings)
+    category_gate_enabled = settings.get("selectionMode") == "category" or bool(excluded_category_ids)
+    threshold_names = _enabled_threshold_names(settings)
     merged_raw: Dict[str, Dict[str, Any]] = {}
     sources_by_id: Dict[str, list[str]] = {}
     for source_key in source_order:
@@ -8152,7 +8302,36 @@ def _visible_source_candidate_result(
             for key in ("first", "second", "third")
             if source_category.get(key) is not None and str(source_category.get(key)).strip()
         ]
-        if not category_logic_enabled:
+        existing_metrics = _promotion_row_metric_values(row)
+        missing_metrics = [
+            metric for metric in threshold_names
+            if existing_metrics.get(metric) is None
+        ]
+        needs_category_detail = category_gate_enabled and len(listed_category_ids) < 3
+        if needs_category_detail or missing_metrics:
+            enrichment = _read_candidate_category_from_detail(
+                page.context, row, product_id, category_tree
+            )
+            category_ids_from_detail = [str(value).strip() for value in enrichment.get("categoryIds", []) if str(value).strip()]
+            if len(category_ids_from_detail) >= 3:
+                source_category = {
+                    "first": category_ids_from_detail[0],
+                    "second": category_ids_from_detail[1],
+                    "third": category_ids_from_detail[2],
+                }
+                base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+                product_info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+                product_info["category"] = source_category
+                if isinstance(base, dict):
+                    base["product_info"] = product_info
+                    row["base_model"] = base
+            detail_payload = _cached_detail_payload(page.context, product_id)
+            _merge_detail_metrics_into_promotion_row(row, detail_payload, product_id)
+            if enrichment.get("reason") and not detail_payload:
+                row["_detailMetricError"] = str(enrichment.get("reason"))
+            listed_category_ids = _promotion_row_category_ids(row)
+            category_results[product_id] = enrichment
+        if not category_gate_enabled:
             category_results[product_id] = {
                 "categoryIds": listed_category_ids,
                 "reason": "通用数据模式不以类目完整性作为候选门槛",
@@ -8176,9 +8355,18 @@ def _visible_source_candidate_result(
                 "diagnostics": diagnostics,
             }
         else:
-            enrichment = _read_candidate_category_from_detail(
-                page.context, row, product_id, category_tree
-            )
+            enrichment = category_results.get(product_id)
+            if enrichment is None:
+                if len(listed_category_ids) >= 3:
+                    enrichment = {
+                        "productId": product_id,
+                        "categoryIds": listed_category_ids,
+                        "reason": "来源商品行已提供完整三级类目 ID",
+                    }
+                else:
+                    enrichment = _read_candidate_category_from_detail(
+                        page.context, row, product_id, category_tree
+                    )
             if enrichment.get("fatal"):
                 fatal_category_error = str(enrichment.get("reason") or "详情页安全状态异常，已停止后续读取")
         category_results[product_id] = enrichment
@@ -8246,13 +8434,13 @@ def _visible_source_candidate_result(
         category_result = category_results.get(product_id, {})
         candidate["categoryStatus"] = "known" if candidate["leafCategoryId"] else "类目未知"
         candidate["categorySource"] = (
-            "详情页" if category_logic_enabled else "来源商品行"
+            "详情页" if category_gate_enabled else "来源商品行"
         ) if candidate["leafCategoryId"] else ""
         if not candidate["leafCategoryId"]:
             candidate["categoryError"] = str(category_result.get("reason") or "详情页未返回完整三级类目 ID")
 
     category_filtered_ids: set[str] = set()
-    if category_logic_enabled:
+    if category_gate_enabled:
         invalid_category = [candidate for candidate in candidates if not candidate.get("leafCategoryId")]
         for candidate in invalid_category:
             candidate["analysisRejected"] = True
@@ -8282,7 +8470,6 @@ def _visible_source_candidate_result(
         candidates = [candidate for candidate in candidates if _candidate_matches_manual_categories(candidate, selected_category_ids)]
     # 排除类目是当前账号最终生效设置的一部分；通用模式和品类模式都先应用它，
     # 这样账号个性化选品可以在手动/自动品类范围上继续排除不需要的类目。
-    excluded_category_ids = _excluded_category_selection_ids(settings)
     excluded_by_category = [
         candidate for candidate in candidates
         if excluded_category_ids and _candidate_matches_manual_categories(candidate, excluded_category_ids)
@@ -8355,7 +8542,7 @@ def _visible_source_candidate_result(
         f"{row.get('categoryName') or row['categoryId']}（ID {row['categoryId']}）：{row['basis']}"
         for row in recommendations[:8]
     ) or "无可推荐类目：没有成功补齐类目且达到高分统计条件的商品"
-    if category_logic_enabled:
+    if category_gate_enabled:
         enrichment_summary = (
             f"类目详情补充统计：候选总数 {category_enrichment['candidateCount']} → "
             f"成功补到类目 {category_enrichment['successCount']}，类目未知 {category_enrichment['failureCount']}。"
@@ -8366,7 +8553,7 @@ def _visible_source_candidate_result(
         enrichment_summary = (
             f"通用数据模式类目识别统计：候选总数 {category_enrichment['candidateCount']} → "
             f"列表含完整三级类目 {category_enrichment['successCount']} 个，类目未知 {category_enrichment['failureCount']} 个；"
-            "类目未知商品仍可按数据门槛入选，不计入类目推荐。"
+            "类目未知商品在启用类目范围或排除类目时直接淘汰。"
             + (f"通用设置排除类目过滤 {len(excluded_by_category)} 个商品。" if excluded_by_category else "")
             + f"推荐依据：{recommendation_summary}。"
         )
@@ -9889,9 +10076,7 @@ def _selection_error_requires_pause(error: BaseException) -> bool:
         "websocket", "cdp", "远程调试", "浏览器已关闭", "页面已关闭", "连接中断", "连接失败",
         "net::err_", "request failed", "timed out", "timeout", "超时", "等待期限", "尚未完成",
         "未能稳定", "未结束", "pending", "unstable",
-        "多个包含该商品 id 的卡片", "无法按商品 id 唯一定位", "无法按精确商品 id",
-        "候选商品身份不唯一",
-        "身份无法唯一确认", "缺少商品 id", "商品 id 缺失",
+        # 商品身份类错误由候选层隔离；只有账号/浏览器状态错误才升级为暂停。
     )
     if any(marker in message for marker in pause_markers):
         return True
@@ -10665,7 +10850,7 @@ def _read_candidate_category_from_detail(
             response_errors.append('DETAIL_CATEGORY_ID_MISMATCH_OR_MISSING')
 
     try:
-        detail_page = context.new_page()
+        detail_page = _tracked_new_page(context, "detail")
         detail_page.on('response', on_detail)
         diagnostics['navigationState'] = 'started'
         try:
@@ -10754,6 +10939,9 @@ def _read_candidate_category_from_detail(
                 category_tree,
                 identity_verified_by_page=identity_verified_by_page,
             )
+            # 类目补核验同时为佣金、体验分和其他详情指标保留同一份已核对响应，
+            # 后续统一筛选不得再次打开同一商品详情页。
+            _cache_detail_payload(context, product_id, payload)
             if category_ids:
                 return {
                     'productId': product_id,
@@ -11623,9 +11811,24 @@ def execute_selected_candidates(
                 )
                 continue
             except Exception as error:
-                if _selection_error_requires_pause(error) or any(
-                    marker in str(error) for marker in ("商品 ID", "身份无法", "身份不一致", "无法返回选品列表")
-                ):
+                identity_failure = any(
+                    marker in str(error) for marker in ("商品 ID", "身份无法", "身份不一致", "无法返回选品列表", "多个包含该商品")
+                )
+                if identity_failure:
+                    reason = f"商品身份/详情恢复未确认：{error}；已隔离当前商品并继续后续候选"
+                    candidate["analysisRejected"] = True
+                    candidate["thresholdReasons"] = [reason]
+                    candidate["status"] = reason
+                    candidate["cartAdded"] = False
+                    candidate["skipped"] = True
+                    rejected_candidates.append(candidate)
+                    _report_operation_progress(
+                        progress, "商品数据分析", index=position, total=len(selected_candidates),
+                        percent=int(position * 100 / len(selected_candidates)), message=reason,
+                        product_id=product_id, product_title=title,
+                    )
+                    continue
+                if _selection_error_requires_pause(error):
                     raise RuntimeError(f"商品数据分析失败并触发安全停止：{error}") from error
                 _apply_detail_metrics(candidate, None, str(error))
             analyzed_candidates.append(candidate)

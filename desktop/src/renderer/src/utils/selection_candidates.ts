@@ -22,6 +22,46 @@ export interface SelectionRegistrySnapshot {
   categoryUsage?: Record<string, number>
 }
 
+/** 只保留会改变来源候选结果的设置，用于同批次候选池复用。 */
+export function selectionFilterFingerprint(settings: Record<string, unknown>): string {
+  const stable = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(stable)
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>
+      return Object.fromEntries(Object.keys(record).sort().map((key) => [key, stable(record[key])]))
+    }
+    return value
+  }
+  const sources = settings.sources && typeof settings.sources === 'object'
+    ? settings.sources as Record<string, unknown> : {}
+  const thresholds = settings.thresholds && typeof settings.thresholds === 'object'
+    ? settings.thresholds as Record<string, unknown> : {}
+  const filters = settings.filters && typeof settings.filters === 'object'
+    ? settings.filters as Record<string, unknown> : {}
+  return JSON.stringify(stable({
+    sources: {
+      hotSpotEnabled: sources.hotSpotEnabled !== false,
+      allianceRankEnabled: sources.allianceRankEnabled !== false,
+      priority: Array.isArray(sources.priority) ? sources.priority : []
+    },
+    selectionMode: settings.selectionMode ?? 'general',
+    categoryMode: settings.categoryMode ?? 'auto',
+    categorySelection: settings.categorySelection ?? {},
+    excludedCategorySelection: settings.excludedCategorySelection ?? {},
+    filters,
+    thresholds,
+    poolPriority: settings.poolPriority ?? [],
+    poolFallback: settings.poolFallback !== false,
+    trendPreference: settings.trendPreference ?? '上升优先',
+    bannedWords: settings.bannedWords ?? []
+  }))
+}
+
+/** 权限/可见范围未知时不复用；相同托管 profile 才视为已确认同一来源权限。 */
+export function selectionPoolVisibilityFingerprint(profilePath?: string): string {
+  return String(profilePath ?? '').trim().replace(/[\\/]+/g, '\\').replace(/[\\]+$/, '').toLowerCase()
+}
+
 export function candidateLeafCategoryId(candidate: SelectionCandidateRankInput): string {
   return String(candidate.leafCategoryId ?? candidate.categoryIds?.at(-1) ?? '').trim()
 }

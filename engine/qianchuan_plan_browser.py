@@ -38,7 +38,11 @@ def plan_id_in_list_text(body: str, plan_name: str, budget: int,
 
 def verify_created_plan(context, job: dict, budget: int) -> str:
     """创建回执不带 ID 时，只读回查千川计划列表，不重新提交。"""
-    list_page = context.new_page()
+    list_page = next((item for item in reversed(context.pages)
+                      if not item.is_closed() and urlparse(item.url).path == "/uni-prom"), None)
+    created_page = list_page is None
+    if list_page is None:
+        list_page = context.new_page()
     try:
         advertiser = str(job["advertiser_id"])
         list_page.goto("https://qianchuan.jinritemai.com/uni-prom?" +
@@ -51,7 +55,8 @@ def verify_created_plan(context, job: dict, budget: int) -> str:
         return plan_id_in_list_text(list_page.locator("body").inner_text(),
                                     str(job["plan_name"]), budget)
     finally:
-        list_page.close()
+        if created_page:
+            list_page.close()
 
 
 def one(locator, label: str):
@@ -381,7 +386,7 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
     read_verified_port(profile_path, port, int(job["qianchuan_account_id"]), douyin_account_id)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
     screenshot = diagnostics_dir / f"plan-{job_id}.png"
-    stage, submitted, page = "connect", False, None
+    stage, submitted, page, created_page = "connect", False, None, False
     responses: list[str] = []
     submission_errors: list[str] = []
     api_events: list[dict[str, str | int]] = []
@@ -392,7 +397,10 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
         if len(browser.contexts) != 1:
             raise UploadStopped("千川浏览器上下文不唯一", stage=stage)
         # 在已连接的账号浏览器中使用一个临时标签，执行完立即关闭；不覆盖用户正在看的页面。
-        page = browser.contexts[0].new_page()
+        existing_page = next((item for item in reversed(browser.contexts[0].pages)
+                              if not item.is_closed() and urlparse(item.url).path == CREATE_PATH), None)
+        created_page = existing_page is None
+        page = existing_page or browser.contexts[0].new_page()
         stage = "navigate"
         page.goto("https://qianchuan.jinritemai.com" + CREATE_PATH + "?" +
                   urlencode({"aavid": advertiser}), wait_until="domcontentloaded", timeout=30_000)
@@ -555,7 +563,7 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
                 "selectedMaterialIds": selected_material_ids,
                 "screenshotPath": str(screenshot), "reason": "已点击发布计划，但未取得唯一计划 ID；请在千川核查，禁止自动重发" + material_note + feedback}
     except Exception as error:
-        if page is not None:
+        if created_page and page is not None:
             try:
                 page.screenshot(path=str(screenshot), full_page=True, timeout=8_000)
             except Exception:

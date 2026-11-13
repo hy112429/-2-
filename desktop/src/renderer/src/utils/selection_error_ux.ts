@@ -7,6 +7,9 @@ export type SelectionErrorClassification =
   | 'SEARCHBOX_ZERO_EXHAUSTED'
   | 'SEARCHBOX_CONTROL_EXHAUSTED'
   | 'LOGIN_OR_PAGE_STATE_UNCONFIRMED'
+  | 'PRODUCT_ID_MISMATCH'
+  | 'PRODUCT_DETAIL_FAILED'
+  | 'ACCOUNT_PERMISSION'
 
 export interface UserSelectionError {
   userMessage: string
@@ -73,6 +76,13 @@ function classify(input: unknown, raw: string, explicitClassification: string): 
   }
   if (/SEARCHBOX_ZERO_EXHAUSTED/.test(combined)) return 'SEARCHBOX_ZERO_EXHAUSTED'
   if (/SEARCHBOX_CONTROL_EXHAUSTED/.test(combined)) return 'SEARCHBOX_CONTROL_EXHAUSTED'
+  if (/PRODUCT_ID_MISMATCH|商品 ID.{0,12}(?:不一致|无法确认)|身份无法唯一确认|多个包含该商品/.test(combined)) {
+    return 'PRODUCT_ID_MISMATCH'
+  }
+  if (/PRODUCT_DETAIL_FAILED|详情(?:页)?(?:打开|读取|回读).{0,12}(?:失败|超时)|无法返回选品列表/.test(combined)) {
+    return 'PRODUCT_DETAIL_FAILED'
+  }
+  if (/ACCOUNT_PERMISSION|权限不足|无权限|未授权|广告主.*不可见/.test(combined)) return 'ACCOUNT_PERMISSION'
   if (
     /ACCOUNT_SWITCH_CAPTCHA|验证码|滑块(?:验证)?|安全验证|人工验证|CAPTCHA|VERIFICATION REQUIRED|VERIFICATION CHALLENGE|SECURITY CHALLENGE|VERIFY-CENTER/i.test(combined)
   ) {
@@ -208,6 +218,20 @@ export function toUserSelectionError(input: unknown): UserSelectionError {
   if (classification === 'SEARCHBOX_ZERO_EXHAUSTED' || classification === 'SEARCHBOX_CONTROL_EXHAUSTED') {
     return {
       userMessage: '该账号的百应选品搜索控件经有限恢复仍无法唯一定位；已保留诊断与截图路径，本轮跳过该账号并继续其他账号。',
+      classification,
+      diagnostic: extracted.diagnostic || undefined
+    }
+  }
+  if (classification === 'PRODUCT_ID_MISMATCH' || classification === 'PRODUCT_DETAIL_FAILED') {
+    return {
+      userMessage: '当前商品身份或详情核验未确认，已跳过该商品并继续候选。',
+      classification,
+      diagnostic: extracted.diagnostic || undefined
+    }
+  }
+  if (classification === 'ACCOUNT_PERMISSION') {
+    return {
+      userMessage: '当前账号来源权限不足，已跳过当前账号并继续后续账号。',
       classification,
       diagnostic: extracted.diagnostic || undefined
     }

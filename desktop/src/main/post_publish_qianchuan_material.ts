@@ -56,6 +56,26 @@ async function stateCommand(...args: string[]): Promise<Json> {
   return result
 }
 
+async function douyinBatchGate(): Promise<{ ready: boolean; reason: string }> {
+  const outcome = await runEngineCommand('selection_recovery.py', [
+    '--db', getClientPaths().databasePath, 'batch', 'recent'
+  ])
+  if (!outcome.ok) return { ready: false, reason: outcome.error ?? '无法读取最近选品批次' }
+  const result = object(outcome.result)
+  const batch = object(result['batch'])
+  const accounts = Array.isArray(batch['accounts']) ? batch['accounts'].map(object) : []
+  if (!accounts.length || batch['state'] !== 'completed') {
+    return { ready: false, reason: '全账号抖音选品/发布批次尚未完成' }
+  }
+  for (const account of accounts) {
+    if (String(account['state']) !== 'completed') return { ready: false, reason: `账号 ${String(account['accountId'] ?? '')} 尚未完成` }
+    const completed = Array.isArray(account['completed']) ? account['completed'].map(object) : []
+    const confirmed = completed.filter((item) => item['cartAdded'] === true && item['publishQueueStatus'] === 'published')
+    if (confirmed.length < 5) return { ready: false, reason: `账号 ${String(account['accountId'] ?? '')} 抖音发布确认不足 5/5` }
+  }
+  return { ready: true, reason: '全账号抖音发布已确认完成' }
+}
+
 function jsonArg(value: unknown): string {
   return JSON.stringify(value)
 }
@@ -439,10 +459,30 @@ export function firePostPublishQianchuanMaterial(queueId: number, trigger: Trigg
   })
 }
 
+/** 抖音确认后只登记千川待办；实际素材下载/上传由全账号阶段闸门统一启动。 */
+export function queuePostPublishQianchuanMaterial(queueId: number, trigger: TriggerSource): void {
+  setImmediate(() => {
+    void runEngineCommand('post_publish_material.py', [
+      '--db', getClientPaths().databasePath, 'queue',
+      '--publish-queue-id', String(safeId(queueId, '发布队列 ID')), '--trigger', trigger
+    ]).then((outcome) => {
+      if (!outcome.ok) throw new Error(outcome.error ?? '千川待办登记失败')
+      console.info(`[发布后千川素材] 队列 #${queueId} 已登记待办，等待全账号抖音发布完成`)
+    }).catch((error) => {
+      console.error(`[发布后千川素材] 队列 #${queueId} 待办登记失败：${String(error)}`)
+    })
+  })
+}
+
 async function reconcileTick(): Promise<void> {
   if (reconcileRunning) return
   reconcileRunning = true
   try {
+    const gate = await douyinBatchGate()
+    if (!gate.ready) {
+      console.info(`[发布后素材] 千川全局闸门未通过：${gate.reason}`)
+      return
+    }
     const due = await stateCommand('due', '--limit', '30')
     for (const row of rows(due['rows'])) {
       const queueId = Number(row['publishQueueId'])
@@ -479,14 +519,14 @@ export async function markQueuePublishedAndTrigger(queueId: number): Promise<Jso
   if (!outcome.ok) throw new Error(outcome.error ?? '记录发布成功失败')
   const result = object(outcome.result)
   if (result['ok'] !== true) throw new Error(String(result['error'] ?? '记录发布成功失败'))
-  if (result['platformStatus'] === 'published') firePostPublishQianchuanMaterial(id, 'mark-published')
+  if (result['platformStatus'] === 'published') queuePostPublishQianchuanMaterial(id, 'mark-published')
   return result
 }
 
 /** renderer 的 submit-finish 也走成功后通知；此入口只接受 published。 */
 export function notifyPostPublishFinished(queueId: number, platformStatus: unknown, trigger: TriggerSource): Json {
   const id = safeId(queueId, '发布队列 ID')
-  if (platformStatus === 'published') firePostPublishQianchuanMaterial(id, trigger)
+  if (platformStatus === 'published') queuePostPublishQianchuanMaterial(id, trigger)
   return { ok: true, triggered: platformStatus === 'published' }
 }
 

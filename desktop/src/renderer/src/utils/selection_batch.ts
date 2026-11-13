@@ -543,7 +543,7 @@ export async function runSequentialSelectionBatch<TAccount extends SelectionBatc
         status,
         message: result?.message
       })
-      if ((stopAfterIncomplete && status !== '完成') || result?.continueBatch === false) {
+      if ((stopAfterIncomplete && status !== '完成' && result?.continueBatch !== true) || result?.continueBatch === false) {
         for (const remaining of ordered.slice(index + 1)) {
           onStatus(remaining, '未执行')
           outcomes.push({

@@ -202,6 +202,32 @@ def begin(connection: sqlite3.Connection, queue_id: int, trigger_source: str) ->
         raise
 
 
+def queue_pending(connection: sqlite3.Connection, queue_id: int, trigger_source: str) -> Dict[str, Any]:
+    """发布确认后只登记待办，不启动下载、查询或 Step17 上传。"""
+    task = _published_task(connection, queue_id)
+    existing = connection.execute(
+        "SELECT r.*, p.product_name FROM post_publish_material_runs r "
+        "JOIN publish_queue p ON p.id=r.publish_queue_id WHERE r.publish_queue_id=?", (queue_id,)
+    ).fetchone()
+    if existing:
+        return {"ok": True, "queued": False, "run": _payload(existing)}
+    timestamp = now_text()
+    connection.execute(
+        "INSERT INTO post_publish_material_runs "
+        "(publish_queue_id, account_id, product_id, status, reason, attempt_count, trigger_source, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'enqueued', ?, 0, ?, ?, ?)",
+        (queue_id, int(task["account_id"]), str(task["product_id"]),
+         "已登记千川待办；等待全账号抖音发布阶段完成后统一执行。", trigger_source[:80], timestamp, timestamp),
+    )
+    _record_event(connection, queue_id, 0, "enqueued", "queue", "等待全账号抖音发布阶段完成", {"trigger": trigger_source})
+    row = connection.execute(
+        "SELECT r.*, p.product_name FROM post_publish_material_runs r "
+        "JOIN publish_queue p ON p.id=r.publish_queue_id WHERE r.publish_queue_id=?", (queue_id,)
+    ).fetchone()
+    connection.commit()
+    return {"ok": True, "queued": True, "run": _payload(row)}
+
+
 def retry(connection: sqlite3.Connection, queue_id: int, trigger_source: str = "manual_retry") -> Dict[str, Any]:
     task = _published_task(connection, queue_id)
     connection.commit()
@@ -379,6 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
     start = commands.add_parser("begin")
     start.add_argument("--publish-queue-id", type=int, required=True)
     start.add_argument("--trigger", default="published")
+    queue = commands.add_parser("queue")
+    queue.add_argument("--publish-queue-id", type=int, required=True)
+    queue.add_argument("--trigger", default="published")
     again = commands.add_parser("retry")
     again.add_argument("--publish-queue-id", type=int, required=True)
     again.add_argument("--trigger", default="manual_retry")
@@ -410,6 +439,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 result = settings_set(connection, bool(args.enabled))
             elif args.command == "begin":
                 result = begin(connection, args.publish_queue_id, args.trigger)
+            elif args.command == "queue":
+                result = queue_pending(connection, args.publish_queue_id, args.trigger)
             elif args.command == "retry":
                 result = retry(connection, args.publish_queue_id, args.trigger)
             elif args.command == "update":
