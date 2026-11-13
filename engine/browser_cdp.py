@@ -4514,8 +4514,9 @@ def run_watch(profile_path: Path) -> int:
                                     candidate for candidate in reversed(context.pages)
                                     if not candidate.is_closed()
                                     and urlparse(candidate.url).path.rstrip("/") == target_path
+                                    and getattr(candidate, "_touguang_managed_selection_page", False) is not True
                                     and not candidate.evaluate(
-                                        "() => window.__touguangManagedSelectionPage === true || window.name === '__touguangManagedSelectionPage'"
+                                        "() => window.__touguangManagedSelectionPage === true || window.name === '__touguangManagedSelectionPage' || window.name === '__touguangBackgroundSelectionPage'"
                                     )
                                 ), None)
                                 if page is None:
@@ -4545,14 +4546,20 @@ def run_watch(profile_path: Path) -> int:
                                 ),
                             })
                         else:
-                            emit({
-                                "type": "result",
-                                "id": command_id,
-                                **collect_filter_catalog(
-                                    page,
-                                    include_category_tree=command.get("includeCategoryTree") is True,
-                                ),
-                            })
+                            try:
+                                emit({
+                                    "type": "result",
+                                    "id": command_id,
+                                    **collect_filter_catalog(
+                                        page,
+                                        include_category_tree=command.get("includeCategoryTree") is True,
+                                    ),
+                                })
+                            finally:
+                                try:
+                                    page.close()
+                                except Exception:
+                                    pass
                     elif action == "check-account-logins":
                         try:
                             account_id = command.get("accountId")
@@ -4563,6 +4570,8 @@ def run_watch(profile_path: Path) -> int:
                         except Exception as error:
                             emit({"type": "result", "id": command_id, "ok": False, "error": str(error)})
                     elif action == "run-selection":
+                        page = None
+                        close_selection_page = False
                         try:
                             report_progress = lambda payload: emit({"type": "progress", "id": command_id, **payload})
                             _report_operation_progress(report_progress, "正在连接百应选品页", message="等待托管页面就绪")
@@ -4574,9 +4583,20 @@ def run_watch(profile_path: Path) -> int:
                                     "并能正常打开选品广场后重试。"
                                 )
                             result = run_selection_command(page, context, command, report_progress)
+                            completed_rows = result.get("completed")
+                            close_selection_page = result.get("ok") is True and not any(
+                                isinstance(item, dict) and item.get("manualAction")
+                                for item in (completed_rows if isinstance(completed_rows, list) else [])
+                            )
                             emit({"type": "result", "id": command_id, **result})
                         except Exception as error:
                             emit({"type": "result", "id": command_id, "ok": False, "error": str(error)})
+                        finally:
+                            if page is not None and close_selection_page:
+                                try:
+                                    page.close()
+                                except Exception:
+                                    pass
                     elif action == "prepare-douyin-publish":
                         try:
                             report_progress = lambda payload: emit({"type": "progress", "id": command_id, **payload})
@@ -4770,6 +4790,14 @@ def _create_background_page(context: BrowserContext, browser: Browser) -> Page:
             cdp.detach()
         except Exception:
             pass
+
+
+def _create_selection_work_page(context: BrowserContext) -> Page:
+    """选品临时页在托管 Chrome 中后台打开，不打断用户当前标签。"""
+    browser = context.browser
+    if isinstance(browser, Browser):
+        return _create_background_page(context, browser)
+    return context.new_page()
 
 
 def _login_preflight_page(context: BrowserContext, browser: Browser, marker: str) -> Page:
@@ -5064,7 +5092,10 @@ def find_selection_page(
     managed_pages: list[Page] = []
     for page in reversed(context.pages):
         try:
-            if not page.is_closed() and page.evaluate("() => window.__touguangManagedSelectionPage === true || window.name === '__touguangManagedSelectionPage'"):
+            if not page.is_closed() and (
+                getattr(page, "_touguang_managed_selection_page", False) is True
+                or page.evaluate("() => window.__touguangManagedSelectionPage === true || window.name === '__touguangManagedSelectionPage' || window.name === '__touguangBackgroundSelectionPage'")
+            ):
                 managed_pages.append(page)
         except Exception:
             continue
@@ -5075,7 +5106,10 @@ def find_selection_page(
     background_candidates: list[Page] = []
     for candidate in candidates:
         try:
-            if candidate.evaluate("() => window.__touguangBackgroundSelectionPage === true || window.name === '__touguangBackgroundSelectionPage'"):
+            if (
+                getattr(candidate, "_touguang_background_selection_page", False) is True
+                or candidate.evaluate("() => window.__touguangBackgroundSelectionPage === true || window.name === '__touguangBackgroundSelectionPage'")
+            ):
                 background_candidates.append(candidate)
                 continue
         except Exception:
@@ -5156,10 +5190,13 @@ def find_selection_page(
         target = _create_background_page(context, active_browser)
     except Exception:
         return None
+    setattr(target, "_touguang_managed_selection_page", True)
+    setattr(target, "_touguang_background_selection_page", True)
 
-    if attached is not None:
-        attach_page(target, attached)
+    ready = False
     try:
+        if attached is not None:
+            attach_page(target, attached)
         _report_operation_progress(
             progress,
             "打开百应选品广场",
@@ -5176,9 +5213,16 @@ def find_selection_page(
             return None
         # 页面可能经历重定向或脚本重载，确认就绪后重新打自动化标记。
         target.evaluate("() => { window.__touguangManagedSelectionPage = true; window.__touguangBackgroundSelectionPage = true; window.name = '__touguangBackgroundSelectionPage' }")
+        ready = True
         return target
     except Exception:
         return None
+    finally:
+        if not ready:
+            try:
+                target.close()
+            except Exception:
+                pass
 
 
 def _filter_control(page: Page, label: str) -> Any:
@@ -6972,7 +7016,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             return
 
     try:
-        source_page = page.context.new_page()
+        source_page = _create_selection_work_page(page.context)
         source_page.on("response", observe_rate_limit)
         # SPA 页面可能迟迟不触发 DOMContentLoaded；先等首个响应提交，再按真实列表/空状态判断就绪。
         response = source_page.goto(url, wait_until="commit", timeout=45_000)
@@ -10545,7 +10589,7 @@ def _read_candidate_category_from_detail(
             response_errors.append('DETAIL_CATEGORY_ID_MISMATCH_OR_MISSING')
 
     try:
-        detail_page = context.new_page()
+        detail_page = _create_selection_work_page(context)
         detail_page.on('response', on_detail)
         diagnostics['navigationState'] = 'started'
         try:
@@ -11796,6 +11840,18 @@ def execute_selected_candidates(
         if already_in_cart:
             cart_path = "alreadyInCart"
             candidate["cartPath"] = cart_path
+            if analyze_before_cart and candidate.get("cartAdded") is not True and candidate.get("cartAttempted") is not True:
+                completed.append({
+                    "productId": product_id,
+                    "title": title,
+                    "cartAdded": False,
+                    "cartAttempted": False,
+                    "alreadyInCart": True,
+                    "skipped": True,
+                    "cartStatus": "百应选品车已有此商品",
+                    "status": "该商品已在百应选品车；不计入本轮新增数量，继续补选其他商品。",
+                })
+                continue
         if candidate.get("cartAttempted") is True and not already_in_cart:
             completed.append({
                 "productId": str(candidate.get("productId") or ""),
@@ -12072,6 +12128,7 @@ def execute_selected_candidates(
                     completed.append({
                         "productId": candidate.get("productId"), "title": title,
                         "cartAdded": False, "cartAttempted": cart_attempted, "skipped": True,
+                        "confirmedCartRejection": True,
                         "analysisRejected": bool(unavailable),
                         "thresholdReasons": [rejection_status],
                         "cartStatus": "商品无库存/不可加车，已跳过" if unavailable else "平台明确拒绝此商品",
@@ -12387,6 +12444,34 @@ def execute_selected_candidates(
             status = str(item.get("status") or "")
             if status and "候选评分" not in status:
                 item["status"] = status + "；" + item["analysisSummary"]
+    if analyze_before_cart and not stop_after_cart and max_selected_products is not None:
+        try:
+            target = max(0, int(max_selected_products))
+        except (TypeError, ValueError):
+            target = len(selected_candidates)
+        added = sum(1 for item in completed if item.get("cartAdded") is True)
+        # 首批详情核验只找够目标数量的达标商品。若后续加车被明确跳过，
+        # 再核验尚未分析的备用候选；加车结果不明时保留检查点，避免超额加车。
+        uncertain = any(
+            item.get("manualAction")
+            or (
+                item.get("cartAttempted") is True
+                and item.get("cartAdded") is not True
+                and item.get("confirmedCartRejection") is not True
+            )
+            or (item.get("cartAdded") is not True and item.get("skipped") is not True)
+            for item in completed
+        )
+        remaining_indexes = [
+            int(candidate["cardIndex"]) for candidate in selected_candidates
+            if candidate.get("analysisAttempted") is not True
+        ]
+        if added < target and remaining_indexes and not uncertain:
+            completed.extend(execute_selected_candidates(
+                page, context, candidates, remaining_indexes, download_root, settings,
+                stop_after_cart=stop_after_cart, progress=progress,
+                analyze_before_cart=True, max_selected_products=target - added,
+            ))
     return completed
 
 
@@ -13011,7 +13096,7 @@ def _execute_visible_source_candidates(
         if not group:
             continue
         label, url = BAIYING_SELECTION_SQUARE_SOURCE if source_key == "selectionSquare" else BAIYING_PRIORITY_SOURCES[source_key]
-        source_page = context.new_page()
+        source_page = _create_selection_work_page(context)
         try:
             _report_operation_progress(
                 progress, "回到百应来源商品行", index=len(completed), total=len(selected),

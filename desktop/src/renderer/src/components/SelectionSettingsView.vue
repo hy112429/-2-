@@ -1848,7 +1848,7 @@ async function saveAccount(): Promise<void> {
       accountDraft.downloadPath = downloadValidation.path
     }
     if (accountFilterOverridesEnabled.value && (!Number.isInteger(accountFilterDraft.value.candidateLimit) || accountFilterDraft.value.candidateLimit < 1 || accountFilterDraft.value.candidateLimit > 10)) {
-      throw new Error('账号候选上限须为 1–10 的整数。')
+      throw new Error('每轮每账号新增商品目标数须为 1–10 的整数。')
     }
     if (accountFilterOverridesEnabled.value) {
       validateCommissionRateThreshold(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
@@ -3365,7 +3365,6 @@ async function executeAccountSelection(
       }
     }
 
-    const hasSkippedProduct = completed.some((item) => item.skipped === true)
     const hasIncompleteProduct = hasQuotaFailure || hasQueueFailure || completed.some((item) =>
       item.skipped !== true && (item.cartAdded !== true || typeof item.video9x16 !== 'string')
     )
@@ -3386,18 +3385,20 @@ async function executeAccountSelection(
         await recovery.persist({ state: 'completed', stage: 'completed', error: '', completed })
       }
     }
-    const partial = hasIncompleteProduct || hasSkippedProduct || categoryWarnings.length > 0
+    const requestedCount = Number(settings.candidateLimit ?? 5)
+    const batchTarget = Number.isFinite(requestedCount) ? Math.max(1, Math.min(10, requestedCount)) : 5
+    const partial = hasIncompleteProduct || quotaProducts.length < batchTarget
     accountStatuses[targetAccountId] = partial ? '部分完成' : '完成'
-    reportSelectionProgress(targetAccountId, partial ? '当前账号处理结束，存在跳过或待恢复商品' : '当前账号选品完成', {
+    reportSelectionProgress(targetAccountId, partial ? '当前账号处理结束，商品数量未补齐或存在待恢复商品' : '当前账号选品完成', {
       itemIndex: completed.length,
       itemTotal: completed.length,
       percent: partial ? null : 100,
-      message: summary
+      message: `本轮目标 ${batchTarget} 个，已加车 ${quotaProducts.length} 个。${summary}`
     })
     return {
       status: partial ? '部分完成' : '完成',
-      message: summary,
-      continueBatch: !hasIncompleteProduct && (hasSkippedProduct || categoryWarnings.length > 0)
+      message: `本轮目标 ${batchTarget} 个，已加车 ${quotaProducts.length} 个。${summary}`,
+      continueBatch: !hasIncompleteProduct && partial
     }
   } catch (cause) {
     const reason = String(cause instanceof Error ? cause.message : cause)
@@ -5711,7 +5712,7 @@ onUnmounted(() => {
           </section>
 
           <details id="global-filters" class="card filter-card">
-            <summary>选品条件 · 候选上限 {{ global.candidateLimit }}</summary>
+            <summary>选品条件 · 每轮每账号目标 {{ global.candidateLimit }} 个商品</summary>
             <SelectionFilterEditor
               v-model="globalFilterSettings"
               title="选品条件"
@@ -5734,7 +5735,7 @@ onUnmounted(() => {
               <label>通用默认每账号商品上限<input v-model.number="global.quota.perAccountProducts" type="number" min="1"></label>
               <label>通用默认每账号视频上限<input v-model.number="global.quota.perAccountVideos" type="number" min="1"></label>
             </div>
-            <p class="hint">账号未单独设置时使用这些默认值。限额只控制客户端选品和发布计划，不代表平台吞吐承诺；待确认和已排期任务会占用计划日期用量。</p>
+            <p class="hint">每轮目标数量在“选品条件”设置；这里是每日累计上限。账号未单独设置时使用这些默认值。限额只控制客户端选品和发布计划，不代表平台吞吐承诺；待确认和已排期任务会占用计划日期用量。</p>
           </section>
         </template>
 

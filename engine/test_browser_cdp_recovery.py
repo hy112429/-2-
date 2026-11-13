@@ -1408,6 +1408,76 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         locate.assert_not_called()
         self.assertEqual(page.listeners, {})
 
+    def test_safe_cart_skip_refills_from_unanalyzed_candidate(self):
+        candidates = [
+            {"cardIndex": 0, "productId": "product-a", "title": "商品A", "sourceKey": "allianceRank"},
+            {"cardIndex": 1, "productId": "product-b", "title": "商品B", "sourceKey": "allianceRank"},
+        ]
+        with patch.object(browser_cdp, "_candidate_needs_detail_enrichment", return_value=False), \
+                patch.object(browser_cdp, "_evaluate_candidate_thresholds", return_value=[]), \
+                patch.object(browser_cdp, "_candidate_quality_scores"), \
+                patch.object(browser_cdp, "_visible_baiying_prompt", return_value=("", "")), \
+                patch.object(browser_cdp, "_locate_candidate_card", side_effect=CandidateCartSkip("product-a", "商品已不可加车")), \
+                patch.object(browser_cdp, "execute_selected_candidates", return_value=[{
+                    "productId": "product-b", "cartAdded": True
+                }]) as refill:
+            result = execute_selected_candidates(
+                FakePage({}), MagicMock(), candidates, [0, 1], ".", {},
+                analyze_before_cart=True, max_selected_products=1,
+            )
+
+        self.assertTrue(result[0]["skipped"])
+        self.assertEqual(result[1]["productId"], "product-b")
+        self.assertEqual(refill.call_args.args[3], [1])
+        self.assertEqual(refill.call_args.kwargs["max_selected_products"], 1)
+
+    def test_uncertain_cart_result_does_not_refill(self):
+        candidates = [
+            {"cardIndex": 0, "productId": "product-a", "title": "商品A", "sourceKey": "allianceRank"},
+            {"cardIndex": 1, "productId": "product-b", "title": "商品B", "sourceKey": "allianceRank"},
+        ]
+        with patch.object(browser_cdp, "_candidate_needs_detail_enrichment", return_value=False), \
+                patch.object(browser_cdp, "_evaluate_candidate_thresholds", return_value=[]), \
+                patch.object(browser_cdp, "_candidate_quality_scores"), \
+                patch.object(browser_cdp, "_visible_baiying_prompt", return_value=(
+                    "manual_verification", "请完成验证"
+                )), patch.object(browser_cdp, "execute_selected_candidates") as refill:
+            result = execute_selected_candidates(
+                FakePage({}), MagicMock(), candidates, [0, 1], ".", {},
+                analyze_before_cart=True, max_selected_products=1,
+            )
+
+        self.assertEqual(result[0]["manualAction"], "complete_baiying_verification")
+        refill.assert_not_called()
+
+    def test_confirmed_platform_rejection_refills_from_next_candidate(self):
+        candidates = [
+            {"cardIndex": 0, "productId": "product-a", "title": "商品A", "sourceKey": "allianceRank"},
+            {"cardIndex": 1, "productId": "product-b", "title": "商品B", "sourceKey": "allianceRank"},
+        ]
+        card = MagicMock()
+        card.inner_text.return_value = "商品A 加选品车"
+        card.locator.return_value.first.count.return_value = 1
+        with patch.object(browser_cdp, "_candidate_needs_detail_enrichment", return_value=False), \
+                patch.object(browser_cdp, "_evaluate_candidate_thresholds", return_value=[]), \
+                patch.object(browser_cdp, "_candidate_quality_scores"), \
+                patch.object(browser_cdp, "_is_alliance_direct_cart_row", return_value=False), \
+                patch.object(browser_cdp, "_visible_baiying_prompt", side_effect=[
+                    ("", ""), ("", ""), ("cart_error", "商品无库存")
+                ]), patch.object(browser_cdp, "_dismiss_cart_error_dialog"), \
+                patch.object(browser_cdp, "_locate_candidate_card", return_value=(MagicMock(), card)), \
+                patch.object(browser_cdp, "execute_selected_candidates", return_value=[{
+                    "productId": "product-b", "cartAdded": True
+                }]) as refill:
+            result = execute_selected_candidates(
+                FakePage({}), MagicMock(), candidates, [0, 1], ".", {},
+                analyze_before_cart=True, max_selected_products=1,
+            )
+
+        self.assertTrue(result[0]["confirmedCartRejection"])
+        self.assertFalse(result[0]["cartAdded"])
+        self.assertEqual(refill.call_args.args[3], [1])
+
     def test_invoice_prompt_clicks_add_cart_once_and_keeps_eligibility_warning(self):
         page = FakePage({})
         title = MagicMock()
@@ -1527,6 +1597,22 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         self.assertTrue(result[0]["cartAttempted"])
         self.assertIn("不重复点击本商品，已跳过并继续下一个候选", result[0]["status"])
         button.click.assert_not_called()
+
+    def test_product_already_in_platform_cart_does_not_fill_new_product_target(self):
+        candidate = {"cardIndex": 0, "productId": "product-a", "title": "商品A"}
+        card = MagicMock()
+        card.inner_text.return_value = "商品A 已加选品车"
+        with patch.object(browser_cdp, "_visible_baiying_prompt", return_value=("", "")), \
+                patch.object(browser_cdp, "_locate_candidate_card", return_value=(MagicMock(), card)):
+            result = execute_selected_candidates(
+                FakePage({}), MagicMock(), [candidate], [0], ".", {},
+                stop_after_cart=True, analyze_before_cart=True,
+            )
+
+        self.assertFalse(result[0]["cartAdded"])
+        self.assertTrue(result[0]["alreadyInCart"])
+        self.assertTrue(result[0]["skipped"])
+        card.locator.return_value.first.click.assert_not_called()
 
     def test_candidate_add_cart_action_text_is_exact_negative_cart_evidence(self):
         self.assertTrue(_candidate_has_add_cart_action_text("商品A 加选品车"))
@@ -1679,6 +1765,21 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         )])
         self.assertTrue(cdp.detached)
 
+    def test_selection_work_page_uses_background_target(self):
+        class FakeBrowser:
+            pass
+
+        context = MagicMock()
+        context.browser = FakeBrowser()
+        background_page = MagicMock()
+        with patch.object(browser_cdp, "Browser", FakeBrowser), \
+                patch.object(browser_cdp, "_create_background_page", return_value=background_page) as create_page:
+            result = browser_cdp._create_selection_work_page(context)
+
+        self.assertIs(result, background_page)
+        create_page.assert_called_once_with(context, context.browser)
+        context.new_page.assert_not_called()
+
     def test_visible_managed_page_is_left_open_and_replaced_by_background_page(self):
         visible_page = MagicMock()
         visible_page.url = "https://buyin.jinritemai.com/dashboard/merch-picking-library"
@@ -1707,6 +1808,40 @@ class BrowserCdpRecoveryTests(unittest.TestCase):
         create_page.assert_called_once_with(context, browser)
         visible_page.close.assert_not_called()
         background_page.goto.assert_called_once()
+        background_page.close.assert_not_called()
+
+    def test_background_selection_page_reused_after_js_marker_lost(self):
+        background_page = MagicMock()
+        background_page.url = "https://buyin.jinritemai.com/dashboard/merch-picking-library"
+        background_page.is_closed.return_value = False
+        background_page.evaluate.side_effect = lambda script: (
+            "window.name === '__touguangBackgroundSelectionPage'" in script
+        )
+        context = MagicMock()
+        context.pages = [background_page]
+        browser = MagicMock()
+
+        with patch.object(browser_cdp, "_create_background_page") as create_page, \
+                patch.object(browser_cdp, "wait_for_selection_page_ready", return_value=True):
+            result = find_selection_page(context, browser=browser)
+
+        self.assertIs(result, background_page)
+        create_page.assert_not_called()
+        background_page.close.assert_not_called()
+
+    def test_unready_new_selection_page_is_closed(self):
+        background_page = MagicMock()
+        background_page.url = "about:blank"
+        context = MagicMock()
+        context.pages = []
+        browser = MagicMock()
+
+        with patch.object(browser_cdp, "_create_background_page", return_value=background_page), \
+                patch.object(browser_cdp, "wait_for_selection_page_ready", return_value=False):
+            result = find_selection_page(context, browser=browser)
+
+        self.assertIsNone(result)
+        background_page.close.assert_called_once_with()
 
     def test_category_parent_expands_to_actionable_leaf_categories(self):
         food_root = {"name": "食品饮料", "children": [

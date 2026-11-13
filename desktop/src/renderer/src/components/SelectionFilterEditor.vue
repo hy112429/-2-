@@ -129,7 +129,7 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
       </button>
     </div>
     <div class="form-grid">
-      <label>候选上限（1–10）<input :value="modelValue.candidateLimit" type="number" min="1" max="10" :disabled="disabled" @input="setCandidateLimit(($event.target as HTMLInputElement).value)"></label>
+      <label>每轮每账号新增商品目标数（1–10）<input :value="modelValue.candidateLimit" type="number" min="1" max="10" :disabled="disabled" @input="setCandidateLimit(($event.target as HTMLInputElement).value)"></label>
       <label>带货数据走势<select :value="modelValue.trendPreference" :disabled="disabled" @change="setTrendPreference(($event.target as HTMLSelectElement).value)"><option>上升优先</option><option>不限走势</option></select></label>
       <label>销售额阈值<input :value="modelValue.thresholds.salesAmount ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('salesAmount', ($event.target as HTMLInputElement).value)"></label>
       <label>销量阈值<input :value="modelValue.thresholds.salesCount ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('salesCount', ($event.target as HTMLInputElement).value)"></label>
