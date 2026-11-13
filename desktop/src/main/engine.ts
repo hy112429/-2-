@@ -34,6 +34,7 @@ const ALLOWED_SCRIPTS = new Set([
   'db.py',
   'session_bridge.py',
   'baiying_cache.py',
+  'baiying_promotion_videos.py',
   'douyin_batch.py',
   'link_parser.py',
   'link_batch.py',

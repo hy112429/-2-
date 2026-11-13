@@ -286,8 +286,30 @@ const assets = {
 
 /** 百应批量抓取：按商品ID列表驱动登录视图逐页抓取缓存 */
 const baiying = {
+  clipboardProductId: (): Promise<{ ok: boolean; productId?: string; error?: string }> =>
+    ipcRenderer.invoke('baiying:clipboardProductId'),
+
+  /** 读取或保存该账号的同款带货作品下载额度，至少 10 条。 */
+  promotionQuota: (params: { accountId: number; limit?: number }): Promise<{ ok: boolean; quota?: number; error?: string }> =>
+    ipcRenderer.invoke('baiying:promotionQuota', params),
+
+  /** 在已登录百应的商品「带货内容」中读取完整视频地址。 */
+  promotionVideos: (params: { productId: string }): Promise<{
+    ok: boolean
+    accountId?: number
+    accountName?: string
+    accountSource?: string
+    downloadPath?: string
+    commodityId?: string
+    cacheWarning?: string
+    available?: number
+    limit?: number
+    videos?: Array<{ videoId: string; url: string; title: string; author: string; duration?: number; publishTime?: number; shareUrl?: string }>
+    error?: string
+  }> => ipcRenderer.invoke('baiying:promotionVideos', params),
+
   /** 返回启用账号及每个账号已保存的专属百应 Chrome profile 路径。 */
-  batchAccounts: (): Promise<{ ok?: boolean; accounts?: Array<{ id: number; name: string; profilePath?: string }>; error?: string }> =>
+  batchAccounts: (): Promise<{ ok?: boolean; accounts?: Array<{ id: number; name: string; profilePath?: string; downloadPath?: string }>; error?: string }> =>
     ipcRenderer.invoke('baiying:batchAccounts'),
 
   /** 启动批量抓取，立刻返回 {taskId}；进度与终态走 onBatchEvent */
@@ -377,7 +399,7 @@ const account = {
 
 /** 千川账户登录态：独立分区（persist:qc-{id}），与抖音账号分区互不共用（A-12 多开隔离） */
 const qianchuan = {
-  apiStatus: (): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number }> => ipcRenderer.invoke('qianchuan:api:status'),
+  apiStatus: (): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number; authorizationPending: boolean }> => ipcRenderer.invoke('qianchuan:api:status'),
   apiConfigure: (params: { appId: string; secret: string }): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:api:configure', toPlainIpcPayload(params)),
   apiAuthorize: (url: string): Promise<{ ok: boolean; callback: string; profilePath: string }> => ipcRenderer.invoke('qianchuan:api:authorize', url),
   apiVideos: (params: { advertiserId: string; productId: string; awemeId: string; cursor?: string }): Promise<{ videos: Array<{ videoId: string; awemeItemId: string; title: string; url: string; duration: number | null }>; hasMore: boolean; cursor: string; totalReturned: number }> => ipcRenderer.invoke('qianchuan:api:videos', toPlainIpcPayload(params)),

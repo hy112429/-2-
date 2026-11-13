@@ -224,7 +224,7 @@ def upsert_product(
     return {"ok": True, "created": existing is None, "product": row_to_dict(row)}
 
 
-def set_commodity(db_path: Path, product_id: str, commodity_id: str) -> Dict[str, Any]:
+def set_commodity(db_path: Path, product_id: str, commodity_id: str, account_id: Optional[int] = None) -> Dict[str, Any]:
     """补全/更新 product_id 对应的 commodity_id（推广ID），行不存在则建占位行。"""
     with connect(db_path) as connection:
         existing = connection.execute(
@@ -232,13 +232,14 @@ def set_commodity(db_path: Path, product_id: str, commodity_id: str) -> Dict[str
         ).fetchone()
         if existing is None:
             connection.execute(
-                "INSERT INTO baiying_products (product_id, commodity_id, captured_at) VALUES (?, ?, ?)",
-                (product_id, commodity_id, now_text()),
+                "INSERT INTO baiying_products (product_id, account_id, commodity_id, captured_at) VALUES (?, ?, ?, ?)",
+                (product_id, account_id, commodity_id, now_text()),
             )
         else:
             connection.execute(
-                "UPDATE baiying_products SET commodity_id = ?, captured_at = ? WHERE product_id = ?",
-                (commodity_id, now_text(), product_id),
+                "UPDATE baiying_products SET commodity_id = ?, "
+                "account_id = COALESCE(?, account_id), captured_at = ? WHERE product_id = ?",
+                (commodity_id, account_id, now_text(), product_id),
             )
         row = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
@@ -305,6 +306,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_commodity = sub.add_parser("set-commodity", help="补全 product_id 的 commodity_id（推广ID）")
     p_commodity.add_argument("--product-id", required=True)
     p_commodity.add_argument("--commodity-id", required=True)
+    p_commodity.add_argument("--account-id", type=int, default=None)
 
     p_get = sub.add_parser("get", help="按商品 ID 查询")
     p_get.add_argument("--product-id", required=True)
@@ -348,7 +350,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 account_id,
             )
         elif args.command == "set-commodity":
-            payload = set_commodity(db_path, args.product_id, args.commodity_id)
+            payload = set_commodity(db_path, args.product_id, args.commodity_id, args.account_id)
         elif args.command == "get":
             payload = get_product(db_path, args.product_id)
         elif args.command == "list":

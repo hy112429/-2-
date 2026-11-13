@@ -2,6 +2,7 @@ import { ipcMain } from 'electron'
 import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { getClientPaths, getDownloadDir } from './app-dirs'
+import { waitForCartVideoDownload } from './baiying_batch'
 import { runEngineCommand, runScript } from './engine'
 import { queryPlayableVideos, resolveAuthorizedAweme } from './qianchuan_api'
 import {
@@ -131,15 +132,6 @@ export async function runPostPublishQianchuanMaterialForQueue(
       return { ok: true, status: 'disabled', reason }
     }
 
-    let resolvedAweme: { advertiserId: string; awemeId: string; awemeName: string }
-    try {
-      resolvedAweme = await resolveAuthorizedAweme(advertiserId, String(binding['douyin_id'] ?? ''))
-    } catch (error) {
-      const reason = `千川授权预检未通过：${error instanceof Error ? error.message : String(error)}`
-      await saveStatus(id, 'blocked_auth', reason, { stage: 'authorization_preflight' })
-      return { ok: false, status: 'blocked_auth', error: reason }
-    }
-
     let remaining: number
     try {
       const quota = await getPostPublishQuotaRemaining(accountId, productId)
@@ -159,6 +151,50 @@ export async function runPostPublishQianchuanMaterialForQueue(
       const reason = '下载前检测到全局开关已关闭；未发起下载。'
       await saveStatus(id, 'disabled', reason, { stage: 'feature_disabled' })
       return { ok: true, status: 'disabled', reason }
+    }
+
+    // 同商品正在下载时先等其完成，再复核素材，避免发布流程同时重复下载。
+    await waitForCartVideoDownload(accountId, productId)
+    // 加车后可能已从同账号百应下载入库；发布确认后直接复用，避免再取同款视频。
+    let reusableAssets: number[]
+    try {
+      const existing = await getPostPublishEligibleAssets(accountId)
+      reusableAssets = rows(existing['rows'])
+        .filter((row) => row['eligible'] === true && row['sourceType'] === 'web_download' &&
+          Number(row['accountId']) === accountId && String(row['productId'] ?? '') === productId)
+        .slice(0, remaining)
+        .map((row) => safeId(row['assetId'], '素材 ID'))
+    } catch (error) {
+      const reason = `无法复核已下载素材：${error instanceof Error ? error.message : String(error)}`
+      await saveStatus(id, 'needs_review', reason, { stage: 'existing_asset_check' })
+      return { ok: false, status: 'needs_review', error: reason }
+    }
+    if (reusableAssets.length) {
+      const enqueued = await enqueuePostPublishAssets(accountId, productId, localQianchuanId, reusableAssets)
+      const jobs = rows(enqueued['jobs'])
+      const accepted = Math.max(0, Number(enqueued['acceptedCount'] ?? jobs.length))
+      const acceptedAssetIds = jobs.map((job) => Number(job['assetId'])).filter((value) => Number.isSafeInteger(value) && value > 0)
+      const uploadJobIds = jobs.map((job) => Number(job['id'])).filter((value) => Number.isSafeInteger(value) && value > 0)
+      if (accepted < 1) {
+        const reason = '加车后已下载素材在 Step17 入队复核时不再符合资格，请先核查素材归属。'
+        await saveStatus(id, 'needs_review', reason, { stage: 'existing_asset_enqueue', assetIds: reusableAssets })
+        return { ok: false, status: 'needs_review', error: reason }
+      }
+      const reason = `复用加车后已下载的 ${accepted} 条同账号同商品素材，已加入 Step17；未重复下载。`
+      await saveStatus(id, 'enqueued', reason, {
+        stage: 'step17_enqueue_existing', videoCount: accepted,
+        assetIds: acceptedAssetIds, uploadJobIds
+      })
+      return { ok: true, status: 'enqueued', acceptedCount: accepted, assetIds: acceptedAssetIds, uploadJobIds, reason }
+    }
+
+    let resolvedAweme: { advertiserId: string; awemeId: string; awemeName: string }
+    try {
+      resolvedAweme = await resolveAuthorizedAweme(advertiserId, String(binding['douyin_id'] ?? ''))
+    } catch (error) {
+      const reason = `千川授权预检未通过：${error instanceof Error ? error.message : String(error)}`
+      await saveStatus(id, 'blocked_auth', reason, { stage: 'authorization_preflight' })
+      return { ok: false, status: 'blocked_auth', error: reason }
     }
 
     let videos

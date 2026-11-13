@@ -1,7 +1,10 @@
-import { ipcMain, type WebContents } from 'electron'
+import { clipboard, ipcMain, type WebContents } from 'electron'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { onProductCaptured } from './probe'
 import { runScript } from './engine'
-import { commandManagedBrowser } from './external_browser'
+import { commandManagedBrowser, validateManagedProfilePath } from './external_browser'
+import { getClientPaths, getDownloadDir } from './app-dirs'
 
 /**
  * 百应「半自动批量浏览」驱动（T-15）
@@ -36,6 +39,7 @@ interface BaiyingCaptureAccount {
   id: number
   name: string
   profilePath?: string
+  downloadPath?: string
   status: string
 }
 
@@ -269,22 +273,253 @@ async function loadBaiyingCaptureAccounts(): Promise<BaiyingCaptureAccount[]> {
       throw new Error(`读取账号“${String(row.name ?? id)}”的百应浏览器路径失败：${settingsReply.error ?? '未知错误'}`)
     }
     const settings = (settingsReply.result as {
-      settings?: { account?: { browserProfilePath?: unknown } }
+      settings?: { account?: { browserProfilePath?: unknown; downloadPath?: unknown } }
     }).settings?.account
     const configuredPath = typeof settings?.browserProfilePath === 'string' ? settings.browserProfilePath.trim() : ''
+    const downloadPath = typeof settings?.downloadPath === 'string' ? settings.downloadPath.trim() : ''
     accounts.push({
       id,
       name: String(row.name ?? `账号-${id}`),
       status: String(row.status ?? ''),
-      ...(configuredPath ? { profilePath: configuredPath } : {})
+      ...(configuredPath ? { profilePath: configuredPath } : {}),
+      ...(downloadPath ? { downloadPath } : {})
     })
   }
   return accounts
 }
 
+async function resolvePromotionOwner(productId: string, accounts: BaiyingCaptureAccount[]): Promise<{
+  account: BaiyingCaptureAccount
+  commodityId: string
+  source: string
+}> {
+  const stored = await runScript('baiying_promotion_videos.py', {
+    args: ['--resolve-account', '--product-id', productId],
+    onEvent: () => undefined
+  }).promise
+  if (!stored.ok || !stored.result) throw new Error(stored.error ?? '无法读取选品账号记录')
+  const resolved = stored.result as { found?: boolean; accountId?: number; commodityId?: string; accountSource?: string }
+  if (resolved.found) {
+    const account = accounts.find((row) => row.id === resolved.accountId)
+    if (!account) throw new Error(`该商品所属账号 ${resolved.accountId ?? '未知'} 已停用或不存在，不能改用其他账号下载`)
+    return { account, commodityId: String(resolved.commodityId ?? ''), source: String(resolved.accountSource ?? '选品记录') }
+  }
+
+  // 未落库时，只查看已启动的账号浏览器中是否正打开该商品；不启动其他账号。
+  const matches: Array<{ account: BaiyingCaptureAccount; commodityId: string }> = []
+  for (const account of accounts) {
+    let profilePath: string
+    try {
+      profilePath = validateManagedProfilePath(`account-${account.id}`, account.profilePath)
+    } catch {
+      continue
+    }
+    const probe = await runScript('baiying_promotion_videos.py', {
+      args: ['--find-open-product', '--product-id', productId, '--profile-path', profilePath],
+      onEvent: () => undefined
+    }).promise
+    const found = probe.result as { found?: boolean; commodityId?: string } | undefined
+    if (probe.ok && found?.found && /^\d{8,20}$/.test(String(found.commodityId ?? ''))) {
+      matches.push({ account, commodityId: String(found.commodityId) })
+    }
+  }
+  if (matches.length > 1) throw new Error('多个账号浏览器都打开了该商品，无法确定选品账号；请先通过软件选品记录归属')
+  if (matches.length === 0) throw new Error('未找到该商品的选品账号记录，也没有账号专属百应浏览器打开该商品页')
+  return { ...matches[0], source: '已打开的百应商品页' }
+}
+
+const CART_DOWNLOAD_ACTIVE = new Set<string>()
+const CART_DOWNLOAD_TAILS = new Map<number, Promise<void>>()
+const CART_DOWNLOAD_JOBS = new Map<string, Promise<void>>()
+
+function cartDownloadDate(date = new Date()): string {
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+function cartDownloadTimestamp(seconds?: number): string {
+  const parsed = Number.isFinite(seconds) && seconds && seconds > 0 ? new Date(seconds * 1000) : new Date()
+  const date = Number.isFinite(parsed.getTime()) ? parsed : new Date()
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+}
+
+function cartDownloadDestination(folder: string, productId: string, videoId: string, serial: number, publishTime?: number): string {
+  const prefix = `${productId}_${videoId}_${String(serial).padStart(3, '0')}_`
+  const original = join(folder, `${prefix}${cartDownloadTimestamp(publishTime)}.mp4`)
+  if (!existsSync(original)) return original
+  // 文件存在却未进入素材库时，保留原文件供核查，使用新时间戳重新下载并登记来源。
+  for (let offset = 0; offset < 60; offset++) {
+    const retry = join(folder, `${prefix}${cartDownloadTimestamp(Math.floor(Date.now() / 1000) + offset)}.mp4`)
+    if (!existsSync(retry)) return retry
+  }
+  throw new Error(`视频 ${videoId} 的目标文件名已占满，未覆盖原文件`)
+}
+
+/** 加车成功后下载同款作品；下载失败不回滚已确认的百应加车。 */
+async function runCartVideoDownload(accountId: number, productId: string, commodityId: string): Promise<void> {
+  if (!Number.isSafeInteger(accountId) || accountId < 1 || !/^\d{8,20}$/.test(productId)) {
+    throw new Error('加车下载的账号或商品 ID 无效')
+  }
+  const account = (await loadBaiyingCaptureAccounts()).find((row) => row.id === accountId)
+  if (!account) throw new Error(`选品账号 ${accountId} 已停用或不存在`)
+  const profilePath = validateManagedProfilePath(`account-${accountId}`, account.profilePath)
+  const dbPath = getClientPaths().databasePath
+  const args = [
+    '--db', dbPath, '--account-id', String(accountId), '--product-id', productId,
+    '--profile-path', profilePath
+  ]
+  if (/^\d{8,20}$/.test(commodityId)) args.push('--commodity-id', commodityId)
+  const discovered = await runScript('baiying_promotion_videos.py', {
+    internal: true, args, onEvent: () => undefined
+  }).promise
+  if (!discovered.ok || !discovered.result) throw new Error(discovered.error ?? '百应没有返回带货视频')
+  const found = discovered.result as {
+    videos?: Array<{ videoId: string; url: string; publishTime?: number }>
+    commodityId?: string
+  }
+  const videos = Array.isArray(found.videos) ? found.videos : []
+  if (!videos.length) {
+    console.info(`[加车后视频] 账号 ${accountId} 商品 ${productId} 暂无同款带货作品`)
+    return
+  }
+  const existing = await runScript('baiying_promotion_videos.py', {
+    internal: true,
+    args: ['--db', dbPath, '--account-id', String(accountId), '--product-id', productId, '--existing-videos'],
+    onEvent: () => undefined
+  }).promise
+  if (!existing.ok || !existing.result) throw new Error(existing.error ?? '无法检查已入库视频，已停止以防重复下载')
+  const alreadyDownloaded = new Set((existing.result as { videoIds?: string[] }).videoIds ?? [])
+  const accountRoot = account.downloadPath || join(getDownloadDir(), `账号-${accountId}`)
+  const folder = join(accountRoot, cartDownloadDate(), productId)
+  const tasks = videos.flatMap((video, index) =>
+    /^\d{8,25}$/.test(video.videoId) && /^https:\/\//.test(video.url) && !alreadyDownloaded.has(video.videoId)
+      ? [{
+          id: `cart-${accountId}-${productId}-${video.videoId}`,
+          product_id: productId,
+          account_id: accountId,
+          verify_video: true,
+          url: video.url,
+          dest: cartDownloadDestination(folder, productId, video.videoId, index + 1, video.publishTime)
+        }]
+      : []
+  )
+  if (!tasks.length) {
+    console.info(`[加车后视频] 账号 ${accountId} 商品 ${productId}：${videos.length} 条已入库，无需重复下载`)
+    return
+  }
+  const downloaded = await runScript('download_queue.py', {
+    internal: true,
+    args: ['--db', dbPath, '--workers', '1', '--max-retries', '2'],
+    stdinJson: tasks,
+    onEvent: () => undefined
+  }).promise
+  const summary = (downloaded.result as { data?: { success?: number; failed?: number } } | undefined)?.data
+  console.info(`[加车后视频] 账号 ${accountId} 商品 ${productId}：新增 ${summary?.success ?? 0} 条，失败 ${summary?.failed ?? (downloaded.ok ? 0 : tasks.length)} 条，目录 ${folder}`)
+  if (!downloaded.ok) throw new Error(downloaded.error ?? '部分视频下载失败，可在商品查询页重新下载')
+}
+
+/** 选品回调只负责触发，视频下载与后续选品、图转视频和发布并行。 */
+export function fireCartVideoDownload(accountId: number, productId: string, commodityId = ''): void {
+  const key = `${accountId}:${productId}`
+  if (CART_DOWNLOAD_ACTIVE.has(key)) return
+  CART_DOWNLOAD_ACTIVE.add(key)
+  const previous = CART_DOWNLOAD_TAILS.get(accountId) ?? Promise.resolve()
+  const current = previous.then(() => runCartVideoDownload(accountId, productId, commodityId))
+    .catch((error) => console.error(`[加车后视频] 账号 ${accountId} 商品 ${productId}：${error instanceof Error ? error.message : String(error)}`))
+    .finally(() => {
+      CART_DOWNLOAD_ACTIVE.delete(key)
+      CART_DOWNLOAD_JOBS.delete(key)
+      if (CART_DOWNLOAD_TAILS.get(accountId) === current) CART_DOWNLOAD_TAILS.delete(accountId)
+    })
+  CART_DOWNLOAD_TAILS.set(accountId, current)
+  CART_DOWNLOAD_JOBS.set(key, current)
+}
+
+/** 发布后先等同商品的加车下载结束，再决定是否需要调用千川接口重新下载。 */
+export async function waitForCartVideoDownload(accountId: number, productId: string): Promise<void> {
+  await CART_DOWNLOAD_JOBS.get(`${accountId}:${productId}`)
+}
+
 // ---------------------------------------------------------------- IPC 注册
 
 export function registerBaiyingBatchIpc(): void {
+  ipcMain.handle('baiying:clipboardProductId', async () => {
+    const copied = (await clipboard.readText()).trim()
+    const match = /^(?:商品\s*ID\s*[:：]?\s*)?(\d{8,20})$/i.exec(copied)
+    if (!match) {
+      return { ok: false, error: '剪贴板里不是 8–20 位商品 ID；请先在百应商品页点击「ID」复制' }
+    }
+    return { ok: true, productId: match[1] }
+  })
+
+  ipcMain.handle('baiying:promotionQuota', async (_event, params: { accountId?: number; limit?: number }) => {
+    try {
+      const accountId = Number(params?.accountId)
+      if (!Number.isSafeInteger(accountId) || accountId < 1) throw new Error('账号 ID 无效')
+      if (!(await loadBaiyingCaptureAccounts()).some((account) => account.id === accountId)) {
+        throw new Error('账号不存在或已停用')
+      }
+      const args = ['--account-id', String(accountId)]
+      if (params.limit === undefined) args.push('--get-quota')
+      else {
+        if (!Number.isSafeInteger(params.limit) || params.limit < 10) {
+          throw new Error('每账号下载额度至少 10 条')
+        }
+        args.push('--set-quota', String(params.limit))
+      }
+      const outcome = await runScript('baiying_promotion_videos.py', { args, onEvent: () => undefined }).promise
+      if (!outcome.ok || !outcome.result) throw new Error(outcome.error ?? '读取下载额度失败')
+      return outcome.result
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle('baiying:promotionVideos', async (_event, params: { productId?: string }) => {
+    try {
+      const productId = String(params?.productId ?? '').trim()
+      if (!/^\d{8,20}$/.test(productId)) throw new Error('商品 ID 格式无效')
+      const { account, commodityId, source } = await resolvePromotionOwner(productId, await loadBaiyingCaptureAccounts())
+      const accountId = account.id
+      const options = { profileKey: `account-${accountId}`, profilePath: account.profilePath }
+      const login = await commandManagedBrowser('check-account-logins', { accountId }, options)
+      const baiying = login.baiying as { state?: string; message?: string } | undefined
+      if (login.ok !== true || baiying?.state !== 'logged_in') {
+        throw new Error(`账号“${account.name}”的百应尚未登录：${baiying?.message ?? '请先登录专属浏览器'}`)
+      }
+      const profilePath = validateManagedProfilePath(options.profileKey, options.profilePath)
+      const args = ['--account-id', String(accountId), '--product-id', productId, '--profile-path', profilePath]
+      if (commodityId) args.push('--commodity-id', commodityId)
+      const outcome = await runScript('baiying_promotion_videos.py', {
+        args,
+        onEvent: () => undefined
+      }).promise
+      if (!outcome.ok || !outcome.result) throw new Error(outcome.error ?? '读取百应同款带货作品失败')
+      const result = outcome.result as { commodityId?: string }
+      if (result.commodityId && /^\d{8,20}$/.test(result.commodityId)) {
+        const saved = await runScript('baiying_cache.py', {
+          args: [
+            'set-commodity', '--product-id', productId,
+            '--commodity-id', result.commodityId, '--account-id', String(accountId)
+          ],
+          onEvent: () => undefined
+        }).promise
+        if (!saved.ok) return {
+          ...(outcome.result as Record<string, unknown>), accountId, accountName: account.name,
+          downloadPath: account.downloadPath ?? '', accountSource: source,
+          cacheWarning: saved.error ?? '推广 ID 缓存失败'
+        }
+      }
+      return {
+        ...(outcome.result as Record<string, unknown>), accountId, accountName: account.name,
+        downloadPath: account.downloadPath ?? '', accountSource: source
+      }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
   ipcMain.handle('baiying:batchAccounts', async () => {
     try {
       return { ok: true, accounts: await loadBaiyingCaptureAccounts() }
