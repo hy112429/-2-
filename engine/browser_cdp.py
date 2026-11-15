@@ -6645,7 +6645,7 @@ def _candidate_rows(
                 "sources": sources,
                 "selectionMode": str(settings.get("selectionMode") or "general"),
                 "categoryMode": str(settings.get("categoryMode") or "auto"),
-                "categoryIds": [str(category.get(key)) for key in ("first", "second", "third") if isinstance(category.get(key), (str, int))],
+                "categoryIds": _promotion_row_category_ids(row),
                 "coverUrl": str(img_urls[0]) if img_urls else "",
                 "inCart": bool((base.get("extend_info") or {}).get("is_in_cart")) if isinstance(base.get("extend_info"), dict) else False,
                 "selected": False,
@@ -6721,11 +6721,8 @@ def _promotion_row_category_ids(row: Dict[str, Any]) -> list[str]:
     base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
     info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
     category = info.get("category") if isinstance(info.get("category"), dict) else {}
-    return [
-        str(category.get(key)).strip()
-        for key in ("first", "second", "third")
-        if category.get(key) is not None and str(category.get(key)).strip()
-    ]
+    return [_category_id_scalar(category.get(key)) for key in ("first", "second", "third")
+            if _category_id_scalar(category.get(key))]
 
 
 def _merge_detail_metrics_into_promotion_row(
@@ -7297,7 +7294,78 @@ def _save_priority_source_dom_evidence(
         }
 
 
-def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[str], list[Dict[str, Any]], Dict[str, Any]]:
+def _source_category_tabs(page: Page, source_key: str, category_tree: Sequence[Any]) -> list[Dict[str, Any]]:
+    """读取来源分类控件的稳定 ID；名称仅用于诊断，不参与类目匹配。"""
+    selector = (
+        'div[class*="subCategoryGroup"] > div[class*="box"]'
+        if source_key == "allianceRank"
+        else 'div[class*="cateFilterMain"] > div[class*="box"]'
+    )
+    raw = page.evaluate("""({ selector }) => {
+      const nodes = Array.from(document.querySelectorAll(selector));
+      const validId = (value) => {
+        const text = String(value ?? '').trim();
+        return /^\\d+(?:__RC_CASCADER_SPLIT__\\d+)*$/.test(text) &&
+          text.split('__RC_CASCADER_SPLIT__').every(part => Number(part) > 0) ? text : '';
+      };
+      const reactId = (element, name) => {
+        const ids = new Set();
+        const seen = new WeakSet();
+        let count = 0;
+        const walk = (node, depth) => {
+          if (!node || typeof node !== 'object' || seen.has(node) || depth > 5 || ++count > 250) return;
+          seen.add(node);
+          if (Array.isArray(node)) { node.slice(0, 20).forEach(child => walk(child, depth + 1)); return; }
+          const label = String(node.name ?? node.label ?? node.title ?? node.text ?? '').trim();
+          for (const key of ['category_id', 'categoryId', 'cate_id', 'cateId', 'pathKey']) {
+            const id = validId(node[key]);
+            if (id && (!label || label === name)) ids.add(id);
+          }
+          if (label === name) {
+            const id = validId(node.id ?? node.value);
+            if (id) ids.add(id);
+          }
+          for (const [key, child] of Object.entries(node)) {
+            if (key === '__proto__' || key === 'ownerDocument' || key === 'stateNode') continue;
+            walk(child, depth + 1);
+          }
+        };
+        for (let current = element, depth = 0; current && depth < 3; current = current.parentElement, depth += 1) {
+          for (const key of Object.keys(current)) if (key.startsWith('__reactProps$')) walk(current[key], 0);
+        }
+        return ids.size === 1 ? [...ids][0] : '';
+      };
+      return nodes.slice(0, 60).map((node, index) => {
+        const name = String(node.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 50);
+        const ownIds = [node.getAttribute('data-path-key'), node.getAttribute('data-category-id'),
+          node.getAttribute('data-cate-id'), node.getAttribute('data-id')].map(validId).filter(Boolean);
+        const id = new Set(ownIds).size === 1 ? ownIds[0] : ownIds.length ? '' : reactId(node, name);
+        const className = String(node.className || '');
+        return { index, name, categoryId: id || '', selected:
+          node.getAttribute('aria-selected') === 'true' || node.getAttribute('aria-checked') === 'true' ||
+          /(?:active|selected|checked|current)/i.test(className),
+          ambiguousId: ownIds.length > 1 && new Set(ownIds).size !== 1 };
+      }).filter(item => item.name);
+    }""", {"selector": selector})
+    tabs: list[Dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        category_id = _category_id_scalar(item.get("categoryId"))
+        path, level = _resolve_single_category_id(category_id, category_tree)
+        tabs.append({
+            "index": int(item.get("index", 0)), "name": str(item.get("name") or "")[:50],
+            "categoryId": category_id, "selected": item.get("selected") is True,
+            "categoryIds": path, "level": level,
+            "status": "mapped" if path else "unresolved",
+        })
+    return tabs
+
+
+def _read_priority_source_product_ids(
+    page: Page, source_key: str, category_tree: Sequence[Any] = (),
+    category_tab: Optional[Dict[str, Any]] = None,
+) -> tuple[set[str], list[Dict[str, Any]], Dict[str, Any]]:
     """只读取热点/榜单当前可见行的商品数据；不搜索、加车或翻页。"""
     source = BAIYING_PRIORITY_SOURCES.get(source_key)
     if source is None:
@@ -7357,6 +7425,32 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             raise RuntimeError("百应要求验证码或安全验证，已停止当前账号")
         if prompt_kind:
             raise RuntimeError(f"百应来源页面存在待处理提示，商品身份无法唯一确认：{prompt_text[:160]}")
+
+        tab_read_error = ""
+        try:
+            tabs = _source_category_tabs(source_page, source_key, category_tree)
+        except Exception as error:
+            if category_tab is not None:
+                raise RecoverablePrioritySourceReadError(f"{label}分类控件无法安全回读") from error
+            tabs = []
+            tab_read_error = type(error).__name__
+        if category_tab is not None:
+            expected_id = str(category_tab.get("categoryId") or "")
+            expected_index = int(category_tab.get("index", -1))
+            selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
+            if not expected_id or selected_tab is None or selected_tab["categoryId"] != expected_id:
+                raise RecoverablePrioritySourceReadError(f"{label}来源分类控件已变化，无法按稳定 ID 选中分类")
+            tab_selector = ('div[class*="subCategoryGroup"] > div[class*="box"]'
+                            if source_key == "allianceRank" else 'div[class*="cateFilterMain"] > div[class*="box"]')
+            source_page.locator(tab_selector).nth(expected_index).click(timeout=8_000)
+            source_page.wait_for_timeout(1_000)
+            tabs = _source_category_tabs(source_page, source_key, category_tree)
+            selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
+            if selected_tab is None or selected_tab["categoryId"] != expected_id or not selected_tab["selected"]:
+                raise RecoverablePrioritySourceReadError(f"{label}来源分类选中状态无法回读；未将商品归入该分类")
+        else:
+            selected_tabs = [item for item in tabs if item["selected"]]
+            selected_tab = selected_tabs[0] if len(selected_tabs) == 1 else None
 
         readiness_reached = False
         readiness_wait_started = time.monotonic()
@@ -7771,6 +7865,10 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             listContainersWithChildren: listContainerChildCounts.filter((count) => count > 0).length,
             listContainerChildCounts,
             listContainerSamples,
+            scrollPosition: visibleListContainers.slice(0, 1).map((element) => ({
+              top: Number(element.scrollTop || 0), height: Number(element.scrollHeight || 0),
+              viewport: Number(element.clientHeight || 0)
+            }))[0] || null,
             scrollContainerOuterHtml,
             contentRootSelector,
             contentRootMatchCount: allContentRoots.length,
@@ -7804,6 +7902,17 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             dict(row) for row in raw_rows
             if isinstance(row, dict) and str(row.get("product_id") or "").strip()
         ]
+        if selected_tab and selected_tab.get("status") == "mapped":
+            for row in product_rows:
+                row["_sourceCategory"] = {
+                    "name": selected_tab["name"], "id": selected_tab["categoryId"],
+                    "categoryIds": selected_tab["categoryIds"], "level": selected_tab["level"],
+                    "source": source_key, "selected": True,
+                }
+        snapshot["sourceCategoryTabs"] = tabs
+        snapshot["sourceCategoryReadError"] = tab_read_error
+        snapshot["selectedSourceCategory"] = selected_tab
+        snapshot["readAt"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
         complete_category_path_count = 0
         for row in product_rows:
             base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
@@ -7838,6 +7947,12 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                 "productNodeCount": int(snapshot.get("visibleProductNodeCount", 0) or 0),
                 "firstProductIds": list(snapshot.get("ids", []))[:3],
                 "sourceOutcome": "① 滚动区出现商品",
+                "sourceCategoryTabs": tabs,
+                "sourceCategoryReadError": tab_read_error,
+                "selectedSourceCategory": selected_tab,
+                "scrollPosition": snapshot.get("scrollPosition"),
+                "readAt": snapshot.get("readAt"),
+                "pagePath": snapshot.get("pagePath"),
                 "detail": json.dumps(recognized_detail, ensure_ascii=False),
             }
         evidence = _save_priority_source_dom_evidence(source_key, source_page, snapshot, readiness_reached)
@@ -7987,6 +8102,7 @@ def _collect_priority_source_ids(
     warnings: list[str] = []
     source_results: list[Dict[str, Any]] = []
     source_candidates: dict[str, list[Dict[str, Any]]] = {}
+    category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
     for index, source_key in enumerate(selected_sources, start=1):
         label = BAIYING_PRIORITY_SOURCES[source_key][0]
         _report_operation_progress(
@@ -7998,7 +8114,51 @@ def _collect_priority_source_ids(
             message=f"正在读取{label}当前页；不会触发搜索、加车或发布",
         )
         try:
-            product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key)
+            product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key, category_tree)
+            by_product = {str(row["product_id"]): row for row in product_rows}
+            for row in by_product.values():
+                source_category = row.get("_sourceCategory")
+                row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
+            tabs = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
+            mapped_tabs = [tab for tab in tabs if isinstance(tab, dict) and tab.get("status") == "mapped"
+                           and tab.get("selected") is not True]
+            tab_reads: list[Dict[str, Any]] = []
+            for tab in mapped_tabs[:24]:
+                try:
+                    tab_ids, tab_rows, tab_evidence = _read_priority_source_product_ids(
+                        page, source_key, category_tree, category_tab=tab
+                    )
+                    product_ids.update(tab_ids)
+                    tab_reads.append({"categoryId": tab.get("categoryId"), "productCount": len(tab_ids),
+                                      "readAt": tab_evidence.get("readAt"), "pagePath": tab_evidence.get("pagePath"),
+                                      "scrollPosition": tab_evidence.get("scrollPosition")})
+                    for row in tab_rows:
+                        product_id = str(row.get("product_id") or "").strip()
+                        if not product_id:
+                            continue
+                        source_category = row.get("_sourceCategory")
+                        if product_id not in by_product:
+                            by_product[product_id] = row
+                            row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
+                        else:
+                            existing = by_product[product_id]
+                            categories = existing.get("_sourceCategories") if isinstance(existing.get("_sourceCategories"), list) else []
+                            if isinstance(source_category, dict) and source_category not in categories:
+                                categories.append(source_category)
+                            merged = _merge_candidate_source_rows(existing, row)
+                            merged["_sourceCategories"] = categories
+                            by_product[product_id] = merged
+                except Exception as error:
+                    if _selection_error_requires_pause(error):
+                        raise
+                    warnings.append(f"{label}分类 {tab.get('name') or tab.get('categoryId')} 读取失败；其商品不使用来源级类目：{_safe_diagnostic_text(error, 180)}")
+            product_rows = list(by_product.values())
+            evidence["categoryTabReads"] = tab_reads
+            evidence["unmappedCategoryTabs"] = sum(1 for tab in tabs if isinstance(tab, dict) and tab.get("status") != "mapped")
+            evidence["categoryTabReadLimitReached"] = len(mapped_tabs) > 24
+            evidence["productIdFingerprint"] = hashlib.sha256("|".join(sorted(product_ids)).encode("utf-8")).hexdigest()
+            if len(mapped_tabs) > 24:
+                warnings.append(f"{label}分类超过 24 个；本轮仅读取前 24 个稳定 ID 分类，其余保留待验")
             membership[source_key] = product_ids
             source_candidates[source_key] = product_rows
             source_results.append({
@@ -8014,6 +8174,12 @@ def _collect_priority_source_ids(
                 "pageListDiagnosis": str(evidence.get("pageListDiagnosis") or ""),
                 "detail": str(evidence.get("detail") or ""),
                 "diagnosticId": str(evidence.get("diagnosticId") or ""),
+                "categoryTabReads": evidence.get("categoryTabReads", []),
+                "unmappedCategoryTabs": evidence.get("unmappedCategoryTabs", 0),
+                "productIdFingerprint": evidence.get("productIdFingerprint", ""),
+                "readAt": evidence.get("readAt", ""),
+                "pagePath": evidence.get("pagePath", ""),
+                "scrollPosition": evidence.get("scrollPosition"),
             })
         except RecoverablePrioritySourceReadError as error:
             detail = _safe_diagnostic_text(error, 2_400)
@@ -8178,12 +8344,77 @@ def _candidate_as_promotion_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _scroll_selection_square_rows(
+    page: Page, settings: Dict[str, Any], known_ids: set[str], max_steps: int = 6,
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]]]:
+    """只滚动现有选品广场页面，收集实际产生的新 material_list 响应。"""
+    collector = _MaterialListCollector(settings)
+    rows: list[Dict[str, Any]] = []
+    reads: list[Dict[str, Any]] = []
+    unchanged = 0
+    _listen_to_material_list(page, collector)
+    try:
+        for step in range(1, max_steps + 1):
+            mark = collector.mark()
+            position = page.evaluate("""() => {
+              const visible = (element) => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > innerWidth * .35 && rect.height > innerHeight * .25 &&
+                  style.display !== 'none' && style.visibility !== 'hidden';
+              };
+              const containers = [document.scrollingElement, ...document.querySelectorAll('main, [class*=scroll], [class*=list]')]
+                .filter(element => element && visible(element) && element.scrollHeight > element.clientHeight + 80);
+              const target = containers.sort((a, b) =>
+                (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
+              if (!target) return { moved: false, top: 0, height: 0 };
+              const before = target.scrollTop;
+              target.scrollTop = Math.min(target.scrollHeight - target.clientHeight,
+                before + Math.max(250, Math.round(target.clientHeight * .8)));
+              return { moved: target.scrollTop > before, top: target.scrollTop, height: target.scrollHeight };
+            }""")
+            if not isinstance(position, dict) or not position.get("moved"):
+                break
+            page.wait_for_timeout(900)
+            if collector.request_count_since(mark):
+                state = _wait_for_material_list_settled_bounded(
+                    page, collector, mark, window_seconds=4, max_windows=2, quiet_seconds=0.8
+                )
+                if state == "pending":
+                    reads.append({"step": step, "scrollTop": position.get("top"), "status": "pending"})
+                    break
+            if collector.rate_limit_error_since(mark):
+                _mark_page_rate_limited(id(page))
+                raise RuntimeError("百应选品广场滚动时返回 11001，已停止当前账号后续请求")
+            new_ids: set[str] = set()
+            for sequence, payload in collector.successes:
+                if sequence <= mark:
+                    continue
+                for row in _promotion_items(payload):
+                    product_id = str(row.get("product_id") or "").strip()
+                    if product_id and product_id not in known_ids:
+                        known_ids.add(product_id)
+                        new_ids.add(product_id)
+                        rows.append(row)
+            reads.append({
+                "step": step, "scrollTop": position.get("top"), "scrollHeight": position.get("height"),
+                "readAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "requestCount": collector.request_count_since(mark), "newProductIds": len(new_ids),
+            })
+            unchanged = 0 if new_ids else unchanged + 1
+            if unchanged >= 2:
+                break
+    finally:
+        _remove_material_list_listeners(page, collector)
+    return rows, reads
+
+
 def _collect_selection_square_rows(
     page: Page,
     settings: Dict[str, Any],
     progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
-    """读取选品广场当前筛选结果；类目为空时查询全部，不翻页。"""
+    """读取选品广场筛选结果及实际滚动产生的新列表响应。"""
     label, url = BAIYING_SELECTION_SQUARE_SOURCE
     parsed_current = urlparse(page.url)
     parsed_target = urlparse(url)
@@ -8208,6 +8439,7 @@ def _collect_selection_square_rows(
     category_selection_by_id: Dict[str, Dict[str, Any]] = {}
     warnings: list[str] = []
     observed_rows = 0
+    page_reads: list[Dict[str, Any]] = []
     for index, query in enumerate(queries, start=1):
         query_settings = copy.deepcopy(query)
         # 三源采集先保留原始候选，实际指标稍后统一核验；平台佣金档位仍须按账号上限选择。
@@ -8238,16 +8470,31 @@ def _collect_selection_square_rows(
         raw_rows = _promotion_items(payload)
         if not raw_rows:
             raw_rows = [
-                _candidate_as_promotion_row(candidate)
+                {**_candidate_as_promotion_row(candidate), "_categorySourceHint": "react_card"}
                 for candidate in result.get("candidates", [])
                 if isinstance(candidate, dict)
             ]
+        visible_ids = {str(row.get("product_id") or "").strip() for row in raw_rows}
+        more_rows, scroll_reads = _scroll_selection_square_rows(page, query_settings, visible_ids)
+        raw_rows.extend(more_rows)
+        page_reads.extend({"query": index, **entry} for entry in scroll_reads)
         observed_rows += len(raw_rows)
         selection = query_settings.get("categorySelection")
         for row in raw_rows:
             product_id = str(row.get("product_id") or "").strip()
             if not product_id:
                 continue
+            evidence = _row_category_evidence(
+                row, product_id, settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else [],
+                str(row.get("_categorySourceHint") or "material_list"),
+            )
+            row["_categoryEvidence"] = evidence
+            if evidence.get("status") == "known":
+                base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+                info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+                info["category"] = dict(zip(("first", "second", "third"), evidence["categoryIds"]))
+                base["product_info"] = info
+                row["base_model"] = base
             if product_id not in rows_by_id:
                 rows_by_id[product_id] = row
                 if isinstance(selection, dict):
@@ -8260,7 +8507,8 @@ def _collect_selection_square_rows(
     ids = set(rows_by_id)
     detail = (
         f"{label}读取 material_list {observed_rows} 行，去重后 {len(ids)} 个商品 ID；"
-        f"类目模式 {selection_mode}，手动类目查询 {len(queries)} 组；未翻页。"
+        f"类目模式 {selection_mode}，手动类目查询 {len(queries)} 组；"
+        f"实际滚动 {len(page_reads)} 次，新增响应商品 {sum(item.get('newProductIds', 0) for item in page_reads)} 个。"
     )
     return list(rows_by_id.values()), {
         "sourceKey": "selectionSquare",
@@ -8275,6 +8523,10 @@ def _collect_selection_square_rows(
         "pageListDiagnosis": "当前选品广场列表未解析到商品 ID" if not ids else "",
         "detail": detail,
         "warnings": warnings,
+        "pageReads": page_reads,
+        "productIdFingerprint": hashlib.sha256("|".join(sorted(ids)).encode("utf-8")).hexdigest(),
+        "readAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        "pagePath": _detail_diagnostic_path(page.url),
     }
 
 
@@ -8422,20 +8674,47 @@ def _visible_source_candidate_result(
     source_urls = {key: value[1] for key, value in BAIYING_PRIORITY_SOURCES.items()}
     source_urls["selectionSquare"] = BAIYING_SELECTION_SQUARE_SOURCE[1]
     excluded_category_ids = _excluded_category_selection_ids(settings)
-    category_gate_enabled = settings.get("selectionMode") == "category" or bool(excluded_category_ids)
+    # 商品类目未知或互相冲突时，任何模式都不能把它当作可加车候选。
+    category_gate_enabled = True
     threshold_names = _enabled_threshold_names(settings)
+    category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
     merged_raw: Dict[str, Dict[str, Any]] = {}
     sources_by_id: Dict[str, list[str]] = {}
+    category_evidence_by_id: Dict[str, list[Dict[str, Any]]] = {}
+    source_categories_by_id: Dict[str, list[Dict[str, Any]]] = {}
+
+    def merge_source_row(source_key: str, source_row: Dict[str, Any]) -> None:
+        product_id = str(source_row.get("product_id") or "").strip()
+        if not product_id:
+            return
+        row = copy.deepcopy(source_row)
+        evidence = row.get("_categoryEvidence") if isinstance(row.get("_categoryEvidence"), dict) else _row_category_evidence(
+            row, product_id, category_tree, "material_list" if source_key == "selectionSquare" else "source_row"
+        )
+        category_evidence_by_id.setdefault(product_id, []).append(evidence)
+        base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+        info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+        if evidence.get("status") == "known":
+            info["category"] = dict(zip(("first", "second", "third"), evidence["categoryIds"]))
+        else:
+            info.pop("category", None)
+        base["product_info"] = info
+        row["base_model"] = base
+        source_categories = row.get("_sourceCategories") if isinstance(row.get("_sourceCategories"), list) else []
+        if not source_categories and isinstance(row.get("_sourceCategory"), dict):
+            source_categories = [row["_sourceCategory"]]
+        for category in source_categories:
+            if isinstance(category, dict) and category not in source_categories_by_id.setdefault(product_id, []):
+                source_categories_by_id[product_id].append(category)
+        if product_id not in merged_raw:
+            merged_raw[product_id] = row
+        else:
+            merged_raw[product_id] = _merge_candidate_source_rows(merged_raw[product_id], row)
+        sources_by_id.setdefault(product_id, []).append(source_key)
+
     for source_key in source_order:
         for row in source_candidates.get(source_key, []):
-            product_id = str(row.get("product_id") or "").strip()
-            if not product_id:
-                continue
-            if product_id not in merged_raw:
-                merged_raw[product_id] = copy.deepcopy(row)
-            else:
-                merged_raw[product_id] = _merge_candidate_source_rows(merged_raw[product_id], row)
-            sources_by_id.setdefault(product_id, []).append(source_key)
+            merge_source_row(source_key, row)
 
     selection_square_ids: set[str] = set()
     for row in selection_square_rows:
@@ -8443,11 +8722,42 @@ def _visible_source_candidate_result(
         if not product_id:
             continue
         selection_square_ids.add(product_id)
-        if product_id not in merged_raw:
-            merged_raw[product_id] = copy.deepcopy(row)
+        merge_source_row("selectionSquare", row)
+
+    excluded_level1 = settings.get("excludedCategorySelection", {}).get("level1", []) if isinstance(settings.get("excludedCategorySelection"), dict) else []
+    for product_id, row in merged_raw.items():
+        evidences = category_evidence_by_id.get(product_id, [])
+        exact_paths = {tuple(evidence.get("categoryIds", [])) for evidence in evidences if evidence.get("status") == "known"}
+        ambiguous = any(evidence.get("status") == "ambiguous" for evidence in evidences) or len(exact_paths) > 1
+        source_categories = source_categories_by_id.get(product_id, [])
+        source_roots = {str(item["categoryIds"][0]) for item in source_categories
+                        if isinstance(item.get("categoryIds"), list) and item["categoryIds"]}
+        source_paths = [item.get("categoryIds", []) for item in source_categories
+                        if isinstance(item.get("categoryIds"), list) and item["categoryIds"]]
+        if len(source_roots) > 1 or any(
+            not all(_category_id_matches(path[index], exact[index]) for index in range(len(path)))
+            for path in source_paths for exact in exact_paths
+        ) or any(
+            not all(_category_id_matches(left[index], right[index]) for index in range(min(len(left), len(right))))
+            for left in source_paths for right in source_paths
+        ):
+            ambiguous = True
+        row["_sourceCategories"] = source_categories
+        row["_categoryAmbiguous"] = ambiguous
+        row["_sourceLevelExcluded"] = any(
+            _category_id_matches(root, _category_id_scalar(excluded))
+            for root in source_roots for excluded in excluded_level1 if _category_id_scalar(excluded)
+        )
+        base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+        info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+        if len(exact_paths) == 1 and not ambiguous:
+            path = next(iter(exact_paths))
+            info["category"] = dict(zip(("first", "second", "third"), path))
+            row["_categoryEvidence"] = next(evidence for evidence in evidences if evidence.get("status") == "known")
         else:
-            merged_raw[product_id] = _merge_candidate_source_rows(merged_raw[product_id], row)
-        sources_by_id.setdefault(product_id, []).append("selectionSquare")
+            info.pop("category", None)
+        base["product_info"] = info
+        row["base_model"] = base
 
     raw_rows = list(merged_raw.values())
     raw_ids = set(merged_raw)
@@ -8466,7 +8776,6 @@ def _visible_source_candidate_result(
         "titleInference": "未使用；低置信度标题推测未进入类目决策",
     }
     category_results: Dict[str, Dict[str, Any]] = {}
-    category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
     category_logic_enabled = settings.get("selectionMode") == "category"
     source_probes: Dict[str, Dict[str, Any]] = {}
     sampled_enrichments: Dict[str, Dict[str, Any]] = {}
@@ -8478,7 +8787,12 @@ def _visible_source_candidate_result(
             sample_rows = [
                 source_row for source_row in source_rows
                 if str(source_row.get("product_id") or "").strip() in raw_ids_to_check
-                and len(_promotion_row_category_ids(source_row)) < 3
+                and not merged_raw[str(source_row.get("product_id") or "").strip()].get("_sourceLevelExcluded")
+                and not merged_raw[str(source_row.get("product_id") or "").strip()].get("_categoryAmbiguous")
+                and _row_category_evidence(
+                    source_row, str(source_row.get("product_id") or "").strip(), category_tree,
+                    "material_list" if source_key == "selectionSquare" else "source_row",
+                ).get("status") != "known"
             ][:3]
             source_probe: Dict[str, Any] = {
                 "sourceKey": source_key, "label": source_labels[source_key],
@@ -8522,6 +8836,7 @@ def _visible_source_candidate_result(
                     sampled_enrichments[sample_id] = {
                         "productId": sample_id, "categoryIds": category_ids,
                         "reason": "", "diagnostics": {"sourceProbe": sample_diagnostic},
+                        "categorySource": "react_card" if card_probe.get("status") == "category_from_source_card" else "detail_api",
                     }
                     source_probe["status"] = "category_available"
                     break
@@ -8533,14 +8848,14 @@ def _visible_source_candidate_result(
                     }
             if source_probe["status"] == "sampling":
                 sample_statuses = [item["status"] for item in source_probe["samples"]]
-                if len(sample_statuses) == 3 and len(set(sample_statuses)) == 1 and sample_statuses[0] in {
-                    "matched_response_without_category", "category_field_unresolved", "detail_entry_unavailable",
-                }:
-                    source_probe["status"] = {
-                        "matched_response_without_category": "category_data_unavailable",
-                        "category_field_unresolved": "category_field_unresolved",
-                        "detail_entry_unavailable": "detail_entry_unavailable",
-                    }[sample_statuses[0]]
+                if len(sample_statuses) == 3 and all(status in {
+                    "matched_response_without_category", "category_field_unresolved", "detail_entry_unavailable"
+                } for status in sample_statuses):
+                    source_probe["status"] = (
+                        "category_field_unresolved" if "category_field_unresolved" in sample_statuses
+                        else "category_data_unavailable" if "matched_response_without_category" in sample_statuses
+                        else "entry_unavailable"
+                    )
                     source_category_unavailable.add(source_key)
                     warnings.append(
                         f"{source_labels[source_key]}连续 3 件商品的详情诊断均为 {source_probe['status']}；"
@@ -8597,29 +8912,32 @@ def _visible_source_candidate_result(
         base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
         product_info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
         source_category = product_info.get("category") if isinstance(product_info.get("category"), dict) else {}
-        listed_category_ids = [
-            str(source_category.get(key)).strip()
-            for key in ("first", "second", "third")
-            if source_category.get(key) is not None and str(source_category.get(key)).strip()
-        ]
+        listed_category_ids = _promotion_row_category_ids(row)
+        source_level_excluded = row.get("_sourceLevelExcluded") is True
+        category_ambiguous = row.get("_categoryAmbiguous") is True
         existing_metrics = _promotion_row_metric_values(row)
         missing_metrics = [
             metric for metric in threshold_names
             if existing_metrics.get(metric) is None
         ]
         needs_category_detail = category_gate_enabled and len(listed_category_ids) < 3
-        if needs_category_detail or missing_metrics:
+        if not source_level_excluded and not category_ambiguous and (needs_category_detail or missing_metrics):
             enrichment = read_verified_detail(row, product_id)
             category_ids_from_detail = [str(value).strip() for value in enrichment.get("categoryIds", []) if str(value).strip()]
             if len(category_ids_from_detail) >= 3:
-                source_category = {
-                    "first": category_ids_from_detail[0],
-                    "second": category_ids_from_detail[1],
-                    "third": category_ids_from_detail[2],
-                }
+                if len(listed_category_ids) >= 3 and listed_category_ids != category_ids_from_detail[:3]:
+                    category_ambiguous = True
+                    row["_categoryAmbiguous"] = True
+                    enrichment = {"productId": product_id, "categoryIds": [],
+                                  "reason": "来源行与精确详情的三级类目 ID 冲突", "status": "ambiguous"}
+                else:
+                    source_category = dict(zip(("first", "second", "third"), category_ids_from_detail[:3]))
                 base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
                 product_info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
-                product_info["category"] = source_category
+                if category_ambiguous:
+                    product_info.pop("category", None)
+                else:
+                    product_info["category"] = source_category
                 if isinstance(base, dict):
                     base["product_info"] = product_info
                     row["base_model"] = base
@@ -8629,18 +8947,6 @@ def _visible_source_candidate_result(
                 row["_detailMetricError"] = str(enrichment.get("reason"))
             listed_category_ids = _promotion_row_category_ids(row)
             category_results[product_id] = enrichment
-        if not category_gate_enabled:
-            category_results[product_id] = {
-                "categoryIds": listed_category_ids,
-                "reason": "通用数据模式不以类目完整性作为候选门槛",
-            }
-            if len(listed_category_ids) >= 3:
-                category_enrichment["successCount"] += 1
-                category_enrichment["successes"].append({"productId": product_id, "categoryIds": listed_category_ids[:3], "source": "列表数据"})
-            else:
-                category_enrichment["failureCount"] += 1
-                category_enrichment["failureDetails"].append({"productId": product_id, "reason": "列表行未提供完整三级类目 ID；通用数据模式仍可按数据门槛判断"})
-            continue
         if fatal_category_error:
             diagnostics = _new_detail_category_diagnostics(
                 _product_detail_url(product_id, row, base, product_info)
@@ -8654,15 +8960,24 @@ def _visible_source_candidate_result(
             }
         else:
             enrichment = category_results.get(product_id)
-            if enrichment is None:
+            if category_ambiguous:
+                enrichment = {"productId": product_id, "categoryIds": [], "status": "ambiguous",
+                              "reason": "同一商品的来源类目冲突，不能安全归类"}
+            elif source_level_excluded:
+                enrichment = {"productId": product_id, "categoryIds": [], "status": "excluded_source_level",
+                              "reason": "命中已核验的来源一级排除类目"}
+            elif enrichment is None:
                 if len(listed_category_ids) >= 3:
                     enrichment = {
                         "productId": product_id,
                         "categoryIds": listed_category_ids,
                         "reason": "来源商品行已提供完整三级类目 ID",
+                        "categorySource": row.get("_categoryEvidence", {}).get("categorySource", "material_list"),
                     }
                 else:
                     enrichment = read_verified_detail(row, product_id)
+                    if len(enrichment.get("categoryIds", [])) >= 3:
+                        enrichment["categorySource"] = "detail_api"
             if enrichment.get("fatal"):
                 fatal_category_error = str(enrichment.get("reason") or "详情页安全状态异常，已停止后续读取")
         category_results[product_id] = enrichment
@@ -8724,14 +9039,34 @@ def _visible_source_candidate_result(
             candidate["sourceKey"] = source_key
             candidate["sourceUrl"] = source_urls[source_key]
         candidate["selectionMode"] = "category" if category_logic_enabled else "general"
-        category_ids = [str(value) for value in candidate.get("categoryIds", []) if str(value)]
+        category_ids = [_category_id_scalar(value) for value in candidate.get("categoryIds", [])]
+        category_ids = category_ids if len(category_ids) == 3 and all(category_ids) else []
         candidate["leafCategoryId"] = category_ids[-1] if len(category_ids) >= 3 else ""
         candidate["sourceCategorySelection"] = {}
         category_result = category_results.get(product_id, {})
-        candidate["categoryStatus"] = "known" if candidate["leafCategoryId"] else "类目未知"
-        candidate["categorySource"] = (
-            "详情页" if category_gate_enabled else "来源商品行"
-        ) if candidate["leafCategoryId"] else ""
+        merged_row = merged_raw.get(product_id, {})
+        source_categories = merged_row.get("_sourceCategories") if isinstance(merged_row.get("_sourceCategories"), list) else []
+        source_category = source_categories[0] if len(source_categories) == 1 else {}
+        candidate["sourceCategoryName"] = str(source_category.get("name") or "")
+        candidate["sourceCategoryId"] = str(source_category.get("id") or "")
+        candidate["sourceCategoryLevel"] = int(source_category.get("level") or 0)
+        candidate["sourceCategoryIds"] = source_category.get("categoryIds", [])
+        candidate["categoryStatus"] = (
+            "ambiguous" if merged_row.get("_categoryAmbiguous") else
+            "known" if candidate["leafCategoryId"] else "unknown"
+        )
+        candidate["categorySource"] = str(category_result.get("categorySource") or (
+            merged_row.get("_categoryEvidence", {}).get("categorySource", "")
+            if candidate["leafCategoryId"] else ""
+        ))
+        candidate["categoryConfidence"] = (
+            "exact" if candidate["leafCategoryId"] else
+            "source_level" if source_category else "unresolved"
+        )
+        if merged_row.get("_sourceLevelExcluded"):
+            candidate["leafCategoryId"] = ""
+            candidate["categoryStatus"] = "unknown"
+            candidate["categoryConfidence"] = "source_level"
         if not candidate["leafCategoryId"]:
             candidate["categoryError"] = str(category_result.get("reason") or "详情页未返回完整三级类目 ID")
 
@@ -8740,8 +9075,11 @@ def _visible_source_candidate_result(
         invalid_category = [candidate for candidate in candidates if not candidate.get("leafCategoryId")]
         for candidate in invalid_category:
             candidate["analysisRejected"] = True
+            reason = str(candidate.get("categoryError") or "来源数据未提供三级类目 ID")
             candidate["thresholdReasons"] = [
-                f"类目未知：{candidate.get('categoryError') or '来源数据未提供三级类目 ID'}"
+                reason if reason.startswith("命中已核验的来源一级排除类目") else
+                f"类目冲突：{reason}" if candidate.get("categoryStatus") == "ambiguous" else
+                f"类目未知：{reason}"
             ]
             candidate["status"] = candidate["thresholdReasons"][0]
             candidate["cartAdded"] = False
@@ -9667,6 +10005,119 @@ def _category_path_metadata(tree: Sequence[Any]) -> Dict[str, tuple[str, str, st
                     path_id = _category_path_id(third_id, second_id)
                     result[path_id] = (root_id, second_id, path_id)
     return result
+
+
+def _category_tree_paths(tree: Sequence[Any]) -> list[tuple[str, str, str]]:
+    paths: list[tuple[str, str, str]] = []
+    for root in tree:
+        if not isinstance(root, dict):
+            continue
+        first = _category_id_scalar(root.get("id"))
+        for second_node in (root.get("children") if isinstance(root.get("children"), list) else []):
+            if not isinstance(second_node, dict):
+                continue
+            second = _category_id_scalar(second_node.get("id"))
+            for third_node in (second_node.get("children") if isinstance(second_node.get("children"), list) else []):
+                if not isinstance(third_node, dict):
+                    continue
+                third = _category_id_scalar(third_node.get("id"))
+                if first and second and third:
+                    paths.append((first, second, _category_path_id(third, second)))
+    return paths
+
+
+def _category_id_matches(actual: str, expected: str) -> bool:
+    return actual == expected or actual.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1] == expected.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1]
+
+
+def _normalize_exact_category_path(values: Sequence[Any], category_tree: Sequence[Any]) -> list[str]:
+    if len(values) != 3:
+        return []
+    supplied = [_category_id_scalar(value) for value in values]
+    if not all(supplied):
+        return []
+    paths = _category_tree_paths(category_tree)
+    if not paths:
+        # 平台明确给出完整三级路径时可以保留；单个末级 ID 不能在没有树时补全。
+        return supplied
+    matches = {path for path in paths if all(_category_id_matches(path[index], supplied[index]) for index in range(3))}
+    return list(next(iter(matches))) if len(matches) == 1 else []
+
+
+def _resolve_single_category_id(value: Any, category_tree: Sequence[Any]) -> tuple[list[str], int]:
+    category_id = _category_id_scalar(value)
+    if not category_id:
+        return [], 0
+    matches: set[tuple[tuple[str, ...], int]] = set()
+    for path in _category_tree_paths(category_tree):
+        for level in range(1, 4):
+            if _category_id_matches(path[level - 1], category_id):
+                matches.add((path[:level], level))
+    if len(matches) != 1:
+        return [], 0
+    path, level = next(iter(matches))
+    return list(path), level
+
+
+def _row_category_evidence(row: Dict[str, Any], product_id: str, category_tree: Sequence[Any], source: str) -> Dict[str, Any]:
+    """只从精确商品行的类目字段取证；冲突、0 和单个无法映射的 ID 都不放行。"""
+    if str(row.get("product_id") or "").strip() != product_id:
+        return {"status": "unknown", "categoryIds": [], "reason": "来源商品 ID 不一致"}
+    base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+    info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+    nodes = [("product_info", info), ("base_model", base), ("row", row)]
+    candidates: list[tuple[list[str], str]] = []
+    field_seen = False
+    for prefix, node in nodes:
+        for key in ("category", "category_info", "categoryInfo"):
+            raw = node.get(key)
+            if not isinstance(raw, dict):
+                continue
+            field_seen = True
+            for names in (("first", "second", "third"), ("first_cate_id", "second_cate_id", "third_cate_id"),
+                          ("firstCategoryId", "secondCategoryId", "thirdCategoryId")):
+                if all(name in raw for name in names):
+                    path = _normalize_exact_category_path([raw[name] for name in names], category_tree)
+                    if path:
+                        candidates.append((path, f"{prefix}.{key}"))
+        for key in ("categoryIds", "category_ids", "categoryPath", "category_path"):
+            raw = node.get(key)
+            if raw is None:
+                continue
+            field_seen = True
+            if isinstance(raw, list):
+                path = _normalize_exact_category_path(raw, category_tree)
+                if path:
+                    candidates.append((path, f"{prefix}.{key}"))
+            elif isinstance(raw, str) and key in {"categoryPath", "category_path"}:
+                parts = [part.strip() for part in re.split(r"\s*[,/>]\s*", raw) if part.strip()]
+                path = _normalize_exact_category_path(parts, category_tree)
+                if path:
+                    candidates.append((path, f"{prefix}.{key}"))
+        for names in (("first_cate_id", "second_cate_id", "third_cate_id"),
+                      ("first_category_id", "second_category_id", "third_category_id")):
+            if any(name in node for name in names):
+                field_seen = True
+                path = _normalize_exact_category_path([node.get(name) for name in names], category_tree)
+                if path:
+                    candidates.append((path, f"{prefix}.{names[0]}"))
+        for key in ("category_id", "categoryId", "alli_cate_id", "alliCateId"):
+            if key not in node:
+                continue
+            field_seen = True
+            path, level = _resolve_single_category_id(node.get(key), category_tree)
+            if level == 3:
+                candidates.append((path, f"{prefix}.{key}"))
+    distinct = {tuple(path) for path, _ in candidates}
+    if len(distinct) > 1:
+        return {"status": "ambiguous", "categoryIds": [], "reason": "同一商品行出现互相冲突的三级类目 ID"}
+    if len(distinct) == 1:
+        path, field = candidates[0]
+        return {"status": "known", "categoryIds": path, "categorySource": source,
+                "categoryConfidence": "exact", "categoryField": field}
+    return {"status": "unknown", "categoryIds": [],
+            "reason": "来源类目字段无效或无法唯一映射" if field_seen else "来源商品行未提供类目字段",
+            "categoryConfidence": "unresolved"}
 
 
 def _clear_platform_category_root(
@@ -10810,7 +11261,9 @@ def _category_id_scalar(value: Any) -> str:
         return ""
     text = str(value).strip()
     pattern = r"^\d+(?:" + re.escape(CATEGORY_PATH_SEPARATOR) + r"\d+)*$"
-    return text if re.fullmatch(pattern, text) else ""
+    if not re.fullmatch(pattern, text):
+        return ""
+    return text if all(int(part) > 0 for part in text.split(CATEGORY_PATH_SEPARATOR)) else ""
 
 
 def _detail_category_path(
@@ -10859,24 +11312,7 @@ def _detail_category_path(
     visited: set[int] = set()
 
     def normalize_path(values: Sequence[str]) -> list[str]:
-        if len(values) < 3 or not all(values[-3:]):
-            return []
-        first, second, third = [str(value).strip() for value in values[-3:]]
-        first_tail = first.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1]
-        second_tail = second.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1]
-        paths = leaf_paths.get(third, [])
-        if not paths:
-            paths = leaf_paths.get(third.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1], [])
-        matches = [
-            path for path in paths
-            if path[0].rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1] == first_tail
-            and path[1].rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1] == second_tail
-        ]
-        if len(matches) == 1:
-            return [str(value) for value in matches[0]]
-        if third in metadata and metadata[third][2]:
-            return [str(value) for value in metadata[third]]
-        return [first, second, third]
+        return _normalize_exact_category_path(values[-3:], category_tree)
 
     def walk(node: Any, path: str = "", in_category_scope: bool = False, depth: int = 0) -> list[str]:
         if depth > 9 or not isinstance(node, (dict, list)):

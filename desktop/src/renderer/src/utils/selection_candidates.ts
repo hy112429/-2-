@@ -2,6 +2,7 @@ export interface SelectionCandidateRankInput {
   productId: string
   leafCategoryId?: string
   categoryIds?: string[]
+  categoryStatus?: string
   unifiedScore?: number | null
   analysisScore?: number | null
   analysisRawScore?: number | null
@@ -63,13 +64,18 @@ export function selectionPoolVisibilityFingerprint(profilePath?: string): string
 }
 
 export function candidateLeafCategoryId(candidate: SelectionCandidateRankInput): string {
-  return String(candidate.leafCategoryId ?? candidate.categoryIds?.at(-1) ?? '').trim()
+  if (candidate.categoryStatus === 'unknown' || candidate.categoryStatus === 'ambiguous') return ''
+  const path = candidate.categoryIds?.map((value) => String(value).trim()) ?? []
+  if (path.length !== 3 || path.some((value) => !/^\d+(?:__RC_CASCADER_SPLIT__\d+)*$/.test(value) ||
+    value.split('__RC_CASCADER_SPLIT__').some((part) => Number(part) <= 0))) return ''
+  const explicit = String(candidate.leafCategoryId ?? '').trim()
+  return explicit && explicit !== path[2] ? '' : path[2]
 }
 
 export function filterCandidatesByRegistry<T extends SelectionCandidateRankInput>(
   rows: T[],
   snapshot: SelectionRegistrySnapshot,
-  allowUnknownCategory = false,
+  _allowUnknownCategory = false,
   enforceCategoryUniqueness = true
 ): { eligible: T[]; excluded: Array<{ candidate: T; reason: string }> } {
   const usedProducts = new Set(snapshot.usedProductIds.map(String))
@@ -82,7 +88,7 @@ export function filterCandidatesByRegistry<T extends SelectionCandidateRankInput
       excluded.push({ candidate, reason: '来源数据缺少商品 ID' })
     } else if (usedProducts.has(candidate.productId)) {
       excluded.push({ candidate, reason: '商品 ID 已在全账号池登记' })
-    } else if (!categoryId && !allowUnknownCategory) {
+    } else if (!categoryId) {
       excluded.push({ candidate, reason: '品类模式下来源数据缺少三级类目 ID' })
     } else if (enforceCategoryUniqueness && categoryId && usedCategories.has(categoryId)) {
       excluded.push({ candidate, reason: '该账号历史或本轮已使用此末级类目' })

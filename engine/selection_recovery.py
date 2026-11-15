@@ -45,7 +45,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
         "batch_id TEXT NOT NULL, account_id INTEGER NOT NULL, account_name TEXT NOT NULL, "
         "sequence_no INTEGER NOT NULL, state TEXT NOT NULL, stage TEXT NOT NULL DEFAULT '', "
         "error TEXT NOT NULL DEFAULT '', candidates_json TEXT, selected_indexes_json TEXT, "
-        "completed_json TEXT, updated_at TEXT NOT NULL, "
+        "completed_json TEXT, source_pool_state_json TEXT, updated_at TEXT NOT NULL, "
         "PRIMARY KEY(batch_id, account_id), "
         "FOREIGN KEY(batch_id) REFERENCES selection_run_batches(batch_id));"
         "CREATE TABLE IF NOT EXISTS selection_run_logs ("
@@ -77,6 +77,9 @@ def connect(db_path: Path) -> sqlite3.Connection:
     product_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(product_list_rows)")}
     if "candidate_json" not in product_columns:
         connection.execute("ALTER TABLE product_list_rows ADD COLUMN candidate_json TEXT NOT NULL DEFAULT '{}'")
+    account_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(selection_run_accounts)")}
+    if "source_pool_state_json" not in account_columns:
+        connection.execute("ALTER TABLE selection_run_accounts ADD COLUMN source_pool_state_json TEXT")
     connection.commit()
     return connection
 
@@ -113,6 +116,8 @@ def account_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "candidates": decode_json(row["candidates_json"], None),
         "selectedIndexes": decode_json(row["selected_indexes_json"], None),
         "completed": decode_json(row["completed_json"], None),
+        "sourcePoolState": decode_json(row["source_pool_state_json"], None)
+        if "source_pool_state_json" in row.keys() else None,
         "updatedAt": row["updated_at"],
     }
 
@@ -536,19 +541,21 @@ def update_account(connection: sqlite3.Connection, batch_id: str, account_id: in
         "candidates": "candidates",
         "selectedIndexes": "selected_indexes",
         "completed": "completed",
+        "sourcePoolState": "source_pool_state",
     }
     merged = {key: current.get(key) for key in allowed}
     merged.update({key: value[key] for key in allowed if key in value})
     timestamp = now_text()
     connection.execute(
         "UPDATE selection_run_accounts SET state = ?, stage = ?, error = ?, candidates_json = ?, "
-        "selected_indexes_json = ?, completed_json = ?, updated_at = ? "
+        "selected_indexes_json = ?, completed_json = ?, source_pool_state_json = ?, updated_at = ? "
         "WHERE batch_id = ? AND account_id = ?",
         (
             str(merged["state"]), str(merged["stage"] or ""), str(merged["error"] or ""),
             json.dumps(merged["candidates"], ensure_ascii=False) if merged["candidates"] is not None else None,
             json.dumps(merged["selectedIndexes"], ensure_ascii=False) if merged["selectedIndexes"] is not None else None,
             json.dumps(merged["completed"], ensure_ascii=False) if merged["completed"] is not None else None,
+            json.dumps(merged["sourcePoolState"], ensure_ascii=False) if merged["sourcePoolState"] is not None else None,
             timestamp, batch_id, account_id,
         ),
     )
@@ -1097,7 +1104,8 @@ def refresh_candidate_fetch_batch(
         )
         connection.execute(
             "UPDATE selection_run_accounts SET state = 'queued', stage = 'queued', error = '', "
-            "candidates_json = NULL, selected_indexes_json = NULL, completed_json = NULL, updated_at = ? "
+            "candidates_json = NULL, selected_indexes_json = NULL, completed_json = NULL, "
+            "source_pool_state_json = NULL, updated_at = ? "
             "WHERE batch_id = ? AND state != 'completed'",
             (timestamp, batch_id),
         )

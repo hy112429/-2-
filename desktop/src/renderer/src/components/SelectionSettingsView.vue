@@ -114,6 +114,11 @@ interface SelectionRecoveryAccount {
   candidates: SelectionCandidate[] | null
   selectedIndexes: number[] | null
   completed: Array<Record<string, unknown>> | null
+  sourcePoolState?: {
+    sources: Record<string, { fingerprint: string; productCount: number; readAt: string; pagePath?: string; scrollPosition?: number }>
+    samePoolCount: number
+    nextRetryAt?: string
+  } | null
   updatedAt?: string
 }
 
@@ -162,6 +167,11 @@ interface PrioritySourceReadResult {
   detail?: string
   dataCapturedAt?: string
   visibilityFingerprint?: string
+  productIdFingerprint?: string
+  readAt?: string
+  pagePath?: string
+  scrollPosition?: number | { top?: number; height?: number; viewport?: number }
+  pageReads?: Array<{ query?: number; step: number; scrollTop?: number; newProductIds?: number }>
 }
 
 function visibleSourceNoCandidateMessage(
@@ -2884,7 +2894,7 @@ async function executeAccountSelection(
         ? `重点类目推荐依据：${previewPlan.recommendedCategories.slice(0, 8).map((row) =>
             `${categoryName(row.categoryId)}（高分商品 ${row.highScoreCount} 个，平均统一分 ${row.averageScore}）`
           ).join('；')}`
-        : '无可推荐类目：当前通过筛选的候选没有可识别完整三级类目 ID。类目未知商品仍按通用数据模式保留。'
+        : '无可推荐类目：当前通过筛选的候选没有可识别完整三级类目 ID。类目未知商品不会加车。'
       const emptyCandidateMessage = settings._visibleSourcesOnly === true
         ? visibleSourceNoCandidateMessage(
           previewSourceResults,
@@ -2937,8 +2947,35 @@ async function executeAccountSelection(
         ).filter(Boolean))].sort().join('|')
       }
       let lastReadFingerprint = candidateReadFingerprint(fetched, completed)
+      let sourcePoolState: NonNullable<SelectionRecoveryAccount['sourcePoolState']> =
+        recovery?.state.sourcePoolState ?? { sources: {}, samePoolCount: 0 }
+      const cooldownRemaining = (): number => sourcePoolState.nextRetryAt
+        ? Math.max(0, new Date(sourcePoolState.nextRetryAt).getTime() - Date.now()) : 0
+      const checkpointSourcePool = async (results: PrioritySourceReadResult[], unchanged: boolean): Promise<void> => {
+        const sources = Object.fromEntries(results
+          .filter((item) => item.status === 'read' || item.status === 'empty')
+          .map((item) => [item.sourceKey, {
+            fingerprint: String(item.productIdFingerprint || ''),
+            productCount: Math.max(0, Number(item.productCount) || 0),
+            readAt: String(item.readAt || new Date().toISOString()),
+            pagePath: String(item.pagePath || ''),
+            scrollPosition: Number(typeof item.scrollPosition === 'object'
+              ? item.scrollPosition?.top : item.scrollPosition) || 0
+          }]))
+        const prior = sourcePoolState.sources ?? {}
+        const sameSources = Object.keys(sources).length > 0 &&
+          Object.keys(sources).every((key) => sources[key].fingerprint &&
+            sources[key].fingerprint === prior[key]?.fingerprint)
+        const samePoolCount = unchanged && sameSources ? sourcePoolState.samePoolCount + 1 : 0
+        const nextRetryAt = samePoolCount > 0
+          ? new Date(Date.now() + Math.min(30, 5 * 2 ** (samePoolCount - 1)) * 60_000).toISOString()
+          : undefined
+        sourcePoolState = { sources, samePoolCount, nextRetryAt }
+        await recovery?.persist({ sourcePoolState })
+      }
       const refillCandidatePool = async (force = false): Promise<void> => {
         if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
+        if (cooldownRemaining() > 0) return
         const retryDelays = [1_000, 2_500, 6_000]
         for (let attempt = 0; attempt < retryDelays.length && fetched.length < candidateLimit; attempt += 1) {
           const delayMs = retryDelays[attempt]
@@ -2966,20 +3003,24 @@ async function executeAccountSelection(
           if (refill.ok !== true) continue
           const newRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
           const readFingerprint = candidateReadFingerprint(refill.candidates, refill.rejectedCandidates)
+          const refillSources = Array.isArray(refill.prioritySourceResults)
+            ? refill.prioritySourceResults as PrioritySourceReadResult[] : []
           const previousCount = fetched.length
           const byProduct = new Map(fetched.map((row) => [row.productId, row]))
           for (const row of newRows) if (!byProduct.has(row.productId)) byProduct.set(row.productId, row)
           fetched = [...byProduct.values()].map((row, index) => ({ ...row, cardIndex: index }))
+          const unchanged = fetched.length === previousCount && readFingerprint !== '' && readFingerprint === lastReadFingerprint
+          await checkpointSourcePool(refillSources, unchanged)
           await recovery?.logEvent({
             stage: '候选补充', code: 'INFO_CANDIDATE_REFILL_RESULT',
             message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
             detail: `本次新读取 ${newRows.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
           })
-          if (fetched.length === previousCount && readFingerprint && readFingerprint === lastReadFingerprint) {
+          if (unchanged) {
             await recovery?.logEvent({
               stage: '候选补充', code: 'WARNING_CANDIDATE_POOL_UNCHANGED',
               message: '再次读取仍是同一批商品 ID，已停止本轮无效补读。',
-              detail: `当前可执行候选 ${fetched.length}/${candidateLimit}；保留缺额和检查点，不放宽条件。`
+              detail: `当前可执行候选 ${fetched.length}/${candidateLimit}；保留缺额和检查点，不放宽条件。下次重查 ${sourcePoolState.nextRetryAt || '待手动恢复'}。`
             })
             break
           }
@@ -3054,6 +3095,12 @@ async function executeAccountSelection(
         )
         if (maxProducts <= 0) throw new Error('该账号今日商品或视频配额已用完；新任务需等待后续可用日期。')
 
+        if (cooldownRemaining() > 0 && fetched.length < candidateLimit) {
+          const reason = `来源连续返回同一商品池；保留 ${fetched.length}/${candidateLimit} 缺额，${sourcePoolState.nextRetryAt} 后再查。`
+          await recovery?.persist({ state: 'needs_retry', stage: 'candidate_refilling', error: reason, candidates: fetched })
+          return { status: '部分完成', message: reason, continueBatch: false }
+        }
+
         await persistStage('candidate_fetch')
         stage = '百应筛选并获取候选'
         accountStatuses[targetAccountId] = '获取候选中'
@@ -3074,6 +3121,7 @@ async function executeAccountSelection(
               downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: !recovery
             }))
         if (preview.ok !== true) throw new Error(String(preview.error ?? '百应候选获取失败'))
+        const previousReadFingerprint = lastReadFingerprint
         lastReadFingerprint = candidateReadFingerprint(preview.candidates, preview.rejectedCandidates)
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
         const stableAccountKey = `local:${targetAccountId}`
@@ -3124,6 +3172,10 @@ async function executeAccountSelection(
         }
         const prioritySourceResults = Array.isArray(preview.prioritySourceResults)
           ? preview.prioritySourceResults as PrioritySourceReadResult[] : []
+        await checkpointSourcePool(
+          prioritySourceResults,
+          Boolean(previousReadFingerprint && lastReadFingerprint === previousReadFingerprint && fetched.length < candidateLimit)
+        )
         const prioritySourceMatchStatus = String(preview.prioritySourceMatchStatus || 'complete')
         const listRejected = Array.isArray(preview.rejectedCandidates)
           ? preview.rejectedCandidates as SelectionCandidate[] : []
