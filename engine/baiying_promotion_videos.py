@@ -326,6 +326,12 @@ def find_commodity_by_product_search(browser, context, product_id: str) -> str:
         try:
             search_field.first.wait_for(state="visible", timeout=15_000)
         except PlaywrightTimeoutError as error:
+            final_page = urlparse(page.url)
+            if final_page.hostname != target.hostname or final_page.path.rstrip("/") != target.path.rstrip("/"):
+                raise RuntimeError(
+                    f"该账号百应选品广场跳转至 {final_page.hostname or '未知域名'}"
+                    f"{final_page.path[:120]}；请先确认专属浏览器的百应登录和选品权限"
+                ) from error
             raise RuntimeError("该账号百应搜索框未出现，请检查登录状态或选品广场权限") from error
         if search_field.count() != 1:
             raise RuntimeError("百应选品广场搜索框不唯一，无法安全按商品 ID 检索")
@@ -461,7 +467,8 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
             temporary_page = page
             target_url = detail_url(product_id, commodity_id)
             page.goto(target_url, wait_until="commit", timeout=20_000)
-            if urlparse(page.url).hostname != "buyin.jinritemai.com":
+            final_page = urlparse(page.url)
+            if final_page.hostname != "buyin.jinritemai.com" or final_page.path != urlparse(DETAIL_ROUTE).path:
                 raise RuntimeError("该账号百应登录态已失效；请在该账号专属浏览器登录百应后重试")
             tab = page.get_by_text("带货内容", exact=True)
             try:
