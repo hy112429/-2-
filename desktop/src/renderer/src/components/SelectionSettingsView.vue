@@ -3024,6 +3024,8 @@ async function executeAccountSelection(
           if (refill.ok !== true) continue
           const newRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
           const rejectedRows = Array.isArray(refill.rejectedCandidates) ? refill.rejectedCandidates as SelectionCandidate[] : []
+          const readFingerprint = candidateReadFingerprint(refill.candidates, refill.rejectedCandidates)
+          const previousCount = fetched.length
           const observedRows = [...newRows, ...rejectedRows]
           const newObservedIds = [...new Set(observedRows.map((row) => String(row.productId ?? '').trim()).filter(Boolean))]
             .filter((productId) => !observedProductIds.has(productId))

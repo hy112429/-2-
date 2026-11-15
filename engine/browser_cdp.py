@@ -7575,7 +7575,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                     const scalarId = (value) => {
                       if (typeof value !== 'string' && typeof value !== 'number') return '';
                       const text = String(value).trim();
-                      return /^\d+(?:__RC_CASCADER_SPLIT__\d+)*$/.test(text) ? text : '';
+                      return /^\\d+(?:__RC_CASCADER_SPLIT__\\d+)*$/.test(text) ? text : '';
                     };
                     const walk = (node, path, depth, categoryScope) => {
                       if (!node || typeof node !== 'object' || depth > 6 || visited >= 500 || seen.has(node)) return;
