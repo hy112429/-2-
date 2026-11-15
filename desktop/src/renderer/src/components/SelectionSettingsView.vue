@@ -2924,6 +2924,16 @@ async function executeAccountSelection(
       const candidateLimit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(10, requestedLimit)) : 5
       const hasExplicitPreviewSelection =
         reviewedPreviewAccountId === targetAccountId && reviewedProductIds !== undefined
+      const candidateReadFingerprint = (candidatesRead: unknown, rejectedRead: unknown): string => {
+        const rows = [
+          ...(Array.isArray(candidatesRead) ? candidatesRead : []),
+          ...(Array.isArray(rejectedRead) ? rejectedRead : [])
+        ]
+        return [...new Set(rows.map((row) =>
+          row && typeof row === 'object' ? String((row as { productId?: unknown }).productId ?? '').trim() : ''
+        ).filter(Boolean))].sort().join('|')
+      }
+      let lastReadFingerprint = candidateReadFingerprint(fetched, completed)
       const refillCandidatePool = async (force = false): Promise<void> => {
         if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
         const retryDelays = [1_000, 2_500, 6_000]
@@ -2952,6 +2962,8 @@ async function executeAccountSelection(
           }))
           if (refill.ok !== true) continue
           const newRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
+          const readFingerprint = candidateReadFingerprint(refill.candidates, refill.rejectedCandidates)
+          const previousCount = fetched.length
           const byProduct = new Map(fetched.map((row) => [row.productId, row]))
           for (const row of newRows) if (!byProduct.has(row.productId)) byProduct.set(row.productId, row)
           fetched = [...byProduct.values()].map((row, index) => ({ ...row, cardIndex: index }))
@@ -2960,6 +2972,15 @@ async function executeAccountSelection(
             message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
             detail: `本次新读取 ${newRows.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
           })
+          if (fetched.length === previousCount && readFingerprint && readFingerprint === lastReadFingerprint) {
+            await recovery?.logEvent({
+              stage: '候选补充', code: 'WARNING_CANDIDATE_POOL_UNCHANGED',
+              message: '再次读取仍是同一批商品 ID，已停止本轮无效补读。',
+              detail: `当前可执行候选 ${fetched.length}/${candidateLimit}；保留缺额和检查点，不放宽条件。`
+            })
+            break
+          }
+          if (readFingerprint) lastReadFingerprint = readFingerprint
         }
         if (fetched.length < candidateLimit) {
           await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: `候选补充后仍只有 ${fetched.length}/${candidateLimit}，未放宽筛选条件。`, candidates: fetched })
@@ -3050,6 +3071,7 @@ async function executeAccountSelection(
               downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: !recovery
             }))
         if (preview.ok !== true) throw new Error(String(preview.error ?? '百应候选获取失败'))
+        lastReadFingerprint = candidateReadFingerprint(preview.candidates, preview.rejectedCandidates)
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
         const stableAccountKey = `local:${targetAccountId}`
         const targetCount = Number(settings.candidateLimit ?? 5)
@@ -3256,71 +3278,35 @@ async function executeAccountSelection(
           )
         }
         if (!eligible.length) {
-          if (duplicateSkips.length) {
-            const examples = duplicateSkips.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
-            const skippedSummary = `本账号已有 ${duplicateSkips.length} 个已排队或已发布商品，已阻止重复选品${examples ? `，例如：${examples}${duplicateSkips.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志。`
-            accountStatuses[targetAccountId] = '已跳过账号内重复商品'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
           const titleFilterSkipped = completed.filter((item) => item.titleFilterExcluded === true)
-          if (titleFilterSkipped.length) {
-            const examples = titleFilterSkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
-            const skippedSummary = `商品标题屏蔽排除 ${titleFilterSkipped.length} 个候选，未执行加车${examples ? `；例如：${examples}${titleFilterSkipped.length > 3 ? '等' : ''}` : ''}；命中词和商品明细已记入选品日志。`
-            accountStatuses[targetAccountId] = '部分完成（标题屏蔽）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
           const analysisSkipped = completed.filter((item) => item.analysisRejected === true)
-          if (analysisSkipped.length) {
-            const skippedSummary = `候选列表数据分析排除 ${analysisSkipped.length} 个商品，未执行加车；原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（筛选未通过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
           const globallySkipped = completed.filter((item) =>
             item.mutualExclusionSkipped === true || item.registryExcluded === true
           )
-          if (globallySkipped.length) {
-            const examples = globallySkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
-            const skippedSummary = `本机商品 ID 互斥/登记过滤 ${globallySkipped.length} 个候选，未执行加车${examples ? `；例如：${examples}${globallySkipped.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志。`
-            accountStatuses[targetAccountId] = '部分完成（商品互斥跳过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
-          if (categoryWarnings.length) {
-            const skippedSummary = `本账号没有可执行候选；已跳过 ${categoryWarnings.length} 个可恢复的类目或来源读取问题，原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（类目/来源已跳过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
-          if (fetched.length < candidateLimit) {
-            const refillMessage = `候选补充中：当前 ${fetched.length}/${candidateLimit}；筛选条件未放宽，当前账号保持检查点，未推进下一个账号。`
-            accountStatuses[targetAccountId] = `candidate_refilling（${fetched.length}/${candidateLimit}）`
-            await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: refillMessage, candidates: fetched })
-            return { status: '部分完成', message: refillMessage, continueBatch: false }
-          }
-          throw new Error(settings._visibleSourcesOnly === true
-            ? visibleSourceNoCandidateMessage(
-              prioritySourceResults,
-              '已读取百应当前可见商品，但当前没有可执行候选；请查看筛选条件、已选商品/类目和跳过原因。'
-            )
-            : '已查询全部已启用来源与选品广场兜底，仍没有符合条件的商品。')
+          const categoryUnknownCount = analysisSkipped.filter((item) =>
+            Array.isArray(item.thresholdReasons) && item.thresholdReasons.some((reason) => String(reason).startsWith('类目未知'))
+          ).length
+          const confirmedCartCount = completed.filter((item) => item.cartAdded === true).length
+          const reason = [
+            `当前可执行候选 0/${candidateLimit}，确认加车 ${confirmedCartCount}/${candidateLimit}；当前账号未达目标，保留检查点，不推进下一个账号。`,
+            categoryUnknownCount ? `类目无法核实 ${categoryUnknownCount} 个` : '',
+            analysisSkipped.length > categoryUnknownCount ? `其他数据筛选排除 ${analysisSkipped.length - categoryUnknownCount} 个` : '',
+            titleFilterSkipped.length ? `标题屏蔽 ${titleFilterSkipped.length} 个` : '',
+            globallySkipped.length ? `登记或互斥跳过 ${globallySkipped.length} 个` : '',
+            duplicateSkips.length ? `重复发布锁跳过 ${duplicateSkips.length} 个` : '',
+            categoryWarnings.length ? `来源读取问题 ${categoryWarnings.length} 项` : ''
+          ].filter(Boolean).join('；')
+          accountStatuses[targetAccountId] = `needs_retry（候选 0/${candidateLimit}，加车 ${confirmedCartCount}/${candidateLimit}）`
+          await recovery?.logEvent({
+            stage: '候选补充', code: 'WARNING_CANDIDATE_TARGET_UNMET',
+            message: `当前账号没有可执行候选，确认加车 ${confirmedCartCount}/${candidateLimit}，已保留缺额。`,
+            detail: reason
+          })
+          await recovery?.persist({
+            state: 'needs_retry', stage: 'candidate_refilling', error: reason,
+            candidates: fetched, selectedIndexes: [], completed
+          })
+          return { status: '部分完成', message: reason, continueBatch: false }
         }
         selectedIndexes = eligible.map((candidate) => candidate.cardIndex)
         selectedIndexesToExecute = selectedIndexes
@@ -3488,7 +3474,11 @@ async function executeAccountSelection(
         }
         const returnedIds = new Set(returned.map((item) => String(item.productId ?? '')))
         const priorById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
-        const mergedReturned = returned.map((item) => ({ ...(priorById.get(String(item.productId ?? '')) ?? {}), ...item }))
+        const mergedReturned = returned.map((item) => {
+          const prior = priorById.get(String(item.productId ?? ''))
+          // 重新通过筛选的商品不能继承上次“类目未知”等淘汰标记。
+          return { ...(prior?.skipped === true ? {} : prior ?? {}), ...item }
+        })
         completed = [...completed.filter((item) => !returnedIds.has(String(item.productId ?? ''))), ...mergedReturned]
         const returnedByProductId = new Map<string, Record<string, unknown>>(returned
           .filter((item) => String(item.productId ?? ''))
@@ -5392,7 +5382,9 @@ async function runSelectionBatch(): Promise<void> {
         return accountOutcome ?? { status: '部分完成' as const, message: '当前账号没有返回处理结果。' }
       },
       (account, status) => {
-        accountStatuses[account.id] = status
+        if (!(status === '部分完成' && accountStatuses[account.id]?.startsWith('needs_retry'))) {
+          accountStatuses[account.id] = status
+        }
         const accountIndex = activeTaskAccounts.findIndex((item) => item.id === account.id) + 1
         if (['完成', '部分完成', '失败'].includes(status)) handledAccountIds.add(account.id)
         const isCurrent = status === '执行中' || status === '失败' || status === '完成' || status === '部分完成'
