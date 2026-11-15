@@ -6519,17 +6519,26 @@ def _candidate_rows(
             if actual is None:
                 pending_thresholds.append(metric_name)
                 try:
-                    minimum = float(threshold)
+                    boundary = float(threshold)
                 except (TypeError, ValueError):
                     continue
                 known_rejection_reasons.append(
-                    f"缺少{metric_labels.get(metric_name, metric_name)}实测数据，无法核验阈值 {minimum:g}"
+                    f"缺少{metric_labels.get(metric_name, metric_name)}实测数据，无法核验"
+                    f"{'上限' if metric_name == 'commissionRate' else '阈值'} {boundary:g}"
                 )
                 continue
             try:
-                if actual < float(threshold):
+                boundary = float(threshold)
+                if metric_name == "commissionRate":
+                    if not math.isfinite(actual) or not 0 <= actual <= 100:
+                        known_rejection_reasons.append("佣金率数据超出 0–100%，无法核验设定上限")
+                    elif actual > boundary:
+                        known_rejection_reasons.append(
+                            f"佣金率 {actual:g} 超过设定上限 {boundary:g}"
+                        )
+                elif actual < boundary:
                     known_rejection_reasons.append(
-                        f"{metric_labels.get(metric_name, metric_name)} {actual:g} 低于设定阈值 {float(threshold):g}"
+                        f"{metric_labels.get(metric_name, metric_name)} {actual:g} 低于设定阈值 {boundary:g}"
                     )
             except (TypeError, ValueError):
                 continue
@@ -6728,11 +6737,45 @@ def _merge_detail_metrics_into_promotion_row(
     return row
 
 
-def _selection_filter_signature(settings: Dict[str, Any]) -> str:
+def _commission_rate_upper_bound(settings: Dict[str, Any]) -> Optional[float]:
+    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    raw = settings.get("_platformCommissionRateUpperBound", thresholds.get("commissionRate"))
+    if raw is None or raw == "":
+        return None
+    try:
+        bound = float(raw)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("佣金率上限须为 0–100 之间的百分数") from error
+    if not 0 <= bound <= 100:
+        raise RuntimeError("佣金率上限须为 0–100 之间的百分数")
+    return bound
+
+
+def _effective_selection_filters(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """数字上限决定平台佣金档位，旧手选档位不得覆盖账号当前设置。"""
     filters = copy.deepcopy(settings.get("filters") if isinstance(settings.get("filters"), dict) else {})
+    for group in ("delivery", "product"):
+        values = filters.get(group)
+        if isinstance(values, dict):
+            values.pop("佣金区间", None)
+    bound = _commission_rate_upper_bound(settings)
+    # 当前百应佣金档位为单选。只有 0–10 档覆盖全部目标范围；
+    # 其他上限保留平台不限，再以列表和精确详情中的实际佣金率核验。
+    if bound is not None and bound <= 10:
+        product_filters = filters.get("product")
+        if not isinstance(product_filters, dict):
+            product_filters = {}
+            filters["product"] = product_filters
+        product_filters["佣金区间"] = "0%-10%"
+    return filters
+
+
+def _selection_filter_signature(settings: Dict[str, Any]) -> str:
+    filters = _effective_selection_filters(settings)
     desired_settings = {
         "categorySelection": settings.get("categorySelection", {}),
         "filters": filters,
+        "commissionRateUpperBound": _commission_rate_upper_bound(settings),
         "searchKeyword": str(settings.get("searchKeyword") or "").strip(),
     }
     return json.dumps(desired_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -7035,10 +7078,14 @@ def _can_reuse_applied_non_category_filters(applied_signature: str, settings: Di
     if not isinstance(applied, dict):
         return False
     applied_filters = applied.get("filters") if isinstance(applied.get("filters"), dict) else {}
-    current_filters = settings.get("filters") if isinstance(settings.get("filters"), dict) else {}
+    current_filters = _effective_selection_filters(settings)
     applied_keyword = str(applied.get("searchKeyword") or "").strip()
     current_keyword = _configured_search_keyword(settings)
-    return applied_filters == current_filters and applied_keyword == current_keyword
+    return (
+        applied_filters == current_filters
+        and applied.get("commissionRateUpperBound") == _commission_rate_upper_bound(settings)
+        and applied_keyword == current_keyword
+    )
 
 
 def _candidate_result(
@@ -8119,6 +8166,8 @@ def _collect_selection_square_rows(
     observed_rows = 0
     for index, query in enumerate(queries, start=1):
         query_settings = copy.deepcopy(query)
+        # 三源采集先保留原始候选，实际指标稍后统一核验；平台佣金档位仍须按账号上限选择。
+        query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
         query_settings["thresholds"] = {}
         query_settings["_unifiedSourceCollection"] = True
         query_settings["_candidatePoolLimit"] = 200
@@ -9817,7 +9866,7 @@ def apply_filter_settings(
     preserve_other_filters: bool = False,
     replace_category_selection: bool = False,
 ) -> list[str]:
-    values = settings.get("filters") if isinstance(settings.get("filters"), dict) else {}
+    values = _effective_selection_filters(settings)
     warnings: list[str] = []
     group_values: Dict[str, Any] = {}
     for value in values.values() if isinstance(values, dict) else []:
@@ -9881,7 +9930,16 @@ def apply_filter_settings(
         if not selected:
             continue
         cached_options = catalog.get(label) if isinstance(catalog, dict) else None
-        _apply_configured_filter_field(page, label, selected, cached_options, warnings)
+        if label == "佣金区间":
+            try:
+                _apply_configured_filter_field(page, label, selected, cached_options, warnings)
+            except Exception as error:
+                if _selection_error_requires_pause(error):
+                    raise
+                warnings.append(f"百应佣金区间未能应用；继续按商品实际佣金率上限筛选：{_safe_diagnostic_text(error, 180)}")
+                continue
+        else:
+            _apply_configured_filter_field(page, label, selected, cached_options, warnings)
         page.wait_for_timeout(80)
     if feature_catalog:
         states = page.evaluate("""(labels) => {
@@ -11828,13 +11886,18 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
         actual = _number(data.get(metric))
         label = metric_labels.get(metric, metric)
         try:
-            minimum = float(threshold)
+            boundary = float(threshold)
         except (TypeError, ValueError):
             continue
         if actual is None:
-            reasons.append(f"缺少{label}实测数据，无法核验阈值 {minimum:g}")
-        elif actual < minimum:
-            reasons.append(f"{label} {actual:g} 低于设定阈值 {minimum:g}")
+            reasons.append(f"缺少{label}实测数据，无法核验{'上限' if metric == 'commissionRate' else '阈值'} {boundary:g}")
+        elif metric == "commissionRate":
+            if not math.isfinite(actual) or not 0 <= actual <= 100:
+                reasons.append("佣金率数据超出 0–100%，无法核验设定上限")
+            elif actual > boundary:
+                reasons.append(f"佣金率 {actual:g} 超过设定上限 {boundary:g}")
+        elif actual < boundary:
+            reasons.append(f"{label} {actual:g} 低于设定阈值 {boundary:g}")
     candidate["thresholdReasons"] = reasons
     candidate["eligible"] = not reasons
     return reasons
@@ -13789,6 +13852,7 @@ def _execute_visible_source_candidates(
                                          and any(row["sourceCategorySelection"].get(level) for level in ("level1", "level2", "level3"))), None)
                 if isinstance(source_selection, dict):
                     query_settings["categorySelection"] = source_selection
+                query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
                 query_settings["thresholds"] = {}
                 query_settings["_candidatePoolLimit"] = 200
                 query_settings["candidateLimit"] = 200

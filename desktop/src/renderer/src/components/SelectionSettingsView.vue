@@ -1442,8 +1442,11 @@ async function loadGlobal(): Promise<void> {
     level1: [...(excludedCat.level1 ?? [])], level2: [...(excludedCat.level2 ?? [])], level3: [...(excludedCat.level3 ?? [])]
   }
   const savedProductFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.product ?? {}) }
+  const savedDeliveryFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.delivery ?? {}) }
+  delete savedDeliveryFilters['佣金区间']
+  delete savedProductFilters['佣金区间']
   global.filters = {
-    delivery: { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.delivery ?? {}) },
+    delivery: savedDeliveryFilters,
     product: savedProductFilters,
     features: Array.isArray((settings.filters as Record<string, unknown> | undefined)?.features)
       ? [...((settings.filters as Record<string, unknown[]>).features as string[])]
@@ -1765,7 +1768,7 @@ async function saveGlobal(): Promise<void> {
     if (global.selectionMode === 'category' && global.categoryMode === 'manual' && !hasSelectedCategory(global.categorySelection)) {
       throw new Error('已选择手动选类目，请至少勾选一个类目；或切回自动推荐。')
     }
-    validateCommissionRateThreshold(global.thresholds.commissionRate, '通用设置')
+    validateCommissionRateUpperBound(global.thresholds.commissionRate, '通用设置')
     validateExperienceScoreThreshold(global.thresholds.experienceScore, '通用设置')
     for (const [label, value] of Object.entries({
       '每品视频上限': global.quota.perProductVideos,
@@ -1800,10 +1803,10 @@ function appendOptionalMallTitleBannedWords(): void {
   notice.value = `已将 ${additions.length} 个候选词加入编辑框；点击「保存通用设置」后生效。`
 }
 
-function validateCommissionRateThreshold(value: number | null | undefined, scope: string): void {
+function validateCommissionRateUpperBound(value: number | null | undefined, scope: string): void {
   if (value === null || value === undefined) return
   if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) {
-    throw new Error(`${scope}佣金率阈值须为 0–100 之间的百分数。`)
+    throw new Error(`${scope}佣金率上限须为 0–100 之间的百分数。`)
   }
 }
 
@@ -1942,7 +1945,7 @@ async function saveAccount(): Promise<boolean> {
       throw new Error('账号候选上限须为 1–10 的整数。')
     }
     if (accountFilterOverridesEnabled.value) {
-      validateCommissionRateThreshold(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
+      validateCommissionRateUpperBound(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
       validateExperienceScoreThreshold(accountFilterDraft.value.thresholds.experienceScore, '账号个性化')
     }
     if (accountDraft.dailyQuotaOverride.enabled && (
@@ -2595,7 +2598,7 @@ async function prepareAccountRunContext(
   if (filterOverrides && typeof filterOverrides === 'object' && !Array.isArray(filterOverrides)) {
     Object.assign(settings, createSelectionFilterSettings(filterOverrides, createSelectionFilterSettings(globalSnapshot)))
   }
-  validateCommissionRateThreshold(
+  validateCommissionRateUpperBound(
     ((settings.thresholds ?? {}) as Record<string, number | null>).commissionRate,
     '账号运行设置'
   )
