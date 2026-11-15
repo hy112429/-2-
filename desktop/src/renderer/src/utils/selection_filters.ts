@@ -71,7 +71,11 @@ export function createSelectionFilterSettings(
   const fallbackThresholds = fallback.thresholds
   const fallbackSources = fallback.sources
   const candidateLimit = Number(source.candidateLimit)
+  const deliveryFilters = normalizeFilterGroup(sourceFilters.delivery, fallbackFilters.delivery)
   const productFilters = normalizeFilterGroup(sourceFilters.product, fallbackFilters.product)
+  // 数字佣金上限是唯一设置入口；旧版手选的百应档位不能继续覆盖它。
+  delete deliveryFilters['佣金区间']
+  delete productFilters['佣金区间']
   const sourceSources = asRecord(source.sources)
   const sourcePriority = Array.isArray(sourceSources.priority)
     ? sourceSources.priority.map(String).filter((item): item is 'hotSpot' | 'allianceRank' => item === 'hotSpot' || item === 'allianceRank')
@@ -83,7 +87,7 @@ export function createSelectionFilterSettings(
   return {
     candidateLimit: Number.isFinite(candidateLimit) ? candidateLimit : fallback.candidateLimit,
     filters: {
-      delivery: normalizeFilterGroup(sourceFilters.delivery, fallbackFilters.delivery),
+      delivery: deliveryFilters,
       product: productFilters,
       features: normalizeFeatures(sourceFilters.features, fallbackFilters.features)
     },

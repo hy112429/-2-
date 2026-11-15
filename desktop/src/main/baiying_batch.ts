@@ -581,6 +581,7 @@ export async function waitForCartVideoDownload(accountId: number, productId: str
 export async function retryCartVideoDownload(accountId: number, productId: string, additionalUnique = 0): Promise<void> {
   await waitForCartVideoDownload(accountId, productId)
   const owner = await resolvePromotionOwner(productId, await loadBaiyingCaptureAccounts())
+  if (!owner) throw new Error('发布商品缺少可核验的选品账号，已停止补下载')
   if (owner.account.id !== accountId) throw new Error('商品选品账号与发布账号不一致，已停止补下载')
   const current = await cartState('get', accountId, productId)
   const job = current['job'] as { uniqueCount?: number } | null

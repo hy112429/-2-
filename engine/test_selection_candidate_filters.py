@@ -39,7 +39,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
             "poolPriority": [],
             "poolFallback": True,
             "sources": {"hotSpotEnabled": True, "allianceRankEnabled": True, "priority": ["hotSpot", "allianceRank"]},
-            "thresholds": {"commissionRate": 20, "experienceScore": 4.5},
+            "thresholds": {"commissionRate": 10, "experienceScore": 4.5},
             "trendPreference": "不限走势",
             "categoryTree": [],
         }
@@ -48,9 +48,9 @@ class SelectionCandidateFilterTests(unittest.TestCase):
 
     def test_three_sources_share_exclusion_and_thresholds(self):
         rows = {
-            "hotSpot": [promotion_row("hot-good", ("root", "beauty", "ok-leaf"), 25, 4.8)],
-            "allianceRank": [promotion_row("rank-bad", ("root", "beauty", "ok-leaf"), 10, 4.8)],
-            "selectionSquare": [promotion_row("square-blocked", ("root", "other", "blocked-leaf"), 30, 4.9)],
+            "hotSpot": [promotion_row("hot-good", ("root", "beauty", "ok-leaf"), 10, 4.8)],
+            "allianceRank": [promotion_row("rank-bad", ("root", "beauty", "ok-leaf"), 25, 4.8)],
+            "selectionSquare": [promotion_row("square-blocked", ("root", "other", "blocked-leaf"), 10, 4.9)],
         }
         membership = {key: {row["product_id"] for row in values} for key, values in rows.items()}
         result = browser_cdp._visible_source_candidate_result(
@@ -66,7 +66,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual([item["productId"] for item in result["candidates"]], ["hot-good"])
         rejected = {item["productId"]: item for item in result["rejectedCandidates"]}
         self.assertIn("rank-bad", rejected)
-        self.assertIn("佣金率 10 低于设定阈值 20", rejected["rank-bad"]["thresholdReasons"])
+        self.assertIn("佣金率 25 超过设定上限 10", rejected["rank-bad"]["thresholdReasons"])
         self.assertIn("square-blocked", rejected)
         self.assertIn("命中当前设置中排除的类目", rejected["square-blocked"]["thresholdReasons"])
 
@@ -88,7 +88,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
             )
         self.assertEqual(result["candidates"], [])
         reasons = result["rejectedCandidates"][0]["thresholdReasons"]
-        self.assertIn("缺少佣金率实测数据，无法核验阈值 20", reasons)
+        self.assertIn("缺少佣金率实测数据，无法核验上限 10", reasons)
         self.assertIn("缺少体验分实测数据，无法核验阈值 4.5", reasons)
 
     def test_detail_metrics_are_written_back_to_common_candidate_shape(self):

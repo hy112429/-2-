@@ -6528,17 +6528,26 @@ def _candidate_rows(
             if actual is None:
                 pending_thresholds.append(metric_name)
                 try:
-                    minimum = float(threshold)
+                    boundary = float(threshold)
                 except (TypeError, ValueError):
                     continue
                 known_rejection_reasons.append(
-                    f"缺少{metric_labels.get(metric_name, metric_name)}实测数据，无法核验阈值 {minimum:g}"
+                    f"缺少{metric_labels.get(metric_name, metric_name)}实测数据，无法核验"
+                    f"{'上限' if metric_name == 'commissionRate' else '阈值'} {boundary:g}"
                 )
                 continue
             try:
-                if actual < float(threshold):
+                boundary = float(threshold)
+                if metric_name == "commissionRate":
+                    if not math.isfinite(actual) or not 0 <= actual <= 100:
+                        known_rejection_reasons.append("佣金率数据超出 0–100%，无法核验设定上限")
+                    elif actual > boundary:
+                        known_rejection_reasons.append(
+                            f"佣金率 {actual:g} 超过设定上限 {boundary:g}"
+                        )
+                elif actual < boundary:
                     known_rejection_reasons.append(
-                        f"{metric_labels.get(metric_name, metric_name)} {actual:g} 低于设定阈值 {float(threshold):g}"
+                        f"{metric_labels.get(metric_name, metric_name)} {actual:g} 低于设定阈值 {boundary:g}"
                     )
             except (TypeError, ValueError):
                 continue
@@ -6737,11 +6746,45 @@ def _merge_detail_metrics_into_promotion_row(
     return row
 
 
-def _selection_filter_signature(settings: Dict[str, Any]) -> str:
+def _commission_rate_upper_bound(settings: Dict[str, Any]) -> Optional[float]:
+    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    raw = settings.get("_platformCommissionRateUpperBound", thresholds.get("commissionRate"))
+    if raw is None or raw == "":
+        return None
+    try:
+        bound = float(raw)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("佣金率上限须为 0–100 之间的百分数") from error
+    if not 0 <= bound <= 100:
+        raise RuntimeError("佣金率上限须为 0–100 之间的百分数")
+    return bound
+
+
+def _effective_selection_filters(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """数字上限决定平台佣金档位，旧手选档位不得覆盖账号当前设置。"""
     filters = copy.deepcopy(settings.get("filters") if isinstance(settings.get("filters"), dict) else {})
+    for group in ("delivery", "product"):
+        values = filters.get(group)
+        if isinstance(values, dict):
+            values.pop("佣金区间", None)
+    bound = _commission_rate_upper_bound(settings)
+    # 当前百应佣金档位为单选。只有 0–10 档覆盖全部目标范围；
+    # 其他上限保留平台不限，再以列表和精确详情中的实际佣金率核验。
+    if bound is not None and bound <= 10:
+        product_filters = filters.get("product")
+        if not isinstance(product_filters, dict):
+            product_filters = {}
+            filters["product"] = product_filters
+        product_filters["佣金区间"] = "0%-10%"
+    return filters
+
+
+def _selection_filter_signature(settings: Dict[str, Any]) -> str:
+    filters = _effective_selection_filters(settings)
     desired_settings = {
         "categorySelection": settings.get("categorySelection", {}),
         "filters": filters,
+        "commissionRateUpperBound": _commission_rate_upper_bound(settings),
         "searchKeyword": str(settings.get("searchKeyword") or "").strip(),
     }
     return json.dumps(desired_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -7044,10 +7087,14 @@ def _can_reuse_applied_non_category_filters(applied_signature: str, settings: Di
     if not isinstance(applied, dict):
         return False
     applied_filters = applied.get("filters") if isinstance(applied.get("filters"), dict) else {}
-    current_filters = settings.get("filters") if isinstance(settings.get("filters"), dict) else {}
+    current_filters = _effective_selection_filters(settings)
     applied_keyword = str(applied.get("searchKeyword") or "").strip()
     current_keyword = _configured_search_keyword(settings)
-    return applied_filters == current_filters and applied_keyword == current_keyword
+    return (
+        applied_filters == current_filters
+        and applied.get("commissionRateUpperBound") == _commission_rate_upper_bound(settings)
+        and applied_keyword == current_keyword
+    )
 
 
 def _candidate_result(
@@ -7154,7 +7201,7 @@ def _save_priority_source_dom_evidence(
     snapshot: Dict[str, Any],
     readiness_reached: bool,
 ) -> Dict[str, Any]:
-    """候选未识别或候选类目字段缺失时，保存脱敏 DOM 与识别信息。"""
+    """候选未识别时保存页面结构证据；类目缺失改用字段级诊断。"""
     diagnostic_id = f"priority-source-{source_key}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns() % 1_000_000_000:09d}"
     root = Path(os.environ.get("TOUGUANG_DATA_DIR", r"D:\software\投广客户端\data"))
     evidence_dir = root / "diagnostics" / "selection" / "priority-sources"
@@ -7525,26 +7572,29 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                     const found = {};
                     const seen = new WeakSet();
                     let visited = 0;
-                    const walk = (node, path, depth) => {
+                    const scalarId = (value) => {
+                      if (typeof value !== 'string' && typeof value !== 'number') return '';
+                      const text = String(value).trim();
+                      return /^\d+(?:__RC_CASCADER_SPLIT__\d+)*$/.test(text) ? text : '';
+                    };
+                    const walk = (node, path, depth, categoryScope) => {
                       if (!node || typeof node !== 'object' || depth > 6 || visited >= 500 || seen.has(node)) return;
                       seen.add(node);
                       visited += 1;
                       if (Array.isArray(node)) {
-                        node.slice(0, 12).forEach((child, index) => walk(child, `${path}[${index}]`, depth + 1));
+                        node.slice(0, 12).forEach((child, index) => walk(child, `${path}[${index}]`, depth + 1, categoryScope));
                         return;
                       }
                       for (const [key, child] of Object.entries(node)) {
                         if (Object.keys(found).length >= 24) break;
                         const nextPath = path ? `${path}.${key}` : key;
-                        if (/(category|cate)/i.test(key)) {
-                          const safeValue = safeJson(child);
-                          const encoded = JSON.stringify(safeValue);
-                          found[nextPath] = encoded && encoded.length > 800 ? `${encoded.slice(0, 800)}…` : safeValue;
-                        }
-                        if (child && typeof child === 'object') walk(child, nextPath, depth + 1);
+                        const inCategory = categoryScope || /(category|cate)/i.test(key);
+                        const numericId = inCategory ? scalarId(child) : '';
+                        if (numericId) found[nextPath] = numericId;
+                        if (child && typeof child === 'object') walk(child, nextPath, depth + 1, inCategory);
                       }
                     };
-                    walk(root, '', 0);
+                    walk(root, '', 0, false);
                     return found;
                   };
                   const category = productInfo.category && typeof productInfo.category === 'object'
@@ -7557,7 +7607,6 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                     categoryFieldSamples.push({
                       productId: id,
                       productInfoKeys: Object.keys(productInfo).slice(0, 60),
-                      category: safeJson(category),
                       categoryLikeFields: collectCategoryFields(value)
                     });
                   }
@@ -7767,12 +7816,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                 "实际等待毫秒": readiness_wait_ms,
             }
             if product_rows and complete_category_path_count == 0:
-                category_evidence = _save_priority_source_dom_evidence(
-                    source_key, source_page, snapshot, readiness_reached
-                )
-                recognized_detail["类目缺失DOM证据JSON"] = category_evidence.get("jsonPath", "未能保存")
-                recognized_detail["类目缺失DOM证据HTML"] = category_evidence.get("htmlPath", "未能保存")
-                recognized_detail["类目缺失诊断ID"] = category_evidence.get("diagnosticId", "")
+                recognized_detail["类目缺失诊断"] = "仅记录数值类目字段样例；详情来源诊断写入类目补读报告"
             return ids, product_rows, {
                 "candidateNodeCount": int(snapshot.get("visibleProductNodeCount", 0) or 0),
                 "productNodeCount": int(snapshot.get("visibleProductNodeCount", 0) or 0),
@@ -8203,6 +8247,8 @@ def _collect_selection_square_rows(
     page_fingerprints: list[str] = []
     for index, query in enumerate(queries, start=1):
         query_settings = copy.deepcopy(query)
+        # 三源采集先保留原始候选，实际指标稍后统一核验；平台佣金档位仍须按账号上限选择。
+        query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
         query_settings["thresholds"] = {}
         query_settings["_unifiedSourceCollection"] = True
         query_settings["_candidatePoolLimit"] = 200
@@ -8335,6 +8381,95 @@ def _save_category_enrichment_report(report: Dict[str, Any]) -> str:
         return str(report["reportPath"])
 
 
+def _probe_source_card_category(
+    page: Page,
+    source_key: str,
+    row: Dict[str, Any],
+    category_tree: Sequence[Any],
+) -> Dict[str, Any]:
+    """在原账号内只读点击精确商品卡；只返回脱敏诊断，不持久化详情响应。"""
+    product_id = str(row.get("product_id") or "").strip()
+    base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+    info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+    title = str(info.get("name") or row.get("title") or row.get("product_name") or "").strip()
+    diagnostic: Dict[str, Any] = {
+        "sourceKey": source_key, "productId": product_id,
+        "entryKind": "source_card", "entryPath": "", "responses": [],
+        "finalPagePaths": [], "status": "entry_unavailable", "categoryIds": [],
+    }
+    if not product_id or not title:
+        diagnostic["reason"] = "来源行缺少可核对的商品 ID 或标题"
+        return diagnostic
+    source_page: Optional[Page] = None
+    try:
+        if source_key == "selectionSquare":
+            source_page = page
+        else:
+            browser = page.context.browser
+            if browser is None:
+                diagnostic["reason"] = "账号浏览器连接不可用"
+                return diagnostic
+            source_page = _create_background_page(page.context, browser)
+            source_page.goto(BAIYING_PRIORITY_SOURCES[source_key][1], wait_until="commit", timeout=20_000)
+        diagnostic["entryPath"] = _detail_diagnostic_path(source_page.url)
+        prompt_kind, _ = _visible_baiying_prompt(source_page)
+        if prompt_kind in {"manual_verification", "login", "account_unavailable"}:
+            raise RuntimeError(f"百应来源页账号状态异常：{prompt_kind}")
+        candidate = {"productId": product_id, "title": title, "sourceKey": source_key}
+        if source_key != "selectionSquare" and not _ensure_priority_source_candidate_visible(
+            source_page, source_key, candidate, timeout_ms=8_000
+        ):
+            diagnostic["reason"] = "来源商品卡未在有限滚动窗口内按精确 ID 定位"
+            return diagnostic
+        payload, error = _capture_candidate_detail(
+            source_page, page.context, candidate, None, None,
+            diagnostics=diagnostic, timeout_seconds=12,
+        )
+        matched_payloads = diagnostic.pop("_matchedPayloads", [])
+        category_ids: list[str] = []
+        category_error = ""
+        for matched_payload in [payload, *matched_payloads]:
+            if not isinstance(matched_payload, dict):
+                continue
+            found_ids, found_error = _detail_category_path(matched_payload, product_id, category_tree)
+            if not category_error:
+                category_error = found_error
+            if len(found_ids) >= 3:
+                category_ids = found_ids
+                break
+        if payload is None and not matched_payloads:
+            diagnostic["reason"] = "商品卡详情未取得精确 ID 响应：" + _safe_diagnostic_text(error, 180)
+            return diagnostic
+        diagnostic["exactResponseSeen"] = True
+        diagnostic["categoryIds"] = category_ids
+        if len(category_ids) >= 3:
+            diagnostic["status"] = "category_from_source_card"
+        elif any(item.get("categoryFieldSamples") for item in diagnostic["responses"]):
+            diagnostic["status"] = "category_field_unresolved"
+            diagnostic["reason"] = category_error
+        else:
+            diagnostic["status"] = "matched_response_without_category"
+            diagnostic["reason"] = category_error
+        return diagnostic
+    except Exception as error:
+        message = str(error).casefold()
+        if any(marker in message for marker in (
+            "登录", "验证码", "安全验证", "风控", "限流", "11001",
+            "account_unavailable", "manual_verification", "target closed",
+            "browser has been closed", "context has been closed", "browser disconnected", "websocket", "cdp",
+        )):
+            raise
+        diagnostic["reason"] = f"商品卡只读核验失败：{type(error).__name__}"
+        return diagnostic
+    finally:
+        diagnostic.pop("_matchedPayloads", None)
+        if source_page is not None and source_page is not page:
+            try:
+                source_page.close()
+            except Exception:
+                pass
+
+
 def _visible_source_candidate_result(
     page: Page,
     source_candidates: Dict[str, list[Dict[str, Any]]],
@@ -8400,6 +8535,127 @@ def _visible_source_candidate_result(
     category_results: Dict[str, Dict[str, Any]] = {}
     category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
     category_logic_enabled = settings.get("selectionMode") == "category"
+    source_probes: Dict[str, Dict[str, Any]] = {}
+    sampled_enrichments: Dict[str, Dict[str, Any]] = {}
+    source_category_unavailable: set[str] = set()
+    if category_gate_enabled:
+        raw_ids_to_check = {str(row.get("product_id") or "").strip() for row in raw_rows}
+        for source_key in [*source_order, "selectionSquare"]:
+            source_rows = selection_square_rows if source_key == "selectionSquare" else source_candidates.get(source_key, [])
+            sample_rows = [
+                source_row for source_row in source_rows
+                if str(source_row.get("product_id") or "").strip() in raw_ids_to_check
+                and len(_promotion_row_category_ids(source_row)) < 3
+            ][:3]
+            source_probe: Dict[str, Any] = {
+                "sourceKey": source_key, "label": source_labels[source_key],
+                "sampleLimit": 3, "samples": [], "exactMissingCount": 0,
+                "status": "not_needed" if not sample_rows else "sampling",
+            }
+            for sample_row in sample_rows:
+                sample_id = str(sample_row.get("product_id") or "").strip()
+                card_probe = _probe_source_card_category(page, source_key, sample_row, category_tree)
+                category_ids = card_probe.get("categoryIds", [])
+                direct_result: Dict[str, Any] = {}
+                if len(category_ids) < 3:
+                    direct_result = _read_candidate_category_from_detail(
+                        page.context, sample_row, sample_id, category_tree
+                    )
+                    if direct_result.get("fatal"):
+                        raise RuntimeError(str(direct_result.get("reason") or "百应详情账号状态异常"))
+                    if len(direct_result.get("categoryIds", [])) >= 3:
+                        category_ids = direct_result["categoryIds"]
+                direct_diagnostics = direct_result.get("diagnostics") if isinstance(direct_result.get("diagnostics"), dict) else {}
+                exact_response_seen = bool(card_probe.get("exactResponseSeen")) or bool(
+                    direct_diagnostics.get("verifiedResponseCount")
+                )
+                sample_status = (
+                    "category_from_source_card" if card_probe.get("status") == "category_from_source_card"
+                    else "category_from_direct_route" if len(category_ids) >= 3
+                    else "category_field_unresolved" if card_probe.get("status") == "category_field_unresolved"
+                    or direct_diagnostics.get("verifiedCategoryFieldSamples")
+                    else "matched_response_without_category" if exact_response_seen
+                    else "detail_entry_unavailable"
+                )
+                sample_diagnostic = {
+                    "productId": sample_id, "status": sample_status,
+                    "categoryIds": category_ids,
+                    "card": card_probe, "direct": direct_diagnostics,
+                }
+                source_probe["samples"].append(sample_diagnostic)
+                if sample_status == "matched_response_without_category":
+                    source_probe["exactMissingCount"] += 1
+                if len(category_ids) >= 3:
+                    sampled_enrichments[sample_id] = {
+                        "productId": sample_id, "categoryIds": category_ids,
+                        "reason": "", "diagnostics": {"sourceProbe": sample_diagnostic},
+                    }
+                    source_probe["status"] = "category_available"
+                    break
+                if sample_id not in sampled_enrichments:
+                    sampled_enrichments[sample_id] = {
+                        "productId": sample_id, "categoryIds": [],
+                        "reason": str(direct_result.get("reason") or card_probe.get("reason") or "详情类目未知"),
+                        "diagnostics": {"sourceProbe": sample_diagnostic},
+                    }
+            if source_probe["status"] == "sampling":
+                sample_statuses = [item["status"] for item in source_probe["samples"]]
+                if len(sample_statuses) == 3 and len(set(sample_statuses)) == 1 and sample_statuses[0] in {
+                    "matched_response_without_category", "category_field_unresolved", "detail_entry_unavailable",
+                }:
+                    source_probe["status"] = {
+                        "matched_response_without_category": "category_data_unavailable",
+                        "category_field_unresolved": "category_field_unresolved",
+                        "detail_entry_unavailable": "detail_entry_unavailable",
+                    }[sample_statuses[0]]
+                    source_category_unavailable.add(source_key)
+                    warnings.append(
+                        f"{source_labels[source_key]}连续 3 件商品的详情诊断均为 {source_probe['status']}；"
+                        "本轮停止重复探测该来源，保留缺额待重试"
+                    )
+                else:
+                    source_probe["status"] = "entry_or_category_unresolved"
+            source_probes[source_key] = source_probe
+            for source_result in source_results:
+                if source_result.get("sourceKey") == source_key:
+                    source_result["categoryProbeStatus"] = source_probe["status"]
+                    source_result["categoryProbeCount"] = len(source_probe["samples"])
+                    break
+        category_enrichment["sourceProbes"] = source_probes
+        category_enrichment["categoryUnavailableSources"] = sorted(source_category_unavailable)
+
+    def read_verified_detail(row: Dict[str, Any], product_id: str) -> Dict[str, Any]:
+        sampled = sampled_enrichments.get(product_id)
+        if sampled and len(sampled.get("categoryIds", [])) >= 3:
+            return sampled
+        product_sources = sources_by_id.get(product_id, [])
+        if product_sources and all(key in source_category_unavailable for key in product_sources):
+            return {
+                "productId": product_id, "categoryIds": [],
+                "reason": "已尝试来源的详情入口或类目字段连续抽样后仍无法核实；保留缺额待重试",
+                "diagnostics": {
+                    "sourceCategoryUnavailable": product_sources,
+                    **(sampled.get("diagnostics", {}) if sampled else {}),
+                },
+            }
+        if sampled and len(product_sources) == 1:
+            return sampled
+        last_result: Optional[Dict[str, Any]] = sampled
+        for source_key in product_sources:
+            if source_key in source_category_unavailable:
+                continue
+            source_rows = selection_square_rows if source_key == "selectionSquare" else source_candidates.get(source_key, [])
+            source_row = next((
+                item for item in source_rows
+                if str(item.get("product_id") or "").strip() == product_id
+            ), None)
+            if source_row is not None:
+                result = _read_candidate_category_from_detail(page.context, source_row, product_id, category_tree)
+                if result.get("fatal") or len(result.get("categoryIds", [])) >= 3:
+                    return result
+                last_result = result
+        return last_result or _read_candidate_category_from_detail(page.context, row, product_id, category_tree)
+
     fatal_category_error = ""
     for index, row in enumerate(raw_rows, start=1):
         product_id = str(row.get("product_id") or "").strip()
@@ -8420,9 +8676,7 @@ def _visible_source_candidate_result(
         ]
         needs_category_detail = category_gate_enabled and len(listed_category_ids) < 3
         if needs_category_detail or missing_metrics:
-            enrichment = _read_candidate_category_from_detail(
-                page.context, row, product_id, category_tree
-            )
+            enrichment = read_verified_detail(row, product_id)
             category_ids_from_detail = [str(value).strip() for value in enrichment.get("categoryIds", []) if str(value).strip()]
             if len(category_ids_from_detail) >= 3:
                 source_category = {
@@ -8475,9 +8729,7 @@ def _visible_source_candidate_result(
                         "reason": "来源商品行已提供完整三级类目 ID",
                     }
                 else:
-                    enrichment = _read_candidate_category_from_detail(
-                        page.context, row, product_id, category_tree
-                    )
+                    enrichment = read_verified_detail(row, product_id)
             if enrichment.get("fatal"):
                 fatal_category_error = str(enrichment.get("reason") or "详情页安全状态异常，已停止后续读取")
         category_results[product_id] = enrichment
@@ -8657,6 +8909,12 @@ def _visible_source_candidate_result(
         enrichment_summary = (
             f"类目详情补充统计：候选总数 {category_enrichment['candidateCount']} → "
             f"成功补到类目 {category_enrichment['successCount']}，类目未知 {category_enrichment['failureCount']}。"
+            + (
+                "类目数据不可用来源："
+                + "、".join(source_labels[key] for key in sorted(source_category_unavailable))
+                + "；具体区分入口不可用、字段待解析和响应无类目见来源诊断；本轮不再反复打开这些来源的同类详情，缺额保留待重试。"
+                if source_category_unavailable else ""
+            )
             + (f"未知类目明细：{failure_summary}。" if failure_summary else "")
             + f"推荐依据：{recommendation_summary}。"
         )
@@ -9719,7 +9977,7 @@ def apply_filter_settings(
     preserve_other_filters: bool = False,
     replace_category_selection: bool = False,
 ) -> list[str]:
-    values = settings.get("filters") if isinstance(settings.get("filters"), dict) else {}
+    values = _effective_selection_filters(settings)
     warnings: list[str] = []
     group_values: Dict[str, Any] = {}
     for value in values.values() if isinstance(values, dict) else []:
@@ -9783,7 +10041,16 @@ def apply_filter_settings(
         if not selected:
             continue
         cached_options = catalog.get(label) if isinstance(catalog, dict) else None
-        _apply_configured_filter_field(page, label, selected, cached_options, warnings)
+        if label == "佣金区间":
+            try:
+                _apply_configured_filter_field(page, label, selected, cached_options, warnings)
+            except Exception as error:
+                if _selection_error_requires_pause(error):
+                    raise
+                warnings.append(f"百应佣金区间未能应用；继续按商品实际佣金率上限筛选：{_safe_diagnostic_text(error, 180)}")
+                continue
+        else:
+            _apply_configured_filter_field(page, label, selected, cached_options, warnings)
         page.wait_for_timeout(80)
     if feature_catalog:
         states = page.evaluate("""(labels) => {
@@ -10523,6 +10790,32 @@ def _product_detail_url(product_id: str, *sources: Any) -> str:
     return f"https://haohuo.jinritemai.com/views/product/item2?id={quote(product_id)}"
 
 
+def _baiying_category_detail_url(product_id: str, row: Dict[str, Any]) -> str:
+    """复用百应商品决策页的已验证入口；推广 ID 缺失时不猜测。"""
+    commodity_id = str(row.get("promotion_id") or row.get("commodity_id") or "").strip()
+    if not re.fullmatch(r"\d{8,20}", product_id) or not re.fullmatch(r"\d{8,20}", commodity_id):
+        return ""
+    return (
+        "https://buyin.jinritemai.com/dashboard/merch-picking-library/merch-promoting"
+        f"?commodity_id={quote(commodity_id)}&id={quote(commodity_id)}&product_id={quote(product_id)}"
+        "&commodity_location=1&decision_enter_from=pc.selection_square.recommend_main"
+        "&only_query_params=1&universal_append=1"
+        "&pre_universal_page_params_id=87e0475e-4976-40dd-83c8-658b76d382de"
+    )
+
+
+def _category_detail_url_matches_product(parsed: Any, product_id: str, commodity_id: str = "") -> bool:
+    if getattr(parsed, "hostname", None) == "buyin.jinritemai.com":
+        query = parse_qs(str(getattr(parsed, "query", "") or ""))
+        return (
+            getattr(parsed, "path", "").rstrip("/") == "/dashboard/merch-picking-library/merch-promoting"
+            and query.get("product_id") == [product_id]
+            and ("commodity_id" not in query or query["commodity_id"] == [commodity_id])
+            and ("id" not in query or query["id"] == [commodity_id])
+        )
+    return getattr(parsed, "hostname", None) == "haohuo.jinritemai.com" and _url_matches_exact_product_id(parsed, product_id)
+
+
 def _detail_product_sources(payload: Any, expected_product_id: str) -> tuple[str, list[Dict[str, Any]], str]:
     """只从详情响应中提取与候选商品 ID 一致的数据节点。"""
     if not isinstance(payload, dict):
@@ -10983,6 +11276,8 @@ def _new_detail_category_diagnostics(detail_url: str) -> Dict[str, Any]:
         'detailApiResponseCount': 0,
         'detailApiRequestIdMatchCount': 0,
         'detailApiCategoryFieldSamples': [],
+        'verifiedResponseCount': 0,
+        'verifiedCategoryFieldSamples': [],
     }
 
 
@@ -11079,15 +11374,18 @@ def _read_candidate_category_from_detail(
     product_id = str(expected_product_id or '').strip()
     base = row.get('base_model') if isinstance(row.get('base_model'), dict) else {}
     product_info = base.get('product_info') if isinstance(base.get('product_info'), dict) else {}
-    detail_url = _product_detail_url(product_id, row, base, product_info)
+    baiying_detail_url = _baiying_category_detail_url(product_id, row)
+    detail_url = baiying_detail_url or _product_detail_url(product_id, row, base, product_info)
+    commodity_id = str(row.get("promotion_id") or row.get("commodity_id") or "").strip() if baiying_detail_url else ""
     diagnostics = _new_detail_category_diagnostics(detail_url)
+    diagnostics['entryKind'] = 'baiying_promotion' if baiying_detail_url else 'product_share'
     try:
         parsed_url = urlparse(detail_url)
     except ValueError:
         return {'productId': product_id, 'categoryIds': [], 'reason': 'DETAIL_URL_INVALID', 'diagnostics': diagnostics}
-    if parsed_url.scheme != 'https' or parsed_url.hostname != 'haohuo.jinritemai.com':
+    if parsed_url.scheme != 'https' or parsed_url.hostname not in {'haohuo.jinritemai.com', 'buyin.jinritemai.com'}:
         return {'productId': product_id, 'categoryIds': [], 'reason': 'DETAIL_URL_NOT_ALLOWED', 'diagnostics': diagnostics}
-    if not _url_matches_exact_product_id(parsed_url, product_id):
+    if not _category_detail_url_matches_product(parsed_url, product_id, commodity_id):
         return {'productId': product_id, 'categoryIds': [], 'reason': 'DETAIL_URL_PRODUCT_ID_MISMATCH', 'diagnostics': diagnostics}
 
     detail_page: Optional[Page] = None
@@ -11170,11 +11468,16 @@ def _read_candidate_category_from_detail(
             except Exception as error:
                 response_record['jsonParsed'] = False
                 response_record['jsonParseErrorType'] = type(error).__name__
-        if len(diagnostics['responses']) < 200:
-            diagnostics['responses'].append(response_record)
-        else:
-            diagnostics['responsesTruncated'] = True
+        relevant_response = is_category_detail_response or request_product_id_match or product_id in response_record['responseProductIds']
+        if relevant_response or len(diagnostics['responses']) < 8:
+            if len(diagnostics['responses']) < 30:
+                diagnostics['responses'].append(response_record)
+            else:
+                diagnostics['responsesTruncated'] = True
         if not is_category_detail_response:
+            return
+        if status is not None and not 200 <= status < 300:
+            response_errors.append(f'DETAIL_CATEGORY_HTTP_{status}')
             return
         if payload is None:
             response_errors.append('DETAIL_CATEGORY_JSON_UNREADABLE')
@@ -11188,16 +11491,27 @@ def _read_candidate_category_from_detail(
             response_errors.append('DETAIL_CATEGORY_ID_UNREADABLE')
             return
         if not identity_error and actual_id == product_id:
+            diagnostics['verifiedResponseCount'] += 1
+            field_samples = response_record.get('categoryFieldSamples', [])
+            if field_samples and not diagnostics['verifiedCategoryFieldSamples']:
+                diagnostics['verifiedCategoryFieldSamples'] = field_samples
             payloads.append((payload, False))
         elif is_product_detail_api and not actual_id:
-            # 本次证据确认该 200 JSON 来自商品详情页实际接口；页面最终 URL 会再次
-            # 与候选商品 ID 精确核对，之后才允许在完整响应树中读取类目字段。
-            payloads.append((payload, True))
+            # 请求带有目标 ID 不等于响应证明了商品身份；不从无 ID 的响应认定类目。
+            response_errors.append('DETAIL_CATEGORY_RESPONSE_PRODUCT_ID_MISSING')
         else:
             response_errors.append('DETAIL_CATEGORY_ID_MISMATCH_OR_MISSING')
 
     try:
-        detail_page = _tracked_new_page(context, "detail")
+        active_browser = context.browser
+        if active_browser is None:
+            diagnostics['navigationState'] = 'background_page_unavailable'
+            return {
+                'productId': product_id, 'categoryIds': [],
+                'reason': 'DETAIL_BACKGROUND_PAGE_UNAVAILABLE', 'fatal': True,
+                'diagnostics': diagnostics,
+            }
+        detail_page = _create_background_page(context, active_browser)
         detail_page.on('response', on_detail)
         diagnostics['navigationState'] = 'started'
         try:
@@ -11231,7 +11545,7 @@ def _read_candidate_category_from_detail(
                 'reason': "\u5bfc\u822a\u5931\u8d25 (\u6700\u7ec8\u9875\u9762\u4e0d\u5728\u5141\u8bb8\u57df\u540d)",
                 'diagnostics': diagnostics,
             }
-        if not _url_matches_exact_product_id(urlparse(detail_page.url), product_id):
+        if not _category_detail_url_matches_product(urlparse(detail_page.url), product_id, commodity_id):
             diagnostics['navigationState'] = 'redirected_to_unmatched_product'
             return {
                 'productId': product_id,
@@ -11301,7 +11615,9 @@ def _read_candidate_category_from_detail(
             )
             # 类目补核验同时为佣金、体验分和其他详情指标保留同一份已核对响应，
             # 后续统一筛选不得再次打开同一商品详情页。
-            _cache_detail_payload(context, product_id, payload)
+            actual_id, _, identity_error = _detail_product_sources(payload, product_id)
+            if actual_id == product_id and not identity_error:
+                _cache_detail_payload(context, product_id, payload)
             if category_ids:
                 return {
                     'productId': product_id,
@@ -11596,6 +11912,8 @@ def _capture_candidate_detail(
     candidate: Dict[str, Any],
     settings: Optional[Dict[str, Any]],
     progress: Optional[Callable[[Dict[str, Any]], None]],
+    diagnostics: Optional[Dict[str, Any]] = None,
+    timeout_seconds: int = DETAIL_ANALYSIS_TIMEOUT_SECONDS,
 ) -> tuple[Optional[Dict[str, Any]], str]:
     """在加车前只读打开候选商品详情，捕获 pack_detail 后恢复选品页。"""
     product_id = str(candidate.get("productId") or "").strip()
@@ -11664,10 +11982,47 @@ def _capture_candidate_detail(
             opened_pages.append(new_page)
 
     def on_detail(response: Any) -> None:
-        if "pack_detail" not in str(getattr(response, "url", "")):
+        is_pack_detail = "pack_detail" in str(getattr(response, "url", ""))
+        if not is_pack_detail and diagnostics is None:
             return
         try:
+            if not is_pack_detail:
+                request = getattr(response, "request", None)
+                resource_type = getattr(request, "resource_type", "")
+                if callable(resource_type):
+                    resource_type = resource_type()
+                if str(resource_type).casefold() not in {"xhr", "fetch"}:
+                    return
+                headers = getattr(response, "headers", {})
+                if callable(headers):
+                    headers = headers()
+                if not isinstance(headers, dict) or "json" not in str(headers.get("content-type", "")).casefold():
+                    return
+            status = getattr(response, "status", None)
+            if callable(status):
+                status = status()
             payload = response.json()
+            if diagnostics is not None:
+                response_ids = _detail_diagnostic_product_ids(payload)
+                if product_id in response_ids or _detail_request_matches_product(getattr(response, "request", None), product_id):
+                    if len(diagnostics["responses"]) < 30:
+                        diagnostics["responses"].append({
+                            "path": _detail_diagnostic_path(getattr(response, "url", "")),
+                            "status": status if isinstance(status, int) else None,
+                            "responseProductIds": response_ids,
+                            "categoryFieldSamples": _detail_diagnostic_category_fields(payload),
+                        })
+                    if isinstance(payload, dict) and (status is None or 200 <= status < 300):
+                        actual_id, _, identity_error = _detail_product_sources(payload, product_id)
+                        if actual_id == product_id and not identity_error:
+                            matched = diagnostics.setdefault("_matchedPayloads", [])
+                            if len(matched) < 8:
+                                matched.append(payload)
+            if not is_pack_detail:
+                return
+            if isinstance(status, int) and not 200 <= status < 300:
+                response_errors.append(f"详情响应 HTTP {status}")
+                return
             if isinstance(payload, dict):
                 response_product_id, _, identity_error = _detail_product_sources(payload, product_id)
                 if response_product_id == product_id and not identity_error:
@@ -11677,13 +12032,14 @@ def _capture_candidate_detail(
                         f"忽略了无法匹配当前商品的详情响应（商品 ID {response_product_id or '未提供'}；{identity_error}）"
                     )
         except Exception as error:
-            response_errors.append(f"详情响应解析失败：{type(error).__name__}")
+            if is_pack_detail:
+                response_errors.append(f"详情响应解析失败：{type(error).__name__}")
 
     context.on("page", on_page)
     context.on("response", on_detail)
     try:
         _click_candidate_detail_target(title_locator, detail_card, product_id, str(candidate.get("title") or ""))
-        deadline = time.time() + DETAIL_ANALYSIS_TIMEOUT_SECONDS
+        deadline = time.time() + timeout_seconds
         while time.time() < deadline and not detail_payloads:
             for detail_page in [page, *opened_pages]:
                 prompt_kind, prompt_text = _visible_baiying_prompt(detail_page)
@@ -11708,6 +12064,11 @@ def _capture_candidate_detail(
         else:
             response_errors.append(f"打开详情失败：{type(error).__name__}: {_safe_diagnostic_text(error, 300)}")
     finally:
+        if diagnostics is not None:
+            diagnostics["finalPagePaths"] = list(dict.fromkeys(
+                _detail_diagnostic_path(getattr(detail_page, "url", ""))
+                for detail_page in [page, *opened_pages]
+            ))[:5]
         try:
             context.remove_listener("page", on_page)
         except Exception:
@@ -11740,7 +12101,7 @@ def _capture_candidate_detail(
             ) from verify_error
         candidate["_detailClickSkipped"] = True
         reason = detail_click_skip_reason or "; ".join(response_errors) or (
-            f"打开商品详情后 {DETAIL_ANALYSIS_TIMEOUT_SECONDS} 秒内未捕获到与目标商品 ID 匹配的 pack_detail 响应"
+            f"打开商品详情后 {timeout_seconds} 秒内未捕获到与目标商品 ID 匹配的 pack_detail 响应"
         )
         candidate["_detailClickSkipReason"] = reason
         return None, reason + "；原列表商品 ID 已复核，未加车，已跳过此商品"
@@ -11898,13 +12259,18 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
         actual = _number(data.get(metric))
         label = metric_labels.get(metric, metric)
         try:
-            minimum = float(threshold)
+            boundary = float(threshold)
         except (TypeError, ValueError):
             continue
         if actual is None:
-            reasons.append(f"缺少{label}实测数据，无法核验阈值 {minimum:g}")
-        elif actual < minimum:
-            reasons.append(f"{label} {actual:g} 低于设定阈值 {minimum:g}")
+            reasons.append(f"缺少{label}实测数据，无法核验{'上限' if metric == 'commissionRate' else '阈值'} {boundary:g}")
+        elif metric == "commissionRate":
+            if not math.isfinite(actual) or not 0 <= actual <= 100:
+                reasons.append("佣金率数据超出 0–100%，无法核验设定上限")
+            elif actual > boundary:
+                reasons.append(f"佣金率 {actual:g} 超过设定上限 {boundary:g}")
+        elif actual < boundary:
+            reasons.append(f"{label} {actual:g} 低于设定阈值 {boundary:g}")
     candidate["thresholdReasons"] = reasons
     candidate["eligible"] = not reasons
     return reasons
@@ -13859,6 +14225,7 @@ def _execute_visible_source_candidates(
                                          and any(row["sourceCategorySelection"].get(level) for level in ("level1", "level2", "level3"))), None)
                 if isinstance(source_selection, dict):
                     query_settings["categorySelection"] = source_selection
+                query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
                 query_settings["thresholds"] = {}
                 query_settings["_candidatePoolLimit"] = 200
                 query_settings["candidateLimit"] = 200

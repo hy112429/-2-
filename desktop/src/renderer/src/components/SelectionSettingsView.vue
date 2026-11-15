@@ -1495,8 +1495,11 @@ async function loadGlobal(): Promise<void> {
     level1: [...(excludedCat.level1 ?? [])], level2: [...(excludedCat.level2 ?? [])], level3: [...(excludedCat.level3 ?? [])]
   }
   const savedProductFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.product ?? {}) }
+  const savedDeliveryFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.delivery ?? {}) }
+  delete savedDeliveryFilters['佣金区间']
+  delete savedProductFilters['佣金区间']
   global.filters = {
-    delivery: { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.delivery ?? {}) },
+    delivery: savedDeliveryFilters,
     product: savedProductFilters,
     features: Array.isArray((settings.filters as Record<string, unknown> | undefined)?.features)
       ? [...((settings.filters as Record<string, unknown[]>).features as string[])]
@@ -1818,7 +1821,7 @@ async function saveGlobal(): Promise<void> {
     if (global.selectionMode === 'category' && global.categoryMode === 'manual' && !hasSelectedCategory(global.categorySelection)) {
       throw new Error('已选择手动选类目，请至少勾选一个类目；或切回自动推荐。')
     }
-    validateCommissionRateThreshold(global.thresholds.commissionRate, '通用设置')
+    validateCommissionRateUpperBound(global.thresholds.commissionRate, '通用设置')
     validateExperienceScoreThreshold(global.thresholds.experienceScore, '通用设置')
     for (const [label, value] of Object.entries({
       '每品视频上限': global.quota.perProductVideos,
@@ -1853,10 +1856,10 @@ function appendOptionalMallTitleBannedWords(): void {
   notice.value = `已将 ${additions.length} 个候选词加入编辑框；点击「保存通用设置」后生效。`
 }
 
-function validateCommissionRateThreshold(value: number | null | undefined, scope: string): void {
+function validateCommissionRateUpperBound(value: number | null | undefined, scope: string): void {
   if (value === null || value === undefined) return
   if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) {
-    throw new Error(`${scope}佣金率阈值须为 0–100 之间的百分数。`)
+    throw new Error(`${scope}佣金率上限须为 0–100 之间的百分数。`)
   }
 }
 
@@ -1995,7 +1998,7 @@ async function saveAccount(): Promise<boolean> {
       throw new Error('账号候选上限须为 1–10 的整数。')
     }
     if (accountFilterOverridesEnabled.value) {
-      validateCommissionRateThreshold(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
+      validateCommissionRateUpperBound(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
       validateExperienceScoreThreshold(accountFilterDraft.value.thresholds.experienceScore, '账号个性化')
     }
     if (accountDraft.dailyQuotaOverride.enabled && (
@@ -2648,7 +2651,7 @@ async function prepareAccountRunContext(
   if (filterOverrides && typeof filterOverrides === 'object' && !Array.isArray(filterOverrides)) {
     Object.assign(settings, createSelectionFilterSettings(filterOverrides, createSelectionFilterSettings(globalSnapshot)))
   }
-  validateCommissionRateThreshold(
+  validateCommissionRateUpperBound(
     ((settings.thresholds ?? {}) as Record<string, number | null>).commissionRate,
     '账号运行设置'
   )
@@ -2978,6 +2981,16 @@ async function executeAccountSelection(
       let refillSourceUnchanged = false
       const hasExplicitPreviewSelection =
         reviewedPreviewAccountId === targetAccountId && reviewedProductIds !== undefined
+      const candidateReadFingerprint = (candidatesRead: unknown, rejectedRead: unknown): string => {
+        const rows = [
+          ...(Array.isArray(candidatesRead) ? candidatesRead : []),
+          ...(Array.isArray(rejectedRead) ? rejectedRead : [])
+        ]
+        return [...new Set(rows.map((row) =>
+          row && typeof row === 'object' ? String((row as { productId?: unknown }).productId ?? '').trim() : ''
+        ).filter(Boolean))].sort().join('|')
+      }
+      let lastReadFingerprint = candidateReadFingerprint(fetched, completed)
       const refillCandidatePool = async (force = false): Promise<void> => {
         if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
         const retryDelays = [1_000, 2_500, 6_000]
@@ -3032,6 +3045,15 @@ async function executeAccountSelection(
             message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
             detail: `本次候选 ${newRows.length} 条、淘汰 ${rejectedRows.length} 条；新商品 ID ${newObservedIds.length} 个；按商品 ID 去重后 ${fetched.length} 条。`
           })
+          if (fetched.length === previousCount && readFingerprint && readFingerprint === lastReadFingerprint) {
+            await recovery?.logEvent({
+              stage: '候选补充', code: 'WARNING_CANDIDATE_POOL_UNCHANGED',
+              message: '再次读取仍是同一批商品 ID，已停止本轮无效补读。',
+              detail: `当前可执行候选 ${fetched.length}/${candidateLimit}；保留缺额和检查点，不放宽条件。`
+            })
+            break
+          }
+          if (readFingerprint) lastReadFingerprint = readFingerprint
         }
         if (fetched.length < candidateLimit) {
           const refillReason = refillSourceUnchanged
@@ -3138,6 +3160,7 @@ async function executeAccountSelection(
               downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: !recovery
             }))
         if (preview.ok !== true) throw new Error(String(preview.error ?? '百应候选获取失败'))
+        lastReadFingerprint = candidateReadFingerprint(preview.candidates, preview.rejectedCandidates)
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
         const stableAccountKey = `local:${targetAccountId}`
         const targetCount = Number(settings.candidateLimit ?? 5)
@@ -3551,7 +3574,11 @@ async function executeAccountSelection(
         }
         const returnedIds = new Set(returned.map((item) => String(item.productId ?? '')))
         const priorById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
-        const mergedReturned = returned.map((item) => ({ ...(priorById.get(String(item.productId ?? '')) ?? {}), ...item }))
+        const mergedReturned = returned.map((item) => {
+          const prior = priorById.get(String(item.productId ?? ''))
+          // 重新通过筛选的商品不能继承上次“类目未知”等淘汰标记。
+          return { ...(prior?.skipped === true ? {} : prior ?? {}), ...item }
+        })
         completed = [...completed.filter((item) => !returnedIds.has(String(item.productId ?? ''))), ...mergedReturned]
         const returnedByProductId = new Map<string, Record<string, unknown>>(returned
           .filter((item) => String(item.productId ?? ''))
@@ -5460,7 +5487,9 @@ async function runSelectionBatch(): Promise<void> {
         return accountOutcome ?? { status: '部分完成' as const, message: '当前账号没有返回处理结果。' }
       },
       (account, status) => {
-        accountStatuses[account.id] = status
+        if (!(status === '部分完成' && accountStatuses[account.id]?.startsWith('needs_retry'))) {
+          accountStatuses[account.id] = status
+        }
         const accountIndex = activeTaskAccounts.findIndex((item) => item.id === account.id) + 1
         if (['完成', '部分完成', '失败'].includes(status)) handledAccountIds.add(account.id)
         const isCurrent = status === '执行中' || status === '失败' || status === '完成' || status === '部分完成'
