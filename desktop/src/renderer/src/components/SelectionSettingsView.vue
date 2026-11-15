@@ -118,6 +118,8 @@ interface SelectionRecoveryAccount {
     sources: Record<string, { fingerprint: string; productCount: number; readAt: string; pagePath?: string; scrollPosition?: number }>
     samePoolCount: number
     nextRetryAt?: string
+    detailAttemptedIds?: string[]
+    tabOffsets?: Record<string, number>
   } | null
   updatedAt?: string
 }
@@ -172,6 +174,9 @@ interface PrioritySourceReadResult {
   pagePath?: string
   scrollPosition?: number | { top?: number; height?: number; viewport?: number }
   pageReads?: Array<{ query?: number; step: number; scrollTop?: number; newProductIds?: number }>
+  categoryTabNextOffset?: number
+  categoryTabTotal?: number
+  sourceCategoryTabs?: Array<{ name?: string; categoryId?: string; status?: string; level?: number; selected?: boolean }>
 }
 
 function visibleSourceNoCandidateMessage(
@@ -237,7 +242,7 @@ interface AccountCandidatePlan {
   prioritySourceResults: PrioritySourceReadResult[]
   warnings: string[]
   recommendedCategories: Array<{ categoryId: string; highScoreCount: number; averageScore: number }>
-  categoryEnrichment?: { summary?: string }
+  categoryEnrichment?: { summary?: string; detailUnresolvedProductIds?: string[]; deferredCount?: number }
 }
 
 interface FilterField {
@@ -2165,6 +2170,17 @@ async function prepareBatchCandidatePlans(
     const visibilityFingerprint = selectionPoolVisibilityFingerprint(
       context.resolvedProfilePath ?? context.profilePath
     )
+    const samePoolAccountCount = visibilityFingerprint
+      ? orderedTargets.filter((other) => {
+          const otherContext = contexts.get(other.id)
+          return otherContext &&
+            selectionFilterFingerprint(otherContext.settings) === filterFingerprint &&
+            selectionPoolVisibilityFingerprint(otherContext.resolvedProfilePath ?? otherContext.profilePath) === visibilityFingerprint
+        }).length
+      : 1
+    const configuredTarget = Number(context.settings.candidateLimit ?? 5)
+    settings._candidateDesiredPoolCount = Math.min(200,
+      Math.max(1, Number.isFinite(configuredTarget) ? configuredTarget : 5) * samePoolAccountCount)
     const sharedPoolKey = `${filterFingerprint}\u0000${visibilityFingerprint}`
     const sameFilterDifferentVisibility = [...sharedPools.values()].some((pool) =>
       pool.filterFingerprint === filterFingerprint && pool.visibilityFingerprint !== visibilityFingerprint
@@ -2951,7 +2967,15 @@ async function executeAccountSelection(
         recovery?.state.sourcePoolState ?? { sources: {}, samePoolCount: 0 }
       const cooldownRemaining = (): number => sourcePoolState.nextRetryAt
         ? Math.max(0, new Date(sourcePoolState.nextRetryAt).getTime() - Date.now()) : 0
-      const checkpointSourcePool = async (results: PrioritySourceReadResult[], unchanged: boolean): Promise<void> => {
+      const resetExpiredPool = async (): Promise<void> => {
+        if (!sourcePoolState.nextRetryAt || cooldownRemaining() > 0) return
+        sourcePoolState = { sources: {}, samePoolCount: 0, detailAttemptedIds: [], tabOffsets: {} }
+        await recovery?.persist({ sourcePoolState })
+      }
+      const checkpointSourcePool = async (
+        results: PrioritySourceReadResult[], unchanged: boolean,
+        enrichment?: { detailUnresolvedProductIds?: string[]; deferredCount?: number }
+      ): Promise<void> => {
         const sources = Object.fromEntries(results
           .filter((item) => item.status === 'read' || item.status === 'empty')
           .map((item) => [item.sourceKey, {
@@ -2966,18 +2990,31 @@ async function executeAccountSelection(
         const sameSources = Object.keys(sources).length > 0 &&
           Object.keys(sources).every((key) => sources[key].fingerprint &&
             sources[key].fingerprint === prior[key]?.fingerprint)
-        const samePoolCount = unchanged && sameSources ? sourcePoolState.samePoolCount + 1 : 0
+        const tabOffsets = { ...(sourcePoolState.tabOffsets ?? {}) }
+        for (const item of results) {
+          if (Number.isInteger(item.categoryTabNextOffset)) tabOffsets[item.sourceKey] = Number(item.categoryTabNextOffset)
+        }
+        const detailAttemptedIds = [...new Set([
+          ...(sourcePoolState.detailAttemptedIds ?? []),
+          ...(Array.isArray(enrichment?.detailUnresolvedProductIds) ? enrichment.detailUnresolvedProductIds : [])
+        ].map(String).filter((id) => /^\d+$/.test(id)))].slice(-200)
+        const hasPendingWork = Number(enrichment?.deferredCount ?? 0) > 0 || results.some((item) =>
+          item.status === 'skipped' || Number(item.categoryTabNextOffset ?? 0) < Number(item.categoryTabTotal ?? 0)
+        )
+        const samePoolCount = unchanged && sameSources && !hasPendingWork ? sourcePoolState.samePoolCount + 1 : 0
         const nextRetryAt = samePoolCount > 0
           ? new Date(Date.now() + Math.min(30, 5 * 2 ** (samePoolCount - 1)) * 60_000).toISOString()
           : undefined
-        sourcePoolState = { sources, samePoolCount, nextRetryAt }
+        sourcePoolState = { sources, samePoolCount, nextRetryAt, detailAttemptedIds, tabOffsets }
         await recovery?.persist({ sourcePoolState })
       }
       const refillCandidatePool = async (force = false): Promise<void> => {
-        if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
+        if (hasExplicitPreviewSelection || (candidatePlan && !force) || (!force && fetched.length >= candidateLimit)) return
         if (cooldownRemaining() > 0) return
+        await resetExpiredPool()
+        const refillGoal = force ? fetched.length + candidateLimit : candidateLimit
         const retryDelays = [1_000, 2_500, 6_000]
-        for (let attempt = 0; attempt < retryDelays.length && fetched.length < candidateLimit; attempt += 1) {
+        for (let attempt = 0; attempt < retryDelays.length && fetched.length < refillGoal; attempt += 1) {
           const delayMs = retryDelays[attempt]
           accountStatuses[targetAccountId] = `candidate_refilling（${fetched.length}/${candidateLimit}）`
           reportSelectionProgress(targetAccountId, 'candidate_refilling', {
@@ -2994,27 +3031,47 @@ async function executeAccountSelection(
           await new Promise((resolve) => setTimeout(resolve, delayMs))
           const refill = await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
             ...profile,
-            settings: { ...settings, _candidatePoolLimit: Math.min(200, candidateLimit + (attempt + 1) * 40) },
+            settings: {
+              ...settings, _candidatePoolLimit: Math.min(200, candidateLimit + (attempt + 1) * 40),
+              _categoryDetailSkipIds: sourcePoolState.detailAttemptedIds ?? [],
+              _sourceCategoryTabOffsets: sourcePoolState.tabOffsets ?? {}
+            },
             accountId: targetAccountId,
             downloadPath: context.downloadPath,
             previewOnly: true,
             closeAfterAutomation: !recovery
           }))
           if (refill.ok !== true) continue
-          const newRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
+          const queriedRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
+          const registryRefill = await filterByLocalRegistry(
+            `local:${targetAccountId}`, queriedRows, candidateLimit,
+            settings.selectionMode === 'category' ? 'category' : 'general'
+          )
+          const newRows = registryRefill.candidates
           const readFingerprint = candidateReadFingerprint(refill.candidates, refill.rejectedCandidates)
           const refillSources = Array.isArray(refill.prioritySourceResults)
             ? refill.prioritySourceResults as PrioritySourceReadResult[] : []
+          const refillEnrichment = refill.categoryEnrichment && typeof refill.categoryEnrichment === 'object'
+            ? refill.categoryEnrichment as AccountCandidatePlan['categoryEnrichment'] : undefined
           const previousCount = fetched.length
           const byProduct = new Map(fetched.map((row) => [row.productId, row]))
           for (const row of newRows) if (!byProduct.has(row.productId)) byProduct.set(row.productId, row)
           fetched = [...byProduct.values()].map((row, index) => ({ ...row, cardIndex: index }))
-          const unchanged = fetched.length === previousCount && readFingerprint !== '' && readFingerprint === lastReadFingerprint
-          await checkpointSourcePool(refillSources, unchanged)
+          const hasPendingWork = Number(refillEnrichment?.deferredCount ?? 0) > 0 || refillSources.some((item) =>
+            item.status === 'skipped' || Number(item.categoryTabNextOffset ?? 0) < Number(item.categoryTabTotal ?? 0)
+          )
+          const sameSourceFingerprints = refillSources.some((item) => Boolean(item.productIdFingerprint)) &&
+            refillSources.filter((item) => item.status === 'read' || item.status === 'empty').every((item) =>
+              Boolean(item.productIdFingerprint) &&
+              item.productIdFingerprint === sourcePoolState.sources?.[item.sourceKey]?.fingerprint
+            )
+          const unchanged = fetched.length === previousCount && !hasPendingWork &&
+            (Boolean(readFingerprint) && readFingerprint === lastReadFingerprint || sameSourceFingerprints)
+          await checkpointSourcePool(refillSources, unchanged, refillEnrichment)
           await recovery?.logEvent({
             stage: '候选补充', code: 'INFO_CANDIDATE_REFILL_RESULT',
             message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
-            detail: `本次新读取 ${newRows.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
+            detail: `本次新读取 ${queriedRows.length} 条，本机登记过滤 ${registryRefill.excluded.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
           })
           if (unchanged) {
             await recovery?.logEvent({
@@ -3030,7 +3087,7 @@ async function executeAccountSelection(
           await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: `候选补充后仍只有 ${fetched.length}/${candidateLimit}，未放宽筛选条件。`, candidates: fetched })
         }
       }
-      await refillCandidatePool()
+      if (resumeCart || fetched.length > 0) await refillCandidatePool()
       if (resumeCart) {
         const allSelectedCandidates = fetched.filter((candidate) => selectedIndexes.includes(candidate.cardIndex))
         if (allSelectedCandidates.length !== new Set(selectedIndexes).size || allSelectedCandidates.length !== selectedIndexes.length) {
@@ -3100,13 +3157,18 @@ async function executeAccountSelection(
           await recovery?.persist({ state: 'needs_retry', stage: 'candidate_refilling', error: reason, candidates: fetched })
           return { status: '部分完成', message: reason, continueBatch: false }
         }
+        await resetExpiredPool()
 
         await persistStage('candidate_fetch')
         stage = '百应筛选并获取候选'
         accountStatuses[targetAccountId] = '获取候选中'
         const candidateQuerySettings = hasExplicitPreviewSelection
           ? settings
-          : { ...settings, _candidatePoolLimit: 200 }
+          : {
+              ...settings, _candidatePoolLimit: 200,
+              _categoryDetailSkipIds: sourcePoolState.detailAttemptedIds ?? [],
+              _sourceCategoryTabOffsets: sourcePoolState.tabOffsets ?? {}
+            }
         const preview = candidatePlan
           ? {
               ok: true,
@@ -3114,7 +3176,8 @@ async function executeAccountSelection(
               rejectedCandidates: candidatePlan.rejectedCandidates,
               warnings: candidatePlan.warnings,
               prioritySourceResults: candidatePlan.prioritySourceResults,
-              recommendedCategories: candidatePlan.recommendedCategories
+              recommendedCategories: candidatePlan.recommendedCategories,
+              categoryEnrichment: candidatePlan.categoryEnrichment
             }
           : await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
               ...profile, settings: candidateQuerySettings, accountId: targetAccountId,
@@ -3174,7 +3237,9 @@ async function executeAccountSelection(
           ? preview.prioritySourceResults as PrioritySourceReadResult[] : []
         await checkpointSourcePool(
           prioritySourceResults,
-          Boolean(previousReadFingerprint && lastReadFingerprint === previousReadFingerprint && fetched.length < candidateLimit)
+          Boolean(previousReadFingerprint && lastReadFingerprint === previousReadFingerprint && fetched.length < candidateLimit),
+          preview.categoryEnrichment && typeof preview.categoryEnrichment === 'object'
+            ? preview.categoryEnrichment as AccountCandidatePlan['categoryEnrichment'] : undefined
         )
         const prioritySourceMatchStatus = String(preview.prioritySourceMatchStatus || 'complete')
         const listRejected = Array.isArray(preview.rejectedCandidates)
@@ -3324,7 +3389,7 @@ async function executeAccountSelection(
           chosenProducts.has(candidate.productId) && !productLocks.has(candidate.productId) &&
           (usage[candidate.productId] ?? 0) < quotaSettings.perProductVideos
         )
-        if (eligible.length < candidateLimit && !hasExplicitPreviewSelection && !candidatePlan) {
+        if (eligible.length < candidateLimit && !hasExplicitPreviewSelection) {
           await refillCandidatePool(true)
           const eligibleProductIds = new Set([...chosenProducts, ...fetched.map((candidate) => candidate.productId)])
           eligible = fetched.filter((candidate) =>

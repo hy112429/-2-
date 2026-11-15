@@ -168,6 +168,94 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual(result["prioritySourceResults"][0]["categoryProbeStatus"], "category_data_unavailable")
         self.assertEqual(result["candidates"], [])
 
+    def test_samples_are_spread_across_source_categories(self):
+        rows = [promotion_row(str(index), None, 8, 4.8) for index in range(1, 5)]
+        for index, row in enumerate(rows, start=1):
+            row["_sourceCategory"] = {"id": str(index), "categoryIds": [str(index)], "level": 1}
+        samples, groups = browser_cdp._category_probe_sample_rows(rows)
+        self.assertEqual(groups, 4)
+        self.assertEqual([row["product_id"] for row in samples], ["1", "3", "4"])
+        same_page = [promotion_row(str(index), None, 8, 4.8) for index in range(1, 40)]
+        for row in same_page:
+            row["_sourceReadPage"] = "query:1:initial"
+        spread, groups = browser_cdp._category_probe_sample_rows(same_page)
+        self.assertEqual(groups, 1)
+        self.assertEqual([row["product_id"] for row in spread], ["1", "20", "39"])
+
+    def test_detail_reads_stop_after_target_and_leave_checkpoint_cursor(self):
+        rows = [promotion_row(str(index), None, 8, 4.8) for index in range(1, 41)]
+        page = type("FakePage", (), {"context": object()})()
+        with patch.object(browser_cdp, "_probe_source_card_category", return_value={
+            "status": "category_from_source_card", "categoryIds": ["1", "201", "301"],
+        }), patch.object(browser_cdp, "_read_candidate_category_from_detail", side_effect=lambda context, row, product_id, tree: {
+            "productId": product_id, "categoryIds": ["1", "201", "301"], "reason": "",
+        }) as detail, patch.object(browser_cdp, "_cached_detail_payload", return_value=None):
+            result = browser_cdp._visible_source_candidate_result(
+                page, {"hotSpot": rows}, {"hotSpot": {str(index) for index in range(1, 41)}},
+                [{"sourceKey": "hotSpot", "label": "热点", "status": "read", "productCount": 40}],
+                [], {}, [], self.settings(candidateLimit=1, thresholds={}),
+            )
+        self.assertGreaterEqual(len(result["candidates"]), 1)
+        self.assertLessEqual(detail.call_count, 10)
+        self.assertGreater(result["categoryEnrichment"]["deferredCount"], 0)
+        self.assertLessEqual(len(result["categoryEnrichment"]["detailAttemptedProductIds"]), 12)
+        self.assertEqual(result["categoryEnrichment"]["detailUnresolvedProductIds"], [])
+        self.assertIn("待续核验", result["categoryEnrichment"]["summary"])
+
+    def test_scrolled_react_cards_supply_new_id_without_extra_api_request(self):
+        page = type("FakePage", (), {
+            "evaluate": lambda self, script: {"moved": True, "kind": "card_ancestor", "top": 800, "height": 2000},
+            "wait_for_timeout": lambda self, ms: None,
+        })()
+        row = promotion_row("123456789", ("1", "201", "301"), 8, 4.8)
+        with patch.object(browser_cdp, "_listen_to_material_list"), patch.object(
+            browser_cdp, "_remove_material_list_listeners"
+        ), patch.object(browser_cdp, "_rendered_material_payload", return_value={
+            "data": {"summary_promotions": [row]}
+        }):
+            rows, reads = browser_cdp._scroll_selection_square_rows(page, self.settings(), set(), max_steps=1)
+        self.assertEqual([item["product_id"] for item in rows], ["123456789"])
+        self.assertEqual(rows[0]["_categorySourceHint"], "react_card")
+        self.assertEqual(reads[0]["reactNewProductIds"], 1)
+
+    def test_source_tabs_resume_from_saved_offset_in_bounded_group(self):
+        tabs = [
+            {"index": index, "name": str(index), "categoryId": str(index + 1),
+             "categoryIds": [str(index + 1)], "status": "mapped", "selected": False}
+            for index in range(6)
+        ]
+        seen: list[int] = []
+
+        def read_source(page, source_key, tree, category_tab=None):
+            if category_tab is None:
+                return set(), [], {"sourceCategoryTabs": tabs, "productCount": 0}
+            seen.append(category_tab["index"])
+            product_id = str(100000000 + category_tab["index"])
+            return {product_id}, [promotion_row(product_id, None, 8, 4.8)], {"readAt": "2026-11-15T12:00:00"}
+
+        with patch.object(browser_cdp, "_read_priority_source_product_ids", side_effect=read_source):
+            _, _, results, _ = browser_cdp._collect_priority_source_ids(
+                object(), self.settings(candidateLimit=1,
+                    sources={"hotSpotEnabled": True, "allianceRankEnabled": False, "priority": ["hotSpot"]},
+                    _sourceCategoryTabOffsets={"hotSpot": 2}),
+            )
+        self.assertEqual(seen, [2, 3, 4])
+        self.assertEqual(results[0]["categoryTabNextOffset"], 5)
+        self.assertEqual(results[0]["categoryTabTotal"], 6)
+
+    def test_fatal_detail_state_stops_later_detail_reads(self):
+        rows = [promotion_row(str(index), ("1", "201", "301"), None, 4.8) for index in range(1, 3)]
+        page = type("FakePage", (), {"context": object()})()
+        with patch.object(browser_cdp, "_read_candidate_category_from_detail", return_value={
+            "productId": "1", "categoryIds": [], "reason": "账号登录状态异常", "fatal": True,
+        }) as detail, patch.object(browser_cdp, "_cached_detail_payload", return_value=None):
+            browser_cdp._visible_source_candidate_result(
+                page, {"hotSpot": rows}, {"hotSpot": {"1", "2"}},
+                [{"sourceKey": "hotSpot", "label": "热点", "status": "read", "productCount": 2}],
+                [], {}, [], self.settings(),
+            )
+        self.assertEqual(detail.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8103,6 +8103,14 @@ def _collect_priority_source_ids(
     source_results: list[Dict[str, Any]] = []
     source_candidates: dict[str, list[Dict[str, Any]]] = {}
     category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
+    raw_tab_offsets = settings.get("_sourceCategoryTabOffsets")
+    tab_offsets = raw_tab_offsets if isinstance(raw_tab_offsets, dict) else {}
+    try:
+        target_count = max(1, min(10, int(settings.get("candidateLimit", 5))))
+    except (TypeError, ValueError):
+        target_count = 5
+    tab_read_budget = min(8, max(3, target_count * 2))
+    excluded_roots = settings.get("excludedCategorySelection", {}).get("level1", []) if isinstance(settings.get("excludedCategorySelection"), dict) else []
     for index, source_key in enumerate(selected_sources, start=1):
         label = BAIYING_PRIORITY_SOURCES[source_key][0]
         _report_operation_progress(
@@ -8120,10 +8128,22 @@ def _collect_priority_source_ids(
                 source_category = row.get("_sourceCategory")
                 row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
             tabs = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
+            def excluded_tab(tab: Dict[str, Any]) -> bool:
+                path = tab.get("categoryIds")
+                if not isinstance(path, list) or not path:
+                    return False
+                return any(_category_id_matches(str(path[0]), _category_id_scalar(excluded))
+                           for excluded in excluded_roots if _category_id_scalar(excluded))
+
             mapped_tabs = [tab for tab in tabs if isinstance(tab, dict) and tab.get("status") == "mapped"
-                           and tab.get("selected") is not True]
+                           and tab.get("selected") is not True and not excluded_tab(tab)]
+            try:
+                tab_offset = max(0, min(len(mapped_tabs), int(tab_offsets.get(source_key, 0))))
+            except (TypeError, ValueError):
+                tab_offset = 0
+            tab_batch = mapped_tabs[tab_offset:tab_offset + tab_read_budget]
             tab_reads: list[Dict[str, Any]] = []
-            for tab in mapped_tabs[:24]:
+            for tab in tab_batch:
                 try:
                     tab_ids, tab_rows, tab_evidence = _read_priority_source_product_ids(
                         page, source_key, category_tree, category_tab=tab
@@ -8155,10 +8175,12 @@ def _collect_priority_source_ids(
             product_rows = list(by_product.values())
             evidence["categoryTabReads"] = tab_reads
             evidence["unmappedCategoryTabs"] = sum(1 for tab in tabs if isinstance(tab, dict) and tab.get("status") != "mapped")
-            evidence["categoryTabReadLimitReached"] = len(mapped_tabs) > 24
+            evidence["categoryTabNextOffset"] = tab_offset + len(tab_batch)
+            evidence["categoryTabTotal"] = len(mapped_tabs)
+            evidence["categoryTabReadLimitReached"] = evidence["categoryTabNextOffset"] < len(mapped_tabs)
             evidence["productIdFingerprint"] = hashlib.sha256("|".join(sorted(product_ids)).encode("utf-8")).hexdigest()
-            if len(mapped_tabs) > 24:
-                warnings.append(f"{label}分类超过 24 个；本轮仅读取前 24 个稳定 ID 分类，其余保留待验")
+            if evidence["categoryTabReadLimitReached"]:
+                warnings.append(f"{label}本轮读取 {len(tab_batch)} 个分类，剩余 {len(mapped_tabs) - evidence['categoryTabNextOffset']} 个按检查点续读")
             membership[source_key] = product_ids
             source_candidates[source_key] = product_rows
             source_results.append({
@@ -8175,6 +8197,12 @@ def _collect_priority_source_ids(
                 "detail": str(evidence.get("detail") or ""),
                 "diagnosticId": str(evidence.get("diagnosticId") or ""),
                 "categoryTabReads": evidence.get("categoryTabReads", []),
+                "categoryTabNextOffset": evidence.get("categoryTabNextOffset", 0),
+                "categoryTabTotal": evidence.get("categoryTabTotal", 0),
+                "sourceCategoryTabs": [
+                    {key: tab.get(key) for key in ("name", "categoryId", "selected", "categoryIds", "level", "status")}
+                    for tab in tabs if isinstance(tab, dict)
+                ],
                 "unmappedCategoryTabs": evidence.get("unmappedCategoryTabs", 0),
                 "productIdFingerprint": evidence.get("productIdFingerprint", ""),
                 "readAt": evidence.get("readAt", ""),
@@ -8360,18 +8388,38 @@ def _scroll_selection_square_rows(
               const visible = (element) => {
                 const rect = element.getBoundingClientRect();
                 const style = getComputedStyle(element);
-                return rect.width > innerWidth * .35 && rect.height > innerHeight * .25 &&
+                return rect.width > 0 && rect.height > 0 &&
                   style.display !== 'none' && style.visibility !== 'hidden';
               };
-              const containers = [document.scrollingElement, ...document.querySelectorAll('main, [class*=scroll], [class*=list]')]
-                .filter(element => element && visible(element) && element.scrollHeight > element.clientHeight + 80);
-              const target = containers.sort((a, b) =>
-                (b.clientWidth * b.clientHeight) - (a.clientWidth * a.clientHeight))[0];
-              if (!target) return { moved: false, top: 0, height: 0 };
+              const canScroll = (element) => element && visible(element) &&
+                element.scrollHeight > element.clientHeight + 80 &&
+                element.scrollTop < element.scrollHeight - element.clientHeight - 2;
+              const cards = Array.from(document.querySelectorAll('[class*="__card___"]')).filter(visible);
+              let target = null;
+              let kind = '';
+              for (const card of cards) {
+                for (let node = card.parentElement, depth = 0; node && depth < 10; node = node.parentElement, depth += 1) {
+                  if (canScroll(node)) { target = node; kind = 'card_ancestor'; break; }
+                }
+                if (target) break;
+              }
+              if (!target) {
+                target = Array.from(document.querySelectorAll(
+                  '[class*="infinite-scroller"], [class*="virtual-list"], [class*="scroll-container"], main'
+                )).find(canScroll);
+                if (target) kind = 'list_container';
+              }
+              if (!target && canScroll(document.scrollingElement)) {
+                target = document.scrollingElement; kind = 'document';
+              }
+              if (!target) return { moved: false, found: false, top: 0, height: 0 };
               const before = target.scrollTop;
               target.scrollTop = Math.min(target.scrollHeight - target.clientHeight,
                 before + Math.max(250, Math.round(target.clientHeight * .8)));
-              return { moved: target.scrollTop > before, top: target.scrollTop, height: target.scrollHeight };
+              try { target.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+              return { moved: target.scrollTop > before, found: true, kind,
+                top: target.scrollTop, height: target.scrollHeight,
+                atEnd: target.scrollTop >= target.scrollHeight - target.clientHeight - 2 };
             }""")
             if not isinstance(position, dict) or not position.get("moved"):
                 break
@@ -8380,13 +8428,17 @@ def _scroll_selection_square_rows(
                 state = _wait_for_material_list_settled_bounded(
                     page, collector, mark, window_seconds=4, max_windows=2, quiet_seconds=0.8
                 )
-                if state == "pending":
-                    reads.append({"step": step, "scrollTop": position.get("top"), "status": "pending"})
+                if collector.rate_limit_error_since(mark):
+                    _mark_page_rate_limited(id(page))
+                    raise RuntimeError("百应选品广场滚动时返回 11001，已停止当前账号后续请求")
+                if state in {"pending", "unstable"}:
+                    reads.append({"step": step, "scrollTop": position.get("top"), "status": state})
                     break
             if collector.rate_limit_error_since(mark):
                 _mark_page_rate_limited(id(page))
                 raise RuntimeError("百应选品广场滚动时返回 11001，已停止当前账号后续请求")
             new_ids: set[str] = set()
+            response_new_ids = 0
             for sequence, payload in collector.successes:
                 if sequence <= mark:
                     continue
@@ -8395,11 +8447,26 @@ def _scroll_selection_square_rows(
                     if product_id and product_id not in known_ids:
                         known_ids.add(product_id)
                         new_ids.add(product_id)
+                        response_new_ids += 1
+                        row["_sourceReadPage"] = f"scroll:{step}"
                         rows.append(row)
+            rendered = _rendered_material_payload(page)
+            react_new_ids = 0
+            for row in _promotion_items(rendered):
+                product_id = str(row.get("product_id") or "").strip()
+                if product_id and product_id not in known_ids:
+                    known_ids.add(product_id)
+                    new_ids.add(product_id)
+                    react_new_ids += 1
+                    row["_sourceReadPage"] = f"scroll:{step}"
+                    row["_categorySourceHint"] = "react_card"
+                    rows.append(row)
             reads.append({
                 "step": step, "scrollTop": position.get("top"), "scrollHeight": position.get("height"),
+                "containerKind": position.get("kind"), "atEnd": position.get("atEnd"),
                 "readAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
                 "requestCount": collector.request_count_since(mark), "newProductIds": len(new_ids),
+                "responseNewProductIds": response_new_ids, "reactNewProductIds": react_new_ids,
             })
             unchanged = 0 if new_ids else unchanged + 1
             if unchanged >= 2:
@@ -8474,6 +8541,8 @@ def _collect_selection_square_rows(
                 for candidate in result.get("candidates", [])
                 if isinstance(candidate, dict)
             ]
+        for row in raw_rows:
+            row["_sourceReadPage"] = f"query:{index}:initial"
         visible_ids = {str(row.get("product_id") or "").strip() for row in raw_rows}
         more_rows, scroll_reads = _scroll_selection_square_rows(page, query_settings, visible_ids)
         raw_rows.extend(more_rows)
@@ -8655,6 +8724,43 @@ def _probe_source_card_category(
                 pass
 
 
+def _category_probe_group(row: Dict[str, Any], index: int, total: int) -> str:
+    source = row.get("_sourceCategory") if isinstance(row.get("_sourceCategory"), dict) else {}
+    source_id = str(source.get("id") or "")
+    page_step = str(row.get("_sourceReadPage") or "")
+    if source_id or page_step:
+        return f"{source_id}|{page_step}"
+    # 页面未提供分组信息时，跨列表头、中、尾取样，避免只看前三张卡。
+    return f"position:{min(2, index * 3 // max(1, total))}"
+
+
+def _category_probe_sample_rows(rows: Sequence[Dict[str, Any]], limit: int = 3) -> tuple[list[Dict[str, Any]], int]:
+    if not rows or limit <= 0:
+        return [], 0
+    groups: Dict[str, list[Dict[str, Any]]] = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(_category_probe_group(row, index, len(rows)), []).append(row)
+    if len(groups) == 1 and len(rows) > limit:
+        indexes = [round(index * (len(rows) - 1) / max(1, limit - 1)) for index in range(limit)]
+        return [rows[index] for index in indexes], 1
+    group_rows_list = list(groups.values())
+    group_sample_count = min(limit, len(group_rows_list))
+    group_indexes = [round(index * (len(group_rows_list) - 1) / max(1, group_sample_count - 1))
+                     for index in range(group_sample_count)]
+    sampled = [group_rows_list[index][0] for index in group_indexes]
+    if len(sampled) < limit:
+        sampled_ids = {str(row.get("product_id") or "") for row in sampled}
+        spread_count = min(limit, len(rows))
+        spread = [rows[round(index * (len(rows) - 1) / max(1, spread_count - 1))]
+                  for index in range(spread_count)]
+        for row in [*spread, *rows]:
+            if str(row.get("product_id") or "") not in sampled_ids:
+                sampled.append(row)
+                if len(sampled) >= limit:
+                    break
+    return sampled, len(groups)
+
+
 def _visible_source_candidate_result(
     page: Page,
     source_candidates: Dict[str, list[Dict[str, Any]]],
@@ -8678,6 +8784,10 @@ def _visible_source_candidate_result(
     category_gate_enabled = True
     threshold_names = _enabled_threshold_names(settings)
     category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
+    detail_skip_ids = {
+        str(value) for value in settings.get("_categoryDetailSkipIds", [])
+        if isinstance(value, (str, int)) and str(value).isdigit()
+    } if isinstance(settings.get("_categoryDetailSkipIds"), list) else set()
     merged_raw: Dict[str, Dict[str, Any]] = {}
     sources_by_id: Dict[str, list[str]] = {}
     category_evidence_by_id: Dict[str, list[Dict[str, Any]]] = {}
@@ -8779,28 +8889,33 @@ def _visible_source_candidate_result(
     category_logic_enabled = settings.get("selectionMode") == "category"
     source_probes: Dict[str, Dict[str, Any]] = {}
     sampled_enrichments: Dict[str, Dict[str, Any]] = {}
+    detail_attempted_ids: set[str] = set()
     source_category_unavailable: set[str] = set()
     if category_gate_enabled:
         raw_ids_to_check = {str(row.get("product_id") or "").strip() for row in raw_rows}
         for source_key in [*source_order, "selectionSquare"]:
             source_rows = selection_square_rows if source_key == "selectionSquare" else source_candidates.get(source_key, [])
-            sample_rows = [
+            probe_candidates = [
                 source_row for source_row in source_rows
                 if str(source_row.get("product_id") or "").strip() in raw_ids_to_check
+                and str(source_row.get("product_id") or "").strip() not in detail_skip_ids
                 and not merged_raw[str(source_row.get("product_id") or "").strip()].get("_sourceLevelExcluded")
                 and not merged_raw[str(source_row.get("product_id") or "").strip()].get("_categoryAmbiguous")
                 and _row_category_evidence(
                     source_row, str(source_row.get("product_id") or "").strip(), category_tree,
                     "material_list" if source_key == "selectionSquare" else "source_row",
                 ).get("status") != "known"
-            ][:3]
+            ]
+            sample_rows, group_count = _category_probe_sample_rows(probe_candidates)
             source_probe: Dict[str, Any] = {
                 "sourceKey": source_key, "label": source_labels[source_key],
                 "sampleLimit": 3, "samples": [], "exactMissingCount": 0,
+                "candidateGroupCount": group_count,
                 "status": "not_needed" if not sample_rows else "sampling",
             }
             for sample_row in sample_rows:
                 sample_id = str(sample_row.get("product_id") or "").strip()
+                detail_attempted_ids.add(sample_id)
                 card_probe = _probe_source_card_category(page, source_key, sample_row, category_tree)
                 category_ids = card_probe.get("categoryIds", [])
                 direct_result: Dict[str, Any] = {}
@@ -8848,7 +8963,7 @@ def _visible_source_candidate_result(
                     }
             if source_probe["status"] == "sampling":
                 sample_statuses = [item["status"] for item in source_probe["samples"]]
-                if len(sample_statuses) == 3 and all(status in {
+                if len(sample_statuses) == 3 and group_count <= 3 and all(status in {
                     "matched_response_without_category", "category_field_unresolved", "detail_entry_unavailable"
                 } for status in sample_statuses):
                     source_probe["status"] = (
@@ -8862,7 +8977,7 @@ def _visible_source_candidate_result(
                         "本轮停止重复探测该来源，保留缺额待重试"
                     )
                 else:
-                    source_probe["status"] = "entry_or_category_unresolved"
+                    source_probe["status"] = "category_probe_incomplete" if group_count > 3 else "entry_or_category_unresolved"
             source_probes[source_key] = source_probe
             for source_result in source_results:
                 if source_result.get("sourceKey") == source_key:
@@ -8904,11 +9019,56 @@ def _visible_source_candidate_result(
                 last_result = result
         return last_result or _read_candidate_category_from_detail(page.context, row, product_id, category_tree)
 
+    try:
+        requested_target = max(1, min(200, int(settings.get("_candidateDesiredPoolCount", settings.get("candidateLimit", 5)))))
+    except (TypeError, ValueError):
+        requested_target = 5
+    desired_pool_count = min(200, requested_target + max(4, requested_target // 2))
+    detail_read_budget = min(40, max(12, desired_pool_count * 2))
+    pre_candidates, _, pre_rejected = _candidate_rows(
+        {"data": {"summary_promotions": raw_rows}},
+        {**settings, "_sourceMembership": source_membership}, 200, preserve_product_ids,
+    )
+    pre_rank = {str(row.get("productId") or ""): index for index, row in enumerate(pre_candidates)}
+    pre_blocked_ids = {
+        str(row.get("productId") or "") for row in pre_rejected
+        if row.get("titleFilterExcluded") or any(
+            not str(reason).startswith("缺少") for reason in row.get("thresholdReasons", [])
+        )
+    }
+    raw_rows.sort(key=lambda row: (
+        str(row.get("product_id") or "") in pre_blocked_ids,
+        len(_promotion_row_category_ids(row)) < 3,
+        pre_rank.get(str(row.get("product_id") or ""), len(pre_rank)),
+    ))
+
+    def ready_after_detail(row: Dict[str, Any]) -> bool:
+        if row.get("_sourceLevelExcluded") or row.get("_categoryAmbiguous") or len(_promotion_row_category_ids(row)) < 3:
+            return False
+        ready, _, _ = _candidate_rows(
+            {"data": {"summary_promotions": [row]}},
+            {**settings, "_sourceMembership": source_membership}, 1,
+        )
+        if not ready or ready[0].get("pendingThresholds"):
+            return False
+        if category_logic_enabled and settings.get("categoryMode") == "manual" and not _candidate_matches_manual_categories(
+            ready[0], _manual_category_selection_ids(settings)
+        ):
+            return False
+        return not excluded_category_ids or not _candidate_matches_manual_categories(ready[0], excluded_category_ids)
+
     fatal_category_error = ""
+    processed_rows: list[Dict[str, Any]] = []
+    deferred_ids: list[str] = []
+    qualified_count = 0
     for index, row in enumerate(raw_rows, start=1):
         product_id = str(row.get("product_id") or "").strip()
         if not product_id:
             continue
+        if qualified_count >= desired_pool_count:
+            deferred_ids.extend(str(item.get("product_id") or "") for item in raw_rows[index - 1:]
+                                if str(item.get("product_id") or "") not in detail_skip_ids)
+            break
         base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
         product_info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
         source_category = product_info.get("category") if isinstance(product_info.get("category"), dict) else {}
@@ -8921,7 +9081,23 @@ def _visible_source_candidate_result(
             if existing_metrics.get(metric) is None
         ]
         needs_category_detail = category_gate_enabled and len(listed_category_ids) < 3
-        if not source_level_excluded and not category_ambiguous and (needs_category_detail or missing_metrics):
+        if needs_category_detail and product_id in detail_skip_ids:
+            continue
+        product_sources = sources_by_id.get(product_id, [])
+        source_unavailable = bool(product_sources) and all(key in source_category_unavailable for key in product_sources)
+        detail_needed = not fatal_category_error and not source_level_excluded and not category_ambiguous and (needs_category_detail or missing_metrics)
+        if product_id in pre_blocked_ids and detail_needed:
+            category_results[product_id] = {
+                "productId": product_id, "categoryIds": listed_category_ids,
+                "reason": "商品行已被明确的标题或指标条件排除，未打开详情",
+            }
+            detail_needed = False
+        if detail_needed and product_id not in sampled_enrichments and not source_unavailable:
+            if len(detail_attempted_ids) >= detail_read_budget:
+                deferred_ids.append(product_id)
+                continue
+            detail_attempted_ids.add(product_id)
+        if detail_needed:
             enrichment = read_verified_detail(row, product_id)
             category_ids_from_detail = [str(value).strip() for value in enrichment.get("categoryIds", []) if str(value).strip()]
             if len(category_ids_from_detail) >= 3:
@@ -9016,6 +9192,23 @@ def _visible_source_candidate_result(
                 else f"详情类目读取 {index}/{len(raw_rows)}：商品 {product_id} 类目未知；{enrichment.get('reason', '详情页未返回完整三级类目 ID')}"
             ),
         )
+        processed_rows.append(row)
+        if ready_after_detail(row):
+            qualified_count += 1
+
+    raw_rows = processed_rows
+    category_enrichment["processedCount"] = len(raw_rows)
+    category_enrichment["detailReadBudget"] = detail_read_budget
+    category_enrichment["detailAttemptedProductIds"] = sorted(detail_attempted_ids)
+    category_enrichment["detailUnresolvedProductIds"] = sorted(
+        product_id for product_id in detail_attempted_ids
+        if len(sampled_enrichments.get(product_id, {}).get("categoryIds", [])) < 3
+        and len(category_results.get(product_id, {}).get("categoryIds", [])) < 3
+        and len(_promotion_row_category_ids(merged_raw.get(product_id, {}))) < 3
+    )
+    category_enrichment["deferredCount"] = len(deferred_ids)
+    category_enrichment["deferredProductIds"] = deferred_ids[:20]
+    category_enrichment["qualifiedBeforeLocalRegistry"] = qualified_count
 
     try:
         requested = int(settings.get("_candidatePoolLimit", settings.get("candidateLimit", 5)))
@@ -9178,7 +9371,8 @@ def _visible_source_candidate_result(
     ) or "无可推荐类目：没有成功补齐类目且达到高分统计条件的商品"
     if category_gate_enabled:
         enrichment_summary = (
-            f"类目详情补充统计：候选总数 {category_enrichment['candidateCount']} → "
+            f"类目详情补充统计：读取 {category_enrichment['candidateCount']} 个商品，"
+            f"本轮核验 {category_enrichment['processedCount']} 个，待续核验 {category_enrichment['deferredCount']} 个；"
             f"成功补到类目 {category_enrichment['successCount']}，类目未知 {category_enrichment['failureCount']}。"
             + (
                 "类目数据不可用来源："
@@ -9191,7 +9385,8 @@ def _visible_source_candidate_result(
         )
     else:
         enrichment_summary = (
-            f"通用数据模式类目识别统计：候选总数 {category_enrichment['candidateCount']} → "
+            f"通用数据模式类目识别统计：读取 {category_enrichment['candidateCount']} 个商品，"
+            f"本轮核验 {category_enrichment['processedCount']} 个，待续核验 {category_enrichment['deferredCount']} 个；"
             f"列表含完整三级类目 {category_enrichment['successCount']} 个，类目未知 {category_enrichment['failureCount']} 个；"
             "类目未知商品在启用类目范围或排除类目时直接淘汰。"
             + (f"通用设置排除类目过滤 {len(excluded_by_category)} 个商品。" if excluded_by_category else "")
@@ -9272,8 +9467,8 @@ def _visible_source_candidate_result(
     local_warnings.append(enrichment_summary)
     if source_product_count and not parsed_count:
         local_warnings.append("可见来源读到了商品 ID，但没有解析到可评分的商品行数据；未回退选品广场，本轮停止候选生成。")
-    if parsed_count > len(candidates) + len(rejected):
-        local_warnings.append("部分可见来源行缺少商品标题或可评分字段，已跳过。")
+    if deferred_ids:
+        local_warnings.append(f"本轮有 {len(deferred_ids)} 个商品待续核验；未将其判为字段缺失或筛选失败。")
     result = {
         "ok": True,
         "candidateCount": len(candidates),
@@ -10893,7 +11088,11 @@ def apply_settings_and_collect_candidates(
         _report_operation_progress(
             progress, "当前可见来源候选完成", index=len(result.get("candidates", [])),
             total=len(result.get("candidates", [])), percent=100,
-            message=f"热点/榜单/选品广场当前列表统一筛选后生成 {len(result.get('candidates', []))} 个可评分候选；未翻页",
+            message=(
+                f"三来源统一筛选得到 {len(result.get('candidates', []))} 个候选；"
+                f"选品广场实际滚动 {len(selection_square_result.get('pageReads', []))} 次；"
+                f"待续核验 {result.get('categoryEnrichment', {}).get('deferredCount', 0)} 个"
+            ),
         )
         return result
     # 先完成纯本地类目计划校验，不能因设置冲突而先访问来源页面。
