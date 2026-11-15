@@ -3,7 +3,7 @@
 
 百应 ``pack_detail`` 的 ``sale_content_data.content_list`` 包含作品 ID 和完整
 ``media_info.video_url``。页面请求由用户登录的 Chrome 正常发起；脚本只读取响应。
-临时打开的商品标签在结束时关闭；已有同商品标签会复用并停留在带货内容页。
+搜索和详情均使用结束后关闭的后台标签；已有同商品标签只用于读取推广 ID 线索。
 """
 
 from __future__ import annotations
@@ -13,10 +13,12 @@ import json
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
@@ -33,6 +35,8 @@ FIXED_PARAMS = (
     "&pre_universal_page_params_id=87e0475e-4976-40dd-83c8-658b76d382de"
 )
 MIN_QUOTA = 10
+SELECTION_SQUARE_ROUTE = "https://buyin.jinritemai.com/dashboard/merch-picking-library"
+SEARCH_INPUT_SELECTOR = ".searchInput__input input[role='combobox']"
 
 
 def valid_id(value: object) -> str:
@@ -283,6 +287,145 @@ def parse_page(response, product_id: str) -> tuple[list[dict], int]:
     return videos, int(sale.get("count") or len(videos))
 
 
+def background_page(browser, context):
+    """沿用账号 Chrome/CDP，在后台新建专用页，不切换用户当前标签。"""
+    cdp = browser.new_browser_cdp_session()
+    target_id = ""
+    try:
+        with context.expect_page(timeout=10_000) as opened:
+            result = cdp.send("Target.createTarget", {
+                "url": "about:blank", "background": True, "focus": False,
+            })
+            target_id = str(result.get("targetId") or "")
+        return opened.value
+    except Exception:
+        if target_id:
+            try:
+                cdp.send("Target.closeTarget", {"targetId": target_id})
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            cdp.detach()
+        except Exception:
+            pass
+
+
+def find_commodity_by_product_search(browser, context, product_id: str) -> str:
+    """用账号自己的选品广场搜索；推广 ID 必须来自精确商品 ID 的平台行。"""
+    page = background_page(browser, context)
+    observations: list[str] = []
+    try:
+        page.goto(SELECTION_SQUARE_ROUTE, wait_until="commit", timeout=20_000)
+        current = urlparse(page.url)
+        target = urlparse(SELECTION_SQUARE_ROUTE)
+        if current.hostname != target.hostname or current.path.rstrip("/") != target.path.rstrip("/"):
+            raise RuntimeError("该账号百应选品广场未正常打开，请检查登录状态或页面权限")
+        search_field = page.locator(SEARCH_INPUT_SELECTOR)
+        try:
+            search_field.first.wait_for(state="visible", timeout=15_000)
+        except PlaywrightTimeoutError as error:
+            raise RuntimeError("该账号百应搜索框未出现，请检查登录状态或选品广场权限") from error
+        if search_field.count() != 1:
+            raise RuntimeError("百应选品广场搜索框不唯一，无法安全按商品 ID 检索")
+        search_button = page.get_by_text("搜 索", exact=True).first
+        if search_button.count() == 0:
+            search_button = page.get_by_text("搜索", exact=True).first
+        if search_button.count() == 0:
+            raise RuntimeError("百应选品广场未找到搜索按钮")
+
+        # 平台可能接受纯商品 ID 或商品链接；两种输入都必须回读精确 product_id。
+        search_terms = (product_id, f"https://haohuo.jinritemai.com/views/product/item2?id={product_id}")
+        for index, term in enumerate(search_terms, start=1):
+            results: list[dict] = []
+            last_response_at = [0.0]
+
+            def on_response(response) -> None:
+                parsed = urlparse(str(getattr(response, "url", "")))
+                if parsed.hostname != "buyin.jinritemai.com" or "material_list" not in parsed.path:
+                    return
+                try:
+                    payload = response.json()
+                    if not isinstance(payload, dict):
+                        return
+                    code = payload.get("code")
+                    if str(code) == "11001":
+                        results.append({"rateLimited": True})
+                        last_response_at[0] = time.monotonic()
+                        return
+                    if code not in (None, 0, "0") or response.status != 200:
+                        results.append({"failed": True})
+                        last_response_at[0] = time.monotonic()
+                        return
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                    raw_rows = data.get("summary_promotions")
+                    rows = raw_rows if isinstance(raw_rows, list) else []
+                    matches = [row for row in rows if isinstance(row, dict) and str(row.get("product_id") or "").strip() == product_id]
+                    results.append({
+                        "formatKnown": isinstance(raw_rows, list),
+                        "rowCount": len(rows),
+                        "exactIds": sorted({
+                            valid_id(row.get("promotion_id") or row.get("commodity_id"))
+                            for row in matches
+                        } - {""}),
+                        "exactRows": len(matches),
+                    })
+                    last_response_at[0] = time.monotonic()
+                except Exception:
+                    results.append({"failed": True})
+                    last_response_at[0] = time.monotonic()
+
+            page.on("response", on_response)
+            try:
+                search_field.fill(term, timeout=5_000)
+                if search_field.input_value(timeout=2_000).strip() != term:
+                    raise RuntimeError("百应搜索框未保留输入的商品 ID 或商品链接")
+                try:
+                    search_button.click(timeout=8_000, no_wait_after=True)
+                except PlaywrightTimeoutError as error:
+                    raise RuntimeError("百应商品搜索按钮未能点击，未发起下一种搜索") from error
+                started = time.monotonic()
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    page.wait_for_timeout(250)
+                    now = time.monotonic()
+                    if results and now - started >= 2 and now - last_response_at[0] >= 1:
+                        break
+            finally:
+                try:
+                    page.remove_listener("response", on_response)
+                except PlaywrightError:
+                    pass
+            if any(result.get("rateLimited") for result in results):
+                raise RuntimeError("百应商品搜索返回 11001 限流，已停止继续请求")
+            if not results:
+                raise RuntimeError("百应商品搜索未收到列表响应；当前请求结果不明，未继续发起另一种搜索")
+            if all(result.get("failed") for result in results):
+                raise RuntimeError("百应商品搜索返回异常，未继续发起另一种搜索")
+            if not any(result.get("formatKnown") for result in results):
+                raise RuntimeError("百应商品列表响应格式变化，无法核验商品 ID 和推广 ID")
+            exact_ids = {commodity_id for result in results for commodity_id in result.get("exactIds", [])}
+            if len(exact_ids) > 1:
+                raise RuntimeError("同一商品 ID 对应多个百应推广 ID，无法唯一核验，已停止下载")
+            if exact_ids:
+                return next(iter(exact_ids))
+            matched_rows = sum(int(result.get("exactRows") or 0) for result in results)
+            observations.append(
+                f"第 {index} 种搜索输入：" + (
+                    "精确商品行没有推广 ID" if matched_rows else
+                    "列表没有精确商品 ID" if results else "没有收到商品列表响应"
+                )
+            )
+        raise RuntimeError("该账号未找到可核验的百应推广 ID；" + "；".join(observations))
+    finally:
+        try:
+            if not page.is_closed():
+                page.close()
+        except PlaywrightError:
+            pass
+
+
 def discover(profile_path: str, product_id: str, commodity_id: str | None, limit: int) -> dict:
     profile = Path(profile_path)
     port_file = profile / "DevToolsActivePort"
@@ -299,7 +442,7 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
             if not browser.contexts:
                 raise RuntimeError("账号浏览器没有可用的登录会话")
             context = browser.contexts[0]
-            page = next(
+            open_page = next(
                 (
                     candidate for candidate in context.pages
                     if urlparse(candidate.url).path == urlparse(DETAIL_ROUTE).path
@@ -307,22 +450,16 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
                 ),
                 None,
             )
-            if page is not None:
-                page_params = parse_qs(urlparse(page.url).query)
+            if open_page is not None:
+                page_params = parse_qs(urlparse(open_page.url).query)
                 page_commodity = (page_params.get("commodity_id") or page_params.get("id") or [""])[0]
                 if re.fullmatch(r"\d{8,20}", page_commodity):
                     commodity_id = page_commodity
             if not commodity_id:
-                raise RuntimeError(
-                    "本机未记录该商品的百应推广 ID；请在所选账号的专属百应浏览器打开该商品页后重试"
-                )
-            if page is None:
-                page = context.new_page()
-                temporary_page = page
-                target_url = detail_url(product_id, commodity_id)
-            else:
-                # 保留用户从选品广场打开的原生 URL（其中可能有不同的页面展示参数）。
-                target_url = page.url
+                commodity_id = find_commodity_by_product_search(browser, context, product_id)
+            page = background_page(browser, context)
+            temporary_page = page
+            target_url = detail_url(product_id, commodity_id)
             page.goto(target_url, wait_until="commit", timeout=20_000)
             if urlparse(page.url).hostname != "buyin.jinritemai.com":
                 raise RuntimeError("该账号百应登录态已失效；请在该账号专属浏览器登录百应后重试")
@@ -332,9 +469,12 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
             except PlaywrightTimeoutError as error:
                 if urlparse(page.url).hostname != "buyin.jinritemai.com":
                     raise RuntimeError("该账号百应登录态已失效；请在该账号专属浏览器登录百应后重试") from error
-                raise
-            with page.expect_response(lambda response: is_sale_response(response, product_id), timeout=20_000) as pending:
-                tab.click(timeout=10_000)
+                raise RuntimeError("百应商品页没有出现‘带货内容’入口，请检查商品权限或页面变化") from error
+            try:
+                with page.expect_response(lambda response: is_sale_response(response, product_id), timeout=20_000) as pending:
+                    tab.click(timeout=10_000)
+            except PlaywrightTimeoutError as error:
+                raise RuntimeError("百应未返回与目标商品 ID 精确匹配的带货内容响应") from error
             first_page, available = parse_page(pending.value, product_id)
             videos: list[dict] = []
             seen_ids: set[str] = set()
@@ -373,9 +513,15 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
                 "videos": videos[:limit],
             }
         finally:
-            if temporary_page is not None and not temporary_page.is_closed():
-                temporary_page.close()
-            browser.close()
+            try:
+                if temporary_page is not None and not temporary_page.is_closed():
+                    temporary_page.close()
+            except PlaywrightError:
+                pass
+            try:
+                browser.close()
+            except PlaywrightError:
+                pass
 
 
 def main() -> int:
@@ -422,8 +568,10 @@ def main() -> int:
         if not quota <= candidate_limit <= 500:
             raise ValueError("候选读取上限须在账号额度到 500 条之间")
         return output(discover(args.profile_path, args.product_id, args.commodity_id, candidate_limit))
-    except (OSError, ValueError, RuntimeError, sqlite3.Error, PlaywrightTimeoutError) as error:
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         return output({"ok": False, "error": str(error)})
+    except PlaywrightError as error:
+        return output({"ok": False, "error": f"百应账号浏览器访问失败（{type(error).__name__}），请检查专属 Chrome 是否仍在运行"})
 
 
 if __name__ == "__main__":

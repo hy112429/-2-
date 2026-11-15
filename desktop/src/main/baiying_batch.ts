@@ -298,11 +298,11 @@ async function loadBaiyingCaptureAccounts(): Promise<BaiyingCaptureAccount[]> {
   return accounts
 }
 
-async function resolvePromotionOwner(productId: string, accounts: BaiyingCaptureAccount[]): Promise<{
+async function resolvePromotionOwner(productId: string, accounts: BaiyingCaptureAccount[], allowUnowned = false): Promise<{
   account: BaiyingCaptureAccount
   commodityId: string
   source: string
-}> {
+} | null> {
   const stored = await runScript('baiying_promotion_videos.py', {
     args: ['--resolve-account', '--product-id', productId],
     onEvent: () => undefined
@@ -349,8 +349,10 @@ async function resolvePromotionOwner(productId: string, accounts: BaiyingCapture
     return { account: accounts[0], commodityId: cachedCommodityId, source: '唯一启用账号（旧浏览缓存仅供定位商品）' }
   }
   if (resolved.accountSource === '百应浏览缓存' && accounts.length > 1) {
+    if (allowUnowned) return null
     throw new Error('旧浏览缓存对应账号已停用，当前有多个启用账号；无法自动确定下载账号。请先在目标账号专属百应浏览器打开该商品页')
   }
+  if (allowUnowned) return null
   throw new Error('未找到可用的选品账号记录，也没有启用账号的专属百应浏览器打开该商品页')
 }
 
@@ -549,6 +551,7 @@ export async function waitForCartVideoDownload(accountId: number, productId: str
 export async function retryCartVideoDownload(accountId: number, productId: string, additionalUnique = 0): Promise<void> {
   await waitForCartVideoDownload(accountId, productId)
   const owner = await resolvePromotionOwner(productId, await loadBaiyingCaptureAccounts())
+  if (!owner) throw new Error('发布商品缺少可核验的选品账号，已停止补下载')
   if (owner.account.id !== accountId) throw new Error('商品选品账号与发布账号不一致，已停止补下载')
   const current = await cartState('get', accountId, productId)
   const job = current['job'] as { uniqueCount?: number } | null
@@ -621,41 +624,53 @@ export function registerBaiyingBatchIpc(): void {
     try {
       const productId = String(params?.productId ?? '').trim()
       if (!/^\d{8,20}$/.test(productId)) throw new Error('商品 ID 格式无效')
-      const { account, commodityId, source } = await resolvePromotionOwner(productId, await loadBaiyingCaptureAccounts())
-      const accountId = account.id
-      const options = { profileKey: `account-${accountId}`, profilePath: account.profilePath }
-      const login = await commandManagedBrowser('check-account-logins', { accountId }, options)
-      const baiying = login.baiying as { state?: string; message?: string } | undefined
-      if (login.ok !== true || baiying?.state !== 'logged_in') {
-        throw new Error(`账号“${account.name}”的百应尚未登录：${baiying?.message ?? '请先登录专属浏览器'}`)
-      }
-      const profilePath = validateManagedProfilePath(options.profileKey, options.profilePath)
-      const args = ['--account-id', String(accountId), '--product-id', productId, '--profile-path', profilePath]
-      if (commodityId) args.push('--commodity-id', commodityId)
-      const outcome = await runScript('baiying_promotion_videos.py', {
-        args,
-        onEvent: () => undefined
-      }).promise
-      if (!outcome.ok || !outcome.result) throw new Error(outcome.error ?? '读取百应同款带货作品失败')
-      const result = outcome.result as { commodityId?: string }
-      if (result.commodityId && /^\d{8,20}$/.test(result.commodityId)) {
-        const saved = await runScript('baiying_cache.py', {
-          args: [
-            'set-commodity', '--product-id', productId,
-            '--commodity-id', result.commodityId, '--account-id', String(accountId)
-          ],
-          onEvent: () => undefined
-        }).promise
-        if (!saved.ok) return {
-          ...(outcome.result as Record<string, unknown>), accountId, accountName: account.name,
-          downloadPath: account.downloadPath ?? '', accountSource: source,
-          cacheWarning: saved.error ?? '推广 ID 缓存失败'
+      const accounts = (await loadBaiyingCaptureAccounts()).sort((a, b) => a.id - b.id)
+      if (accounts.length === 0) throw new Error('没有启用的百应账号，请先启用并登录账号')
+      const owner = await resolvePromotionOwner(productId, accounts, true)
+      const candidates = owner ? [owner.account] : accounts
+      const failures: string[] = []
+      for (const account of candidates) {
+        const accountId = account.id
+        try {
+          const options = { profileKey: `account-${accountId}`, profilePath: account.profilePath }
+          // 下载只连接已运行的专属 Chrome；登录预检会自动启动可见浏览器窗口。
+          // Python 在账号自己的后台标签中校验百应登录与商品身份。
+          const profilePath = validateManagedProfilePath(options.profileKey, options.profilePath)
+          const args = ['--account-id', String(accountId), '--product-id', productId, '--profile-path', profilePath]
+          if (owner?.commodityId) args.push('--commodity-id', owner.commodityId)
+          const outcome = await runScript('baiying_promotion_videos.py', { args, onEvent: () => undefined }).promise
+          if (!outcome.ok || !outcome.result) throw new Error(outcome.error ?? '读取百应同款带货作品失败')
+          const result = outcome.result as { commodityId?: string; videos?: unknown[] }
+          if (!owner && (!Array.isArray(result.videos) || result.videos.length === 0)) {
+            failures.push(`账号-${accountId}：已找到商品但百应未返回同款视频`)
+            continue
+          }
+          let cacheWarning = ''
+          if (result.commodityId && /^\d{8,20}$/.test(result.commodityId)) {
+            const saved = await runScript('baiying_cache.py', {
+              args: [
+                'set-commodity', '--product-id', productId,
+                '--commodity-id', result.commodityId, '--account-id', String(accountId)
+              ],
+              onEvent: () => undefined
+            }).promise
+            if (!saved.ok) cacheWarning = saved.error ?? '推广 ID 缓存失败'
+          }
+          return {
+            ...(outcome.result as Record<string, unknown>), accountId, accountName: account.name,
+            downloadPath: account.downloadPath ?? '',
+            accountSource: owner?.source ?? '按账号顺序在百应核验',
+            ...(cacheWarning ? { cacheWarning } : {})
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error)
+          if (owner || /11001|限流|验证码|安全验证|风控/i.test(reason)) {
+            throw new Error(`账号“${account.name}”：${reason}`)
+          }
+          failures.push(`账号-${accountId}：${reason}`)
         }
       }
-      return {
-        ...(outcome.result as Record<string, unknown>), accountId, accountName: account.name,
-        downloadPath: account.downloadPath ?? '', accountSource: source
-      }
+      throw new Error(`所有已启用账号都未找到可下载的同款作品；${failures.slice(0, 7).join('；')}`)
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) }
     }

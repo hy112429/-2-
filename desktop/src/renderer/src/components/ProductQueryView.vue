@@ -6,7 +6,7 @@ import QianchuanVideoQueryPanel from './QianchuanVideoQueryPanel.vue'
 /**
  * 商品查询主界面（真实数据链路）
  *
- * 数据链路：商品 ID → 选品记录自动确定账号 → 该账号百应「带货内容」；
+ * 数据链路：商品 ID → 选品记录或已登录账号逐个核验 → 百应「带货内容」；
  * 只下载同款带货作品的完整视频，账号额度单独保存。
  */
 
@@ -184,7 +184,7 @@ async function search(): Promise<void> {
   }
   searchBusy.value = true
   error.value = ''
-  searchStatus.value = '正在查找同款带货作品…'
+  searchStatus.value = '正在按账号顺序核验商品并查找同款带货作品…'
   foundProduct.value = null
   promotionVideos.value = []
   promotionAvailable.value = 0
@@ -216,6 +216,7 @@ async function search(): Promise<void> {
     if (!started) throw new Error(queueSummary.value || '下载队列未启动')
     searchStatus.value = `已按${queryAccountSource.value}匹配「${queryAccountName.value}」。百应找到 ${promotionAvailable.value} 条同款带货作品，按该账号额度选取 ${promotionVideos.value.length} 条，已启动下载队列。${result.cacheWarning ? `推广 ID 缓存待检查：${result.cacheWarning}` : ''}`
   } catch (err) {
+    searchStatus.value = ''
     error.value = `商品视频搜索失败：${err instanceof Error ? err.message : String(err)}`
   } finally {
     searchBusy.value = false
@@ -1465,7 +1466,7 @@ onBeforeUnmount(() => {
     </details>
 
     <!-- ---------- 真实数据标注 ---------- -->
-    <p v-if="foundProduct" class="real-tag">商品信息来自百应缓存；视频来自选品账号百应「带货内容」</p>
+    <p v-if="foundProduct" class="real-tag">商品信息来自百应缓存；{{ promotionVideos.length ? '视频已从账号百应「带货内容」核验' : '视频仍需在已登录百应账号中核验' }}</p>
 
     <!-- ---------- 商品信息 ---------- -->
     <div v-if="foundProduct" class="product-card">
