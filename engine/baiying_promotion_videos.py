@@ -42,6 +42,17 @@ def valid_id(value: object) -> str:
 
 def resolve_account(db_path: str, product_id: str) -> dict:
     """按选品记录确定账号；浏览缓存只在没有选品归属时兜底。"""
+    def normalized_account_ids(rows) -> set[int]:
+        account_ids: set[int] = set()
+        for row in rows:
+            try:
+                account_id = int(row[0])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if account_id > 0:
+                account_ids.add(account_id)
+        return account_ids
+
     database = Path(db_path)
     if not database.is_file():
         return {"ok": True, "found": False}
@@ -67,13 +78,13 @@ def resolve_account(db_path: str, product_id: str) -> dict:
                 "SELECT account_id FROM product_list_rows WHERE product_id=? "
                 "AND deleted_at IS NULL AND status='cart_added'", (product_id,)
             )
-            sources.append(("已加选品车", {int(row[0]) for row in rows}))
+            sources.append(("已加选品车", normalized_account_ids(rows)))
         if "publish_queue" in tables:
             rows = connection.execute(
                 "SELECT DISTINCT account_id FROM publish_queue WHERE product_id=? "
                 "AND status!='cancelled'", (product_id,)
             )
-            sources.append(("发布队列", {int(row[0]) for row in rows}))
+            sources.append(("发布队列", normalized_account_ids(rows)))
         if "selection_local_registry" in tables:
             rows = connection.execute(
                 "SELECT account_key FROM selection_local_registry WHERE product_id=? "
@@ -88,13 +99,13 @@ def resolve_account(db_path: str, product_id: str) -> dict:
                 "SELECT account_id FROM product_list_rows WHERE product_id=? "
                 "AND deleted_at IS NULL AND status='needs_review'", (product_id,)
             )
-            sources.append(("选品待核查", {int(row[0]) for row in rows}))
+            sources.append(("选品待核查", normalized_account_ids(rows)))
         if "baiying_products" in tables:
             rows = connection.execute(
                 "SELECT account_id FROM baiying_products WHERE product_id=? AND account_id IS NOT NULL",
                 (product_id,),
             )
-            sources.append(("百应浏览缓存", {int(row[0]) for row in rows}))
+            sources.append(("百应浏览缓存", normalized_account_ids(rows)))
 
         for source, account_ids in sources:
             if not account_ids:
@@ -122,6 +133,32 @@ def resolve_account(db_path: str, product_id: str) -> dict:
                 "ok": True, "found": True, "accountId": account_id,
                 "commodityId": commodity_id, "accountSource": source,
             }
+        # 旧缓存可能已经保存了推广 ID，但没有可靠的账号归属。
+        # 推广 ID 只能作为候选账号逐个核验的线索，不能直接推断账号。
+        if "product_list_rows" in tables:
+            row = connection.execute(
+                "SELECT commodity_id FROM product_list_rows WHERE product_id=? "
+                "AND commodity_id IS NOT NULL ORDER BY selected_at DESC LIMIT 1",
+                (product_id,),
+            ).fetchone()
+            if row and valid_id(row[0]):
+                return {
+                    "ok": True, "found": False,
+                    "commodityId": valid_id(row[0]),
+                    "accountSource": "选品记录推广 ID（账号待核验）",
+                }
+        if "baiying_products" in tables:
+            row = connection.execute(
+                "SELECT commodity_id FROM baiying_products WHERE product_id=? "
+                "AND commodity_id IS NOT NULL ORDER BY captured_at DESC LIMIT 1",
+                (product_id,),
+            ).fetchone()
+            if row and valid_id(row[0]):
+                return {
+                    "ok": True, "found": False,
+                    "commodityId": valid_id(row[0]),
+                    "accountSource": "无账号归属缓存",
+                }
         return {"ok": True, "found": False}
     finally:
         connection.close()
@@ -224,6 +261,33 @@ def detail_url(product_id: str, commodity_id: str) -> str:
     )
 
 
+def create_background_page(context, browser):
+    """创建不抢焦点的百应详情页；只用于本次自动任务。"""
+    cdp = browser.new_browser_cdp_session()
+    target_id = None
+    try:
+        with context.expect_page(timeout=10_000) as page_info:
+            created = cdp.send("Target.createTarget", {
+                "url": "about:blank",
+                "background": True,
+                "focus": False,
+            })
+            target_id = str(created.get("targetId") or "") or None
+        return page_info.value
+    except Exception:
+        if target_id:
+            try:
+                cdp.send("Target.closeTarget", {"targetId": target_id})
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            cdp.detach()
+        except Exception:
+            pass
+
+
 def is_detail_response(response, product_id: str) -> bool:
     parsed = urlparse(response.url)
     return (
@@ -231,6 +295,108 @@ def is_detail_response(response, product_id: str) -> bool:
         and "/pc/selection/decision/pack_detail" in parsed.path
         and response.status == 200
     )
+
+
+def is_pack_detail_response(response, product_id: str) -> bool:
+    """判断商品详情响应；只接受与输入商品 ID 完全一致的 JSON。"""
+    parsed = urlparse(response.url)
+    if parsed.hostname != "buyin.jinritemai.com" or response.status != 200:
+        return False
+    if "pack_detail" not in parsed.path and "/ecom/product/detail/" not in parsed.path:
+        return False
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return False
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return False
+        return str(data.get("product_id")) == product_id
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        return False
+
+
+def _collect_media_video_urls(value: object, in_video_context: bool = False) -> list[str]:
+    """从 pack_detail 的 media 对象中提取视频直链，不把封面/音频当视频。"""
+    if isinstance(value, str):
+        return [value] if in_video_context and value.startswith(("http://", "https://")) else []
+    if isinstance(value, list):
+        urls: list[str] = []
+        for item in value:
+            urls.extend(_collect_media_video_urls(item, in_video_context))
+        return urls
+    if not isinstance(value, dict):
+        return []
+    urls: list[str] = []
+    for key, child in value.items():
+        key_text = str(key)
+        if re.search(r"cover|poster|thumb|image|audio|subtitle", key_text, re.IGNORECASE):
+            continue
+        video_context = in_video_context or bool(re.search(r"video|play|movie", key_text, re.IGNORECASE))
+        if video_context and re.fullmatch(r"url|origin_url|video_url|play_url|download_url|src", key_text, re.IGNORECASE):
+            if isinstance(child, str) and child.startswith(("http://", "https://")):
+                urls.append(child)
+            continue
+        urls.extend(_collect_media_video_urls(child, video_context))
+    return urls
+
+
+def parse_pack_detail(response, product_id: str) -> dict:
+    """解析商品主视频商业源；商品 ID 不一致或字段缺失时直接报错。"""
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError("百应商品详情响应不是 JSON，无法确认商业源") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("百应商品详情响应结构无效，无法确认商业源")
+    data = payload.get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError("百应商品详情数据节点无效，无法确认商业源")
+    if str(data.get("product_id")) != product_id:
+        raise RuntimeError("百应商品详情返回了其他商品，已停止使用该视频源")
+    model = data.get("model") if isinstance(data.get("model"), dict) else {}
+    product = model.get("product") if isinstance(model.get("product"), dict) else {}
+    product_base = product.get("product_base") if isinstance(product.get("product_base"), dict) else {}
+    media = product_base.get("media") if isinstance(product_base.get("media"), dict) else {}
+    video_urls = list(dict.fromkeys(_collect_media_video_urls(media)))
+    if not video_urls:
+        raise RuntimeError("百应商品详情没有可确认的 media.video_url")
+    product_cos = product.get("product_cos") if isinstance(product.get("product_cos"), dict) else {}
+    cos = product_cos.get("cos_label") if isinstance(product_cos.get("cos_label"), dict) else {}
+    cos_node = cos.get("cos") if isinstance(cos.get("cos"), dict) else {}
+    cos_value = cos_node.get("cos_ratio")
+    return {
+        "productId": product_id,
+        "title": str(product_base.get("title") or ""),
+        "coverUrl": str(media.get("cover_url") or product_base.get("cover") or ""),
+        "cosRatio": cos_value if isinstance(cos_value, (int, float)) else None,
+        "videoUrls": video_urls,
+        "sourceType": "baiying_pack_detail_media",
+        "sourceField": "model.product.product_base.media.video_url",
+        # 该字段来自已验证的百应商品商业源；content_list 回退源仍保持 unknown。
+        "watermarkStatus": "clean",
+    }
+
+
+def pack_detail_video_rows(detail: dict) -> list[dict]:
+    rows: list[dict] = []
+    seen_paths: set[str] = set()
+    for index, url in enumerate(detail.get("videoUrls") or [], start=1):
+        parsed = urlparse(str(url))
+        source_path = parsed.path or str(url)
+        if source_path in seen_paths:
+            continue
+        seen_paths.add(source_path)
+        rows.append({
+            "videoId": f"pack-detail-{index}",
+            "url": str(url),
+            "sourceType": detail["sourceType"],
+            "sourceField": detail["sourceField"],
+            "watermarkStatus": detail["watermarkStatus"],
+            "title": detail.get("title", ""),
+            "author": "",
+        })
+    return rows
 
 
 def is_sale_response(response, product_id: str) -> bool:
@@ -274,6 +440,9 @@ def parse_page(response, product_id: str) -> tuple[list[dict], int]:
         videos.append({
             "videoId": video_id,
             "url": url,
+            "sourceType": "baiying_content_list",
+            "sourceField": "sale_content_data.content_list[].media_info.video_url",
+            "watermarkStatus": "unknown",
             "title": str(item.get("content_title") or ""),
             "author": str(item.get("author_name") or ""),
             "duration": (item.get("media_info") or {}).get("duration"),
@@ -299,6 +468,7 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
             if not browser.contexts:
                 raise RuntimeError("账号浏览器没有可用的登录会话")
             context = browser.contexts[0]
+            pack_detail = None
             page = next(
                 (
                     candidate for candidate in context.pages
@@ -317,15 +487,41 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
                     "本机未记录该商品的百应推广 ID；请在所选账号的专属百应浏览器打开该商品页后重试"
                 )
             if page is None:
-                page = context.new_page()
+                page = create_background_page(context, browser)
                 temporary_page = page
                 target_url = detail_url(product_id, commodity_id)
             else:
                 # 保留用户从选品广场打开的原生 URL（其中可能有不同的页面展示参数）。
                 target_url = page.url
-            page.goto(target_url, wait_until="commit", timeout=20_000)
+            try:
+                with page.expect_response(
+                    lambda response: is_pack_detail_response(response, product_id),
+                    timeout=20_000,
+                ) as pending_detail:
+                    page.goto(target_url, wait_until="commit", timeout=20_000)
+                pack_detail = parse_pack_detail(pending_detail.value, product_id)
+            except (PlaywrightTimeoutError, RuntimeError):
+                # 商品详情接口未出现时继续尝试带货内容；不能把 content_list 伪装成商业源。
+                pack_detail = None
             if urlparse(page.url).hostname != "buyin.jinritemai.com":
                 raise RuntimeError("该账号百应登录态已失效；请在该账号专属浏览器登录百应后重试")
+            if pack_detail is not None:
+                direct_videos = pack_detail_video_rows(pack_detail)
+                if direct_videos:
+                    return {
+                        "ok": True,
+                        "productId": product_id,
+                        "commodityId": commodity_id,
+                        "available": len(direct_videos),
+                        "limit": limit,
+                        "videos": direct_videos[:limit],
+                        "sourceType": pack_detail["sourceType"],
+                        "sourceField": pack_detail["sourceField"],
+                        "watermarkStatus": pack_detail["watermarkStatus"],
+                        "title": pack_detail.get("title", ""),
+                        "coverUrl": pack_detail.get("coverUrl", ""),
+                        "cosRatio": pack_detail.get("cosRatio"),
+                    }
             tab = page.get_by_text("带货内容", exact=True)
             try:
                 tab.wait_for(state="visible", timeout=20_000)
@@ -371,6 +567,9 @@ def discover(profile_path: str, product_id: str, commodity_id: str | None, limit
                 "available": available,
                 "limit": limit,
                 "videos": videos[:limit],
+                "sourceType": "baiying_content_list",
+                "sourceField": "sale_content_data.content_list[].media_info.video_url",
+                "watermarkStatus": "unknown",
             }
         finally:
             if temporary_page is not None and not temporary_page.is_closed():

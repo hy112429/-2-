@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
+import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import browser_cdp
 
@@ -108,6 +109,37 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual(metrics["experienceScore"], 4.7)
         self.assertEqual(metrics["salesCount"], 100)
         self.assertEqual(row["_detailMetricKeys"], ["commissionRate", "experienceScore", "salesCount"])
+
+    def test_detail_category_parser_accepts_current_serialized_and_named_shapes(self):
+        category_tree = [{
+            "id": "1", "name": "一级", "children": [{
+                "id": "2", "name": "二级", "children": [{"id": "3", "name": "三级", "children": []}]
+            }]
+        }]
+        expected = ["1", "2", "2__RC_CASCADER_SPLIT__3"]
+        payloads = [
+            {"data": {"model": {"product": {"product_id": "p1", "product_base": {"category_path": "1,2,3"}}}}},
+            {"data": json.dumps({"model": {"product": {"product_id": "p1", "product_base": {"categoryIds": ["1", "2", "3"]}}}})},
+            {"data": {"model": {"product": {"product_id": "p1", "product_base": {
+                "category": {"firstName": "一级", "secondName": "二级", "thirdName": "三级"}
+            }}}}},
+        ]
+        for payload in payloads:
+            category_ids, reason = browser_cdp._detail_category_path(payload, "p1", category_tree)
+            self.assertEqual(category_ids, expected)
+            self.assertEqual(reason, "")
+
+    def test_detail_dom_explicit_path_is_accepted_after_identity_is_verified(self):
+        page = MagicMock()
+        page.evaluate.return_value = ["2__RC_CASCADER_SPLIT__3"]
+        tree = [{
+            "id": "1", "name": "一级", "children": [{
+                "id": "2", "name": "二级", "children": [{"id": "3", "name": "三级", "children": []}]
+            }]
+        }]
+        category_ids, reason = browser_cdp._read_detail_category_from_dom(page, "p1", tree)
+        self.assertEqual(category_ids, ["1", "2", "2__RC_CASCADER_SPLIT__3"])
+        self.assertEqual(reason, "")
 
 
 if __name__ == "__main__":

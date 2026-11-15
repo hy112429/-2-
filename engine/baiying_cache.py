@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS baiying_products (
     video_url   TEXT,                            -- 商品素材视频直链
     video_urls_json TEXT,                        -- 商品全部视频直链 JSON 数组
     gallery_json TEXT,                           -- 百应商品详情图 URL 列表
+    video_source_type TEXT,                      -- baiying_pack_detail_media / unknown
+    watermark_status TEXT,                       -- unknown / clean / needs_review
     captured_at TEXT    NOT NULL                 -- 抓取时间（本地 ISO8601）
 );
 """
@@ -77,6 +79,8 @@ MIGRATION_ALTERS = [
     "ALTER TABLE baiying_products ADD COLUMN commodity_id TEXT",
     "ALTER TABLE baiying_products ADD COLUMN video_urls_json TEXT",
     "ALTER TABLE baiying_products ADD COLUMN gallery_json TEXT",
+    "ALTER TABLE baiying_products ADD COLUMN video_source_type TEXT",
+    "ALTER TABLE baiying_products ADD COLUMN watermark_status TEXT",
 ]
 
 
@@ -174,6 +178,8 @@ def upsert_product(
     gallery: Optional[Sequence[str]] = None,
     video_urls: Optional[Sequence[str]] = None,
     account_id: Optional[int] = None,
+    video_source_type: Optional[str] = None,
+    watermark_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     if type(account_id) is not int or account_id < 1:
         account_id = None
@@ -201,15 +207,20 @@ def upsert_product(
             ]
             if not old_video_urls and existing["video_url"]:
                 old_video_urls = [str(existing["video_url"])]
-        normalized_video_urls = list(dict.fromkeys(normalized_video_urls + old_video_urls))
+        if video_source_type == "baiying_pack_detail_media" and normalized_video_urls:
+            # 商业源直链可能带时效签名；重复抓取时只保留本次响应，避免缓存列表反复下载旧签名。
+            normalized_video_urls = list(dict.fromkeys(normalized_video_urls))
+        else:
+            normalized_video_urls = list(dict.fromkeys(normalized_video_urls + old_video_urls))
         primary_video_url = normalized_video_urls[0] if normalized_video_urls else video_url
         connection.execute(
-            "INSERT INTO baiying_products (product_id, account_id, commodity_id, title, cover_url, cos_ratio, video_url, video_urls_json, gallery_json, captured_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO baiying_products (product_id, account_id, commodity_id, title, cover_url, cos_ratio, video_url, video_urls_json, gallery_json, video_source_type, watermark_status, captured_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(product_id) DO UPDATE SET "
             "account_id = COALESCE(excluded.account_id, baiying_products.account_id), "
             "commodity_id = COALESCE(excluded.commodity_id, baiying_products.commodity_id), "
-            "title = excluded.title, cover_url = excluded.cover_url, "
+            "title = COALESCE(excluded.title, baiying_products.title), "
+            "cover_url = COALESCE(excluded.cover_url, baiying_products.cover_url), "
             "cos_ratio = CASE "
             "WHEN excluded.account_id IS NULL AND baiying_products.account_id IS NOT NULL THEN baiying_products.cos_ratio "
             "WHEN excluded.account_id IS NOT baiying_products.account_id THEN excluded.cos_ratio "
@@ -217,10 +228,13 @@ def upsert_product(
             "video_url = COALESCE(excluded.video_url, baiying_products.video_url), "
             "video_urls_json = COALESCE(excluded.video_urls_json, baiying_products.video_urls_json), "
             "gallery_json = COALESCE(excluded.gallery_json, baiying_products.gallery_json), "
+            "video_source_type = COALESCE(excluded.video_source_type, baiying_products.video_source_type), "
+            "watermark_status = COALESCE(excluded.watermark_status, baiying_products.watermark_status), "
             "captured_at = excluded.captured_at",
             (product_id, account_id, commodity_id, title, cover_url, cos_ratio, primary_video_url,
              json.dumps(normalized_video_urls, ensure_ascii=False) if normalized_video_urls else None,
-             json.dumps(list(gallery), ensure_ascii=False) if gallery else None, now_text()),
+             json.dumps(list(gallery), ensure_ascii=False) if gallery else None,
+             video_source_type, watermark_status, now_text()),
         )
         row = connection.execute(
             "SELECT * FROM baiying_products WHERE product_id = ?", (product_id,)
@@ -304,6 +318,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_upsert.add_argument("--cover", default=None)
     p_upsert.add_argument("--cos-ratio", type=float, default=None)
     p_upsert.add_argument("--video-url", default=None)
+    p_upsert.add_argument("--video-source-type", default=None,
+                          help="视频来源字段，例如 baiying_pack_detail_media")
+    p_upsert.add_argument("--watermark-status", default=None,
+                          help="来源水印状态，例如 clean / unknown / needs_review")
     p_upsert.add_argument("--account-id", type=int, default=None, help="捕获来源的本地抖音账号 ID")
     p_upsert.add_argument("--gallery-stdin", action="store_true", help="从 stdin 读取商品详情图 URL JSON 列表")
     p_upsert.add_argument("--detail-stdin", action="store_true", help="从 stdin 读取 {gallery, videoUrls} 商品详情数据")
@@ -353,6 +371,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 gallery,
                 video_urls,
                 account_id,
+                args.video_source_type or ("baiying_pack_detail_media" if args.detail_stdin and video_urls else None),
+                args.watermark_status or ("clean" if args.detail_stdin and video_urls else None),
             )
         elif args.command == "set-commodity":
             payload = set_commodity(db_path, args.product_id, args.commodity_id, args.account_id)

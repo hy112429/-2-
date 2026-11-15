@@ -55,7 +55,7 @@ const INTERNAL_SCRIPTS = new Set([
   'qianchuan_violations.py', 'qianchuan_plan.py', 'qianchuan_plan_browser.py',
   'qianchuan_plan_supplement_browser.py',
   'post_publish_material.py', 'baiying_cart_download_state.py',
-  'video_visual_dedupe.py'
+  'video_visual_dedupe.py', 'watermark_pipeline.py'
 ])
 
 /** 正在运行的任务表：taskId -> 句柄（含取消标志与强杀入口） */

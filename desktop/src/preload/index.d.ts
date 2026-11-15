@@ -493,6 +493,9 @@ declare global {
           downloadPath?: string
           commodityId?: string
           cacheWarning?: string
+          sourceType?: string
+          sourceField?: string
+          watermarkStatus?: string
           available?: number
           limit?: number
           videos?: Array<{ videoId: string; url: string; title: string; author: string; duration?: number; publishTime?: number; shareUrl?: string }>
@@ -565,7 +568,7 @@ declare global {
         postPublishRuns(): Promise<Record<string, unknown>>
         retryPostPublishRun(queueId: number): Promise<Record<string, unknown>>
         planSettings(qcId: number): Promise<Record<string, unknown>>
-        savePlanSettings(params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>>
+        savePlanSettings(params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean; scheduleEnabled: boolean; scheduleTime: string }): Promise<Record<string, unknown>>
         planJobs(params?: { qianchuanAccountId?: number; accountId?: number; status?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
         planLogs(params?: { id?: number; qianchuanAccountId?: number; accountId?: number; status?: string; startDate?: string; endDate?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
         planCandidates(params: { accountId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>

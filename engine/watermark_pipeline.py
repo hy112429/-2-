@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""下载完成后的自动水印处理：先尝试移动水印传统跟踪，再回退 AI。"""
+"""下载完成后的自动水印处理：只调用现有 AI 检测/修复流水线。"""
 
 from __future__ import annotations
 
@@ -156,40 +156,9 @@ def main() -> int:
     if total <= 0:
         return emit({"type": "error", "message": "视频没有可读取的画面"}, 2)
 
-    frames = sorted({round(i * (total - 1) / 4) for i in range(5)})
-    detection_code, detection = child(
-        "remove_watermark.py",
-        ["--input", str(source), "--detect", "--frames", ",".join(map(str, frames))],
-    )
-    points = detection.get("points", []) if detection else []
-    valid_points = [point for point in points if isinstance(point, list) and len(point) == 3]
     destination = output_candidate(source)
 
-    if detection_code == 0 and len(valid_points) >= 2:
-        emit({"type": "stage", "stage": "检测到移动水印，自动跟踪修复", "percent": 5})
-        points_arg = ";".join(",".join(str(int(part)) for part in point) for point in valid_points)
-        code, result = child(
-            "remove_watermark.py",
-            ["--input", str(source), "--output", str(destination), "--points", points_arg],
-        )
-        covered = int((result or {}).get("covered_frames") or 0)
-        if code == 0 and covered > 0 and valid_video(destination, source):
-            return emit({
-                "type": "result",
-                "data": {
-                    "ok": True,
-                    "status": "processed",
-                    "method": "传统跟踪修复",
-                    "file_path": str(destination),
-                    "covered_frames": covered,
-                    "frames": total,
-                },
-            })
-        if destination.exists():
-            destination.unlink()
-        emit({"type": "stage", "stage": "传统跟踪效果不足，转入 AI 自动检测", "percent": 10})
-    else:
-        emit({"type": "stage", "stage": "移动水印未能可靠定位，转入 AI 自动检测", "percent": 5})
+    emit({"type": "stage", "stage": "AI 抽样检测水印中…", "percent": 5})
 
     code, ai_result = child(
         "remove_watermark_ai.py",

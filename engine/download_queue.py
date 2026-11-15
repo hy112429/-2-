@@ -43,7 +43,7 @@ except ImportError:
     from client_paths import DEFAULT_DB_PATH
     from asset_library import ensure_schema as ensure_asset_schema, register_asset
 
-TASK_STATUSES = {"pending", "running", "success", "failed", "skipped"}
+TASK_STATUSES = {"pending", "running", "success", "failed", "skipped", "needs_review"}
 
 # 每个任务一个锁，保护进度事件不交叉
 _event_lock = Lock()
@@ -87,28 +87,46 @@ def connect_db(db_path: str) -> sqlite3.Connection:
         );
         """
     )
+    columns = {row[1] for row in con.execute("PRAGMA table_info(tasks)")}
+    for name, definition in (
+        ("url", "TEXT"),
+        ("product_id", "TEXT"),
+        ("account_id", "INTEGER"),
+        ("source_type", "TEXT"),
+        ("file_path", "TEXT"),
+        ("watermark_status", "TEXT"),
+    ):
+        if name not in columns:
+            con.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+    con.commit()
     return con
 
 
-def upsert_task(con: sqlite3.Connection, task_id: str, url: str, status: str,
-                attempts: int, progress: int, message: Optional[str]) -> None:
+def upsert_task(con: sqlite3.Connection, task: Dict[str, Any], status: str,
+                attempts: int, progress: int, message: Optional[str],
+                file_path: Optional[str] = None,
+                watermark_status: Optional[str] = None) -> None:
     """按 url 作为任务标识 upsert（url 唯一，避免重复插入）。"""
     now = now_text()
     with _db_lock:
         row = con.execute(
-            "SELECT id FROM tasks WHERE message = ? AND task_type = 'download' LIMIT 1",
-            (url,),
+            "SELECT id FROM tasks WHERE task_type = 'download' AND (url = ? OR (url IS NULL AND message = ?)) LIMIT 1",
+            (task["url"], task["url"]),
         ).fetchone()
         if row is None:
             con.execute(
-                "INSERT INTO tasks (task_type, status, attempts, progress, message, created_at, updated_at) "
-                "VALUES ('download', ?, ?, ?, ?, ?, ?)",
-                (status, attempts, progress, url, now, now),
+                "INSERT INTO tasks (task_type, status, attempts, progress, message, url, product_id, account_id, source_type, file_path, watermark_status, created_at, updated_at) "
+                "VALUES ('download', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (status, attempts, progress, message, task["url"], task.get("product_id"), task.get("account_id"),
+                 task.get("source_type"), file_path or task.get("dest"), watermark_status or task.get("watermark_status"), now, now),
             )
         else:
             con.execute(
-                "UPDATE tasks SET status = ?, attempts = ?, progress = ?, message = ?, updated_at = ? WHERE id = ?",
-                (status, attempts, progress, url, now, row[0]),
+                "UPDATE tasks SET status = ?, attempts = ?, progress = ?, message = ?, url = COALESCE(?, url), product_id = COALESCE(?, product_id), "
+                "account_id = COALESCE(?, account_id), source_type = COALESCE(?, source_type), "
+                "file_path = COALESCE(?, file_path), watermark_status = COALESCE(?, watermark_status), updated_at = ? WHERE id = ?",
+                (status, attempts, progress, message, task["url"], task.get("product_id"), task.get("account_id"),
+                 task.get("source_type"), file_path, watermark_status, now, row[0]),
             )
         con.commit()
 
@@ -188,6 +206,65 @@ def ensure_h264(dest: Path) -> str:
         return f"转码失败：{exc}（已保留原文件）"
 
 
+def run_auto_watermark(source: Path, workers: int, task_id: Optional[str] = None, attempts: int = 0) -> Dict[str, Any]:
+    """调用现有自动流水线；任何不确定都保留原片并返回待核查。"""
+    script = Path(__file__).resolve().with_name("watermark_pipeline.py")
+    if not script.is_file():
+        return {"ok": False, "status": "needs_review", "file_path": str(source), "message": "自动水印处理脚本不存在，原视频已保留"}
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        payload = json.dumps({"video_path": str(source), "workers": max(1, min(int(workers), 8))}, ensure_ascii=False)
+        assert proc.stdin is not None
+        proc.stdin.write(payload)
+        proc.stdin.close()
+        result: Optional[Dict[str, Any]] = None
+        output_tail: List[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                output_tail.append(raw[-300:])
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "stage":
+                if task_id:
+                    raw_percent = item.get("percent")
+                    percent = 80 + int(max(0, min(100, float(raw_percent or 0))) * 0.2)
+                    emit({
+                        "type": "task", "status": "running", "tid": task_id,
+                        "percent": percent, "attempts": attempts,
+                        "message": str(item.get("stage") or "自动水印处理中"),
+                    })
+            elif item.get("type") == "result":
+                data = item.get("data")
+                result = data if isinstance(data, dict) else item
+            elif item.get("type") == "error":
+                result = {"ok": False, "status": "needs_review", "file_path": str(source), "message": str(item.get("message") or "自动水印处理失败")}
+        code = proc.wait()
+        if result is None:
+            result = {"ok": False, "status": "needs_review", "file_path": str(source), "message": "自动水印处理没有返回结果"}
+        if code != 0 and result.get("status") not in ("needs_review", "no_watermark"):
+            result = {"ok": False, "status": "needs_review", "file_path": str(source), "message": str(result.get("message") or result.get("error") or "自动水印处理失败")}
+        if output_tail and not result.get("message"):
+            result["message"] = output_tail[-1]
+        return result
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "status": "needs_review", "file_path": str(source), "message": f"自动水印处理异常：{error}"}
+
+
 def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float) -> Dict[str, Any]:
     """执行一次下载。成功返回统计，失败抛异常。"""
     url = task["url"]
@@ -251,8 +328,25 @@ def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float)
 
     # 规格转码：非 H.264/AAC 时转码（小红书 HEVC 等），抖音 h264 源不重编码
     transcode_note = ensure_h264(dest)
-
-    return {"status": "success", "bytes": written, "message": "下载完成" + (f"，{transcode_note}" if transcode_note else ""), "file_path": str(dest)}
+    result: Dict[str, Any] = {
+        "status": "success", "bytes": written,
+        "message": "下载完成" + (f"，{transcode_note}" if transcode_note else ""),
+        "file_path": str(dest),
+        "watermark_status": "not_required",
+    }
+    if task.get("watermark_mode") == "auto":
+        processed = run_auto_watermark(dest, int(task.get("watermark_workers") or 2), task.get("id"), int(task.get("attempts") or 0))
+        status = str(processed.get("status") or "needs_review")
+        result["watermark_status"] = status
+        result["file_path"] = str(processed.get("file_path") or dest)
+        if status == "no_watermark":
+            result["message"] += "；自动检测未发现水印，保留原片"
+        elif status == "processed":
+            result["message"] += "；自动去水印已生成成品"
+        else:
+            result["status"] = "needs_review"
+            result["message"] += f"；{processed.get('message') or '自动水印处理未确认，原片已保留'}"
+    return result
 
 
 def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: float, db_con: sqlite3.Connection) -> Dict[str, Any]:
@@ -263,9 +357,25 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
 
     # 断点续传检查（不进 attempts，不算失败）
     if dest.exists() and dest.stat().st_size > 0:
-        upsert_task(db_con, task["id"], task["url"], "skipped", 0, 100, "文件已存在，跳过")
-        emit({"type": "task", "status": "skipped", "tid": task["id"], "percent": 100, "attempts": 0, "message": "文件已存在，跳过", "file_path": str(dest)})
-        return {"status": "skipped", "id": task["id"]}
+        existing_result: Dict[str, Any] = {
+            "status": "skipped", "id": task["id"], "percent": 100,
+            "message": "文件已存在，跳过", "file_path": str(dest),
+            "watermark_status": "not_checked",
+        }
+        if task.get("watermark_mode") == "auto":
+            processed = run_auto_watermark(dest, int(task.get("watermark_workers") or 2), task.get("id"), 0)
+            existing_result["watermark_status"] = str(processed.get("status") or "needs_review")
+            existing_result["file_path"] = str(processed.get("file_path") or dest)
+            if existing_result["watermark_status"] == "processed":
+                existing_result["message"] += "；已复用文件并完成自动去水印"
+            elif existing_result["watermark_status"] == "no_watermark":
+                existing_result["message"] += "；已复用文件且未检测到水印"
+            else:
+                existing_result["status"] = "needs_review"
+                existing_result["message"] += f"；{processed.get('message') or '自动水印处理未确认，原片已保留'}"
+        upsert_task(db_con, task, existing_result["status"], 0, 100, existing_result["message"], existing_result["file_path"], existing_result["watermark_status"])
+        emit({"type": "task", **existing_result, "tid": task["id"], "attempts": 0})
+        return existing_result
 
     for attempt in range(max_retries + 1):
         task["attempts"] = attempt
@@ -277,17 +387,17 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
             "attempts": attempt,
             "message": "开始下载" if attempt == 0 else f"第 {attempt} 次重试",
         })
-        upsert_task(db_con, task["id"], task["url"], "running", attempt, 0, "下载中")
+        upsert_task(db_con, task, "running", attempt, 0, "下载中")
         try:
             result = download_one(session, task, dest, timeout)
             # 只有本次真实下载成功，才足以证明 web_download 来源；已有文件跳过不作来源推断。
-            if result["status"] == "success":
+            if result["status"] in ("success", "needs_review"):
                 try:
                     with _db_lock:
                         ensure_asset_schema(db_con)
                         explicit_account = task.get("account_id")
                         register_asset(
-                            db_con, str(dest), "web_download",
+                            db_con, str(result.get("file_path") or dest), "web_download",
                             int(explicit_account) if explicit_account is not None else None,
                             str(task["product_id"]) if task.get("product_id") else None,
                         )
@@ -297,7 +407,7 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
                         "type": "asset_registration_warning", "tid": task["id"],
                         "message": f"文件下载成功，但素材来源登记失败：{error}",
                     })
-            upsert_task(db_con, task["id"], task["url"], result["status"], attempt, 100, result.get("message", ""))
+            upsert_task(db_con, task, result["status"], attempt, 100, result.get("message", ""), result.get("file_path"), result.get("watermark_status"))
             emit({
                 "type": "task",
                 "status": result["status"],
@@ -306,17 +416,21 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
                 "attempts": attempt,
                 "message": result.get("message", ""),
                 "file_path": result.get("file_path", ""),
+                "watermark_status": result.get("watermark_status", ""),
+                "source_type": task.get("source_type", ""),
+                "product_id": task.get("product_id", ""),
+                "account_id": task.get("account_id"),
             })
             return {**result, "id": task["id"]}
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
             if cancel_flag["value"]:
-                upsert_task(db_con, task["id"], task["url"], "failed", attempt, 0, "任务已取消")
+                upsert_task(db_con, task, "failed", attempt, 0, "任务已取消")
                 emit({"type": "task", "status": "failed", "tid": task["id"], "percent": 0, "attempts": attempt, "message": "任务已取消"})
                 return {"status": "failed", "id": task["id"], "message": "任务已取消"}
             # 不可重试错误（如签名过期直链）：不白等退避重试，直接判失败
             if isinstance(exc, NoRetryError):
-                upsert_task(db_con, task["id"], task["url"], "failed", attempt, 0, last_error)
+                upsert_task(db_con, task, "failed", attempt, 0, last_error)
                 emit({
                     "type": "task",
                     "status": "failed",
@@ -336,10 +450,10 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
                     "attempts": attempt,
                     "message": f"失败（{last_error}），{delay}s 后第 {attempt + 1} 次重试",
                 })
-                upsert_task(db_con, task["id"], task["url"], "running", attempt, 0, f"等待重试：{last_error}")
+                upsert_task(db_con, task, "running", attempt, 0, f"等待重试：{last_error}")
                 time.sleep(delay)
             else:
-                upsert_task(db_con, task["id"], task["url"], "failed", attempt, 0, last_error)
+                upsert_task(db_con, task, "failed", attempt, 0, last_error)
                 emit({
                     "type": "task",
                     "status": "failed",
@@ -397,7 +511,7 @@ def main() -> int:
     recover_stale_running(db_con)
 
     session = requests.Session()
-    stats = {"success": 0, "failed": 0, "skipped": 0, "done": 0}
+    stats = {"success": 0, "failed": 0, "skipped": 0, "needs_review": 0, "done": 0}
     done_lock = Lock()
 
     def worker_one(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -411,12 +525,14 @@ def main() -> int:
                 stats["success"] += 1
             elif result.get("status") == "skipped":
                 stats["skipped"] += 1
+            elif result.get("status") == "needs_review":
+                stats["needs_review"] += 1
             else:
                 stats["failed"] += 1
             percent = int(stats["done"] * 100 / total)
             emit({
                 "type": "stage",
-                "stage": f"任务 {stats['done']}/{total} 完成（成功 {stats['success']} / 失败 {stats['failed']} / 跳过 {stats['skipped']}）",
+                "stage": f"任务 {stats['done']}/{total} 完成（成功 {stats['success']} / 待核查 {stats['needs_review']} / 失败 {stats['failed']} / 跳过 {stats['skipped']}）",
                 "percent": percent,
             })
         return result
@@ -435,6 +551,7 @@ def main() -> int:
         "success": stats["success"],
         "failed": stats["failed"],
         "skipped": stats["skipped"],
+        "needsReview": stats["needs_review"],
         "canceled": canceled,
     }
     emit({"type": "stage", "stage": "全部结束" if not canceled else "已被取消，队列停止", "percent": 100})

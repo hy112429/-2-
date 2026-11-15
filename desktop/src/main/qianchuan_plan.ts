@@ -304,13 +304,17 @@ export function registerQianchuanPlanIpc(): void {
     if (!Number.isSafeInteger(budget)) throw new Error('日预算须为整数元')
     const source = value(params['videoSource'])
     if (!['uploaded', 'my_video', 'both'].includes(source)) throw new Error('视频来源无效')
+      const scheduleTime = value(params['scheduleTime'] || '09:00')
+      if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(scheduleTime)) throw new Error('千川定时时间无效')
     return command('set-settings', [
       '--qianchuan-account-id', String(validId(params['qianchuanAccountId'])),
       '--daily-budget-yuan', String(budget), '--video-source', source,
       '--enabled', params['enabled'] === true ? '1' : '0',
       '--long-running', params['longRunning'] === false ? '0' : '1',
       '--smart-coupon', params['smartCoupon'] === false ? '0' : '1',
-      '--aigc-enabled', params['aigcEnabled'] === true ? '1' : '0'
+      '--aigc-enabled', params['aigcEnabled'] === true ? '1' : '0',
+      '--schedule-enabled', params['scheduleEnabled'] === true ? '1' : '0',
+      '--schedule-time', scheduleTime
     ])
   }))
   ipcMain.handle('qianchuan:plan:jobs', (_event, raw?: unknown) => reply(() => {
@@ -321,7 +325,7 @@ export function registerQianchuanPlanIpc(): void {
     if (params['accountId'] != null) args.push('--account-id', String(validId(params['accountId'])))
     const status = value(params['status']).trim()
     if (status) {
-      if (!['ready', 'submitting', 'published', 'blocked', 'needs_review'].includes(status)) throw new Error('计划状态筛选值无效')
+      if (!['waiting_selection', 'scheduled', 'ready', 'submitting', 'published', 'blocked', 'needs_review'].includes(status)) throw new Error('计划状态筛选值无效')
       args.push('--status', status)
     }
     return command('jobs', args)
@@ -335,7 +339,7 @@ export function registerQianchuanPlanIpc(): void {
     if (params['accountId'] != null) args.push('--account-id', String(validId(params['accountId'])))
     const status = value(params['status']).trim()
     if (status) {
-      if (!['ready', 'submitting', 'published', 'blocked', 'needs_review'].includes(status)) throw new Error('计划日志状态筛选值无效')
+      if (!['waiting_selection', 'scheduled', 'ready', 'submitting', 'published', 'blocked', 'needs_review'].includes(status)) throw new Error('计划日志状态筛选值无效')
       args.push('--status', status)
     }
     const startDate = value(params['startDate']).trim()

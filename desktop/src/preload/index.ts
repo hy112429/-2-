@@ -318,6 +318,9 @@ const baiying = {
     downloadPath?: string
     commodityId?: string
     cacheWarning?: string
+    sourceType?: string
+    sourceField?: string
+    watermarkStatus?: string
     available?: number
     limit?: number
     videos?: Array<{ videoId: string; url: string; title: string; author: string; duration?: number; publishTime?: number; shareUrl?: string }>
@@ -466,7 +469,7 @@ const qianchuan = {
   retryPostPublishRun: (queueId: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:postPublish:retry', queueId),
   planSettings: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:settings', qcId),
-  savePlanSettings: (params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>> =>
+  savePlanSettings: (params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean; scheduleEnabled: boolean; scheduleTime: string }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:plan:saveSettings', toPlainIpcPayload(params)),
   planJobs: (params?: { qianchuanAccountId?: number; accountId?: number; status?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:plan:jobs', toPlainIpcPayload(params)),

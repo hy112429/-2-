@@ -371,6 +371,7 @@ let activeScheduledStartDate: string | null = null
 let queuedScheduledStart: SelectionScheduleDue | null = null
 const SCHEDULED_RETRY_BASE_DELAY_MS = 30_000
 const SCHEDULED_RETRY_MAX_DELAY_MS = 5 * 60_000
+const CANDIDATE_REFILL_RETRY_DELAY_MS = 60_000
 const runLogWarning = ref('')
 const selectionErrorPresentation = computed(() => toUserSelectionError(error.value))
 const selectionNoticePresentation = computed(() => toUserSelectionError(notice.value))
@@ -382,6 +383,8 @@ const selectionCooldownRemaining = ref(0)
 let selectionCooldownTimer: number | null = null
 let selectionCooldownDeadline: number | null = null
 let selectionAutoResumeTimer: number | null = null
+let candidateRefillAutoResumeTimer: number | null = null
+let candidateRefillAutoResumeIntent: { batchId: string; accountId: number; retryAt: number } | null = null
 let selectionProgressFlushTimer: number | null = null
 let pendingSelectionProgressUpdate: (() => void) | null = null
 let selectionViewUnmounted = false
@@ -934,6 +937,56 @@ function currentAutoResumeState() {
 function clearAutoResumeTimer(): void {
   if (selectionAutoResumeTimer !== null) window.clearTimeout(selectionAutoResumeTimer)
   selectionAutoResumeTimer = null
+}
+
+function clearCandidateRefillAutoResume(): void {
+  if (candidateRefillAutoResumeTimer !== null) window.clearTimeout(candidateRefillAutoResumeTimer)
+  candidateRefillAutoResumeTimer = null
+  candidateRefillAutoResumeIntent = null
+}
+
+function scheduleCandidateRefillAutoResume(batch: SelectionRecoveryBatch | null): void {
+  if (selectionViewUnmounted || busy.value || loginPreflight.value || !batch || batch.state !== 'needs_retry') {
+    if (!batch || candidateRefillAutoResumeIntent?.batchId === batch?.batchId) clearCandidateRefillAutoResume()
+    return
+  }
+  const account = batch.accounts.find((item) =>
+    item.state !== 'completed' && item.stage === 'candidate_refilling' &&
+    !/未产生新商品|来源未变化|来源已耗尽/.test(String(item.error ?? ''))
+  )
+  if (!account) {
+    if (candidateRefillAutoResumeIntent?.batchId === batch.batchId) clearCandidateRefillAutoResume()
+    return
+  }
+  const retryAt = Date.now() + CANDIDATE_REFILL_RETRY_DELAY_MS
+  candidateRefillAutoResumeIntent = { batchId: batch.batchId, accountId: account.accountId, retryAt }
+  if (candidateRefillAutoResumeTimer !== null) return
+  notice.value = `账号「${account.accountName}」候选不足，${Math.ceil(CANDIDATE_REFILL_RETRY_DELAY_MS / 1000)} 秒后自动继续读取下一页和其他已启用来源。`
+  candidateRefillAutoResumeTimer = window.setTimeout(async () => {
+    candidateRefillAutoResumeTimer = null
+    const intent = candidateRefillAutoResumeIntent
+    if (!intent || selectionViewUnmounted || busy.value || loginPreflight.value) return
+    const latest = await runRecovery(['batch', 'latest']).catch(() => ({ batch: null }))
+    const latestBatch = latest.batch as SelectionRecoveryBatch | null
+    const latestAccount = latestBatch?.accounts.find((item) => item.accountId === intent.accountId)
+    if (!latestBatch || latestBatch.batchId !== intent.batchId || latestBatch.state !== 'needs_retry' ||
+      !latestAccount || latestAccount.state === 'completed' || latestAccount.stage !== 'candidate_refilling') {
+      if (candidateRefillAutoResumeIntent?.batchId === intent.batchId) clearCandidateRefillAutoResume()
+      return
+    }
+    recoveryBatch.value = latestBatch
+    recoverySelectionBatchId.value = latestBatch.batchId
+    recoverySelectedAccountIds.value = latestBatch.accounts
+      .filter((item) => item.state !== 'completed')
+      .map((item) => item.accountId)
+    automaticResumeBatchId = latestBatch.batchId
+    automaticResumeAccountId = intent.accountId
+    candidateRefillAutoResumeIntent = null
+    traceSelectionCooldown('renderer_candidate_refill_auto_resume', latestBatch.batchId, {
+      accountId: intent.accountId, retryAt: intent.retryAt, delayMs: CANDIDATE_REFILL_RETRY_DELAY_MS
+    })
+    await startSelection()
+  }, CANDIDATE_REFILL_RETRY_DELAY_MS)
 }
 
 function cooldownAutoResumeDecision(intent: CooldownAutoResumeIntent) {
@@ -2922,11 +2975,16 @@ async function executeAccountSelection(
       let maxSelectedProducts: number | undefined
       const requestedLimit = Number(settings.candidateLimit ?? 5)
       const candidateLimit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(10, requestedLimit)) : 5
+      let refillSourceUnchanged = false
       const hasExplicitPreviewSelection =
         reviewedPreviewAccountId === targetAccountId && reviewedProductIds !== undefined
       const refillCandidatePool = async (force = false): Promise<void> => {
         if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
         const retryDelays = [1_000, 2_500, 6_000]
+        const observedProductIds = new Set<string>([
+          ...fetched.map((row) => String(row.productId ?? '').trim()),
+          ...completed.map((row) => String(row.productId ?? '').trim())
+        ].filter(Boolean))
         for (let attempt = 0; attempt < retryDelays.length && fetched.length < candidateLimit; attempt += 1) {
           const delayMs = retryDelays[attempt]
           accountStatuses[targetAccountId] = `candidate_refilling（${fetched.length}/${candidateLimit}）`
@@ -2952,18 +3010,48 @@ async function executeAccountSelection(
           }))
           if (refill.ok !== true) continue
           const newRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
+          const rejectedRows = Array.isArray(refill.rejectedCandidates) ? refill.rejectedCandidates as SelectionCandidate[] : []
+          const observedRows = [...newRows, ...rejectedRows]
+          const newObservedIds = [...new Set(observedRows.map((row) => String(row.productId ?? '').trim()).filter(Boolean))]
+            .filter((productId) => !observedProductIds.has(productId))
+          if (!newObservedIds.length) {
+            refillSourceUnchanged = true
+            await recovery?.logEvent({
+              stage: '候选补充', code: 'INFO_CANDIDATE_SOURCE_UNCHANGED',
+              message: `第 ${attempt + 1} 次补充未发现新的商品 ID，停止重复读取当前候选池。`,
+              detail: `当前已观察商品 ${observedProductIds.size} 个；等待真实分页、滚动或平台数据更新。`
+            })
+            break
+          }
+          for (const productId of newObservedIds) observedProductIds.add(productId)
           const byProduct = new Map(fetched.map((row) => [row.productId, row]))
           for (const row of newRows) if (!byProduct.has(row.productId)) byProduct.set(row.productId, row)
           fetched = [...byProduct.values()].map((row, index) => ({ ...row, cardIndex: index }))
           await recovery?.logEvent({
             stage: '候选补充', code: 'INFO_CANDIDATE_REFILL_RESULT',
             message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
-            detail: `本次新读取 ${newRows.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
+            detail: `本次候选 ${newRows.length} 条、淘汰 ${rejectedRows.length} 条；新商品 ID ${newObservedIds.length} 个；按商品 ID 去重后 ${fetched.length} 条。`
           })
         }
         if (fetched.length < candidateLimit) {
-          await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: `候选补充后仍只有 ${fetched.length}/${candidateLimit}，未放宽筛选条件。`, candidates: fetched })
+          const refillReason = refillSourceUnchanged
+            ? `候选来源本轮未产生新商品，当前 ${fetched.length}/${candidateLimit}；已暂停重复读取，等待平台分页或数据更新。`
+            : `候选补充后仍只有 ${fetched.length}/${candidateLimit}，未放宽筛选条件。`
+          await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: refillReason, candidates: fetched })
         }
+      }
+      const holdAccountForCandidateRefill = async (reason: string): Promise<{ status: '完成' | '部分完成'; message?: string; continueBatch?: boolean }> => {
+        const message = `${reason}；当前可执行候选 ${eligible.length}/${candidateLimit}，已保留检查点，继续补充候选；筛选条件未放宽，未推进下一个账号。`
+        accountStatuses[targetAccountId] = `candidate_refilling（${eligible.length}/${candidateLimit}）`
+        await recovery?.persist({
+          state: 'in_progress', stage: 'candidate_refilling', error: message,
+          candidates: fetched, selectedIndexes: [], completed
+        })
+        await recovery?.logEvent({
+          stage: '候选补充', code: 'WARNING_CANDIDATE_TARGET_UNMET',
+          message, detail: `当前候选 ${fetched.length} 条，可执行 ${eligible.length} 条；未把部分结果计为完成。`
+        })
+        return { status: '部分完成', message, continueBatch: false }
       }
       await refillCandidatePool()
       if (resumeCart) {
@@ -3259,33 +3347,18 @@ async function executeAccountSelection(
           if (duplicateSkips.length) {
             const examples = duplicateSkips.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
             const skippedSummary = `本账号已有 ${duplicateSkips.length} 个已排队或已发布商品，已阻止重复选品${examples ? `，例如：${examples}${duplicateSkips.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志。`
-            accountStatuses[targetAccountId] = '已跳过账号内重复商品'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
+            return holdAccountForCandidateRefill(skippedSummary)
           }
           const titleFilterSkipped = completed.filter((item) => item.titleFilterExcluded === true)
           if (titleFilterSkipped.length) {
             const examples = titleFilterSkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
             const skippedSummary = `商品标题屏蔽排除 ${titleFilterSkipped.length} 个候选，未执行加车${examples ? `；例如：${examples}${titleFilterSkipped.length > 3 ? '等' : ''}` : ''}；命中词和商品明细已记入选品日志。`
-            accountStatuses[targetAccountId] = '部分完成（标题屏蔽）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
+            return holdAccountForCandidateRefill(skippedSummary)
           }
           const analysisSkipped = completed.filter((item) => item.analysisRejected === true)
           if (analysisSkipped.length) {
             const skippedSummary = `候选列表数据分析排除 ${analysisSkipped.length} 个商品，未执行加车；原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（筛选未通过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
+            return holdAccountForCandidateRefill(skippedSummary)
           }
           const globallySkipped = completed.filter((item) =>
             item.mutualExclusionSkipped === true || item.registryExcluded === true
@@ -3293,21 +3366,11 @@ async function executeAccountSelection(
           if (globallySkipped.length) {
             const examples = globallySkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')
             const skippedSummary = `本机商品 ID 互斥/登记过滤 ${globallySkipped.length} 个候选，未执行加车${examples ? `；例如：${examples}${globallySkipped.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志。`
-            accountStatuses[targetAccountId] = '部分完成（商品互斥跳过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
+            return holdAccountForCandidateRefill(skippedSummary)
           }
           if (categoryWarnings.length) {
             const skippedSummary = `本账号没有可执行候选；已跳过 ${categoryWarnings.length} 个可恢复的类目或来源读取问题，原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（类目/来源已跳过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
+            return holdAccountForCandidateRefill(skippedSummary)
           }
           if (fetched.length < candidateLimit) {
             const refillMessage = `候选补充中：当前 ${fetched.length}/${candidateLimit}；筛选条件未放宽，当前账号保持检查点，未推进下一个账号。`
@@ -4146,7 +4209,7 @@ async function loadRecoveryStatus(): Promise<void> {
   restoreSelectionCooldown(batch)
   if (!batch || !['in_progress', 'needs_retry'].includes(batch.state)) return
   const stageNames: Record<string, string> = {
-    quota_check: '配额校验', candidate_fetch: '获取候选', cart_pending: '加入选品车',
+    quota_check: '配额校验', candidate_fetch: '获取候选', candidate_refilling: '候选补充中', cart_pending: '加入选品车',
     quota_cart: '记录加车配额', video_pending: '生成详情视频'
   }
   for (const item of batch.accounts) {
@@ -4160,6 +4223,7 @@ async function loadRecoveryStatus(): Promise<void> {
   if (remaining) {
     notice.value = '发现未完成批次：' + remaining + ' 个账号任务已保存在本机。点击“继续选品”将从最近检查点继续。'
   }
+  scheduleCandidateRefillAutoResume(batch)
 }
 
 async function saveCandidateFetchRateLimitCheckpoint(
@@ -4235,7 +4299,7 @@ function clearPendingRecoveryAccountSelection(): void {
 function recoveryAccountStageLabel(account: SelectionRecoveryAccount): string {
   const labels: Record<string, string> = {
     quota_check: '配额校验',
-    candidate_fetch: '获取候选',
+    candidate_fetch: '获取候选', candidate_refilling: '候选补充中',
     cart_pending: '加入选品车',
     quota_cart: '记录加车配额',
     video_pending: '生成详情视频'
@@ -4741,6 +4805,10 @@ async function runSelectionBatch(): Promise<void> {
         item.accountId === requestedAutoResumeAccountId && item.state === 'needs_retry' &&
         toUserSelectionError(item.error).classification === 'BAIYING_RATE_LIMIT'
       )
+      const candidateRefillAccount = batch?.accounts.find((item) =>
+        item.accountId === requestedAutoResumeAccountId && item.state !== 'completed' &&
+        item.stage === 'candidate_refilling'
+      )
       const activeIntent = cooldownAutoResumeIntent.value
       const matchingIntent = Boolean(batch && activeIntent &&
         activeIntent.batchId === requestedAutoResumeBatchId && activeIntent.batchId === batch.batchId &&
@@ -4748,14 +4816,14 @@ async function runSelectionBatch(): Promise<void> {
       const pendingTarget = batch?.accounts.find((item) =>
         item.accountId === requestedAutoResumeAccountId && item.state !== 'completed'
       )
-      const checkpointStillResumable = Boolean(batch && batch.state === 'needs_retry' && limitedAccount)
+      const checkpointStillResumable = Boolean(batch && batch.state === 'needs_retry' && (limitedAccount || candidateRefillAccount))
       const inFlightCheckpointStillResumable = Boolean(matchingIntent && pendingTarget)
       if (!batch || batch.batchId !== requestedAutoResumeBatchId ||
         (!checkpointStillResumable && !inFlightCheckpointStillResumable)) {
         traceSelectionCooldown('renderer_auto_resume_checkpoint_rejected', requestedAutoResumeBatchId, {
           currentBatchId: batch?.batchId ?? null, batchState: batch?.state ?? null,
           accountId: requestedAutoResumeAccountId, targetState: pendingTarget?.state ?? null,
-          matchingIntent, checkpointStillResumable, inFlightCheckpointStillResumable
+          targetStage: pendingTarget?.stage ?? null, matchingIntent, checkpointStillResumable, inFlightCheckpointStillResumable
         })
         cooldownAutoResumeIntent.value = null
         autoResumeAccountId.value = null
@@ -5553,6 +5621,7 @@ async function runSelectionBatch(): Promise<void> {
       }
     }
     busy.value = false
+    scheduleCandidateRefillAutoResume(recoveryBatch.value)
   }
 }
 
@@ -5605,6 +5674,7 @@ async function startSelection(): Promise<boolean> {
   if (automaticResumeIsDue) selectionCooldownRemaining.value = 0
   void window.api.selectionCooldown.cancel().catch(() => undefined)
   clearAutoResumeTimer()
+  if (automaticResumeBatchId === null) clearCandidateRefillAutoResume()
   selectionCooldownArmed.value = false
   selectionCooldownDeadline = null
   if (automaticResumeBatchId === null) {
@@ -5696,9 +5766,10 @@ async function traceScheduledRun(
   due: SelectionScheduleDue,
   stage: string,
   attempt?: number,
-  delayMs?: number
+  delayMs?: number,
+  details: { batchId?: string | null; actualStartAt?: number; waitReason?: string } = {}
 ): Promise<void> {
-  await window.api.selectionSchedule.trace({ date: due.date, stage, attempt, delayMs }).catch(() => undefined)
+  await window.api.selectionSchedule.trace({ date: due.date, stage, attempt, delayMs, ...details }).catch(() => undefined)
 }
 
 async function isScheduledSelectionEnabled(): Promise<boolean> {
@@ -5798,7 +5869,10 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
 
         attempts += 1
         attemptCounted = true
-        await traceScheduledRun(due, 'attempt_started', attempts)
+        await traceScheduledRun(due, 'attempt_started', attempts, undefined, {
+          batchId: currentRunBatchId,
+          actualStartAt: Date.now()
+        })
         error.value = ''
         notice.value = `每日计划 ${due.time}：正在运行选品流程（第 ${attempts} 次尝试）。`
         const started = await startSelection()
@@ -5808,6 +5882,10 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
           if (latestBatch && (latestBatch.batchId !== initialBatch?.batchId || currentRunBatchId === latestBatch.batchId)) {
             currentRunBatchId = latestBatch.batchId
           }
+          await traceScheduledRun(due, 'batch_started', attempts, undefined, {
+            batchId: currentRunBatchId,
+            actualStartAt: Date.now()
+          })
         }
 
         const postRunLoginBlock = scheduledLoginBlockReason()
@@ -5837,7 +5915,10 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
             state: 'running', stage: '等待定时自动续跑', message: retryMessage, percent: null
           }
         }
-        await traceScheduledRun(due, 'retry_scheduled', attempts, delayMs)
+        await traceScheduledRun(due, 'retry_scheduled', attempts, delayMs, {
+          batchId: currentRunBatchId,
+          waitReason: reason
+        })
         const retryBatchId = recoveryBatch.value?.batchId
         if (retryBatchId) {
           await runRecovery(['log', 'append', '--batch-id', retryBatchId, '--account-id', '0'], {
@@ -5863,7 +5944,10 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
         const retryMessage = `${error.value}；${Math.ceil(delayMs / 1_000)} 秒后自动重试，定时选品保持运行。`
         notice.value = retryMessage
         await traceScheduledRun(due, 'attempt_error', attempts, delayMs)
-        await traceScheduledRun(due, 'retry_scheduled', attempts, delayMs)
+        await traceScheduledRun(due, 'retry_scheduled', attempts, delayMs, {
+          batchId: currentRunBatchId,
+          waitReason: error.value
+        })
         if (attempts === 1 || attempts % 5 === 0) notifyGlobal(retryMessage, 'error')
         await waitForScheduledRetry(delayMs)
       }
@@ -5958,6 +6042,7 @@ onMounted(async () => {
     error.value = String(cause instanceof Error ? cause.message : cause)
   } finally {
     busy.value = false
+    scheduleCandidateRefillAutoResume(recoveryBatch.value)
     selectionInitialized.value = true
   }
 })
@@ -5974,6 +6059,7 @@ onUnmounted(() => {
   selectionProgressFlushTimer = null
   pendingSelectionProgressUpdate = null
   clearAutoResumeTimer()
+  clearCandidateRefillAutoResume()
 })
 
 </script>

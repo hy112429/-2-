@@ -216,8 +216,9 @@ async function launchChrome(profilePath: string): Promise<number> {
     '--remote-allow-origins=*',
     '--no-first-run',
     '--no-default-browser-check',
+    '--start-minimized',
     'about:blank'
-  ], { detached: true, stdio: 'ignore', windowsHide: false })
+  ], { detached: true, stdio: 'ignore', windowsHide: true })
   child.on('error', () => undefined)
   child.unref()
   const port = await waitForActivePort(profilePath)

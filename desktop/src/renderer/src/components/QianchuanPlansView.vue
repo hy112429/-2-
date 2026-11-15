@@ -45,6 +45,9 @@ interface PlanJob {
   roi_target: number
   reason: string
   screenshot_path: string
+  selection_batch_id?: string
+  planned_at?: string
+  started_at?: string
 }
 interface PlanSupplement {
   id: number
@@ -78,7 +81,9 @@ const settings = reactive({
   videoSource: 'uploaded',
   longRunning: true,
   smartCoupon: true,
-  aigcEnabled: false
+  aigcEnabled: false,
+  scheduleEnabled: false,
+  scheduleTime: '09:00'
 })
 
 const activeAccounts = computed(() => [...new Map(targets.value
@@ -101,7 +106,7 @@ function checked(data: Record<string, unknown>): Record<string, unknown> {
   return data
 }
 function statusText(status: string): string {
-  return ({ ready: '待发布', submitting: '发布中', published: '已发布', blocked: '发布前停止', needs_review: '待核查' } as Record<string, string>)[status] ?? status
+  return ({ waiting_selection: '等待选品发布完成', scheduled: '等待千川定时', ready: '待发布', submitting: '发布中', published: '已发布', blocked: '发布前停止', needs_review: '待核查' } as Record<string, string>)[status] ?? status
 }
 function supplementStatusText(status: string): string {
   return ({ scheduled: '等待补入原计划', appending: '正在补入原计划', applied: '已补入原计划', already_present: '原计划已包含', blocked: '补入暂停', needs_review: '保存结果待核查' } as Record<string, string>)[status] ?? status
@@ -158,6 +163,8 @@ async function refreshPlanData(updateSettings = true): Promise<void> {
     settings.longRunning = Number(saved.long_running ?? 1) !== 0
     settings.smartCoupon = Number(saved.smart_coupon ?? 1) !== 0
     settings.aigcEnabled = Number(saved.aigc_enabled ?? 0) === 1
+    settings.scheduleEnabled = Number(saved.schedule_enabled ?? 0) === 1
+    settings.scheduleTime = String(saved.schedule_time ?? '09:00')
   }
   const historyData = checked(history)
   plans.value = rows<PlanJob>(historyData)
@@ -197,7 +204,7 @@ async function saveSettings(): Promise<void> {
     settingsDirty.value = false
     message.value = settings.enabled
       ? '自动计划已在千川计划工作区启用；符合条件的后续商品会由独立调度处理。'
-      : '自动计划已关闭；手动创建的计划仍可在本页单独确认发布。'
+    : '自动计划已关闭；手动创建的计划仍可在本页单独确认发布。'
     await refreshPlanData()
   } catch (error) { message.value = error instanceof Error ? error.message : String(error) }
   finally { busy.value = false }
@@ -356,6 +363,10 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
           </label>
           <label>日预算（元）<input v-model.number="settings.dailyBudgetYuan" type="number" min="50" max="10000000" step="1" @input="settingsDirty = true" /></label>
           <label>素材来源<select v-model="settings.videoSource" @change="settingsDirty = true"><option value="uploaded">千川已上传素材</option><option value="both">已上传素材并兼容我的视频</option></select></label>
+          <label class="toggle-row"><input v-model="settings.scheduleEnabled" type="checkbox" @change="settingsDirty = true" />
+            <span><strong>启用千川定时</strong><small>到点前只保留本地等待任务，不打开千川页面；仍受全批次选品和抖音发布闸门控制。</small></span>
+          </label>
+          <label>千川开始时间<input v-model="settings.scheduleTime" type="time" @input="settingsDirty = true" /></label>
         </div>
         <p class="formula">投放方式固定为「控成本投放」。保本 ROI = 100 ÷ 佣金率（%）；例如佣金率 20%，ROI 为 5.00。佣金率缺失或账号不匹配时会阻止创建/发布。</p>
         <p v-if="settings.enabled && settings.dailyBudgetYuan < 50" class="reason">自动创建并发布已勾选；请先填写至少 50 元日预算，再保存设置。</p>
@@ -378,7 +389,7 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
       </section>
 
       <section class="card">
-        <div class="section-head"><div><h2>计划列表 · {{ selectedAccountName }}</h2><p>已开启账户自动发布时，自动任务会按队列依次处理；手动任务仍需你确认预算。提交结果不明会暂停同一千川账户的后续自动计划，核实前不会重复发布。</p></div><div class="plan-filters"><label>状态<select v-model="planStatus"><option value="">全部状态</option><option value="ready">待发布</option><option value="submitting">发布中</option><option value="published">已发布</option><option value="blocked">发布前停止</option><option value="needs_review">待核查</option></select></label><button class="btn" :disabled="loading || busy" @click="refreshPlanData(false)">刷新计划</button></div></div>
+        <div class="section-head"><div><h2>计划列表 · {{ selectedAccountName }}</h2><p>已开启账户自动发布时，自动任务会按队列依次处理；定时或选品批次未完成时显示等待状态。提交结果不明会暂停同一千川账户的后续自动计划，核实前不会重复发布。</p></div><div class="plan-filters"><label>状态<select v-model="planStatus"><option value="">全部状态</option><option value="waiting_selection">等待选品发布完成</option><option value="scheduled">等待千川定时</option><option value="ready">待发布</option><option value="submitting">发布中</option><option value="published">已发布</option><option value="blocked">发布前停止</option><option value="needs_review">待核查</option></select></label><button class="btn" :disabled="loading || busy" @click="refreshPlanData(false)">刷新计划</button></div></div>
         <div v-if="!visiblePlans.length" class="empty-state">暂无计划任务。</div>
         <div v-else class="plan-list">
           <article v-for="plan in visiblePlans" :key="plan.id" class="plan-row">
@@ -387,6 +398,7 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
               <small>{{ activeAccounts.find(row => row.id === plan.account_id)?.name || `账号 ${plan.account_id}` }} · 千川广告主 {{ plan.advertiser_id }}</small>
               <small>{{ plan.plan_name }} · 控成本投放 · 预算 {{ displayedBudget(plan) }} · {{ plan.creation_source === 'manual' ? '手动任务' : '自动任务' }}</small>
               <small>商品 {{ plan.product_id }} · 佣金率 {{ plan.commission_rate }}% · 保本 ROI {{ Number(plan.roi_target).toFixed(2) }} · 任务 #{{ plan.id }}<template v-if="plan.remote_plan_id"> · 千川计划 ID {{ plan.remote_plan_id }}</template></small>
+              <small v-if="plan.selection_batch_id">选品批次 {{ plan.selection_batch_id }}<template v-if="plan.planned_at"> · 计划时间 {{ plan.planned_at.replace('T', ' ') }}</template><template v-if="plan.started_at"> · 实际开始 {{ plan.started_at.replace('T', ' ') }}</template></small>
               <small v-if="planMaterialIds(plan).length">{{ planMaterialLabel(plan) }}：{{ planMaterialIds(plan).join('、') }}</small>
               <small v-if="plan.reason" class="reason">{{ plan.reason }}</small>
               <small v-for="extra in visibleSupplements.filter(row => row.plan_job_id === plan.id)" :key="extra.id" :class="{ reason: ['blocked', 'needs_review'].includes(extra.status) }">{{ supplementStatusText(extra.status) }}<template v-if="extra.status === 'scheduled'"> · {{ extra.scheduled_at.replace('T', ' ') }}</template><template v-if="extra.reason"> · {{ extra.reason }}</template></small>
