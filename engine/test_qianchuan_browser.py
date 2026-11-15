@@ -81,6 +81,24 @@ class QianchuanBrowserTests(unittest.TestCase):
             with self.assertRaises(qc.UploadStopped):
                 qc.read_verified_port(profile, 51040, 1)
 
+    def test_reused_account_profile_requires_matching_advertiser(self):
+        matching = types.SimpleNamespace(
+            url="https://qianchuan.jinritemai.com/home?aavid=1878909235499335")
+        other = types.SimpleNamespace(
+            url="https://qianchuan.jinritemai.com/home?aavid=1875414412067016")
+        oauth = types.SimpleNamespace(
+            url="https://qianchuan.jinritemai.com/openapi/qc/audit/oauth.html")
+        browser = types.SimpleNamespace(contexts=[types.SimpleNamespace(
+            pages=[oauth, other, matching])])
+        self.assertIs(qc._select_page(browser, "1878909235499335"), matching)
+        with self.assertRaises(qc.UploadStopped):
+            qc._select_page(browser, "1879582387470400")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = Path(temp_dir) / "account-5"
+            profile.mkdir()
+            with self.assertRaises(qc.UploadStopped):
+                qc.read_verified_port(profile, 51040, 4, 4)
+
     def test_invalid_file_writes_failure_diagnostic_without_browser(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -112,6 +130,7 @@ class QianchuanBrowserTests(unittest.TestCase):
                  patch.object(qc, "_check_page_gate"), \
                  patch.object(qc, "_open_material_area", return_value=fake_page), \
                  patch.object(qc, "_dom_remote_id", return_value=None), \
+                 patch.object(qc, "_search_material_id", return_value=None), \
                  patch.object(qc, "_delay"), \
                  patch.object(qc, "_choose_file", side_effect=select_then_disconnect), \
                  patch.object(qc, "_save_evidence", side_effect=lambda page, options, result: result):
@@ -119,6 +138,98 @@ class QianchuanBrowserTests(unittest.TestCase):
             self.assertEqual(result["status"], "needs_review")
             self.assertTrue(result["submitAttempted"])
             self.assertIsNone(result["remoteMaterialId"])
+
+    def test_large_file_input_uses_local_cdp_fallback(self):
+        calls = []
+
+        class Element:
+            def evaluate(self, expression, *args):
+                calls.append(("evaluate", expression, args))
+
+        element = Element()
+
+        class Input:
+            def set_input_files(self, *_args, **_kwargs):
+                raise RuntimeError("Cannot transfer files larger than 50Mb to a browser not co-located with the server")
+
+            def element_handle(self):
+                return element
+
+        class Session:
+            def send(self, method, params):
+                calls.append((method, params))
+                if method == "DOM.getDocument":
+                    return {"root": {"nodeId": 1}}
+                if method == "DOM.querySelector":
+                    return {"nodeId": 7}
+                return {}
+
+            def detach(self):
+                calls.append(("detach",))
+
+        page = types.SimpleNamespace(
+            context=types.SimpleNamespace(new_cdp_session=lambda _page: Session())
+        )
+        qc._set_file_input_files(page, Input(), [Path("D:/video-large.mp4")], 5_000)
+        methods = [call[0] for call in calls]
+        self.assertIn("DOM.setFileInputFiles", methods)
+        set_call = next(call for call in calls if call[0] == "DOM.setFileInputFiles")
+        self.assertEqual(set_call[1]["nodeId"], 7)
+        self.assertEqual(set_call[1]["files"], ["D:\\video-large.mp4"])
+
+    def test_large_file_chooser_without_local_cdp_stays_uncertain(self):
+        class Chooser:
+            element = None
+
+            def set_files(self, *_args, **_kwargs):
+                raise RuntimeError("Cannot transfer files larger than 50Mb to a browser not co-located with the server")
+
+        with self.assertRaisesRegex(RuntimeError, "50Mb"):
+            qc._set_file_chooser_files(object(), Chooser(), [Path("D:/video-large.mp4")], 5_000)
+
+    def test_upload_wait_recovers_from_one_transient_page_timeout(self):
+        class FakePlaywrightTimeout(Exception):
+            pass
+
+        fake_module = types.ModuleType("playwright.sync_api")
+        fake_module.TimeoutError = FakePlaywrightTimeout
+        options = qc.UploadOptions(Path("qianchuan-1"), 51040, 1,
+                                   Path("video.mp4"), "video.mp4", Path("evidence"),
+                                   upload_timeout_s=30)
+        with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                        "playwright.sync_api": fake_module}), \
+             patch.object(qc, "_check_page_gate", side_effect=[FakePlaywrightTimeout(), None]) as gate, \
+             patch.object(qc, "_upload_ready", return_value=(True, "已完成")) as ready, \
+             patch.object(qc.time, "sleep"):
+            qc._wait_upload_ready(object(), options)
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(ready.call_count, 1)
+
+    def test_existing_remote_material_is_reused_without_upload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            video.write_bytes(b"test")
+            options = qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                       video, "video.mp4", root / "evidence")
+            fake_page = types.SimpleNamespace(on=lambda *_args: None)
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", return_value="7702637375117262889"), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_file") as choose_file, \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, options, result, *a: result):
+                result = qc.upload_material(options)
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual(result["remoteMaterialId"], "7702637375117262889")
+            self.assertFalse(result["submitAttempted"])
+            choose_file.assert_not_called()
 
     def test_missing_file_control_before_selection_is_recoverable_failure(self):
         def no_control(_page, _options, _mark_selection_started):
@@ -140,6 +251,7 @@ class QianchuanBrowserTests(unittest.TestCase):
                  patch.object(qc, "_check_page_gate"), \
                  patch.object(qc, "_open_material_area", return_value=fake_page), \
                  patch.object(qc, "_dom_remote_id", return_value=None), \
+                 patch.object(qc, "_search_material_id", return_value=None), \
                  patch.object(qc, "_delay"), \
                  patch.object(qc, "_choose_file", side_effect=no_control), \
                  patch.object(qc, "_save_evidence", side_effect=lambda page, options, result: result):
@@ -180,6 +292,146 @@ class QianchuanBrowserTests(unittest.TestCase):
             self.assertEqual(qc.main(arguments), 0)
         self.assertIn('"ok": true', output.getvalue())
         self.assertIn('"status": "failed"', output.getvalue())
+
+    def test_batch_refuses_single_file_input_before_selecting_any_file(self):
+        input_control = types.SimpleNamespace(get_attribute=lambda _name: None)
+        option = qc.UploadOptions(Path("qianchuan-1"), 51040, 1,
+                                  Path("one.mp4"), "one.mp4", Path("evidence"))
+        selected = []
+        with patch.object(qc, "_file_input", return_value=input_control), \
+             self.assertRaisesRegex(qc.UploadStopped, "不支持多选"):
+            qc._choose_files(object(), option, [Path("one.mp4"), Path("two.mp4")],
+                             lambda: selected.append(True))
+        self.assertEqual(selected, [])
+
+    def test_batch_partial_remote_confirmation_is_per_material(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = []
+            for name in ("one.mp4", "two.mp4"):
+                path = root / name
+                path.write_bytes(b"isolated video")
+                options.append(qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                                path, name, root / "evidence"))
+            fake_page = types.SimpleNamespace()
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+
+            def select_files(_page, _options, paths, started):
+                self.assertEqual([path.name for path in paths], ["one.mp4", "two.mp4"])
+                started()
+
+            responses = [None, None, "7700000000000000001", None]
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", side_effect=responses), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_files", side_effect=select_files), \
+                 patch.object(qc, "_wait_batch_ready"), \
+                 patch.object(qc, "_submit_control", return_value=types.SimpleNamespace(click=lambda **_k: None)), \
+                 patch.object(qc.time, "monotonic", side_effect=[0, 1, 121]), \
+                 patch.object(qc.time, "sleep"), \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, option, result: result):
+                result = qc.upload_material_batch(options)
+            self.assertEqual([item["status"] for item in result["items"]],
+                             ["succeeded", "needs_review"])
+            self.assertEqual(result["items"][0]["remoteMaterialId"], "7700000000000000001")
+            self.assertTrue(result["items"][1]["submitAttempted"])
+
+    def test_batch_duplicate_remote_ids_are_not_marked_as_unique_successes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = []
+            for name in ("one.mp4", "two.mp4"):
+                path = root / name
+                path.write_bytes(b"same content")
+                options.append(qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                                path, name, root / "evidence"))
+            fake_page = types.SimpleNamespace()
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+            def choose_files(_page, _options, _paths, started):
+                started()
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", side_effect=[None, None,
+                                                                         "7700000000000000001",
+                                                                         "7700000000000000001"]), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_files", side_effect=choose_files), \
+                 patch.object(qc, "_wait_batch_ready"), \
+                 patch.object(qc, "_submit_control", return_value=types.SimpleNamespace(click=lambda **_k: None)), \
+                 patch.object(qc.time, "monotonic", side_effect=[0, 1, 121]), \
+                 patch.object(qc.time, "sleep"), \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, option, result: result):
+                result = qc.upload_material_batch(options)
+            self.assertEqual([item["status"] for item in result["items"]],
+                             ["needs_review", "needs_review"])
+            self.assertEqual([item["remoteMaterialId"] for item in result["items"]], [None, None])
+            self.assertEqual([item["submitAttempted"] for item in result["items"]], [True, True])
+
+    def test_batch_failure_before_file_selection_is_safe_for_single_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = []
+            for name in ("one.mp4", "two.mp4"):
+                path = root / name
+                path.write_bytes(b"isolated video")
+                options.append(qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                                path, name, root / "evidence"))
+            fake_page = types.SimpleNamespace()
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", return_value=None), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_files", side_effect=qc.UploadStopped(
+                     "上传窗口未打开", stage="file_input")), \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, option, result: result):
+                result = qc.upload_material_batch(options)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual([item["status"] for item in result["items"]], ["failed", "failed"])
+            self.assertEqual([item["submitAttempted"] for item in result["items"]], [False, False])
+
+    def test_batch_reuses_all_existing_materials_without_selecting_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            options = []
+            for name in ("one.mp4", "two.mp4"):
+                path = root / name
+                path.write_bytes(b"isolated video")
+                options.append(qc.UploadOptions(root / "qianchuan-1", 51040, 1,
+                                                path, name, root / "evidence"))
+            fake_page = types.SimpleNamespace()
+            fake_module = types.ModuleType("playwright.sync_api")
+            fake_module.sync_playwright = FakePlaywrightContext
+            with patch.dict("sys.modules", {"playwright": types.ModuleType("playwright"),
+                                            "playwright.sync_api": fake_module}), \
+                 patch.object(qc, "read_verified_port", return_value=51040), \
+                 patch.object(qc, "_select_page", return_value=fake_page), \
+                 patch.object(qc, "_check_page_gate"), \
+                 patch.object(qc, "_open_material_area", return_value=fake_page), \
+                 patch.object(qc, "_search_material_id", side_effect=["7700000000000000001", "7700000000000000002"]), \
+                 patch.object(qc, "_delay"), \
+                 patch.object(qc, "_choose_files") as choose_files, \
+                 patch.object(qc, "_save_evidence", side_effect=lambda page, option, result: result):
+                result = qc.upload_material_batch(options)
+            self.assertEqual([item["status"] for item in result["items"]],
+                             ["succeeded", "succeeded"])
+            choose_files.assert_not_called()
 
     def test_failure_with_page_saves_screenshot_and_diagnostic(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from db import DEFAULT_DB_PATH, connect, emit, now_text
+from moving_watermark_quality import ALGORITHM_VERSION, inspect_video
 
 
 DEFAULT_LIMITS = {
@@ -74,6 +75,9 @@ CREATE TABLE IF NOT EXISTS qianchuan_upload_jobs (
     status TEXT NOT NULL DEFAULT 'queued',
     scheduled_date TEXT NOT NULL,
     remote_material_id TEXT NOT NULL DEFAULT '',
+    review_status TEXT NOT NULL DEFAULT '',
+    material_evaluation TEXT NOT NULL DEFAULT '',
+    evaluation_checked_at TEXT NOT NULL DEFAULT '',
     error_code TEXT NOT NULL DEFAULT '',
     error_message TEXT NOT NULL DEFAULT '',
     failure_stage TEXT NOT NULL DEFAULT '',
@@ -89,6 +93,10 @@ CREATE TABLE IF NOT EXISTS qianchuan_upload_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_qc_jobs_schedule
     ON qianchuan_upload_jobs(status, scheduled_date, account_id);
+CREATE INDEX IF NOT EXISTS idx_qc_jobs_status_id
+    ON qianchuan_upload_jobs(status, id);
+CREATE INDEX IF NOT EXISTS idx_qc_jobs_review_account
+    ON qianchuan_upload_jobs(status, qianchuan_account_id);
 CREATE INDEX IF NOT EXISTS idx_qc_jobs_quota
     ON qianchuan_upload_jobs(quota_group_id, scheduled_date, product_id);
 CREATE TABLE IF NOT EXISTS qianchuan_upload_events (
@@ -102,6 +110,17 @@ CREATE TABLE IF NOT EXISTS qianchuan_upload_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_qc_events_job ON qianchuan_upload_events(job_id, id);
+CREATE TABLE IF NOT EXISTS qianchuan_asset_quality_checks (
+    asset_id INTEGER PRIMARY KEY,
+    file_path TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    file_mtime_ns INTEGER NOT NULL,
+    algorithm_version INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    checked_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS qianchuan_product_upload_status (
     account_id INTEGER NOT NULL REFERENCES accounts(id),
     product_id TEXT NOT NULL,
@@ -129,9 +148,16 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     for column, ddl in (
         ("auto_retry_count", "INTEGER NOT NULL DEFAULT 0"),
         ("next_retry_at", "TEXT"),
+        ("review_status", "TEXT NOT NULL DEFAULT ''"),
+        ("material_evaluation", "TEXT NOT NULL DEFAULT ''"),
+        ("evaluation_checked_at", "TEXT NOT NULL DEFAULT ''"),
     ):
         if column not in job_columns:
             connection.execute(f"ALTER TABLE qianchuan_upload_jobs ADD COLUMN {column} {ddl}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qc_jobs_evaluation "
+        "ON qianchuan_upload_jobs(status, evaluation_checked_at, id)"
+    )
     connection.execute(
         "INSERT OR IGNORE INTO qianchuan_upload_preferences (id, auto_retry_enabled, updated_at) "
         "VALUES (1, 1, ?)", (now_text(),),
@@ -373,6 +399,76 @@ def product_quota_remaining(
     }
 
 
+def product_progress(connection: sqlite3.Connection, account_id: int,
+                     product_id: str) -> Dict[str, Any]:
+    """按不同远端素材计成功数；结果不明的任务仍占待核查槽位。"""
+    if account_id < 1 or not product_id.strip():
+        raise ValueError("抖音账号 ID 与商品 ID 必填")
+    rows = connection.execute(
+        "SELECT id, status, remote_material_id FROM qianchuan_upload_jobs "
+        "WHERE account_id=? AND product_id=? ORDER BY id",
+        (account_id, product_id),
+    ).fetchall()
+    remote_ids = {str(row["remote_material_id"]) for row in rows
+                  if row["status"] == "succeeded" and row["remote_material_id"]}
+    pending = [int(row["id"]) for row in rows
+               if row["status"] in ("queued", "uploading", "needs_review")]
+    review = [int(row["id"]) for row in rows if row["status"] == "needs_review"]
+    return {"ok": True, "accountId": account_id, "productId": product_id,
+            "uploadedUniqueCount": len(remote_ids), "pendingCount": len(pending),
+            "pendingJobIds": pending, "needsReviewJobIds": review,
+            "successfulJobCount": sum(row["status"] == "succeeded" for row in rows)}
+
+
+def _quality_fingerprint(path: Path) -> tuple[str, int, int]:
+    stat = path.stat()
+    return str(path), stat.st_size, stat.st_mtime_ns
+
+
+def _cached_quality(connection: sqlite3.Connection, asset_id: int, path: Path) -> Optional[sqlite3.Row]:
+    row = connection.execute(
+        "SELECT * FROM qianchuan_asset_quality_checks WHERE asset_id = ?", (asset_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        fingerprint = _quality_fingerprint(path)
+    except OSError:
+        return None
+    if (row["file_path"], row["file_size"], row["file_mtime_ns"]) != fingerprint:
+        return None
+    return row if row["algorithm_version"] == ALGORITHM_VERSION else None
+
+
+def _check_quality(connection: sqlite3.Connection, asset_id: int, path: Path) -> None:
+    """OCR 在数据库写锁外执行；只缓存当前文件和当前规则的结果。"""
+    if _cached_quality(connection, asset_id, path) is not None:
+        return
+    before = _quality_fingerprint(path)
+    result = inspect_video(path)
+    if before != _quality_fingerprint(path):
+        raise ValueError(f"素材 {asset_id} 在质检期间发生变化，请重新入队")
+    connection.execute(
+        "INSERT INTO qianchuan_asset_quality_checks "
+        "(asset_id, file_path, file_size, file_mtime_ns, algorithm_version, verdict, "
+        "reason, evidence_json, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(asset_id) DO UPDATE SET file_path=excluded.file_path, "
+        "file_size=excluded.file_size, file_mtime_ns=excluded.file_mtime_ns, "
+        "algorithm_version=excluded.algorithm_version, verdict=excluded.verdict, "
+        "reason=excluded.reason, evidence_json=excluded.evidence_json, checked_at=excluded.checked_at",
+        (asset_id, *before, ALGORITHM_VERSION, result["verdict"], result["reason"],
+         json.dumps(result.get("evidence", {}), ensure_ascii=False), now_text()),
+    )
+    connection.commit()
+
+
+def _quality_reason(connection: sqlite3.Connection, asset_id: int, path: Path) -> Optional[str]:
+    row = _cached_quality(connection, asset_id, path)
+    if row is None:
+        raise ValueError(f"素材 {asset_id} 移动水印质检未完成，请重新尝试")
+    return f"劣质：{row['reason']}" if row["verdict"] == "poor_quality" else None
+
+
 def eligible_assets(connection: sqlite3.Connection, account_id: int, limit: int = 200) -> Dict[str, Any]:
     _required_asset_schema(connection)
     account = connection.execute("SELECT name FROM accounts WHERE id = ?", (account_id,)).fetchone()
@@ -401,14 +497,19 @@ def eligible_assets(connection: sqlite3.Connection, account_id: int, limit: int 
     for row in rows:
         item = dict(row)
         file_path = Path(item["filePath"])
+        quality = _cached_quality(connection, int(item["assetId"]), file_path)
+        item["qualityVerdict"] = quality["verdict"] if quality else "unchecked"
         item["eligible"] = bool(item["publishedTaskId"] and item["jobId"] is None
-                                and file_path.suffix.lower() == ".mp4" and file_path.is_file())
+                                and file_path.suffix.lower() == ".mp4" and file_path.is_file()
+                                and item["qualityVerdict"] != "poor_quality")
         if not item["publishedTaskId"]:
             item["reason"] = "该账号同商品尚未确认抖音发布"
         elif item["jobId"] is not None:
             item["reason"] = "已有千川上传任务"
         elif file_path.suffix.lower() != ".mp4" or not file_path.is_file():
             item["reason"] = "本地素材缺少可上传的 MP4 文件"
+        elif item["qualityVerdict"] == "poor_quality":
+            item["reason"] = f"劣质：{quality['reason']}"
         result.append(item)
     return {"ok": True, "accountId": account_id, "rows": result}
 
@@ -467,18 +568,25 @@ def _quota_usage(
 ) -> Dict[str, int]:
     placeholders = ",".join("?" for _ in OCCUPIED_STATUSES)
     base = f"status IN ({placeholders}) AND scheduled_date = ?"
+    # 平台会把字节相同的不同文件归并为同一个素材 ID；成功任务按远端 ID
+    # 去重计数，尚未确认远端结果的任务仍各占一个预留槽位。
+    video_count = (
+        "COUNT(DISTINCT CASE WHEN status = 'succeeded' AND remote_material_id <> '' "
+        "THEN 'remote:' || qianchuan_account_id || ':' || product_id || ':' || remote_material_id "
+        "ELSE 'job:' || id END)"
+    )
     account = connection.execute(
-        f"SELECT COUNT(*) AS videos, COUNT(DISTINCT product_id) AS products "
+        f"SELECT {video_count} AS videos, COUNT(DISTINCT product_id) AS products "
         f"FROM qianchuan_upload_jobs WHERE {base} AND account_id = ?",
         (*OCCUPIED_STATUSES, day, account_id),
     ).fetchone()
     group = connection.execute(
-        f"SELECT COUNT(*) AS videos, COUNT(DISTINCT product_id) AS products "
+        f"SELECT {video_count} AS videos, COUNT(DISTINCT product_id) AS products "
         f"FROM qianchuan_upload_jobs WHERE {base} AND quota_group_id = ?",
         (*OCCUPIED_STATUSES, day, group_id),
     ).fetchone()
     product = connection.execute(
-        f"SELECT COUNT(*) AS videos FROM qianchuan_upload_jobs "
+        f"SELECT {video_count} AS videos FROM qianchuan_upload_jobs "
         f"WHERE {base} AND account_id = ? AND product_id = ?",
         (*OCCUPIED_STATUSES, day, account_id, product_id),
     ).fetchone()
@@ -540,6 +648,16 @@ def enqueue(
         raise ValueError("请选择至少一条素材")
     today = today or date.today()
     connection.commit()
+    for asset_id in ids:
+        asset = connection.execute(
+            "SELECT file_path FROM assets WHERE id = ? AND account_id = ? "
+            "AND source_type = 'web_download' AND status = 'ready'",
+            (asset_id, account_id),
+        ).fetchone()
+        if asset:
+            path = Path(str(asset["file_path"]))
+            if path.suffix.lower() == ".mp4" and path.is_file():
+                _check_quality(connection, asset_id, path)
     connection.execute("BEGIN IMMEDIATE")
     try:
         target_id = _target(connection, account_id, qianchuan_account_id)
@@ -556,6 +674,9 @@ def enqueue(
                 continue
             try:
                 asset = _validated_asset(connection, asset_id, account_id)
+                poor_reason = _quality_reason(connection, asset_id, Path(str(asset["file_path"])))
+                if poor_reason:
+                    raise ValueError(poor_reason)
                 product_id = str(asset["product_id"]).strip()
                 scheduled = _reserve_date(connection, account_id, group_id, product_id, today)
             except ValueError as error:
@@ -607,6 +728,9 @@ def _job_payload(row: sqlite3.Row) -> Dict[str, Any]:
         "materialName": row["material_name"], "status": row["status"],
         "scheduledDate": row["scheduled_date"],
         "remoteMaterialId": row["remote_material_id"],
+        "reviewStatus": row["review_status"],
+        "materialEvaluation": row["material_evaluation"],
+        "evaluationCheckedAt": row["evaluation_checked_at"],
         "reason": row["error_message"], "stage": row["failure_stage"],
         "screenshotPath": row["screenshot_path"],
         "submitAttempted": bool(row["submit_attempted"]),
@@ -621,6 +745,11 @@ def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = N
     now = now or datetime.now()
     today = today or now.date()
     connection.commit()
+    candidate = _job(connection, job_id)
+    if candidate["status"] == "queued":
+        path = Path(str(candidate["file_path"]))
+        if path.is_file():
+            _check_quality(connection, int(candidate["asset_id"]), path)
     connection.execute("BEGIN IMMEDIATE")
     try:
         row = _job(connection, job_id)
@@ -637,7 +766,24 @@ def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = N
         if running >= concurrency:
             raise ValueError(f"当前上传并发已达 {concurrency}，稍后重试领取")
         _target(connection, int(row["account_id"]), int(row["qianchuan_account_id"]))
-        _validated_asset(connection, int(row["asset_id"]), int(row["account_id"]))
+        asset = _validated_asset(connection, int(row["asset_id"]), int(row["account_id"]))
+        if str(asset["file_path"]) != str(row["file_path"]):
+            raise ValueError("任务素材路径与素材库不一致，停止上传")
+        poor_reason = _quality_reason(connection, int(row["asset_id"]), Path(str(row["file_path"])))
+        if poor_reason:
+            timestamp = now_text()
+            connection.execute(
+                "UPDATE qianchuan_upload_jobs SET status = 'rejected_quality', "
+                "error_code = 'MOVING_WATERMARK', error_message = ?, "
+                "failure_stage = 'local_quality', next_retry_at = NULL, "
+                "completed_at = ?, updated_at = ? WHERE id = ?",
+                (poor_reason, timestamp, timestamp, job_id),
+            )
+            _event(connection, job_id, "local_quality", "rejected_quality", poor_reason,
+                   details={"remoteWriteAttempted": False, "quotaHeld": False})
+            connection.commit()
+            return {"ok": False, "rejected": True, "error": poor_reason,
+                    "job": _job_payload(_job(connection, job_id))}
         # 跨日未执行任务在真正上传日重新预占，旧日期的预占不跨日冒充额度。
         if row["scheduled_date"] < today.isoformat():
             scheduled = _reserve_date(connection, int(row["account_id"]),
@@ -669,6 +815,114 @@ def claim(connection: sqlite3.Connection, job_id: int, today: Optional[date] = N
         raise
 
 
+def claim_batch(connection: sqlite3.Connection, job_ids: List[int],
+                today: Optional[date] = None, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """同一账号、商品和千川账户的多条任务共用一次浏览器提交。"""
+    if not 2 <= len(job_ids) <= 10 or len(set(job_ids)) != len(job_ids) or any(i <= 0 for i in job_ids):
+        raise ValueError("批量上传须提供 2–10 个不重复的任务 ID")
+    now = now or datetime.now()
+    today = today or now.date()
+    connection.commit()
+    # 移动水印分析较慢，放在写事务外；事务内再次确认缓存和文件归属。
+    for job_id in job_ids:
+        row = _job(connection, job_id)
+        if row["status"] != "queued":
+            raise ValueError(f"任务 {job_id} 状态已变化，不能批量领取")
+        path = Path(str(row["file_path"]))
+        if path.is_file():
+            _check_quality(connection, int(row["asset_id"]), path)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        rows = [_job(connection, job_id) for job_id in job_ids]
+        first = rows[0]
+        account_id = int(first["account_id"])
+        qc_id = int(first["qianchuan_account_id"])
+        product_id = str(first["product_id"])
+        if any((int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"]))
+               != (account_id, qc_id, product_id) for row in rows):
+            raise ValueError("批量任务必须属于同一抖音账号、商品和千川账户")
+        today_text = today.isoformat()
+        if any(row["status"] != "queued" or
+               row["scheduled_date"] > today_text or
+               (row["next_retry_at"] and row["next_retry_at"] > now.isoformat(timespec="seconds"))
+               for row in rows):
+            raise ValueError("批量任务存在未到期或状态已变化的素材")
+        # 重启后可能同时积压多条跨日任务。先在当前事务中把旧日期临时
+        # 重排到今天，再按整批检查配额；不足时回滚，交给安全的单条路径
+        # 逐条重排，避免一半任务被批量锁住。
+        overdue_ids = [int(row["id"]) for row in rows if row["scheduled_date"] < today_text]
+        if overdue_ids:
+            placeholders = ",".join("?" for _ in overdue_ids)
+            connection.execute(
+                f"UPDATE qianchuan_upload_jobs SET scheduled_date = ?, updated_at = ? "
+                f"WHERE id IN ({placeholders})",
+                (today_text, now_text(), *overdue_ids),
+            )
+            limits = _limits(connection, account_id)
+            members = connection.execute(
+                "SELECT account_id FROM qianchuan_quota_group_members WHERE group_id = ?",
+                (int(first["quota_group_id"]),),
+            ).fetchall()
+            group_limits = [_limits(connection, int(member["account_id"])) for member in members]
+            group_video_cap = min(item["perGroupVideos"] for item in group_limits)
+            group_product_cap = min(item["perGroupProducts"] for item in group_limits)
+            usage = _quota_usage(connection, account_id, int(first["quota_group_id"]),
+                                 product_id, today_text)
+            if (usage["productVideos"] > limits["perProductVideos"] or
+                    usage["accountVideos"] > limits["perAccountVideos"] or
+                    usage["accountProducts"] > limits["perAccountProducts"] or
+                    usage["groupVideos"] > group_video_cap or
+                    usage["groupProducts"] > group_product_cap):
+                raise ValueError("跨日批量任务重排后当日配额不足")
+        running = int(connection.execute(
+            "SELECT COUNT(*) FROM qianchuan_upload_jobs WHERE status = 'uploading'"
+        ).fetchone()[0])
+        if running >= _limits(connection, account_id)["maxConcurrentUploads"]:
+            raise ValueError("当前上传并发已满，稍后重试批量领取")
+        _target(connection, account_id, qc_id)
+        paths: set[str] = set()
+        names: set[str] = set()
+        for row in rows:
+            asset = _validated_asset(connection, int(row["asset_id"]), account_id)
+            path = Path(str(row["file_path"]))
+            name = str(row["material_name"])
+            if str(asset["file_path"]) != str(path):
+                raise ValueError("批量任务素材路径与素材库不一致")
+            if name != path.name or name in names or str(path) in paths:
+                raise ValueError("批量任务文件名必须与本地文件一致且不能重复")
+            names.add(name)
+            paths.add(str(path))
+            poor_reason = _quality_reason(connection, int(row["asset_id"]), path)
+            if poor_reason:
+                timestamp = now_text()
+                connection.execute(
+                    "UPDATE qianchuan_upload_jobs SET status = 'rejected_quality', "
+                    "error_code = 'MOVING_WATERMARK', error_message = ?, "
+                    "failure_stage = 'local_quality', next_retry_at = NULL, "
+                    "completed_at = ?, updated_at = ? WHERE id = ?",
+                    (poor_reason, timestamp, timestamp, int(row["id"])),
+                )
+                _event(connection, int(row["id"]), "local_quality", "rejected_quality", poor_reason,
+                       details={"remoteWriteAttempted": False, "quotaHeld": False})
+                connection.commit()
+                return {"ok": False, "rejected": True, "error": poor_reason,
+                        "job": _job_payload(_job(connection, int(row["id"])))}
+        for row in rows:
+            job_id = int(row["id"])
+            connection.execute(
+                "UPDATE qianchuan_upload_jobs SET status = 'uploading', next_retry_at = NULL, "
+                "started_at = ?, updated_at = ? WHERE id = ? AND status = 'queued'",
+                (now_text(), now_text(), job_id),
+            )
+            _event(connection, job_id, "upload_claim", "started", details={"batchJobIds": job_ids})
+        connection.commit()
+        return {"ok": True, "jobs": [_job_payload(_job(connection, job_id)) for job_id in job_ids],
+                "quotaScope": "local_sqlite"}
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def complete(connection: sqlite3.Connection, job_id: int, remote_material_id: str) -> Dict[str, Any]:
     remote_material_id = remote_material_id.strip()
     if not remote_material_id:
@@ -687,7 +941,7 @@ def complete(connection: sqlite3.Connection, job_id: int, remote_material_id: st
             (remote_material_id, timestamp, timestamp, job_id),
         )
         count = connection.execute(
-            "SELECT COUNT(*) FROM qianchuan_upload_jobs WHERE account_id = ? AND product_id = ? "
+            "SELECT COUNT(DISTINCT remote_material_id) FROM qianchuan_upload_jobs WHERE account_id = ? AND product_id = ? "
             "AND status = 'succeeded'", (row["account_id"], row["product_id"]),
         ).fetchone()[0]
         connection.execute(
@@ -795,7 +1049,8 @@ def recover_interrupted(
                 "UPDATE qianchuan_upload_jobs SET status = 'needs_review', "
                 "error_code = 'PROCESS_INTERRUPTED', "
                 "error_message = '上传执行器中断；远端结果未确认，须核查后处理', "
-                "failure_stage = 'interrupted', completed_at = ?, updated_at = ? WHERE id = ?",
+                "failure_stage = 'interrupted', submit_attempted = 1, "
+                "completed_at = ?, updated_at = ? WHERE id = ?",
                 (now_text(), now_text(), job_id),
             )
             _event(connection, job_id, "interrupted", "needs_review",
@@ -803,6 +1058,39 @@ def recover_interrupted(
                    details={"quotaHeld": True, "olderThanMinutes": older_than_minutes})
         connection.commit()
         return {"ok": True, "recoveredJobIds": recovered, "count": len(recovered)}
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def requeue_preflight_batch(
+    connection: sqlite3.Connection, job_ids: List[int],
+) -> Dict[str, Any]:
+    """把尚未开始选文件的批量任务安全退回队列，供单条路径回退。"""
+    if not 1 <= len(job_ids) <= 10 or len(set(job_ids)) != len(job_ids) or any(i <= 0 for i in job_ids):
+        raise ValueError("批量回排须提供 1–10 个不重复的任务 ID")
+    connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        rows = [_job(connection, job_id) for job_id in job_ids]
+        if any(row["status"] != "uploading" or int(row["submit_attempted"])
+               or row["remote_material_id"] for row in rows):
+            raise ValueError("仅未开始平台写入且无远端回执的批量任务可安全回排")
+        timestamp = now_text()
+        for row in rows:
+            job_id = int(row["id"])
+            connection.execute(
+                "UPDATE qianchuan_upload_jobs SET status = 'queued', "
+                "error_code = '', error_message = '', failure_stage = '', "
+                "screenshot_path = '', started_at = NULL, completed_at = NULL, "
+                "updated_at = ? WHERE id = ? AND status = 'uploading'",
+                (timestamp, job_id),
+            )
+            _event(connection, job_id, "batch_preflight", "queued",
+                   "批量上传尚未选择文件，安全回退单条上传路径",
+                   details={"remoteWriteAttempted": False, "fallback": "single"})
+        connection.commit()
+        return {"ok": True, "jobIds": job_ids, "count": len(job_ids)}
     except Exception:
         connection.rollback()
         raise
@@ -883,8 +1171,12 @@ def resolve_review_absent(
 
 def list_jobs(
     connection: sqlite3.Connection, account_id: Optional[int] = None,
-    status: Optional[str] = None, limit: int = 200,
+    status: Optional[str] = None, limit: int = 200, product_id: Optional[str] = None,
+    qianchuan_account_id: Optional[int] = None, due_only: bool = False,
+    evaluation_due: bool = False, after_id: int = 0, evaluation_kind: str = "all",
 ) -> Dict[str, Any]:
+    if after_id < 0:
+        raise ValueError("任务游标无效")
     where: List[str] = []
     params: List[Any] = []
     if account_id is not None:
@@ -893,12 +1185,48 @@ def list_jobs(
     if status:
         where.append("status = ?")
         params.append(status)
+    if qianchuan_account_id is not None:
+        where.append("qianchuan_account_id = ?")
+        params.append(qianchuan_account_id)
+    if after_id:
+        where.append("id > ?")
+        params.append(after_id)
+    if due_only:
+        where.extend(("status = 'queued'", "scheduled_date <= ?",
+                      "(next_retry_at IS NULL OR next_retry_at <= ?)"))
+        params.extend((date.today().isoformat(), now_text()))
+    if evaluation_due:
+        now = datetime.now()
+        where.extend(("status = 'succeeded'", "remote_material_id <> ''", "("
+            "COALESCE(evaluation_checked_at, '') = '' OR "
+            "(material_evaluation <> '' AND material_evaluation <> '-' "
+            "AND review_status <> '' AND review_status <> '-' AND evaluation_checked_at <= ?) OR "
+            "((material_evaluation = '' OR material_evaluation = '-' OR review_status = '' OR review_status = '-') "
+            "AND evaluation_checked_at <= ?))"))
+        params.extend(((now - timedelta(days=1)).isoformat(timespec="seconds"),
+                       (now - timedelta(minutes=30)).isoformat(timespec="seconds")))
+        if evaluation_kind == "new":
+            where.append("COALESCE(evaluation_checked_at, '') = ''")
+        elif evaluation_kind == "recheck":
+            where.append("COALESCE(evaluation_checked_at, '') <> ''")
+    if product_id is not None:
+        if not product_id.isdigit() or len(product_id) > 30:
+            raise ValueError("商品 ID 无效")
+        where.append("product_id = ?")
+        params.append(product_id)
     sql = "SELECT * FROM qianchuan_upload_jobs"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql += " ORDER BY id ASC LIMIT ?" if due_only or evaluation_due or after_id else " ORDER BY id DESC LIMIT ?"
     rows = connection.execute(sql, (*params, min(max(limit, 1), 1000))).fetchall()
     return {"ok": True, "rows": [_job_payload(row) for row in rows]}
+
+
+def review_accounts(connection: sqlite3.Connection) -> Dict[str, Any]:
+    rows = connection.execute(
+        "SELECT DISTINCT qianchuan_account_id FROM qianchuan_upload_jobs WHERE status='needs_review'"
+    ).fetchall()
+    return {"ok": True, "qianchuanAccountIds": [int(row[0]) for row in rows]}
 
 
 def list_events(connection: sqlite3.Connection, job_id: int) -> Dict[str, Any]:
@@ -928,12 +1256,17 @@ def build_parser() -> argparse.ArgumentParser:
     remaining = commands.add_parser("product-quota-remaining", help="只读计算指定商品今日可用 Step17 条数")
     remaining.add_argument("--account-id", type=int, required=True)
     remaining.add_argument("--product-id", required=True)
+    progress = commands.add_parser("product-progress", help="只读查询商品上传完成与在途数量")
+    progress.add_argument("--account-id", type=int, required=True)
+    progress.add_argument("--product-id", required=True)
     add = commands.add_parser("enqueue", help="批量预占配额并登记上传任务")
     add.add_argument("--account-id", type=int, required=True)
     add.add_argument("--asset-ids", required=True, help="逗号分隔的素材 ID")
     add.add_argument("--qianchuan-account-id", type=int)
     lock = commands.add_parser("claim", help="原子锁定单条到期任务；禁止重复上传")
     lock.add_argument("--id", type=int, required=True)
+    batch_lock = commands.add_parser("claim-batch", help="原子锁定同账号同商品 2–10 条到期任务")
+    batch_lock.add_argument("--ids", required=True, help="逗号分隔的任务 ID")
     one = commands.add_parser("job", help="只读查询单条任务，供浏览器前置检查")
     one.add_argument("--id", type=int, required=True)
     done = commands.add_parser("complete", help="远端 ID 回读后标记成功")
@@ -949,6 +1282,8 @@ def build_parser() -> argparse.ArgumentParser:
     failure.add_argument("--manual-action-required", action="store_true")
     interrupted = commands.add_parser("recover-interrupted", help="显式隔离超时的上传中任务，保留配额待人工核查")
     interrupted.add_argument("--older-than-minutes", type=int, default=30)
+    requeue = commands.add_parser("requeue-preflight-batch", help="批量尚未选文件时回排，供单条路径安全回退")
+    requeue.add_argument("--ids", required=True, help="逗号分隔的任务 ID")
     retry = commands.add_parser("retry-safe", help="人工重排明确未触及远端写入的失败任务")
     retry.add_argument("--id", type=int, required=True)
     review = commands.add_parser("resolve-review-absent", help="人工核对远端无素材后解除隔离并重排")
@@ -956,8 +1291,15 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--note", required=True)
     jobs = commands.add_parser("jobs", help="查看上传任务及状态")
     jobs.add_argument("--account-id", type=int)
+    jobs.add_argument("--product-id")
     jobs.add_argument("--status")
     jobs.add_argument("--limit", type=int, default=200)
+    jobs.add_argument("--qianchuan-account-id", type=int)
+    jobs.add_argument("--due-only", action="store_true")
+    jobs.add_argument("--evaluation-due", action="store_true")
+    jobs.add_argument("--evaluation-kind", choices=("all", "new", "recheck"), default="all")
+    jobs.add_argument("--after-id", type=int, default=0)
+    commands.add_parser("review-accounts", help="列出仍有待人工核查任务的千川账户")
     events = commands.add_parser("events", help="查看单条任务的 Step 14 过程日志")
     events.add_argument("--id", type=int, required=True)
     event = commands.add_parser("event", help="记录浏览器步骤和截图证据")
@@ -992,11 +1334,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                 result = eligible_assets(connection, args.account_id, args.limit)
             elif args.command == "product-quota-remaining":
                 result = product_quota_remaining(connection, args.account_id, args.product_id)
+            elif args.command == "product-progress":
+                result = product_progress(connection, args.account_id, args.product_id)
             elif args.command == "enqueue":
                 ids = [int(value.strip()) for value in args.asset_ids.split(",") if value.strip()]
                 result = enqueue(connection, args.account_id, ids, args.qianchuan_account_id)
             elif args.command == "claim":
                 result = claim(connection, args.id)
+            elif args.command == "claim-batch":
+                result = claim_batch(connection, [int(part.strip()) for part in args.ids.split(",")])
             elif args.command == "job":
                 result = {"ok": True, "job": _job_payload(_job(connection, args.id))}
             elif args.command == "complete":
@@ -1007,12 +1353,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                               args.manual_action_required)
             elif args.command == "recover-interrupted":
                 result = recover_interrupted(connection, args.older_than_minutes)
+            elif args.command == "requeue-preflight-batch":
+                result = requeue_preflight_batch(
+                    connection, [int(part.strip()) for part in args.ids.split(",") if part.strip()]
+                )
             elif args.command == "retry-safe":
                 result = retry_safe(connection, args.id)
             elif args.command == "resolve-review-absent":
                 result = resolve_review_absent(connection, args.id, args.note)
             elif args.command == "jobs":
-                result = list_jobs(connection, args.account_id, args.status, args.limit)
+                result = list_jobs(connection, args.account_id, args.status, args.limit, args.product_id,
+                                   args.qianchuan_account_id, args.due_only, args.evaluation_due,
+                                   args.after_id, args.evaluation_kind)
+            elif args.command == "review-accounts":
+                result = review_accounts(connection)
             elif args.command == "events":
                 result = list_events(connection, args.id)
             elif args.command == "event":

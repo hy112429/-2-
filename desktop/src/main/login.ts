@@ -3,7 +3,7 @@ import type { Cookie } from 'electron'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { attachProbe } from './probe'
-import { commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
+import { closeAutomationLaunchedBrowser, closeManagedAccountBrowser, commandManagedBrowser, inspectManagedBrowserPages, openManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
 import { getClientPaths } from './app-dirs'
 import {
   beginRegistryReservation,
@@ -14,6 +14,9 @@ import {
 } from './selection_registry'
 import { randomUUID } from 'crypto'
 import { fireCartVideoDownload } from './baiying_batch'
+import { runScript } from './engine'
+
+const MAX_SELECTION_CANDIDATE_FALLBACKS = 50
 
 /**
  * 抖音 / 百应 登录态管理与后台探针视图
@@ -594,6 +597,39 @@ async function clearLoginState(): Promise<void> {
 
 // ---------------------------------------------------------------- IPC 注册
 
+async function cacheVerifiedCartCommissions(
+  accountId: number,
+  completed: Array<Record<string, unknown>>
+): Promise<string[]> {
+  const warnings: string[] = []
+  for (const item of completed) {
+    const productId = String(item.productId ?? '').trim()
+    const sources = item.metricSources as Record<string, unknown> | undefined
+    const metrics = item.dataMetrics as Record<string, unknown> | undefined
+    const rate = metrics?.commissionRate
+    if (item.cartAdded !== true || !/^\d{8,20}$/.test(productId) ||
+        sources?.commissionRate !== '商品详情' || typeof rate !== 'number' ||
+        !Number.isFinite(rate) || rate <= 0 || rate > 100) continue
+    try {
+      const outcome = await runScript('baiying_cache.py', {
+        internal: true,
+        args: [
+          '--db', getClientPaths().databasePath, 'upsert',
+          '--product-id', productId, '--account-id', String(accountId),
+          '--cos-ratio', String(rate)
+        ],
+        onEvent: () => undefined
+      }).promise
+      if (!outcome.ok) throw new Error(outcome.error ?? '佣金率缓存失败')
+    } catch (error) {
+      const warning = `${productId}的佣金率未能保存：${error instanceof Error ? error.message : String(error)}`
+      warnings.push(warning)
+      console.warn(`[自动选品] ${warning}`)
+    }
+  }
+  return warnings
+}
+
 export function registerLoginIpc(): void {
   registerSelectionRegistryIpc()
   // 登录目标清单（渲染进程用它渲染下拉框，避免两边各写一份导致漂移）
@@ -631,16 +667,29 @@ export function registerLoginIpc(): void {
     return commandManagedBrowser('inspect-selection', { includeCategoryTree: options.includeCategoryTree === true }, options)
   })
 
-  ipcMain.handle('browser:checkAccountLogins', async (_e, params: { accountId: number; profilePath?: string }) => {
+  ipcMain.handle('browser:checkAccountLogins', async (_e, params: { accountId: number; profilePath?: string; closeAfterAutomation?: boolean }) => {
     if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
       throw new Error('登录预检账号 ID 无效')
     }
-    return commandManagedBrowser('check-account-logins', {
-      accountId: params.accountId
-    }, {
+    const options = {
       profileKey: `account-${params.accountId}`,
       profilePath: params.profilePath
-    })
+    }
+    const result = await commandManagedBrowser('check-account-logins', {
+      accountId: params.accountId
+    }, options)
+    const loginConfirmed = [result['baiying'], result['creatorCenter']].every((item) =>
+      item && typeof item === 'object' && (item as Record<string, unknown>)['state'] === 'logged_in'
+    )
+    if (params.closeAfterAutomation === true && loginConfirmed) {
+      try {
+        await closeAutomationLaunchedBrowser(options)
+      } catch (error) {
+        // 登录状态结果优先返回；窗口清理失败只记日志，不把已确认登录误报为检查失败。
+        console.warn(`[登录预检] 账号 ${params.accountId} 的浏览器未能自动关闭：${String(error)}`)
+      }
+    }
+    return result
   })
 
   ipcMain.handle('browser:inspectAccountPages', async (_e, params: { accountId: number; profilePath?: string }) => {
@@ -651,6 +700,17 @@ export function registerLoginIpc(): void {
       profileKey: `account-${params.accountId}`,
       profilePath: params.profilePath
     })
+  })
+
+  ipcMain.handle('browser:closeAccount', async (_e, params: { accountId: number; profilePath?: string }) => {
+    if (!params || !Number.isInteger(params.accountId) || params.accountId < 1) {
+      throw new Error('关闭账号浏览器的账号 ID 无效')
+    }
+    const closed = await closeManagedAccountBrowser({
+      profileKey: `account-${params.accountId}`,
+      profilePath: params.profilePath
+    })
+    return { ok: true, closed }
   })
 
   ipcMain.handle('browser:runBaiyingSelection', async (event, params: {
@@ -669,6 +729,7 @@ export function registerLoginIpc(): void {
     maxSelectedProducts?: number
     stopAfterCart?: boolean
     previewOnly?: boolean
+    closeAfterAutomation?: boolean
   }) => {
     if (!params || typeof params.profileKey !== 'string' || !Number.isInteger(params.accountId) || params.accountId < 1) {
       throw new Error('百应选品参数无效')
@@ -682,8 +743,20 @@ export function registerLoginIpc(): void {
         event.sender.send('browser:selectionProgress', { accountId: params.accountId, ...progress })
       }
     }
+    const runManagedSelection = async (data: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      const result = await commandManagedBrowser('run-selection', data, browserOptions, onProgress)
+      if (params.closeAfterAutomation === true) {
+        try {
+          await closeAutomationLaunchedBrowser(browserOptions)
+        } catch (error) {
+          // 不用浏览器清理失败覆盖已完成的加车结果；下次账号切换时可继续复用该 profile。
+          console.warn(`[自动选品] 账号 ${params.accountId} 的浏览器未能自动关闭：${String(error)}`)
+        }
+      }
+      return result
+    }
     if (params.previewOnly === true) {
-      return commandManagedBrowser('run-selection', params, browserOptions, onProgress)
+      return runManagedSelection(params)
     }
 
     const accountKey = `local:${params.accountId}`
@@ -706,7 +779,9 @@ export function registerLoginIpc(): void {
         throw new Error('详情恢复只允许读取一个已确认加车的原商品；本次未执行加车。')
       }
       // 商品已在前序阶段确认加车；这里只恢复详情素材，不重新占用登记或发起第二次加车。
-      return commandManagedBrowser('run-selection', params, browserOptions, onProgress)
+      const result = await runManagedSelection(params)
+      const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
+      return { ...result, commissionCacheWarnings: await cacheVerifiedCartCommissions(params.accountId, completed) }
     }
     const maxSelected = Number(params.maxSelectedProducts)
     const fallbackRows = params.allowCandidateFallback === true
@@ -716,7 +791,7 @@ export function registerLoginIpc(): void {
         candidate.skipped !== true && candidate.analysisRejected !== true
       )
       : []
-    const orderedRows = [...selectedRows, ...fallbackRows].slice(0, 30)
+    const orderedRows = [...selectedRows, ...fallbackRows].slice(0, MAX_SELECTION_CANDIDATE_FALLBACKS)
     const reservationLimit = Number.isFinite(maxSelected) && maxSelected > 0
       ? Math.min(orderedRows.length, Math.max(1, Math.ceil(maxSelected * 3)))
       : Math.min(orderedRows.length, selectedRows.length)
@@ -821,7 +896,7 @@ export function registerLoginIpc(): void {
     }
     const runParams = { ...params, selectedIndexes: reservedIndexes }
     try {
-      const result = await commandManagedBrowser('run-selection', runParams, browserOptions, onProgress)
+      const result = await runManagedSelection(runParams)
       const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
       const completedById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
       const settlementWarnings: string[] = []
@@ -839,8 +914,12 @@ export function registerLoginIpc(): void {
         const token = tokenByProduct.get(productId)
         if (!token) continue
         const item = completedById.get(productId)
-        const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' && item.cartAttempted !== true
-        const outcome = item?.cartAdded === true || item?.alreadyInCart === true
+        // 只有明确标记为“点击前控件未命中”才允许释放预留。任何结果不明
+        // 都必须保留为 UNCERTAIN，避免实际已加车后被下一账号再次选中。
+        const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' &&
+          item.cartAttempted !== true && item.skipped === true &&
+          /加车前控件定位失败|未点击加车/.test(String(item.status ?? ''))
+        const outcome = item?.cartAdded === true
           ? 'ADDED'
           : controlFailure || item?.confirmedCartRejection === true || item?.cartAttempted !== true
             ? 'NOT_ADDED'
@@ -867,6 +946,7 @@ export function registerLoginIpc(): void {
       for (const item of confirmedDownloads) {
         fireCartVideoDownload(params.accountId, item.productId, item.commodityId)
       }
+      const commissionCacheWarnings = await cacheVerifiedCartCommissions(params.accountId, completed)
       const rejected = reservationResult.rejected.map((item) => ({ ...item }))
       return {
         ...result,
@@ -876,6 +956,7 @@ export function registerLoginIpc(): void {
           !selectedProductIds.has(String(candidate.productId ?? '').trim())
         ).length,
         registrySettlementWarnings: settlementWarnings,
+        commissionCacheWarnings,
         registryReleaseEvents
       }
     } catch (error) {

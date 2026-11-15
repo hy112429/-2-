@@ -11,7 +11,7 @@ import {
 } from './publish_scheduler'
 import { runEngineCommand, type ScriptOutcome } from './engine'
 import { commandManagedBrowser, validateManagedProfilePath, type ManagedBrowserProgress } from './external_browser'
-import { firePostPublishQianchuanMaterial } from './post_publish_qianchuan_material'
+import { queuePostPublishQianchuanMaterial } from './post_publish_qianchuan_material'
 
 export interface AutoPublishProgressPayload extends ManagedBrowserProgress {
   state: 'idle' | 'running' | 'succeeded' | 'warning' | 'failed'
@@ -121,6 +121,7 @@ async function publishOneDueTask(requestedQueueId?: number, immediate = false): 
   let finalSubmitStageReached = false
   let submissionMayHaveBeenAttempted = false
   let submissionAttemptKnown = false
+  let submissionStarted = false
   let preparedScreenshotPath = ''
   let stage = immediate ? '校验马上发布任务' : '读取到期自动发布任务'
   const reportStage = (nextStage: string, extra: Partial<AutoPublishProgressPayload> = {}): void => {
@@ -216,7 +217,7 @@ async function publishOneDueTask(requestedQueueId?: number, immediate = false): 
     const reviewSettings = await runQueueCommand('auto-settings', 'get')
     const manualReviewEnabled = reviewSettings.manualReviewEnabled === true
 
-    reportStage(manualReviewEnabled ? '上传视频并等待人工复核' : '上传视频、关联商品并提交发布')
+    reportStage(manualReviewEnabled ? '上传视频并等待人工复核' : '上传视频、关联商品并准备发布')
     const prepared = await commandManagedBrowser('prepare-douyin-publish', {
       accountId: task.account_id,
       queueId: task.id,
@@ -226,7 +227,8 @@ async function publishOneDueTask(requestedQueueId?: number, immediate = false): 
       videoPath: String(started.videoPath ?? task.video_path),
       description: String(started.description ?? task.description ?? task.product_name),
       selectionSettingsDbPath: getClientPaths().databasePath,
-      autoPublish: !manualReviewEnabled
+      autoPublish: false,
+      publishMode: 'prepare'
     }, {
       profileKey: `account-${task.account_id}`,
       profilePath
@@ -309,17 +311,20 @@ async function publishOneDueTask(requestedQueueId?: number, immediate = false): 
       }
       throw new Error(String(prepared.error ?? '创作者中心自动发布未完成'))
     }
-    if (manualReviewEnabled || (prepared.manualPublishRequired === true && prepared.platformStatus === 'uploaded_waiting_publish')) {
-      if (prepared.manualPublishRequired !== true || prepared.platformStatus !== 'uploaded_waiting_publish') {
-        submissionMayHaveBeenAttempted = ['published', 'submitted_review'].includes(String(prepared.platformStatus ?? ''))
-        throw new Error('人工复核模式未能确认投稿停在最终发布前；任务转待核查')
-      }
-      const held = await runQueueCommand(
-        'upload-finish', '--id', String(task.id), '--status', 'uploaded_waiting_publish',
-        '--product-url', String(prepared.productUrl ?? started.productUrl ?? task.product_url)
-      )
-      if (held.ok !== true) throw new Error(String(held.error ?? '人工复核检查点未能保存'))
-      failureCheckpointSaved = true
+    const preparedForSubmit = prepared.prepareOnly === true &&
+      prepared.submissionAttempted === false &&
+      prepared.manualPublishRequired === true &&
+      prepared.platformStatus === 'uploaded_waiting_publish'
+    if (!preparedForSubmit) {
+      throw new Error('准备阶段未返回明确的待发布检查点；未点击最终发布，任务转待核查')
+    }
+    const held = await runQueueCommand(
+      'upload-finish', '--id', String(task.id), '--status', 'uploaded_waiting_publish',
+      '--product-url', String(prepared.productUrl ?? started.productUrl ?? task.product_url)
+    )
+    if (held.ok !== true) throw new Error(String(held.error ?? '上传准备检查点未能保存'))
+    failureCheckpointSaved = true
+    if (manualReviewEnabled) {
       broadcastProgress({
         state: 'warning', queueId: task.id, accountId: task.account_id,
         productName: task.product_name, stage: '待人工复核',
@@ -328,21 +333,62 @@ async function publishOneDueTask(requestedQueueId?: number, immediate = false): 
       })
       return
     }
-    // 自动化返回成功表示最终按钮已执行并识别到平台回执；即使写本地回执失败，也不能按未发布处理。
+    reportStage('锁定最终发布提交', { message: '准备检查点已保存，正在原子锁定本次唯一提交' })
+    const submitStarted = await runQueueCommand('submit-start', '--id', String(task.id))
+    if (submitStarted.ok !== true) throw new Error(String(submitStarted.error ?? '无法锁定最终发布提交'))
+    submissionStarted = true
+    failureCheckpointSaved = false
+    if (Number(submitStarted.id) !== task.id || Number(submitStarted.accountId) !== task.account_id) {
+      throw new Error('发布提交锁定回执与当前任务或账号不匹配；任务已转待核查')
+    }
+    reportStage('提交抖音发布', { message: '只提交已准备的投稿，不重新上传或关联商品' })
+    const submitted = await commandManagedBrowser('submit-douyin-publish', {
+      accountId: task.account_id,
+      queueId: task.id,
+      productId: String(submitStarted.productId ?? task.product_id),
+      productName: String(submitStarted.productName ?? task.product_name),
+      productUrl: String(submitStarted.productUrl ?? task.product_url),
+      videoPath: String(submitStarted.videoPath ?? task.video_path),
+      description: String(submitStarted.description ?? task.description ?? task.product_name),
+      selectionSettingsDbPath: getClientPaths().databasePath,
+      respectManualReview: false,
+      publishMode: 'submit'
+    }, {
+      profileKey: `account-${task.account_id}`,
+      profilePath
+    }, (progress: ManagedBrowserProgress) => {
+      finalSubmitStageReached = finalSubmitStageReached || progress.stage === '最终发布提交完成'
+      reportStage(progress.stage, {
+        message: progress.message ?? '',
+        percent: progress.percent,
+        indeterminate: progress.indeterminate,
+        index: progress.index,
+        total: progress.total
+      })
+    })
+    preparedScreenshotPath = typeof submitted.screenshotPath === 'string' ? submitted.screenshotPath : preparedScreenshotPath
+    if (typeof submitted.submissionAttempted === 'boolean') {
+      submissionMayHaveBeenAttempted = submitted.submissionAttempted
+      submissionAttemptKnown = true
+    }
+    if (submitted.ok !== true) throw new Error(String(submitted.error ?? '创作者中心未确认最终发布提交'))
     submissionMayHaveBeenAttempted = true
     submissionAttemptKnown = true
-    const platformStatus = String(prepared.platformStatus ?? '')
-    if (!['published', 'submitted_review'].includes(platformStatus) || prepared.manualPublishRequired !== false) {
-      throw new Error('创作者中心未返回可确认的自动发布回执；任务已转待核查')
+    const platformStatus = String(submitted.platformStatus ?? '')
+    if (Number(submitted.accountId) !== task.account_id || Number(submitted.queueId) !== task.id ||
+        String(submitted.productId ?? '') !== task.product_id ||
+        !['published', 'submitted_review'].includes(platformStatus)) {
+      throw new Error('平台回执与当前发布任务不一致；任务转待核查')
     }
 
     reportStage('保存平台发布回执', { message: `平台状态：${platformStatus}` })
     const finished = await runQueueCommand(
-      'upload-finish', '--id', String(task.id), '--status', platformStatus,
-      '--product-url', String(prepared.productUrl ?? started.productUrl ?? task.product_url)
+      'submit-finish', '--id', String(task.id), '--status', platformStatus,
+      ...(preparedScreenshotPath ? ['--screenshot-path', preparedScreenshotPath] : [])
     )
     if (finished.ok !== true) throw new Error(String(finished.error ?? '平台已处理，但无法保存发布回执'))
-    if (platformStatus === 'published') firePostPublishQianchuanMaterial(task.id, 'upload-finish')
+    failureCheckpointSaved = true
+    if (platformStatus === 'published') queuePostPublishQianchuanMaterial(task.id, 'submit-finish')
     broadcastProgress({
       state: 'succeeded',
       queueId: task.id,
@@ -382,7 +428,16 @@ async function publishOneDueTask(requestedQueueId?: number, immediate = false): 
     }
     if (task) {
       try {
-        if (uploadStarted) {
+        if (submissionStarted) {
+          const failureStatus = submissionMayHaveBeenAttempted || (finalSubmitStageReached && !submissionAttemptKnown)
+            ? 'submission_uncertain'
+            : 'uploaded_waiting_publish'
+          const checkpoint = await runQueueCommand(
+            'submit-finish', '--id', String(task.id), '--status', failureStatus, '--error', message,
+            ...(typeof preparedScreenshotPath === 'string' && preparedScreenshotPath ? ['--screenshot-path', preparedScreenshotPath] : [])
+          )
+          failureCheckpointSaved = checkpoint.ok === true && checkpoint.platformStatus === failureStatus
+        } else if (!failureCheckpointSaved && uploadStarted) {
           const failureStatus = submissionMayHaveBeenAttempted || (finalSubmitStageReached && !submissionAttemptKnown)
             ? 'submission_uncertain'
             : finalSubmitStageReached
@@ -649,7 +704,7 @@ async function publishOneManualRetryTask(queueId: number, options: ManualRetryOp
       )
       checkpointSaved = finished.ok === true
       if (!checkpointSaved) throw new Error('平台已处理，但本地提交检查点保存失败')
-      if (platformStatus === 'published') firePostPublishQianchuanMaterial(queueId, 'submit-finish')
+      if (platformStatus === 'published') queuePostPublishQianchuanMaterial(queueId, 'submit-finish')
       broadcastProgress({
         state: 'succeeded', queueId, accountId: task.accountId, productName: task.productName,
         stage: platformStatus === 'published' ? '手动重发成功' : '手动重发已提交审核',
@@ -710,7 +765,7 @@ async function publishOneManualRetryTask(queueId: number, options: ManualRetryOp
     )
     checkpointSaved = finished.ok === true
     if (!checkpointSaved) throw new Error('平台已处理，但本地上传检查点保存失败')
-    if (platformStatus === 'published') firePostPublishQianchuanMaterial(queueId, 'upload-finish')
+    if (platformStatus === 'published') queuePostPublishQianchuanMaterial(queueId, 'upload-finish')
     broadcastProgress({
       state: task.autoPublish && !manualReviewEnabled && !heldForReview ? 'succeeded' : 'warning',
       queueId, accountId: task.accountId, productName: task.productName,

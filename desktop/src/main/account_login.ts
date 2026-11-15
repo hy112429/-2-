@@ -501,12 +501,26 @@ export function registerAccountLoginIpc(): void {
     return openExternalLogin(url, `account-${params.accountId}`, params.profilePath, params.accountId)
   })
 
-  // 千川登录页在独立的托管 Chrome profile 打开。
-  ipcMain.handle('qianchuan:openLogin', async (_e, qcId: number) => {
+  // 默认在千川专属 profile 打开；账号绑定页可传抖音账号，复用百应所用的账号 profile。
+  ipcMain.handle('qianchuan:openLogin', async (
+    _e,
+    qcId: number,
+    options?: { accountId?: number; profilePath?: string }
+  ) => {
     if (!Number.isSafeInteger(qcId) || qcId < 1) {
       return { ok: false, external: true, url: QC_LOGIN_URL, error: '请选择有效的千川账户档案后再打开登录页' }
     }
-    return openExternalLogin(QC_LOGIN_URL, `qianchuan-${qcId}`, undefined, qcId)
+    if (options?.accountId !== undefined && (!Number.isSafeInteger(options.accountId) || options.accountId < 1)) {
+      return { ok: false, external: true, url: QC_LOGIN_URL, error: '绑定的抖音账号无效，请刷新账号绑定页面后重试' }
+    }
+    if (options?.profilePath !== undefined && typeof options.profilePath !== 'string') {
+      return { ok: false, external: true, url: QC_LOGIN_URL, error: '账号浏览器资料目录格式无效' }
+    }
+    if (options?.profilePath !== undefined && options.accountId === undefined) {
+      return { ok: false, external: true, url: QC_LOGIN_URL, error: '使用抖音账号浏览器资料时必须同时指定账号 ID' }
+    }
+    const profileKey = options?.accountId === undefined ? `qianchuan-${qcId}` : `account-${options.accountId}`
+    return openExternalLogin(QC_LOGIN_URL, profileKey, options?.profilePath, qcId)
   })
 
   ipcMain.handle('account:closeBrowser', () => closeBrowser())

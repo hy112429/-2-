@@ -147,7 +147,7 @@ export function registerAppDirsIpc(): void {
     if (!win) return null
     const settings = readSettings()
     const result = await dialog.showOpenDialog(win, {
-      title: '选择浏览器缓存目录（目录内须有 Default 文件夹）',
+      title: '高级设置：选择浏览器登录资料目录（必须包含 Default 文件夹）',
       defaultPath: existingDirectory(settings.lastProfileDir) ?? app.getPath('home'),
       properties: ['openDirectory', 'createDirectory']
     })
@@ -173,15 +173,20 @@ export function registerAppDirsIpc(): void {
   })
 
   ipcMain.handle('selection:validateProfileDir', (_event, value: unknown) => {
-    if (typeof value !== 'string' || !value.trim()) return { ok: false, error: '请选择浏览器缓存目录' }
+    if (typeof value !== 'string' || !value.trim()) return { ok: false, error: '请选择浏览器登录资料文件夹，或在客户端点“恢复默认”' }
     const target = resolve(value)
     const defaultDir = join(target, 'Default')
     try {
+      if (!statSync(target).isDirectory()) return { ok: false, error: '浏览器登录资料路径不是文件夹，请点“恢复默认”' }
+    } catch {
+      return { ok: false, error: '浏览器登录资料文件夹不存在，请点“恢复默认”；视频下载位置请填写“账号下载路径”' }
+    }
+    try {
       return statSync(defaultDir).isDirectory()
         ? { ok: true, path: target }
-        : { ok: false, error: '所选目录内没有 Default 文件夹' }
+        : { ok: false, error: '这个文件夹不是浏览器登录资料，请点“恢复默认”；视频下载位置请填写“账号下载路径”' }
     } catch {
-      return { ok: false, error: '所选目录内没有 Default 文件夹' }
+      return { ok: false, error: '这个文件夹不是浏览器登录资料，请点“恢复默认”；视频下载位置请填写“账号下载路径”' }
     }
   })
 

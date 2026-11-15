@@ -5,9 +5,9 @@ import QianchuanViolationsView from './QianchuanViolationsView.vue'
 
 interface Target { account_id: number; account_name: string; qianchuan_account_id: number | null; qc_name: string | null; qc_id: string | null }
 interface QianchuanAccount { id: number; qc_name: string | null; qc_id: string | null; subject?: string | null; login_state?: string }
-interface Asset { assetId: number; fileName: string; productId: string; eligible: boolean; reason?: string }
-interface Job { id: number; materialName: string; productId: string; status: string; scheduledDate: string; remoteMaterialId?: string; reason?: string; screenshotPath?: string; autoRetryCount?: number; nextRetryAt?: string | null }
-interface PostPublishRun { publishQueueId: number; accountId: number; productId: string; productName: string; status: string; reason: string; attemptCount: number; videoCount: number; assetIds: number[]; uploadJobIds: number[]; updatedAt: string; canRetry: boolean }
+interface Asset { assetId: number; fileName: string; productId: string; eligible: boolean; reason?: string; qualityVerdict?: string }
+interface Job { id: number; materialName: string; productId: string; status: string; scheduledDate: string; remoteMaterialId?: string; reviewStatus?: string; materialEvaluation?: string; evaluationCheckedAt?: string; reason?: string; screenshotPath?: string; autoRetryCount?: number; nextRetryAt?: string | null }
+interface PostPublishRun { publishQueueId: number; accountId: number; productId: string; productName: string; status: string; reason: string; attemptCount: number; videoCount: number; assetIds: number[]; uploadJobIds: number[]; updatedAt: string; canRetry: boolean; cartDownload?: { status: string; targetCount: number; uniqueCount: number; availableCount: number; error: string; nextRetryAt: string } }
 interface Limits { perProductVideos: number; perAccountProducts: number; perAccountVideos: number; perGroupProducts: number; perGroupVideos: number; maxConcurrentUploads: number; minStepDelayMs: number; maxStepDelayMs: number }
 
 const emit = defineEmits<{
@@ -20,6 +20,7 @@ const accountId = ref(0)
 const qcId = ref(0)
 const assets = ref<Asset[]>([])
 const jobs = ref<Job[]>([])
+const refreshingStatus = ref<Set<number>>(new Set())
 const selected = ref<Set<number>>(new Set())
 const busy = ref(false)
 const loading = ref(false)
@@ -35,6 +36,18 @@ const linkedQianchuanAccounts = computed(() => qianchuanAccounts.value.filter(ro
 const qcBoundToSelectedAccount = computed(() => linked.value.some(row => row.qianchuan_account_id === qcId.value))
 const eligible = computed(() => assets.value.filter(row => row.eligible))
 const due = computed(() => jobs.value.filter(row => row.status === 'queued' && row.scheduledDate <= today() && (!row.nextRetryAt || row.nextRetryAt <= localNow())))
+const uploadSummary = computed(() => {
+  const succeeded = jobs.value.filter(row => row.status === 'succeeded' && row.remoteMaterialId)
+  const unique = new Map<string, Job>()
+  for (const job of succeeded) unique.set(`${job.productId}:${job.remoteMaterialId}`, job)
+  return {
+    tasks: succeeded.length,
+    unique: unique.size,
+    approved: [...unique.values()].filter(job => /审核通过|已通过/.test(job.reviewStatus ?? '')).length,
+    moved: [...unique.values()].filter(job => job.materialEvaluation === '搬运').length,
+    unchecked: [...unique.values()].filter(job => !job.evaluationCheckedAt).length
+  }
+})
 function today(): string { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` }
 function localNow(): string { return new Date().toLocaleString('sv-SE').replace(' ', 'T') }
 function rows<T>(data: Record<string, unknown>): T[] { return Array.isArray(data.rows) ? data.rows as T[] : [] }
@@ -65,7 +78,11 @@ function runAccountCli(args: string[]): Promise<Record<string, unknown>> {
       .catch((error: unknown) => finish(() => reject(error instanceof Error ? error : new Error(String(error)))))
   })
 }
-function statusText(job: Job): string { if (job.status === 'queued' && job.nextRetryAt) return '重试等待'; return ({ queued: '待上传', uploading: '上传中', succeeded: '已上传', failed: '失败', needs_review: '待核查' } as Record<string, string>)[job.status] ?? job.status }
+function statusText(job: Job): string { if (job.status === 'queued' && job.nextRetryAt) return '重试等待'; return ({ queued: '待上传', uploading: '上传中', succeeded: '已上传', failed: '失败', needs_review: '待核查', rejected_quality: '劣质·已拦截' } as Record<string, string>)[job.status] ?? job.status }
+function platformStatusText(value: string | undefined, checkedAt: string | undefined): string {
+  if (!checkedAt) return '未获取'
+  return value && value !== '-' ? value : '平台未显示'
+}
 
 async function loadTargets(): Promise<void> {
   targets.value = rows<Target>(checked(await window.api.qianchuan.uploadTargets()))
@@ -103,6 +120,9 @@ async function refresh(): Promise<void> {
     ])
     postPublishEnabled.value = postConfig.enabled !== false
     postPublishRuns.value = rows<PostPublishRun>(checked(postRuns))
+    if (!previous && postPublishRuns.value.length && accounts.value.some(row => row.id === postPublishRuns.value[0].accountId)) {
+      accountId.value = postPublishRuns.value[0].accountId
+    }
     syncQianchuanSelection()
     if (previous === accountId.value) await loadAccount()
   } catch (error) { message.value = String(error) }
@@ -122,13 +142,14 @@ async function openBrowser(): Promise<void> {
     : result.error ?? '浏览器未能打开'
 }
 async function runJobs(ids: number[]): Promise<void> {
-  let success = 0; let failed = 0; let deferred = 0; let retryPending = 0
+  let success = 0; let failed = 0; let deferred = 0; let retryPending = 0; let qualityRejected = 0
   for (let i = 0; i < ids.length; i += 1) {
     progress.value = `上传 ${i + 1}/${ids.length} · 任务 #${ids[i]}`
     const result = await window.api.qianchuan.runUpload(ids[i])
     if (result.status === 'succeeded') success += 1
     else if (result.status === 'deferred') deferred += 1
     else if (result.status === 'queued' || result.status === 'retry_wait') retryPending += 1
+    else if (result.status === 'rejected_quality') qualityRejected += 1
     else {
       failed += 1
       message.value = `任务 #${ids[i]}：${String(result.error ?? '上传结果待核查')}`
@@ -137,8 +158,8 @@ async function runJobs(ids: number[]): Promise<void> {
     await loadJobs()
   }
   progress.value = ''; await loadAccount()
-  message.value = `本次确认上传 ${success} 条，顺延 ${deferred} 条，自动重试等待 ${retryPending} 条，失败或待核查 ${failed} 条。`
-  notifyGlobal(message.value, failed ? 'error' : retryPending ? 'warning' : 'success')
+  message.value = `本次确认上传 ${success} 条，劣质拦截 ${qualityRejected} 条，顺延 ${deferred} 条，自动重试等待 ${retryPending} 条，失败或待核查 ${failed} 条。`
+  notifyGlobal(message.value, failed ? 'error' : qualityRejected || retryPending ? 'warning' : 'success')
 }
 async function enqueue(): Promise<void> {
   if (!accountId.value || !qcBoundToSelectedAccount.value || !selected.value.size || busy.value) return
@@ -167,6 +188,16 @@ async function runDue(): Promise<void> { if (busy.value || !due.value.length) re
 async function retrySafe(id: number): Promise<void> {
   try { checked(await window.api.qianchuan.retrySafeUpload(id)); await loadJobs(); message.value = `任务 #${id} 已安全重排，按当前额度执行。` }
   catch (error) { message.value = String(error) }
+}
+async function refreshMaterialStatus(id: number): Promise<void> {
+  if (refreshingStatus.value.has(id)) return
+  refreshingStatus.value = new Set([...refreshingStatus.value, id])
+  try {
+    const result = checked(await window.api.qianchuan.refreshMaterialStatus(id))
+    await loadJobs()
+    message.value = `任务 #${id} 判定已更新：审核状态 ${platformStatusText(String(result.reviewStatus ?? ''), String(result.checkedAt ?? ''))}，素材评估 ${platformStatusText(String(result.materialEvaluation ?? ''), String(result.checkedAt ?? ''))}。`
+  } catch (error) { message.value = String(error) }
+  finally { const next = new Set(refreshingStatus.value); next.delete(id); refreshingStatus.value = next }
 }
 function openScreenshot(path: string): void { void window.api.assets.openFolder(path) }
 async function resolveReviewAbsent(id: number): Promise<void> {
@@ -198,7 +229,7 @@ async function savePostPublishSetting(): Promise<void> {
   try {
     checked(await window.api.qianchuan.setPostPublishEnabled(requested))
     message.value = requested
-      ? '发布成功后自动获取视频已开启；每轮最多取 3 条且受 Step17 当日额度限制。'
+      ? '发布成功后自动获取视频已开启；按该账号下载额度取片，并受 Step17 当日额度限制。'
       : '发布后自动获取视频已关闭；当前正在执行的下载不会撤销，之后不再入队。'
     await loadPostPublishRuns()
   } catch (error) {
@@ -209,7 +240,13 @@ async function savePostPublishSetting(): Promise<void> {
 function postPublishStatus(status: string): string {
   return ({ running: '处理中', disabled: '已关闭', blocked_auth: '等待千川授权', blocked_binding: '等待账号绑定',
     skipped_no_video: '无可下载视频', skipped_quota: '额度已用完', failed_query: '查询失败',
-    failed_download: '下载失败', needs_review: '需要核查', enqueued: '已加入 Step17' } as Record<string, string>)[status] ?? status
+    failed_download: '下载失败', needs_review: '需要核查', enqueued: '已加入 Step17',
+    awaiting_upload: '等待上传与核对', needs_fill: '自动补位中', candidate_exhausted: '候选已耗尽',
+    completed: '不同素材已达标' } as Record<string, string>)[status] ?? status
+}
+function cartStatus(status: string): string {
+  return ({ queued: '待下载', running: '下载中', completed: '下载达标', partial: '下载待补齐',
+    failed: '下载失败待重试', exhausted: '候选已耗尽' } as Record<string, string>)[status] ?? status
 }
 async function retryPostPublish(run: PostPublishRun): Promise<void> {
   try {
@@ -233,7 +270,7 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
 
 <template>
   <section class="qc-page">
-    <header class="heading"><div><h1>千川素材上传</h1><p>从本地素材库按账号选取网页下载素材，抖音同商品确认发布后上传到绑定的千川账户。</p></div><div class="heading-actions"><button class="btn" @click="emit('open-qianchuan-accounts')">千川账号与登录</button><button class="btn" @click="emit('navigate', '素材与工具')">查看素材库</button></div></header>
+    <header class="heading"><div><h1>千川素材</h1><p>查看自动上传进度</p></div><div class="heading-actions"><button class="btn" @click="emit('navigate', '商品列表')">查看商品素材</button><button class="btn" @click="emit('open-qianchuan-accounts')">账号与登录</button><button class="btn" @click="emit('navigate', '素材与工具')">素材库</button></div></header>
     <div class="toolbar">
       <label>抖音账号 <select v-model.number="accountId"><option :value="0">选择账号</option><option v-for="account in accounts" :key="account.id" :value="account.id">{{ account.name }}</option></select></label>
       <label>千川账户 <select v-model.number="qcId" :disabled="!linkedQianchuanAccounts.length"><option :value="0">选择已绑定账户</option><option v-for="qc in linkedQianchuanAccounts" :key="qc.id" :value="qc.id">{{ qc.qc_name || `千川档案 #${qc.id}` }}{{ qc.qc_id ? `（ID ${qc.qc_id}）` : '' }}</option></select></label>
@@ -242,14 +279,16 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
     <div v-if="!qianchuanAccounts.length" class="setup-callout"><div><strong>还没有千川账户档案</strong><p>先新增一个千川账户档案，再从这里打开独立登录页。登录后可绑定到抖音账号用于素材上传。</p></div><button class="btn primary" @click="emit('open-qianchuan-accounts')">新增千川账户并登录</button></div>
     <p v-if="accountId && !linked.length" class="hint">此账号尚未绑定千川账户，请先在账号管理完成关联。</p>
     <p v-else-if="qcId && !qcBoundToSelectedAccount" class="hint">当前千川账户尚未绑定到所选抖音账号；登录不受影响，上传前请在「账号管理 → 千川账户」完成绑定。</p>
-    <p class="scope-note">当前额度按本机数据库登记；多台电脑共用额度时须接入共享原子登记服务。</p>
-    <label class="scope-note"><input v-model="retryEnabled" type="checkbox" @change="saveRetry" /> 本机千川上传：提交前失败自动重试（默认开启，最多 3 次：5 / 15 / 60 分钟）</label>
+    <details class="settings"><summary>自动上传与重试设置</summary>
+      <p class="scope-note">当前额度按本机数据库登记；多台电脑共用额度时须接入共享原子登记服务。</p>
+      <label class="scope-note"><input v-model="retryEnabled" type="checkbox" @change="saveRetry" /> 提交前失败自动重试（最多 3 次：5 / 15 / 60 分钟）</label>
+    </details>
     <details class="settings post-publish-settings"><summary>发布成功后自动获取千川视频并加入 Step17</summary>
-      <label class="scope-note"><input v-model="postPublishEnabled" type="checkbox" @change="savePostPublishSetting" /> 自动获取并下载商品视频（默认开启；每商品每轮最多 3 条，受 Step17 当日剩余额度限制）</label>
+      <label class="scope-note"><input v-model="postPublishEnabled" type="checkbox" @change="savePostPublishSetting" /> 自动获取并下载商品视频（默认开启；按账号下载额度，受 Step17 当日剩余额度限制）</label>
       <p class="scope-note">仅在抖音发布状态确认成功后触发。下载素材以发布队列商品 ID 和账号 ID 登记为 web_download；千川上传仍由 Step17 原队列、登录态与额度规则执行。</p>
       <div v-if="!postPublishRuns.length" class="empty">暂无发布后素材记录。</div>
       <div v-else class="post-publish-list"><article v-for="run in postPublishRuns" :key="run.publishQueueId" class="post-publish-row">
-        <div><strong>{{ run.productName || `商品 ${run.productId}` }}</strong><small>发布任务 #{{ run.publishQueueId }} · 账号 {{ run.accountId }} · 商品 {{ run.productId }} · {{ run.videoCount }} 条查询结果 · 第 {{ run.attemptCount }} 次</small><small :class="{ reason: ['blocked_auth','blocked_binding','failed_query','failed_download','needs_review'].includes(run.status) }">{{ run.reason || postPublishStatus(run.status) }}</small></div>
+        <div><strong>{{ run.productName || `商品 ${run.productId}` }}</strong><small>发布任务 #{{ run.publishQueueId }} · 账号 {{ run.accountId }} · 商品 {{ run.productId }} · 第 {{ run.attemptCount }} 次</small><small v-if="run.cartDownload">百应同款下载：{{ cartStatus(run.cartDownload.status) }} · 不同内容 {{ run.cartDownload.uniqueCount }}/{{ run.cartDownload.targetCount }}<span v-if="run.cartDownload.nextRetryAt"> · 下次重试 {{ run.cartDownload.nextRetryAt.replace('T', ' ') }}</span></small><small v-if="run.cartDownload?.error" class="reason">{{ run.cartDownload.error }}</small><small :class="{ reason: ['blocked_auth','blocked_binding','failed_query','failed_download','needs_review','candidate_exhausted'].includes(run.status) }">{{ run.reason || postPublishStatus(run.status) }}</small></div>
         <span class="status" :class="run.status">{{ postPublishStatus(run.status) }}</span>
         <button v-if="run.canRetry" class="btn" :disabled="busy" @click="retryPostPublish(run)">重试</button>
       </article></div>
@@ -257,16 +296,20 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
     <p v-if="message" class="hint">{{ message }}</p><p v-if="progress" class="progress" role="status">{{ progress }}</p>
     <QianchuanViolationsView v-if="linked.some(row => row.qianchuan_account_id === qcId)" :qianchuan-account-id="qcId" />
     <div class="columns">
+      <section class="panel"><header class="panel-head"><div><h2>上传记录</h2><small>{{ jobs.length }} 条任务 · 上传成功 {{ uploadSummary.tasks }} · 审核通过 {{ uploadSummary.approved }} · 搬运 {{ uploadSummary.moved }} · 待核查 {{ uploadSummary.unchecked }}</small></div><button class="btn" :disabled="busy || !due.length" @click="runDue">执行待上传任务</button></header>
+        <div v-if="!jobs.length" class="empty">暂无上传记录。商品发布并准备好素材后，这里会显示进度。</div><div v-else class="list"><article v-for="job in jobs" :key="job.id" class="job"><div class="job-title"><strong :title="job.materialName">{{ job.materialName }}</strong><span :class="['status', job.status]">{{ statusText(job) }}</span></div><small>任务 #{{ job.id }} · 商品 {{ job.productId }} · 排程 {{ job.scheduledDate }}</small><small v-if="job.nextRetryAt">自动重试 {{ job.autoRetryCount ?? 0 }}/3 · 预计 {{ job.nextRetryAt.replace('T', ' ') }}</small><small v-else-if="job.autoRetryCount">已自动重试 {{ job.autoRetryCount }}/3 次</small><small v-if="job.remoteMaterialId">千川素材 ID：{{ job.remoteMaterialId }}</small><small v-if="job.status === 'succeeded'">审核状态：{{ platformStatusText(job.reviewStatus, job.evaluationCheckedAt) }} · 素材评估：<span :class="{ reason: job.materialEvaluation === '搬运' }">{{ platformStatusText(job.materialEvaluation, job.evaluationCheckedAt) }}</span><span v-if="job.evaluationCheckedAt"> · 核对于 {{ job.evaluationCheckedAt.replace('T', ' ') }}</span></small><button v-if="job.status === 'succeeded'" class="btn" :disabled="busy || refreshingStatus.has(job.id)" @click="refreshMaterialStatus(job.id)">{{ refreshingStatus.has(job.id) ? '查询中…' : '刷新平台判定' }}</button><small v-if="job.reason" class="reason">{{ job.reason }}</small><button v-if="job.screenshotPath" class="btn" @click="openScreenshot(job.screenshotPath)">查看失败截图</button><button v-if="job.status === 'failed'" class="btn" :disabled="busy" @click="retrySafe(job.id)">确认未上传后重排</button><template v-if="job.status === 'needs_review'"><button class="btn" :disabled="busy" @click="resolveReviewPresent(job.id)">已在千川，补录 ID</button><button class="btn" :disabled="busy" @click="resolveReviewAbsent(job.id)">核实未上传后重排</button></template></article></div>
+      </section>
+    </div>
+    <details class="settings"><summary>手动添加素材（可用 {{ eligible.length }} 条）</summary>
+    <div class="columns manual-columns">
       <section class="panel"><header class="panel-head"><div><h2>可选素材</h2><small>可入队 {{ eligible.length }} / {{ assets.length }}</small></div><button class="btn" :disabled="!eligible.length" @click="selectAll">全选可用</button></header>
         <p class="explainer">仅显示已归属此账号的网页下载素材；发布未完成会显示原因。</p>
         <div v-if="loading" class="empty">读取中…</div><div v-else-if="!assets.length" class="empty">暂无符合来源和账号归属的素材，请先在素材库核对。</div>
-        <div v-else class="list"><label v-for="asset in assets" :key="asset.assetId" class="asset" :class="{ unavailable: !asset.eligible }"><input type="checkbox" :disabled="!asset.eligible" :checked="selected.has(asset.assetId)" @change="toggle(asset)" /><span><strong :title="asset.fileName">{{ asset.fileName }}</strong><small>商品 {{ asset.productId }} · 素材 #{{ asset.assetId }}</small><small v-if="!asset.eligible" class="reason">{{ asset.reason }}</small></span></label></div>
+        <div v-else class="list"><label v-for="asset in assets" :key="asset.assetId" class="asset" :class="{ unavailable: !asset.eligible }"><input type="checkbox" :disabled="!asset.eligible" :checked="selected.has(asset.assetId)" @change="toggle(asset)" /><span><strong :title="asset.fileName">{{ asset.fileName }}</strong><small>商品 {{ asset.productId }} · 素材 #{{ asset.assetId }}</small><small v-if="asset.qualityVerdict === 'poor_quality'" class="reason">本地质检：劣质，确认移动水印</small><small v-else-if="asset.qualityVerdict === 'suspected'">本地质检：疑似移动文字，按配置继续</small><small v-if="!asset.eligible" class="reason">{{ asset.reason }}</small></span></label></div>
         <footer class="panel-actions"><span>已选 {{ selected.size }} 条</span><button class="btn primary" :disabled="busy || !selected.size || !qcBoundToSelectedAccount" @click="enqueue">{{ busy ? '处理中…' : '入队并上传今日额度' }}</button></footer>
       </section>
-      <section class="panel"><header class="panel-head"><div><h2>上传队列</h2><small>{{ jobs.length }} 条记录</small></div><button class="btn" :disabled="busy || !due.length" @click="runDue">执行到期任务</button></header>
-        <div v-if="!jobs.length" class="empty">尚无上传任务。</div><div v-else class="list"><article v-for="job in jobs" :key="job.id" class="job"><div class="job-title"><strong :title="job.materialName">{{ job.materialName }}</strong><span :class="['status', job.status]">{{ statusText(job) }}</span></div><small>任务 #{{ job.id }} · 商品 {{ job.productId }} · 排程 {{ job.scheduledDate }}</small><small v-if="job.nextRetryAt">自动重试 {{ job.autoRetryCount ?? 0 }}/3 · 预计 {{ job.nextRetryAt.replace('T', ' ') }}</small><small v-else-if="job.autoRetryCount">已自动重试 {{ job.autoRetryCount }}/3 次</small><small v-if="job.remoteMaterialId">千川素材 ID：{{ job.remoteMaterialId }}</small><small v-if="job.reason" class="reason">{{ job.reason }}</small><button v-if="job.screenshotPath" class="btn" @click="openScreenshot(job.screenshotPath)">查看失败截图</button><button v-if="job.status === 'failed'" class="btn" :disabled="busy" @click="retrySafe(job.id)">确认未上传后重排</button><template v-if="job.status === 'needs_review'"><button class="btn" :disabled="busy" @click="resolveReviewPresent(job.id)">已在千川，补录 ID</button><button class="btn" :disabled="busy" @click="resolveReviewAbsent(job.id)">核实未上传后重排</button></template></article></div>
-      </section>
     </div>
+    </details>
     <details class="settings"><summary>上传额度与执行间隔</summary><div class="settings-grid"><label>每品条数<input v-model.number="limits.perProductVideos" type="number" min="1" /></label><label>账号每日品数<input v-model.number="limits.perAccountProducts" type="number" min="1" /></label><label>账号每日条数<input v-model.number="limits.perAccountVideos" type="number" min="1" /></label><label>五账号组每日品数<input v-model.number="limits.perGroupProducts" type="number" min="1" /></label><label>五账号组每日条数<input v-model.number="limits.perGroupVideos" type="number" min="1" /></label><label>最大并发<input v-model.number="limits.maxConcurrentUploads" type="number" min="1" /></label><label>最小间隔（毫秒）<input v-model.number="limits.minStepDelayMs" type="number" min="1" /></label><label>最大间隔（毫秒）<input v-model.number="limits.maxStepDelayMs" type="number" min="1" /></label></div><button class="btn primary" :disabled="!accountId || busy" @click="saveLimits">保存该账号配置</button></details>
   </section>
 </template>
@@ -280,6 +323,9 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
   .heading { flex-wrap: wrap; }
 }
 .qc-page .panel, .qc-page .toolbar, .qc-page .settings { box-shadow: var(--shadow-card); }
+.qc-page > .columns { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+.manual-columns { display: block; min-height: 0; margin-top: 12px; }
+.manual-columns .panel { min-height: 300px; }
 .post-publish-settings .scope-note{display:flex;align-items:flex-start;gap:7px;margin-top:10px}.post-publish-list{display:flex;flex-direction:column;max-height:240px;overflow:auto;margin-top:8px}.post-publish-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:10px;padding:9px 0;border-top:1px solid #eef1f5;font-size:12px}.post-publish-row>div{display:flex;flex-direction:column;gap:3px;min-width:0}.post-publish-row strong,.post-publish-row small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.post-publish-row small{color:#7a8797}.status.blocked_auth,.status.blocked_binding,.status.failed_query,.status.failed_download,.status.needs_review{background:#fff0ed;color:#b3483d}.status.enqueued{background:#e6f7ed;color:#16834d}
 .qc-page .asset:hover, .qc-page .job:hover { background: #f7faff; }
 .qc-page .btn:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }

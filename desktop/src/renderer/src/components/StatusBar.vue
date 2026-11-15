@@ -1,7 +1,4 @@
 <script setup lang="ts">
-// 状态栏三项数据（需求 4）。
-// 现在由 App.vue 传占位值进来，Step 5 接上 SQLite 后换成真实查询结果，
-// 这个组件本身不用改。
 defineProps<{
   assetCount: number
   recordCount: number
@@ -11,18 +8,15 @@ defineProps<{
 
 <template>
   <footer class="status">
-    <span class="item">
-      素材库读取数：<b>{{ assetCount }}</b>
-    </span>
-    <span class="sep">|</span>
-    <span class="item">
-      记录数：<b>{{ recordCount }}</b>
-    </span>
-    <span class="sep">|</span>
-    <span class="item path-item" :title="downloadDir">
-      当前下载目录：<span class="path">{{ downloadDir }}</span>
-    </span>
-    <span class="state">就绪</span>
+    <span class="item">本地素材 <b>{{ assetCount }}</b> 条</span>
+    <details class="status-details">
+      <summary>本机信息</summary>
+      <div class="status-popover">
+        <span>记录数：{{ recordCount }}</span>
+        <span>下载目录：{{ downloadDir || '尚未设置' }}</span>
+      </div>
+    </details>
+    <span class="state">本机就绪</span>
   </footer>
 </template>
 
@@ -50,21 +44,9 @@ defineProps<{
   font-weight: 600;
 }
 
-.sep {
-  color: var(--border);
-}
-
-.path-item {
-  /* 路径可能很长，让它可伸缩并省略号截断，避免把状态栏挤爆 */
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.path {
-  font-family: Consolas, 'Courier New', monospace;
-  color: var(--text);
-}
+.status-details { position: relative; }
+.status-details summary { cursor: pointer; color: #687894; }
+.status-popover { position: absolute; z-index: 5; bottom: 25px; left: 0; display: flex; flex-direction: column; gap: 6px; width: min(440px, 75vw); padding: 12px; border: 1px solid var(--border); border-radius: 7px; background: #fff; box-shadow: var(--shadow-card); color: var(--text); overflow-wrap: anywhere; }
 
 .state {
   margin-left: auto;

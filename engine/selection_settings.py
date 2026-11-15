@@ -34,8 +34,17 @@ PROTOTYPE_BANNED_WORDS = [
     "毛毛和爷爷的小店", "小勇在努力", "黄家敏", "匡赐有好物", "与辉同行", "汉森", "罗总", "郝邵文", "交个朋友", "博学罗交个朋友",
     "亮哥", "罗罗", "亮亮", "安安", "唐梦琪", "三公主", "唐三妹", "一路向前", "一颗小小草",
 ]
-BANNED_WORDS_SEED_VERSION = 1
-DEFAULT_BANNED_WORDS = list(dict.fromkeys([*COMPLIANCE_DEFAULT_BANNED_WORDS, *PROTOTYPE_BANNED_WORDS]))
+SUPERSTITION_BANNED_WORDS = [
+    "封建迷信", "迷信用品", "算命", "算卦", "占卜", "占星", "看相", "看手相", "手相", "面相",
+    "命理", "星座运势", "生肖运势", "风水", "玄学", "运势预测", "改命", "改运", "转运", "开运",
+    "招财", "旺财", "旺运", "催财", "聚财", "招桃花", "催姻缘", "旺姻缘", "辟邪", "驱邪",
+    "镇宅", "化煞", "消灾", "消灾解难", "符咒", "灵符", "护身符", "平安符", "招财符", "太岁符",
+    "五帝钱", "八卦镜", "转运珠", "本命佛", "佛牌", "开光", "法器", "开运摆件", "招财摆件", "风水摆件",
+]
+BANNED_WORDS_SEED_VERSION = 2
+DEFAULT_BANNED_WORDS = list(dict.fromkeys([
+    *COMPLIANCE_DEFAULT_BANNED_WORDS, *PROTOTYPE_BANNED_WORDS, *SUPERSTITION_BANNED_WORDS
+]))
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "candidateLimit": 5,
@@ -96,8 +105,8 @@ def scope_key(account_id: Optional[int]) -> str:
     return "global" if account_id is None else f"account:{account_id}"
 
 
-def migrate_prototype_banned_words(connection: sqlite3.Connection) -> None:
-    """只向已有通用设置追加一次原型名单，不覆盖用户保存的屏蔽词。"""
+def migrate_banned_words_seed(connection: sqlite3.Connection) -> None:
+    """向已有通用设置增量补齐系统屏蔽词，不覆盖用户保存的其他屏蔽词。"""
     try:
         row = connection.execute(
             "SELECT settings_json FROM selection_settings WHERE scope_key = 'global'"
@@ -122,9 +131,15 @@ def migrate_prototype_banned_words(connection: sqlite3.Connection) -> None:
     current_words = settings.get("bannedWords", DEFAULT_BANNED_WORDS)
     if not isinstance(current_words, list):
         return
+    seed_words: list[str] = []
+    if seed_version < 1:
+        seed_words.extend(PROTOTYPE_BANNED_WORDS)
+    if seed_version < 2:
+        seed_words.extend(SUPERSTITION_BANNED_WORDS)
+
     merged_words: list[str] = []
     seen_words: set[str] = set()
-    for value in [*current_words, *PROTOTYPE_BANNED_WORDS]:
+    for value in [*current_words, *seed_words]:
         word = str(value).strip()
         normalized = word.casefold()
         if word and normalized not in seen_words:
@@ -146,8 +161,13 @@ def migrate_prototype_banned_words(connection: sqlite3.Connection) -> None:
         connection.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 
+def migrate_prototype_banned_words(connection: sqlite3.Connection) -> None:
+    """兼容旧调用名；实际补齐全部版本化系统屏蔽词。"""
+    migrate_banned_words_seed(connection)
+
+
 def load_settings(connection: sqlite3.Connection, account_id: Optional[int]) -> Dict[str, Any]:
-    migrate_prototype_banned_words(connection)
+    migrate_banned_words_seed(connection)
     global_row = connection.execute(
         "SELECT settings_json FROM selection_settings WHERE scope_key = 'global'"
     ).fetchone()
@@ -199,7 +219,7 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
 
 def banned_words_from_connection(connection: sqlite3.Connection) -> list[str]:
     """从共享数据库读取全局屏蔽词；尚未迁移的旧库使用内置词表。"""
-    migrate_prototype_banned_words(connection)
+    migrate_banned_words_seed(connection)
     try:
         row = connection.execute(
             "SELECT settings_json FROM selection_settings WHERE scope_key = 'global'"

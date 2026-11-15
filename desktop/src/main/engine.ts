@@ -51,7 +51,11 @@ const ALLOWED_SCRIPTS = new Set([
 
 /** 仅主进程可调用：队列终态与千川页面执行不能由渲染进程任意伪造。 */
 const INTERNAL_SCRIPTS = new Set([
-  'qianchuan_upload.py', 'qianchuan_browser.py', 'qianchuan_violations.py', 'post_publish_material.py'
+  'qianchuan_upload.py', 'qianchuan_browser.py', 'qianchuan_material_status.py',
+  'qianchuan_violations.py', 'qianchuan_plan.py', 'qianchuan_plan_browser.py',
+  'qianchuan_plan_supplement_browser.py',
+  'post_publish_material.py', 'baiying_cart_download_state.py',
+  'video_visual_dedupe.py'
 ])
 
 /** 正在运行的任务表：taskId -> 句柄（含取消标志与强杀入口） */
@@ -386,8 +390,8 @@ export function runScript(script: string, options: RunOptions): TaskHandle {
 }
 
 /** 主进程后台服务执行白名单引擎命令，不依赖某个渲染窗口存活。 */
-export async function runEngineCommand(script: string, args: string[] = []): Promise<ScriptOutcome> {
-  const handle = runScript(script, { args, internal: true, onEvent: () => undefined })
+export async function runEngineCommand(script: string, args: string[] = [], stdinJson?: unknown): Promise<ScriptOutcome> {
+  const handle = runScript(script, { args, stdinJson, internal: true, onEvent: () => undefined })
   return handle.promise
 }
 

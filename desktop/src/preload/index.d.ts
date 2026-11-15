@@ -147,6 +147,12 @@ declare global {
     candidateSnapshot: Record<string, unknown>
     selectedAt: string
     updatedAt: string
+    recordSource: 'selection' | 'qianchuan_upload'
+    materialCount: number
+    materialFirstCount: number
+    materialMovedCount: number
+    materialPendingCount: number
+    materialOtherCount: number
   }
 
   /** engine:run 入参 */
@@ -328,13 +334,14 @@ declare global {
           options?: { profileKey?: string; profilePath?: string }
         ): Promise<{ ok: boolean; url: string; external: boolean; profilePath?: string; port?: number; title?: string; error?: string }>
         inspectBaiyingSelection(options: { profileKey: string; profilePath?: string; includeCategoryTree?: boolean }): Promise<Record<string, unknown>>
-        checkAccountLogins(params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>>
+        checkAccountLogins(params: { accountId: number; profilePath?: string; closeAfterAutomation?: boolean }): Promise<Record<string, unknown>>
         inspectAccountPages(params: { accountId: number; profilePath?: string }): Promise<{
           ok: boolean
           inspectable: boolean
           baiyingOpen: boolean
           creatorCenterOpen: boolean
         }>
+        closeAccount(params: { accountId: number; profilePath?: string }): Promise<{ ok: boolean; closed: boolean }>
         validateProfilePath(options: { profileKey: string; profilePath?: string }): Promise<{ ok: boolean; path?: string; error?: string }>
         runBaiyingSelection(params: {
           profileKey: string
@@ -352,6 +359,7 @@ declare global {
           maxSelectedProducts?: number
           stopAfterCart?: boolean
           previewOnly?: boolean
+          closeAfterAutomation?: boolean
         }): Promise<Record<string, unknown>>
         getSelectionRegistrySnapshot(accountKey: string, candidates: Array<{ productId: string; leafCategoryId: string }>): Promise<{
           usedProductIds: string[]
@@ -359,6 +367,15 @@ declare global {
           categoryUsage: Record<string, number>
           mode: 'local'
         }>
+        getSelectionRegistryBatchSnapshot(entries: Array<{
+          accountKey: string
+          candidates: Array<{ productId: string; leafCategoryId: string }>
+        }>): Promise<Record<string, {
+          usedProductIds: string[]
+          accountUsedCategoryIds: string[]
+          categoryUsage: Record<string, number>
+          mode: 'local'
+        }>>
         onSelectionProgress(cb: (progress: SelectionProgressPayload) => void): () => void
         prepareDouyinPublish(params: {
           accountId: number
@@ -525,13 +542,15 @@ declare global {
         apiAccounts(): Promise<{ accounts: Array<{ id: string; name: string; source: string }>; identities: Array<{ id: string; type: string; name: string }>; warnings: string[]; requiresQianchuanAuthorization: boolean }>
         apiAwemes(advertiserId: string): Promise<Array<{ id: string; name: string }>>
         apiVerifyVideo(path: string): Promise<{ ok: boolean; path: string; bytes?: number; reason?: string }>
-        openLogin(qcId: number): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }>
+        openLogin(qcId: number, options?: { accountId: number; profilePath?: string }): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }>
         checkLogin(qcId: number): Promise<AccountLoginState>
         exportForEngine(qcId: number): Promise<AccountEngineSession>
         clearLogin(qcId: number): Promise<{ ok: boolean }>
         uploadTargets(): Promise<Record<string, unknown>>
         eligibleAssets(accountId: number): Promise<Record<string, unknown>>
         uploadJobs(accountId?: number): Promise<Record<string, unknown>>
+        materialRecords(params: { accountId: number; productId: string }): Promise<Record<string, unknown>>
+        refreshMaterialStatus(jobId: number): Promise<Record<string, unknown>>
         enqueueUpload(params: { accountId: number; assetIds: number[]; qianchuanAccountId: number }): Promise<Record<string, unknown>>
         runUpload(jobId: number): Promise<Record<string, unknown>>
         retrySafeUpload(jobId: number): Promise<Record<string, unknown>>
@@ -545,6 +564,16 @@ declare global {
         setPostPublishEnabled(enabled: boolean): Promise<Record<string, unknown>>
         postPublishRuns(): Promise<Record<string, unknown>>
         retryPostPublishRun(queueId: number): Promise<Record<string, unknown>>
+        planSettings(qcId: number): Promise<Record<string, unknown>>
+        savePlanSettings(params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>>
+        planJobs(params?: { qianchuanAccountId?: number; accountId?: number; status?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
+        planLogs(params?: { id?: number; qianchuanAccountId?: number; accountId?: number; status?: string; startDate?: string; endDate?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
+        planCandidates(params: { accountId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>
+        createManualPlan(params: { publishQueueId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>
+        planSupplements(): Promise<Record<string, unknown>>
+        runPlan(jobId: number, expectedDailyBudgetYuan?: number): Promise<Record<string, unknown>>
+        retryBlockedPlan(jobId: number): Promise<Record<string, unknown>>
+        resolvePlan(params: { id: number; present: boolean; note: string; remotePlanId?: string }): Promise<Record<string, unknown>>
         scanViolations(qcId: number): Promise<Record<string, unknown>>
         prepareViolationDeletion(params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>>
         violationBatch(batchId: number): Promise<Record<string, unknown>>

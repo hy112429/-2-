@@ -8,6 +8,7 @@ import argparse
 import json
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,10 +17,11 @@ from db import DEFAULT_DB_PATH, connect, emit, now_text
 STATUSES = {
     "running", "disabled", "blocked_auth", "blocked_binding", "skipped_no_video",
     "skipped_quota", "failed_query", "failed_download", "needs_review", "enqueued",
+    "awaiting_upload", "needs_fill", "candidate_exhausted", "completed",
 }
 RETRYABLE = {
     "disabled", "blocked_auth", "blocked_binding", "skipped_no_video", "skipped_quota",
-    "failed_query", "failed_download", "needs_review",
+    "failed_query", "failed_download", "needs_review", "needs_fill", "candidate_exhausted",
 }
 
 SCHEMA = """
@@ -148,6 +150,34 @@ def begin(connection: sqlite3.Connection, queue_id: int, trigger_source: str) ->
             "JOIN publish_queue p ON p.id = r.publish_queue_id WHERE r.publish_queue_id = ?", (queue_id,)
         ).fetchone()
         if existing:
+            status = str(existing["status"])
+            # 等待上传/补位/候选耗尽只能由 reconcile 在检测到外部进展后恢复；
+            # 重复的发布成功通知必须保持幂等，不能再次增加 attempt_count。
+            resumable = status == "enqueued" or (
+                trigger_source == "reconcile" and
+                status in {"awaiting_upload", "needs_fill", "candidate_exhausted"}
+            )
+            if status == "running":
+                resumable = datetime.now() - datetime.fromisoformat(existing["updated_at"]) >= timedelta(minutes=30)
+            if resumable:
+                enabled = bool(_settings(connection)["enabled"])
+                new_status = "running" if enabled else "disabled"
+                timestamp = now_text()
+                connection.execute(
+                    "UPDATE post_publish_material_runs SET status=?, attempt_count=attempt_count+1, "
+                    "trigger_source=?, updated_at=? WHERE publish_queue_id=?",
+                    (new_status, trigger_source[:80], timestamp, queue_id),
+                )
+                _record_event(connection, queue_id, int(existing["attempt_count"]) + 1,
+                              new_status, "reconcile", "", {"trigger": trigger_source})
+                refreshed = connection.execute(
+                    "SELECT r.*, p.product_name FROM post_publish_material_runs r "
+                    "JOIN publish_queue p ON p.id=r.publish_queue_id WHERE r.publish_queue_id=?",
+                    (queue_id,),
+                ).fetchone()
+                connection.commit()
+                return {"ok": True, "shouldRun": enabled, "alreadyStarted": False,
+                        "run": _payload(refreshed)}
             connection.commit()
             return {"ok": True, "shouldRun": False, "alreadyStarted": True, "run": _payload(existing)}
         enabled = bool(_settings(connection)["enabled"])
@@ -170,6 +200,32 @@ def begin(connection: sqlite3.Connection, queue_id: int, trigger_source: str) ->
     except Exception:
         connection.rollback()
         raise
+
+
+def queue_pending(connection: sqlite3.Connection, queue_id: int, trigger_source: str) -> Dict[str, Any]:
+    """发布确认后只登记待办，不启动下载、查询或 Step17 上传。"""
+    task = _published_task(connection, queue_id)
+    existing = connection.execute(
+        "SELECT r.*, p.product_name FROM post_publish_material_runs r "
+        "JOIN publish_queue p ON p.id=r.publish_queue_id WHERE r.publish_queue_id=?", (queue_id,)
+    ).fetchone()
+    if existing:
+        return {"ok": True, "queued": False, "run": _payload(existing)}
+    timestamp = now_text()
+    connection.execute(
+        "INSERT INTO post_publish_material_runs "
+        "(publish_queue_id, account_id, product_id, status, reason, attempt_count, trigger_source, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'enqueued', ?, 0, ?, ?, ?)",
+        (queue_id, int(task["account_id"]), str(task["product_id"]),
+         "已登记千川待办；等待全账号抖音发布阶段完成后统一执行。", trigger_source[:80], timestamp, timestamp),
+    )
+    _record_event(connection, queue_id, 0, "enqueued", "queue", "等待全账号抖音发布阶段完成", {"trigger": trigger_source})
+    row = connection.execute(
+        "SELECT r.*, p.product_name FROM post_publish_material_runs r "
+        "JOIN publish_queue p ON p.id=r.publish_queue_id WHERE r.publish_queue_id=?", (queue_id,)
+    ).fetchone()
+    connection.commit()
+    return {"ok": True, "queued": True, "run": _payload(row)}
 
 
 def retry(connection: sqlite3.Connection, queue_id: int, trigger_source: str = "manual_retry") -> Dict[str, Any]:
@@ -255,12 +311,86 @@ def get_run(connection: sqlite3.Connection, queue_id: int) -> Dict[str, Any]:
     return {"ok": True, "run": _payload(row) if row else None}
 
 
+def _with_cart_state(connection: sqlite3.Connection, row: sqlite3.Row) -> Dict[str, Any]:
+    item = _payload(row)
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='baiying_cart_video_downloads'"
+    ).fetchone()
+    if table:
+        cart = connection.execute(
+            "SELECT status, target_count, unique_count, available_count, error, next_retry_at "
+            "FROM baiying_cart_video_downloads WHERE account_id=? AND product_id=?",
+            (item["accountId"], item["productId"]),
+        ).fetchone()
+        if cart:
+            item["cartDownload"] = {
+                "status": cart["status"], "targetCount": cart["target_count"],
+                "uniqueCount": cart["unique_count"], "availableCount": cart["available_count"],
+                "error": cart["error"], "nextRetryAt": cart["next_retry_at"],
+            }
+    return item
+
+
 def list_runs(connection: sqlite3.Connection, limit: int = 30) -> Dict[str, Any]:
     bounded = min(max(int(limit), 1), 200)
     rows = connection.execute(
         "SELECT r.*, p.product_name FROM post_publish_material_runs r "
         "JOIN publish_queue p ON p.id = r.publish_queue_id "
         "ORDER BY r.updated_at DESC, r.publish_queue_id DESC LIMIT ?", (bounded,)
+    ).fetchall()
+    return {"ok": True, "rows": [_with_cart_state(connection, row) for row in rows]}
+
+
+def due_runs(connection: sqlite3.Connection, limit: int = 30) -> Dict[str, Any]:
+    """只恢复确实有外部进展的发布后素材编排。
+
+    ``awaiting_upload`` 和 ``needs_fill`` 是等待态，不是失败态。旧逻辑只要
+    状态超过一分钟就再次调用 ``begin``，导致每分钟把 ``attempt_count`` 加一，
+    即使上传队列和百应下载都没有任何变化也会形成重试风暴。这里要求对应的
+    上传任务或百应下载状态在本次编排之后有更新，才把任务交给 reconcile。
+    """
+    cutoff = (datetime.now() - timedelta(seconds=60)).isoformat(timespec="seconds")
+    settings = _settings(connection)
+    # 绑定修复后自动恢复一次之前被挡住的任务。必须是启用账号、唯一关联、
+    # 广告主 ID 为 8-20 位纯数字；自动下载总开关关闭时绝不触发。
+    valid_binding = (
+        "EXISTS (SELECT 1 FROM accounts a "
+        "JOIN account_qianchuan aq ON aq.account_row_id=a.id "
+        "JOIN qianchuan_accounts q ON q.id=aq.qianchuan_row_id "
+        "WHERE a.id=r.account_id AND a.status='active' "
+        "AND length(trim(coalesce(q.qc_id,''))) BETWEEN 8 AND 20 "
+        "AND trim(q.qc_id) NOT GLOB '*[^0-9]*' "
+        "AND NOT EXISTS (SELECT 1 FROM account_qianchuan aq2 "
+        "WHERE aq2.account_row_id=a.id AND aq2.id<>aq.id))"
+    )
+    has_upload_jobs = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='qianchuan_upload_jobs'"
+    ).fetchone() is not None
+    upload_changed = (
+        "EXISTS (SELECT 1 FROM qianchuan_upload_jobs j "
+        "WHERE j.account_id=r.account_id AND j.product_id=r.product_id "
+        "AND j.updated_at>r.updated_at)"
+        if has_upload_jobs else "0"
+    )
+    has_cart_downloads = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='baiying_cart_video_downloads'"
+    ).fetchone() is not None
+    cart_changed = (
+        "EXISTS (SELECT 1 FROM baiying_cart_video_downloads d "
+        "WHERE d.account_id=r.account_id AND d.product_id=r.product_id "
+        "AND d.updated_at>r.updated_at)"
+        if has_cart_downloads else "0"
+    )
+    rows = connection.execute(
+        "SELECT r.*, p.product_name FROM post_publish_material_runs r "
+        "JOIN publish_queue p ON p.id=r.publish_queue_id "
+        "WHERE p.platform_status='published' AND ((r.status IN ('enqueued','awaiting_upload') "
+        f"AND {upload_changed}) "
+        f"OR (r.status='needs_fill' AND ({upload_changed} OR {cart_changed})) "
+        f"OR (r.status='candidate_exhausted' AND {upload_changed}) "
+        f"OR (r.status='blocked_binding' AND r.attempt_count < 2 AND {valid_binding} AND ?=1)) "
+        "AND r.updated_at<=? ORDER BY r.updated_at LIMIT ?",
+        (int(settings["enabled"]), cutoff, min(max(limit, 1), 100)),
     ).fetchall()
     return {"ok": True, "rows": [_payload(row) for row in rows]}
 
@@ -275,6 +405,9 @@ def build_parser() -> argparse.ArgumentParser:
     start = commands.add_parser("begin")
     start.add_argument("--publish-queue-id", type=int, required=True)
     start.add_argument("--trigger", default="published")
+    queue = commands.add_parser("queue")
+    queue.add_argument("--publish-queue-id", type=int, required=True)
+    queue.add_argument("--trigger", default="published")
     again = commands.add_parser("retry")
     again.add_argument("--publish-queue-id", type=int, required=True)
     again.add_argument("--trigger", default="manual_retry")
@@ -290,6 +423,8 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--publish-queue-id", type=int, required=True)
     listing = commands.add_parser("list")
     listing.add_argument("--limit", type=int, default=30)
+    due = commands.add_parser("due")
+    due.add_argument("--limit", type=int, default=30)
     return parser
 
 
@@ -304,6 +439,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 result = settings_set(connection, bool(args.enabled))
             elif args.command == "begin":
                 result = begin(connection, args.publish_queue_id, args.trigger)
+            elif args.command == "queue":
+                result = queue_pending(connection, args.publish_queue_id, args.trigger)
             elif args.command == "retry":
                 result = retry(connection, args.publish_queue_id, args.trigger)
             elif args.command == "update":
@@ -317,6 +454,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 result = get_run(connection, args.publish_queue_id)
             elif args.command == "list":
                 result = list_runs(connection, args.limit)
+            elif args.command == "due":
+                result = due_runs(connection, args.limit)
             else:
                 raise ValueError("未知命令")
         return emit(result)

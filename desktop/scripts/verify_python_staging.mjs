@@ -21,6 +21,10 @@ const requiredFiles = [
   join(sitePackages, 'onnxruntime', '__init__.py'),
   join(sitePackages, 'numpy', '__init__.py'),
   join(sitePackages, 'cv2', '__init__.py'),
+  join(sitePackages, 'rapidocr', '__init__.py'),
+  join(sitePackages, 'rapidocr', 'models', 'PP-OCRv6_det_small.onnx'),
+  join(sitePackages, 'rapidocr', 'models', 'ch_ppocr_mobile_v2.0_cls_mobile.onnx'),
+  join(sitePackages, 'rapidocr', 'models', 'PP-OCRv6_rec_small.onnx'),
   join(stagingEngine, 'bin', 'ffmpeg.exe'),
   join(stagingEngine, 'bin', 'ffprobe.exe')
 ]
@@ -38,7 +42,7 @@ const env = {
 }
 const probe = spawnSync(python, [
   '-c',
-  'from playwright.sync_api import sync_playwright; import av, cv2, ctranslate2, faster_whisper, huggingface_hub, jieba, numpy, onnxruntime, requests, tokenizers; print("Python package imports OK")'
+  'from playwright.sync_api import sync_playwright; import av, cv2, ctranslate2, faster_whisper, huggingface_hub, jieba, numpy, onnxruntime, rapidocr, requests, tokenizers; print("Python package imports OK")'
 ], { env, encoding: 'utf8', windowsHide: true })
 
 if (probe.status !== 0) {

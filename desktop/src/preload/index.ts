@@ -51,7 +51,7 @@ const browser = {
     ipcRenderer.invoke('browser:inspectBaiyingSelection', options),
 
   /** 复用账号专属外部 Chrome profile，只读核验百应和创作者中心登录态。 */
-  checkAccountLogins: (params: { accountId: number; profilePath?: string }): Promise<Record<string, unknown>> =>
+  checkAccountLogins: (params: { accountId: number; profilePath?: string; closeAfterAutomation?: boolean }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('browser:checkAccountLogins', toPlainIpcPayload(params)),
 
   /** 只读读取账号专属 Chrome 中百应与创作者中心页面是否已打开；不会启动浏览器或检查登录态。 */
@@ -61,6 +61,10 @@ const browser = {
     baiyingOpen: boolean
     creatorCenterOpen: boolean
   }> => ipcRenderer.invoke('browser:inspectAccountPages', toPlainIpcPayload(params)),
+
+  /** 关闭当前账号的客户端专属 Chrome 窗口，保留 profile 与登录态。 */
+  closeAccount: (params: { accountId: number; profilePath?: string }): Promise<{ ok: boolean; closed: boolean }> =>
+    ipcRenderer.invoke('browser:closeAccount', toPlainIpcPayload(params)),
 
   /** 只解析 profile 并校验自定义目录含 Default，不会启动 Chrome。 */
   validateProfilePath: (options: { profileKey: string; profilePath?: string }): Promise<{ ok: boolean; path?: string; error?: string }> =>
@@ -83,6 +87,7 @@ const browser = {
     maxSelectedProducts?: number
     stopAfterCart?: boolean
     previewOnly?: boolean
+    closeAfterAutomation?: boolean
   }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('browser:runBaiyingSelection', toPlainIpcPayload(params)),
 
@@ -93,6 +98,17 @@ const browser = {
     categoryUsage: Record<string, number>
     mode: 'local'
   }> => ipcRenderer.invoke('selection-registry:snapshot', accountKey, toPlainIpcPayload(candidates)),
+
+  /** 一次检查整批多账号候选的本机选品登记。 */
+  getSelectionRegistryBatchSnapshot: (entries: Array<{
+    accountKey: string
+    candidates: Array<{ productId: string; leafCategoryId: string }>
+  }>): Promise<Record<string, {
+    usedProductIds: string[]
+    accountUsedCategoryIds: string[]
+    categoryUsage: Record<string, number>
+    mode: 'local'
+  }>> => ipcRenderer.invoke('selection-registry:snapshot-batch', toPlainIpcPayload(entries)),
 
   /** 订阅百应选品的实时阶段、类目和商品处理进度。 */
   onSelectionProgress: (cb: (progress: SelectionProgressPayload) => void): (() => void) =>
@@ -406,9 +422,9 @@ const qianchuan = {
   apiAccounts: (): Promise<{ accounts: Array<{ id: string; name: string; source: string }>; identities: Array<{ id: string; type: string; name: string }>; warnings: string[]; requiresQianchuanAuthorization: boolean }> => ipcRenderer.invoke('qianchuan:api:accounts'),
   apiAwemes: (advertiserId: string): Promise<Array<{ id: string; name: string }>> => ipcRenderer.invoke('qianchuan:api:awemes', advertiserId),
   apiVerifyVideo: (path: string): Promise<{ ok: boolean; path: string; bytes?: number; reason?: string }> => ipcRenderer.invoke('qianchuan:api:verifyVideo', path),
-  /** 在该千川账户专属托管 Chrome profile 打开登录页 */
-  openLogin: (qcId: number): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }> =>
-    ipcRenderer.invoke('qianchuan:openLogin', qcId),
+  /** 打开千川登录页；可提供绑定的抖音账号以复用百应使用的 Chrome profile */
+  openLogin: (qcId: number, options?: { accountId: number; profilePath?: string }): Promise<{ ok: boolean; url: string; external?: boolean; profilePath?: string; port?: number; error?: string }> =>
+    ipcRenderer.invoke('qianchuan:openLogin', qcId, options),
 
   checkLogin: (qcId: number): Promise<AccountLoginState> =>
     ipcRenderer.invoke('qianchuan:checkLogin', qcId),
@@ -425,6 +441,10 @@ const qianchuan = {
     ipcRenderer.invoke('qianchuan:upload:eligibleAssets', accountId),
   uploadJobs: (accountId?: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:upload:jobs', accountId),
+  materialRecords: (params: { accountId: number; productId: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:materialRecords', params),
+  refreshMaterialStatus: (jobId: number): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:upload:refreshMaterialStatus', jobId),
   enqueueUpload: (params: { accountId: number; assetIds: number[]; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:upload:enqueue', params),
   runUpload: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:upload:run', jobId),
@@ -445,6 +465,22 @@ const qianchuan = {
   postPublishRuns: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:postPublish:runs'),
   retryPostPublishRun: (queueId: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:postPublish:retry', queueId),
+  planSettings: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:settings', qcId),
+  savePlanSettings: (params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:saveSettings', toPlainIpcPayload(params)),
+  planJobs: (params?: { qianchuanAccountId?: number; accountId?: number; status?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:jobs', toPlainIpcPayload(params)),
+  planLogs: (params?: { id?: number; qianchuanAccountId?: number; accountId?: number; status?: string; startDate?: string; endDate?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:logs', toPlainIpcPayload(params)),
+  planCandidates: (params: { accountId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:candidates', toPlainIpcPayload(params)),
+  createManualPlan: (params: { publishQueueId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:createManual', toPlainIpcPayload(params)),
+  planSupplements: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:supplements'),
+  runPlan: (jobId: number, expectedDailyBudgetYuan?: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:run', jobId, expectedDailyBudgetYuan),
+  retryBlockedPlan: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:retryBlocked', jobId),
+  resolvePlan: (params: { id: number; present: boolean; note: string; remotePlanId?: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:resolve', toPlainIpcPayload(params)),
   scanViolations: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:violations:scan', qcId),
   prepareViolationDeletion: (params: { qianchuanAccountId: number; ids: string[] }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:violations:prepare', toPlainIpcPayload(params)),

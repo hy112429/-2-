@@ -9,7 +9,10 @@ import {
   candidateLeafCategoryId,
   filterCandidatesByRegistry,
   rankByRecommendedCategories,
-  scoreUnifiedCandidatePools
+  rankCandidatesForBatch,
+  scoreUnifiedCandidatePools,
+  selectionFilterFingerprint,
+  selectionPoolVisibilityFingerprint
 } from '../utils/selection_candidates'
 import { notifyGlobal } from '../utils/notifications'
 import { toUserSelectionError, toUserSelectionMessage } from '../utils/selection_error_ux'
@@ -157,6 +160,8 @@ interface PrioritySourceReadResult {
   sourceOutcome?: string
   pageListDiagnosis?: string
   detail?: string
+  dataCapturedAt?: string
+  visibilityFingerprint?: string
 }
 
 function visibleSourceNoCandidateMessage(
@@ -199,12 +204,23 @@ interface SelectionRecoveryHooks {
   /** 旧失败分支兼容名称；新成功/提示事件统一使用 logEvent。 */
   logFailure: (value: SelectionRunLogInput) => Promise<void>
   logEvent: (value: SelectionRunLogInput) => Promise<void>
+  logEvents: (values: SelectionRunLogInput[]) => Promise<void>
 }
 
 interface AccountCandidatePlan {
   candidates: SelectionCandidate[]
   /** 完成本机/配额/发布锁过滤后的唯一三源候选池；只留在预览缓存，不写入批次 payload。 */
   candidatePool?: SelectionCandidate[]
+  /** 来源统一筛选后的原始候选池；允许同条件账号复用，账号登记/配额不包含在内。 */
+  sharedCandidatePool?: SelectionCandidate[]
+  candidatePoolMeta?: {
+    createdByAccountId: number
+    filterFingerprint: string
+    visibilityFingerprint: string
+    dataCapturedAt: string
+    reuseStatus: 'created' | 'reused' | 'not_reused'
+    reuseReason?: string
+  }
   registryExcluded: Array<{ candidate: SelectionCandidate; reason: string }>
   mutualExclusionSkipped: SelectionCandidate[]
   rejectedCandidates: SelectionCandidate[]
@@ -245,6 +261,7 @@ interface SelectionCandidate {
   poolRank: number
   sources?: CandidateSource[]
   dataMetrics?: Record<string, number | null>
+  batchRandomKey?: number
   metricSources?: Record<string, string>
   analysisScore?: number | null
   unifiedScore?: number | null
@@ -261,6 +278,8 @@ interface SelectionCandidate {
   analysisError?: string
   analysisRejected?: boolean
   thresholdReasons?: string[]
+  titleBannedWord?: string
+  titleFilterExcluded?: boolean
   status?: string
   selected: boolean
   sourceCategorySelection?: { level1: string[]; level2: string[]; level3: string[] }
@@ -293,8 +312,27 @@ const PROTOTYPE_BANNED_WORDS = [
   '毛毛和爷爷的小店', '小勇在努力', '黄家敏', '匡赐有好物', '与辉同行', '汉森', '罗总', '郝邵文', '交个朋友', '博学罗交个朋友',
   '亮哥', '罗罗', '亮亮', '安安', '唐梦琪', '三公主', '唐三妹', '一路向前', '一颗小小草'
 ]
+const SUPERSTITION_BANNED_WORDS = [
+  '封建迷信', '迷信用品', '算命', '算卦', '占卜', '占星', '看相', '看手相', '手相', '面相',
+  '命理', '星座运势', '生肖运势', '风水', '玄学', '运势预测', '改命', '改运', '转运', '开运',
+  '招财', '旺财', '旺运', '催财', '聚财', '招桃花', '催姻缘', '旺姻缘', '辟邪', '驱邪',
+  '镇宅', '化煞', '消灾', '消灾解难', '符咒', '灵符', '护身符', '平安符', '招财符', '太岁符',
+  '五帝钱', '八卦镜', '转运珠', '本命佛', '佛牌', '开光', '法器', '开运摆件', '招财摆件', '风水摆件'
+]
 const OPTIONAL_MALL_TITLE_BANNED_WORDS = ['编码', '过号', '集合', '随机', '测试', '勿拍', '链接', '补差价']
-const DEFAULT_BANNED_WORDS = Array.from(new Set([...COMPLIANCE_DEFAULT_BANNED_WORDS, ...PROTOTYPE_BANNED_WORDS]))
+const DEFAULT_BANNED_WORDS = Array.from(new Set([
+  ...COMPLIANCE_DEFAULT_BANNED_WORDS, ...PROTOTYPE_BANNED_WORDS, ...SUPERSTITION_BANNED_WORDS
+]))
+
+function matchedSelectionTitleBannedWord(title: unknown, settings: Record<string, unknown>): string {
+  const configured = Array.isArray(settings.bannedWords) ? settings.bannedWords : []
+  const words = Array.from(new Set([
+    ...configured.map((word) => String(word).trim()).filter(Boolean),
+    ...SUPERSTITION_BANNED_WORDS
+  ]))
+  const normalizedTitle = String(title ?? '').toLocaleLowerCase()
+  return words.find((word) => normalizedTitle.includes(word.toLocaleLowerCase())) ?? ''
+}
 
 const DEFAULTS = {
   candidateLimit: 5,
@@ -309,7 +347,7 @@ const DEFAULTS = {
   thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, experienceScore: null as number | null },
   trendPreference: '上升优先',
   bannedWords: [...DEFAULT_BANNED_WORDS],
-  bannedWordsSeedVersion: 1,
+  bannedWordsSeedVersion: 2,
   execution: { publishMode: '自动', pinTime: '', randomIntervalMin: 1, randomIntervalMax: 5 },
   quota: { perProductVideos: 10, perAccountProducts: 5, perAccountVideos: 50 }
 }
@@ -380,6 +418,7 @@ interface SelectionProgressState {
   itemTotal: number | null
   percent: number | null
   indeterminate?: boolean
+  resultSummary?: string
 }
 const selectionProgress = ref<SelectionProgressState | null>(null)
 let stopSelectionProgress: (() => void) | undefined
@@ -402,6 +441,8 @@ const BATCH_SELECTION_WORKFLOW: SelectionWorkflowStep[] = [
   { key: 'video', label: '处理详情图并生成视频', weight: 20 },
   { key: 'queue', label: '写入发布队列（全自动时继续发布）', weight: 12 }
 ]
+
+const BATCH_FALLBACK_CANDIDATE_LIMIT = 50
 
 const PREVIEW_SELECTION_WORKFLOW: SelectionWorkflowStep[] = [
   { key: 'preflight', label: '检查账号设置与本机目录', weight: 15 },
@@ -430,7 +471,7 @@ function workflowIndexForStage(stageValue: string, mode: SelectionProgressState[
   if (/发布|投稿|队列|上传视频|创作者中心|封面|关联百应|发布选项/.test(stage)) return 7
   if (/登记加车配额|记录(?:加车|商品|选品车)?配额|配额记录/.test(stage)) return 5
   if (/加车|核验并处理|处理选中商品|商品数据分析|选品车|候选商品处理/.test(stage)) return 4
-  if (/评分|筛选与互斥|类目推荐|推荐类目|互斥分配|候选分配|ID 去重|ID去重|本机登记|候选计划已就绪|候选统一/.test(stage)) return 3
+  if (/评分|筛选与互斥|类目推荐|推荐类目|互斥分配|候选分配|ID 去重|ID去重|本机登记|核对本机选品记录|保存选品批次|候选计划已就绪|候选统一/.test(stage)) return 3
   if (/统一采集|百应筛选|获取候选|候选预览|查询百应候选|应用选品条件|material_list|来源|热点|联盟|榜单|商品列表/.test(stage)) return 1
   if (/账号配额预检/.test(stage)) return 0
   if (/每日配额|剩余配额|账号配额|quota_check/.test(stage)) return 2
@@ -1063,10 +1104,17 @@ const candidates = ref<SelectionCandidate[]>([])
 const categoryRecommendations = ref<Array<{ categoryId: string; highScoreCount: number; averageScore: number }>>([])
 const previewAccountId = ref<number | null>(null)
 const candidateSelectionCustomized = ref(false)
-const previewCandidatePool = ref<{ accountId: number; fingerprint: string; plan: AccountCandidatePlan } | null>(null)
+const previewCandidatePool = ref<{
+  createdByAccountId: number
+  filterFingerprint: string
+  visibilityFingerprint: string
+  dataCapturedAt: string
+  plan: AccountCandidatePlan
+} | null>(null)
 const previewCandidatePoolCount = ref(0)
 const accountId = ref<number | null>(props.initialAccountId)
 const activeTab = ref<'通用设置' | '账号个性化'>(props.initialAccountId === null ? '通用设置' : '账号个性化')
+const selectionSettingsDialogOpen = ref(false)
 const categories = ref<CategoryNode[]>([])
 const liveCategoryRoots = ref<CategoryNode[]>([])
 const filterGroups = ref<Record<string, FilterField[]>>({})
@@ -1117,6 +1165,7 @@ const accountDraft = reactive({
   selectionMode: 'inherit' as 'inherit' | 'general' | 'category',
   categoryMode: 'inherit' as 'inherit' | 'auto' | 'manual',
   categorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
+  excludedCategorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
   browserProfilePath: '',
   downloadPath: '',
   dailyQuotaOverride: { enabled: false, perAccountProducts: 5, perAccountVideos: 50 }
@@ -1141,11 +1190,14 @@ function runEngine(
   return new Promise((resolve, reject) => {
     let settled = false
     let taskId: string | null = null
+    let timedOut = false
+    let timeoutId: number | null = null
     const pendingEvents: EngineEventPayload[] = []
     let off: () => void = () => undefined
     const finish = (callback: () => void): void => {
       if (settled) return
       settled = true
+      if (timeoutId !== null) window.clearTimeout(timeoutId)
       off()
       callback()
     }
@@ -1159,16 +1211,31 @@ function runEngine(
       if (!taskId) pendingEvents.push(event)
       else handleEvent(event)
     })
-    window.setTimeout(() => finish(() => reject(new Error(`引擎命令超时（${Math.round(timeoutMs / 1000)} 秒）`))), timeoutMs)
+    timeoutId = window.setTimeout(() => {
+      timedOut = true
+      if (taskId) void window.api.engine.cancel(taskId).catch(() => undefined)
+      const operation = script === 'selection_settings.py' && args.includes('quota')
+        ? '读取账号剩余配额'
+        : script === 'publish_queue.py' && args.includes('product-locks')
+          ? '检查商品发布记录'
+          : script === 'selection_recovery.py'
+            ? '读写选品批次记录'
+            : script
+      finish(() => reject(new Error(`${operation}超时（${Math.round(timeoutMs / 1000)} 秒）；已请求停止引擎任务，请先检查选品记录再重试。`)))
+    }, timeoutMs)
     // Electron IPC 使用结构化克隆；Vue 的 reactive/ref 对象不能直接跨进程传递。
     const plainStdinJson = stdinJson === undefined ? undefined : JSON.parse(JSON.stringify(stdinJson)) as unknown
     void window.api.engine.run({ script, args, stdinJson: plainStdinJson }).then((reply) => {
       if (!reply.taskId) finish(() => reject(new Error(reply.error ?? '引擎任务启动失败')))
       else {
         taskId = reply.taskId
+        if (timedOut) {
+          void window.api.engine.cancel(taskId).catch(() => undefined)
+          return
+        }
         pendingEvents.splice(0).forEach(handleEvent)
       }
-    })
+    }).catch((cause) => finish(() => reject(cause)))
   })
 }
 
@@ -1180,9 +1247,12 @@ interface ProductPublishLock {
   platformStatuses: string[]
 }
 
-async function loadProductPublishLocks(accountId: number): Promise<Map<string, ProductPublishLock>> {
+async function loadProductPublishLocks(accountId: number, productIds: readonly string[]): Promise<Map<string, ProductPublishLock>> {
+  const uniqueProductIds = [...new Set(productIds.map(String).map((value) => value.trim()).filter(Boolean))]
+  if (!uniqueProductIds.length) return new Map()
   const result = await runEngine('publish_queue.py', [
-    '--db', DB_PATH, 'product-locks', '--account-id', String(accountId)
+    '--db', DB_PATH, 'product-locks', '--account-id', String(accountId),
+    '--product-ids-json', JSON.stringify(uniqueProductIds)
   ])
   if (result.ok !== true) throw new Error(String(result.error ?? '读取账号商品发布状态失败，已停止选品'))
   const locks = Array.isArray(result.locks) ? result.locks as ProductPublishLock[] : []
@@ -1222,17 +1292,17 @@ async function logDuplicateProductSkips(
   items: readonly Record<string, unknown>[],
   recovery?: SelectionRecoveryHooks
 ): Promise<void> {
-  for (const item of items) {
+  await recovery?.logEvents(items.map((item) => {
     const productId = String(item.productId ?? '')
     const taskIds = Array.isArray(item.publishQueueTaskIds) ? item.publishQueueTaskIds.map(String) : []
-    await recovery?.logFailure({
+    return {
       stage: '选品去重', code: 'DOUYIN_PRODUCT_ALREADY_QUEUED',
       message: conciseFailureMessage(item.status),
       detail: `账号 ${accountId} 的商品 ${productId} 已关联发布任务：${taskIds.join(', ')}`,
       productId,
       productTitle: String(item.title ?? '')
-    })
-  }
+    }
+  }))
 }
 
 /** 在 Vue 渲染上下文中先去掉响应式代理，再跨 contextBridge 调用 preload。 */
@@ -1322,6 +1392,7 @@ function normalizeCurrentCategorySelections(): void {
   global.categorySelection = normalizeCategorySelection(global.categorySelection, categories.value)
   global.excludedCategorySelection = normalizeCategorySelection(global.excludedCategorySelection, categories.value)
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
+  accountDraft.excludedCategorySelection = normalizeCategorySelection(accountDraft.excludedCategorySelection, categories.value)
 }
 
 function pruneCategorySelectionToCatalog(
@@ -1348,10 +1419,12 @@ function pruneCurrentCategorySelections(): number {
   const globalResult = pruneCategorySelectionToCatalog(global.categorySelection, categories.value)
   const globalExcludedResult = pruneCategorySelectionToCatalog(global.excludedCategorySelection, categories.value)
   const accountResult = pruneCategorySelectionToCatalog(accountDraft.categorySelection, categories.value)
+  const accountExcludedResult = pruneCategorySelectionToCatalog(accountDraft.excludedCategorySelection, categories.value)
   global.categorySelection = globalResult.selection
   global.excludedCategorySelection = globalExcludedResult.selection
   accountDraft.categorySelection = accountResult.selection
-  return globalResult.removed + globalExcludedResult.removed + accountResult.removed
+  accountDraft.excludedCategorySelection = accountExcludedResult.selection
+  return globalResult.removed + globalExcludedResult.removed + accountResult.removed + accountExcludedResult.removed
 }
 
 async function loadGlobal(): Promise<void> {
@@ -1369,9 +1442,11 @@ async function loadGlobal(): Promise<void> {
     level1: [...(excludedCat.level1 ?? [])], level2: [...(excludedCat.level2 ?? [])], level3: [...(excludedCat.level3 ?? [])]
   }
   const savedProductFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.product ?? {}) }
+  const savedDeliveryFilters = { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.delivery ?? {}) }
+  delete savedDeliveryFilters['佣金区间']
   delete savedProductFilters['佣金区间']
   global.filters = {
-    delivery: { ...((settings.filters as Record<string, Record<string, unknown>> | undefined)?.delivery ?? {}) },
+    delivery: savedDeliveryFilters,
     product: savedProductFilters,
     features: Array.isArray((settings.filters as Record<string, unknown> | undefined)?.features)
       ? [...((settings.filters as Record<string, unknown[]>).features as string[])]
@@ -1394,7 +1469,10 @@ async function loadGlobal(): Promise<void> {
   }
   global.poolPriority = [...((settings.poolPriority as string[] | undefined) ?? cloneDefault().poolPriority)]
   global.sources = createSelectionFilterSettings(settings).sources
-  global.bannedWords = [...((settings.bannedWords as string[] | undefined) ?? DEFAULT_BANNED_WORDS)]
+  global.bannedWords = Array.from(new Set([
+    ...((settings.bannedWords as string[] | undefined) ?? DEFAULT_BANNED_WORDS),
+    ...SUPERSTITION_BANNED_WORDS
+  ]))
   bannedWordsText.value = global.bannedWords.join('\n')
   categories.value = mergeCategoryTrees(normalizeCategories(result.categories), [])
   normalizeCurrentCategorySelections()
@@ -1427,7 +1505,12 @@ async function loadAccountSettings(): Promise<void> {
   accountDraft.categorySelection = {
     level1: [...(selected.level1 ?? [])], level2: [...(selected.level2 ?? [])], level3: [...(selected.level3 ?? [])]
   }
+  const excluded = (value.excludedCategorySelection ?? global.excludedCategorySelection ?? {}) as Record<string, string[]>
+  accountDraft.excludedCategorySelection = {
+    level1: [...(excluded.level1 ?? [])], level2: [...(excluded.level2 ?? [])], level3: [...(excluded.level3 ?? [])]
+  }
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
+  accountDraft.excludedCategorySelection = normalizeCategorySelection(accountDraft.excludedCategorySelection, categories.value)
   accountDraft.browserProfilePath = String(value.browserProfilePath ?? '')
   accountDraft.downloadPath = String(value.downloadPath ?? '')
   const savedDailyQuota = (value.dailyQuotaOverride ?? {}) as Record<string, unknown>
@@ -1597,6 +1680,8 @@ const excludedLevel2Options = computed(() => categories.value.filter((item) => g
 const excludedLevel3Options = computed(() => excludedLevel2Options.value.filter((item) => global.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 const accountLevel2Options = computed(() => categories.value.filter((item) => accountDraft.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const accountLevel3Options = computed(() => accountLevel2Options.value.filter((item) => accountDraft.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
+const accountExcludedLevel2Options = computed(() => categories.value.filter((item) => accountDraft.excludedCategorySelection.level1.includes(item.id)).flatMap((item) => item.children))
+const accountExcludedLevel3Options = computed(() => accountExcludedLevel2Options.value.filter((item) => accountDraft.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 function selectedCategoryCount(selection: { level1: string[]; level2: string[]; level3: string[] }): number {
   return selection.level1.length + selection.level2.length + selection.level3.length
 }
@@ -1638,10 +1723,10 @@ function categoryAction(level: CategoryLevel, scope: 'global' | 'account', actio
   updateCategory(level, scope)
 }
 
-function updateExcludedCategory(level: CategoryLevel): void {
-  const selected = global.excludedCategorySelection
-  const lv2 = excludedLevel2Options.value
-  const lv3 = excludedLevel3Options.value
+function updateExcludedCategory(level: CategoryLevel, scope: 'global' | 'account'): void {
+  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
+  const lv2 = scope === 'global' ? excludedLevel2Options.value : accountExcludedLevel2Options.value
+  const lv3 = scope === 'global' ? excludedLevel3Options.value : accountExcludedLevel3Options.value
   if (level === 'level1') {
     const allowed = new Set(lv2.map((item) => item.id))
     selected.level2 = selected.level2.filter((id) => allowed.has(id))
@@ -1652,25 +1737,29 @@ function updateExcludedCategory(level: CategoryLevel): void {
   }
 }
 
-function toggleExcludedCategory(id: string, level: CategoryLevel, checked: boolean): void {
-  const current = global.excludedCategorySelection[level]
-  global.excludedCategorySelection[level] = checked
+function toggleExcludedCategory(id: string, level: CategoryLevel, scope: 'global' | 'account', checked: boolean): void {
+  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
+  const current = selected[level]
+  selected[level] = checked
     ? current.includes(id) ? current : [...current, id]
     : current.filter((item) => item !== id)
-  updateExcludedCategory(level)
+  updateExcludedCategory(level, scope)
 }
 
-function excludedCategoryAction(level: CategoryLevel, action: 'all' | 'invert' | 'clear'): void {
+function excludedCategoryAction(level: CategoryLevel, scope: 'global' | 'account', action: 'all' | 'invert' | 'clear'): void {
   const options = level === 'level1'
     ? level1Options.value
-    : level === 'level2' ? excludedLevel2Options.value : excludedLevel3Options.value
-  const current = global.excludedCategorySelection[level]
-  global.excludedCategorySelection[level] = action === 'clear'
+    : level === 'level2'
+      ? (scope === 'global' ? excludedLevel2Options.value : accountExcludedLevel2Options.value)
+      : (scope === 'global' ? excludedLevel3Options.value : accountExcludedLevel3Options.value)
+  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
+  const current = selected[level]
+  selected[level] = action === 'clear'
     ? []
     : action === 'all'
       ? options.map((item) => item.id)
       : options.map((item) => item.id).filter((id) => !current.includes(id))
-  updateExcludedCategory(level)
+  updateExcludedCategory(level, scope)
 }
 
 async function saveGlobal(): Promise<void> {
@@ -1679,7 +1768,7 @@ async function saveGlobal(): Promise<void> {
     if (global.selectionMode === 'category' && global.categoryMode === 'manual' && !hasSelectedCategory(global.categorySelection)) {
       throw new Error('已选择手动选类目，请至少勾选一个类目；或切回自动推荐。')
     }
-    validateCommissionRateThreshold(global.thresholds.commissionRate, '通用设置')
+    validateCommissionRateUpperBound(global.thresholds.commissionRate, '通用设置')
     validateExperienceScoreThreshold(global.thresholds.experienceScore, '通用设置')
     for (const [label, value] of Object.entries({
       '每品视频上限': global.quota.perProductVideos,
@@ -1689,7 +1778,12 @@ async function saveGlobal(): Promise<void> {
       if (!Number.isInteger(value) || value < 1) throw new Error(`${label}必须是大于 0 的整数。`)
     }
     global.execution.publishMode = '自动'
-    global.bannedWords = Array.from(new Set(bannedWordsText.value.split(/\r?\n/).map((word) => word.trim()).filter(Boolean)))
+    global.bannedWords = Array.from(new Set([
+      ...bannedWordsText.value.split(/\r?\n/).map((word) => word.trim()).filter(Boolean),
+      ...SUPERSTITION_BANNED_WORDS
+    ]))
+    global.bannedWordsSeedVersion = 2
+    bannedWordsText.value = global.bannedWords.join('\n')
     await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify(global)))
     notice.value = '通用选品设置已保存；账号未单独配置的条件会继承此设置。'
   } catch (cause) {
@@ -1709,10 +1803,10 @@ function appendOptionalMallTitleBannedWords(): void {
   notice.value = `已将 ${additions.length} 个候选词加入编辑框；点击「保存通用设置」后生效。`
 }
 
-function validateCommissionRateThreshold(value: number | null | undefined, scope: string): void {
+function validateCommissionRateUpperBound(value: number | null | undefined, scope: string): void {
   if (value === null || value === undefined) return
   if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) {
-    throw new Error(`${scope}佣金率阈值须为 0–100 之间的百分数。`)
+    throw new Error(`${scope}佣金率上限须为 0–100 之间的百分数。`)
   }
 }
 
@@ -1747,7 +1841,7 @@ async function chooseGlobalDownloadPath(): Promise<void> {
 
 function ensureAccountPathsSaved(): boolean {
   if (!accountPathsHaveUnsavedChanges.value) return true
-  error.value = '账号路径有未保存的修改。请先点击“保存账号设置”；新批次不会读取未保存的路径。'
+  error.value = '账号路径还没保存，选品没有启动。请展开“调整筛选条件与账号设置”，点击“保存账号设置”；如果浏览器资料路径填的是视频文件夹，请先点该路径旁的“恢复默认”。'
   return false
 }
 
@@ -1815,12 +1909,12 @@ async function refreshAccountCategories(): Promise<void> {
   }
 }
 
-async function saveAccount(): Promise<void> {
-  if (accountId.value === null || busy.value) return
+async function saveAccount(): Promise<boolean> {
+  if (accountId.value === null || busy.value) return false
   const targetAccountId = accountId.value
   if (!isSelectionAccountInScope(targetAccountId)) {
     error.value = '所选账号已不存在，账号设置未保存。'
-    return
+    return false
   }
   busy.value = true
   error.value = ''
@@ -1828,14 +1922,14 @@ async function saveAccount(): Promise<void> {
     if (accountDraft.browserProfilePath) {
       const directoryValidation = await window.api.dir.validateProfileDir(accountDraft.browserProfilePath)
       if (!directoryValidation.ok) {
-        throw new Error(directoryValidation.error ?? '浏览器缓存目录校验失败')
+        throw new Error(directoryValidation.error ?? '浏览器登录资料文件夹不能使用。请点“恢复默认”；视频保存位置请填写“视频保存位置”。')
       }
       const profileValidation = await window.api.browser.validateProfilePath({
         profileKey: 'account-' + targetAccountId,
         profilePath: directoryValidation.path ?? accountDraft.browserProfilePath
       })
       if (!profileValidation.ok || !profileValidation.path) {
-        throw new Error(profileValidation.error ?? '浏览器缓存目录校验失败')
+        throw new Error(`浏览器登录资料文件夹不能使用：${profileValidation.error ?? '请点“恢复默认”后重试'}`)
       }
       accountDraft.browserProfilePath = profileValidation.path
     }
@@ -1843,7 +1937,7 @@ async function saveAccount(): Promise<void> {
     if (accountDraft.downloadPath.trim()) {
       const downloadValidation = await window.api.dir.canonicalizePath(accountDraft.downloadPath)
       if (!downloadValidation.ok || !downloadValidation.path) {
-        throw new Error(downloadValidation.error ?? '账号下载路径无效')
+        throw new Error(`视频保存位置不能使用：${downloadValidation.error ?? '请重新选择文件夹或点“恢复默认”'}`)
       }
       accountDraft.downloadPath = downloadValidation.path
     }
@@ -1851,7 +1945,7 @@ async function saveAccount(): Promise<void> {
       throw new Error('每轮每账号新增商品目标数须为 1–10 的整数。')
     }
     if (accountFilterOverridesEnabled.value) {
-      validateCommissionRateThreshold(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
+      validateCommissionRateUpperBound(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
       validateExperienceScoreThreshold(accountFilterDraft.value.thresholds.experienceScore, '账号个性化')
     }
     if (accountDraft.dailyQuotaOverride.enabled && (
@@ -1868,6 +1962,7 @@ async function saveAccount(): Promise<void> {
       selectionMode: accountDraft.selectionMode,
       categoryMode: accountDraft.categoryMode,
       categorySelection: JSON.parse(JSON.stringify(accountDraft.categorySelection)),
+      excludedCategorySelection: JSON.parse(JSON.stringify(accountDraft.excludedCategorySelection)),
       browserProfilePath: accountDraft.browserProfilePath,
       downloadPath: accountDraft.downloadPath,
       dailyQuotaOverride: {
@@ -1893,8 +1988,10 @@ async function saveAccount(): Promise<void> {
       : '账号选品设置已保存；每日限额继承通用默认值。'
     emit('saved', targetAccountId)
     if (props.dialogOnly) emit('close')
+    return true
   } catch (cause) {
     error.value = String(cause instanceof Error ? cause.message : cause)
+    return false
   } finally {
     busy.value = false
   }
@@ -1916,6 +2013,25 @@ function closeDialog(): void {
   if (!busy.value) emit('close')
 }
 
+function openSelectionSettingsDialog(): void {
+  selectionSettingsDialogOpen.value = true
+}
+
+function closeSelectionSettingsDialog(): void {
+  if (!busy.value) selectionSettingsDialogOpen.value = false
+}
+
+async function saveSelectionSettingsAndClose(): Promise<void> {
+  if (busy.value) return
+  if (activeTab.value === '通用设置') {
+    await saveGlobal()
+    if (!error.value) selectionSettingsDialogOpen.value = false
+    return
+  }
+  const saved = await saveAccount()
+  if (saved) selectionSettingsDialogOpen.value = false
+}
+
 async function filterByLocalRegistry(
   accountKey: string,
   rows: SelectionCandidate[],
@@ -1931,6 +2047,24 @@ async function filterByLocalRegistry(
     productId: candidate.productId,
     leafCategoryId: candidateLeafCategoryId(candidate)
   })))
+  return filterRowsByLocalRegistry(rows, snapshot, targetCount, selectionMode)
+}
+
+function filterRowsByLocalRegistry(
+  rows: SelectionCandidate[],
+  snapshot: {
+    usedProductIds: string[]
+    accountUsedCategoryIds: string[]
+    categoryUsage: Record<string, number>
+    mode: 'local'
+  },
+  targetCount: number,
+  selectionMode: 'general' | 'category'
+): {
+  candidates: SelectionCandidate[]
+  excluded: Array<{ candidate: SelectionCandidate; reason: string }>
+  recommendations: Array<{ categoryId: string; highScoreCount: number; averageScore: number }>
+} {
   const categoryMode = selectionMode === 'category'
   const { eligible, excluded } = filterCandidatesByRegistry(rows, snapshot, !categoryMode, categoryMode)
   if (!categoryMode) {
@@ -1971,7 +2105,9 @@ async function prepareBatchCandidatePlans(
   reviewedAccountId?: number | null,
   reviewedProducts?: ReadonlySet<string>,
   accountSwitchFailures?: Map<number, AccountSwitchFailure>,
-  seededPreviewPlans?: ReadonlyMap<number, AccountCandidatePlan>
+  seededPreviewPlans?: ReadonlyMap<number, AccountCandidatePlan>,
+  batchSeed: string = window.crypto.randomUUID(),
+  keepBrowserOpen = false
 ): Promise<Map<number, AccountCandidatePlan>> {
   const poolRows = new Map<number, SelectionCandidate[]>()
   const sourceIdsByAccount = new Map<number, Map<string, Set<string>>>()
@@ -1984,6 +2120,27 @@ async function prepareBatchCandidatePlans(
   const recommendationsByAccount = new Map<number, AccountCandidatePlan['recommendedCategories']>()
   const capacities = new Map<number, number>()
   const names = new Map(targets.map((account) => [account.id, account.name]))
+  const sharedPools = new Map<string, {
+    rows: SelectionCandidate[]
+    createdByAccountId: number
+    filterFingerprint: string
+    visibilityFingerprint: string
+    dataCapturedAt: string
+    rejectedCandidates: SelectionCandidate[]
+    prioritySourceResults: PrioritySourceReadResult[]
+    warnings: string[]
+    categoryEnrichment?: AccountCandidatePlan['categoryEnrichment']
+  }>()
+  const poolReuseMetaByAccount = new Map<number, AccountCandidatePlan['candidatePoolMeta']>()
+  const sharedPoolRowsByAccount = new Map<number, SelectionCandidate[]>()
+  const pendingByAccount = new Map<number, {
+    account: AccountRow
+    settings: Record<string, unknown>
+    preview: Record<string, unknown>
+    quota: Record<string, unknown>
+    rows: SelectionCandidate[]
+    targetCount: number
+  }>()
 
   const orderedTargets = [...targets].sort((left, right) => left.id - right.id)
   for (const [targetIndex, account] of orderedTargets.entries()) {
@@ -1994,28 +2151,69 @@ async function prepareBatchCandidatePlans(
       _visibleSourcesOnly: true,
       _candidatePoolLimit: 200
     }
+    const filterFingerprint = selectionFilterFingerprint(settings)
+    const visibilityFingerprint = selectionPoolVisibilityFingerprint(
+      context.resolvedProfilePath ?? context.profilePath
+    )
+    const sharedPoolKey = `${filterFingerprint}\u0000${visibilityFingerprint}`
+    const sameFilterDifferentVisibility = [...sharedPools.values()].some((pool) =>
+      pool.filterFingerprint === filterFingerprint && pool.visibilityFingerprint !== visibilityFingerprint
+    )
     const seededPlan = seededPreviewPlans?.get(account.id)
     const seededRows = seededPlan?.candidatePool
+    const seededSharedRows = seededPlan?.sharedCandidatePool
+    const seededMeta = seededPlan?.candidatePoolMeta
+    const reusableSharedPool = seededSharedRows?.length
+      ? {
+          rows: seededSharedRows,
+          createdByAccountId: seededMeta?.createdByAccountId ?? account.id,
+          filterFingerprint: seededMeta?.filterFingerprint ?? filterFingerprint,
+          visibilityFingerprint: seededMeta?.visibilityFingerprint ?? visibilityFingerprint,
+          dataCapturedAt: seededMeta?.dataCapturedAt ?? new Date().toISOString(),
+          rejectedCandidates: seededPlan?.rejectedCandidates ?? [],
+          prioritySourceResults: seededPlan?.prioritySourceResults ?? [],
+          warnings: seededPlan?.warnings ?? [],
+          categoryEnrichment: seededPlan?.categoryEnrichment
+        }
+      : sharedPools.get(sharedPoolKey)
+    const reuseAllowed = Boolean(reusableSharedPool && reusableSharedPool.rows.length &&
+      reusableSharedPool.filterFingerprint === filterFingerprint &&
+      reusableSharedPool.visibilityFingerprint === visibilityFingerprint &&
+      Boolean(visibilityFingerprint))
+    const poolReuseReason = reuseAllowed
+      ? `条件指纹 ${filterFingerprint.slice(0, 12)}、来源可见范围指纹一致，复用账号 ${reusableSharedPool!.createdByAccountId} 的候选数据（采集于 ${reusableSharedPool!.dataCapturedAt}）。`
+      : sameFilterDifferentVisibility
+        ? '筛选条件一致但来源账号权限或可见范围指纹不同，未复用候选池。'
+        : !visibilityFingerprint
+          ? '来源账号可见范围未确认，未复用候选池。'
+          : seededRows?.length
+            ? '预览候选池缺少可验证的来源指纹，未跨账号复用。'
+            : '当前批次没有可复用的同条件候选池，创建新池。'
     reportSelectionProgress(account.id, '统一采集候选池', {
       accountIndex: targetIndex + 1,
       accountTotal: orderedTargets.length,
       completedAccounts: targetIndex,
-      message: seededRows?.length
-        ? `复用预览建立的三源候选池，并重新检查已登记商品与配额（账号 ${account.id}）`
-        : `只读采集热点趋势、联盟榜单和选品广场并统一筛选（账号 ${account.id}）`
+      message: reuseAllowed
+        ? `复用账号 ${reusableSharedPool!.createdByAccountId} 的统一候选池，并重新检查本账号登记、配额和商品状态（${poolReuseReason}）`
+        : `只读采集热点趋势、联盟榜单和选品广场并统一筛选（${poolReuseReason}）`
     })
     let preview: Record<string, unknown>
     let quota: Record<string, unknown>
     try {
-      const previewRequest: Promise<Record<string, unknown>> = seededRows?.length
+      // 先完成本地配额查询，再启动较慢的百应页面采集。并行时若本地命令
+      // 30 秒超时，浏览器仍可能采集到“候选预览完成”，导致界面误报整轮失败。
+      quota = await runEngine('selection_settings.py', [
+        '--db', DB_PATH, 'quota', 'get', '--account-id', String(account.id)
+      ])
+      const previewRequest: Promise<Record<string, unknown>> = reuseAllowed
         ? Promise.resolve({
             ok: true,
-            candidates: seededRows,
-            rejectedCandidates: seededPlan?.rejectedCandidates ?? [],
-            warnings: seededPlan?.warnings ?? [],
-            prioritySourceResults: seededPlan?.prioritySourceResults ?? [],
+            candidates: reusableSharedPool!.rows,
+            rejectedCandidates: reusableSharedPool!.rejectedCandidates,
+            warnings: [...reusableSharedPool!.warnings, poolReuseReason],
+            prioritySourceResults: reusableSharedPool!.prioritySourceResults,
             recommendedCategories: seededPlan?.recommendedCategories ?? [],
-            categoryEnrichment: seededPlan?.categoryEnrichment
+            categoryEnrichment: reusableSharedPool!.categoryEnrichment
           })
         : window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
             profileKey: context.profileKey,
@@ -2023,14 +2221,10 @@ async function prepareBatchCandidatePlans(
             settings,
             accountId: account.id,
             downloadPath: context.downloadPath,
-            previewOnly: true
+            previewOnly: true,
+            closeAfterAutomation: !keepBrowserOpen
           }))
-      ;[preview, quota] = await Promise.all([
-        previewRequest,
-        runEngine('selection_settings.py', [
-          '--db', DB_PATH, 'quota', 'get', '--account-id', String(account.id)
-        ])
-      ])
+      preview = await previewRequest
     } catch (cause) {
       const classification = toUserSelectionError(cause).classification
       if (accountSwitchFailures && (
@@ -2056,7 +2250,31 @@ async function prepareBatchCandidatePlans(
       }
       throw cause
     }
-    let rows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
+    const rows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
+    if (!reuseAllowed && rows.length) {
+      sharedPools.set(sharedPoolKey, {
+        rows: rows.map((row) => ({ ...row })),
+        createdByAccountId: account.id,
+        filterFingerprint,
+        visibilityFingerprint,
+        dataCapturedAt: new Date().toISOString(),
+        rejectedCandidates: Array.isArray(preview.rejectedCandidates) ? preview.rejectedCandidates as SelectionCandidate[] : [],
+        prioritySourceResults: Array.isArray(preview.prioritySourceResults) ? preview.prioritySourceResults as PrioritySourceReadResult[] : [],
+        warnings: Array.isArray(preview.warnings) ? preview.warnings.map(String) : [],
+        categoryEnrichment: preview.categoryEnrichment && typeof preview.categoryEnrichment === 'object'
+          ? preview.categoryEnrichment as AccountCandidatePlan['categoryEnrichment'] : undefined
+      })
+    }
+    const sharedPool = reuseAllowed ? reusableSharedPool! : sharedPools.get(sharedPoolKey)
+    sharedPoolRowsByAccount.set(account.id, sharedPool?.rows ?? rows)
+    poolReuseMetaByAccount.set(account.id, {
+      createdByAccountId: sharedPool?.createdByAccountId ?? account.id,
+      filterFingerprint,
+      visibilityFingerprint,
+      dataCapturedAt: sharedPool?.dataCapturedAt ?? new Date().toISOString(),
+      reuseStatus: reuseAllowed ? 'reused' : 'created',
+      reuseReason: poolReuseReason
+    })
     collectedSourceIdsByAccount.set(account.id, new Map(
       [...new Set(rows.flatMap((candidate) => candidate.sources ?? []))].map((sourceKey) => [
         sourceKey,
@@ -2065,13 +2283,41 @@ async function prepareBatchCandidatePlans(
     ))
     const rawTarget = Number(settings.candidateLimit ?? 5)
     const targetCount = Number.isFinite(rawTarget) ? Math.max(1, Math.min(10, rawTarget)) : 5
-    const registry = await filterByLocalRegistry(
-      `local:${account.id}`,
-      rows,
+    pendingByAccount.set(account.id, { account, settings, preview, quota, rows, targetCount })
+  }
+
+  if (pendingByAccount.size) {
+    for (const account of pendingByAccount.keys()) {
+      reportSelectionProgress(account, '核对本机选品记录', {
+        accountIndex: orderedTargets.findIndex((item) => item.id === account) + 1,
+        accountTotal: orderedTargets.length,
+        message: `正在把 ${pendingByAccount.size} 个账号的候选 ID 合并查询本机登记。`
+      })
+    }
+  }
+  const registrySnapshots = await window.api.browser.getSelectionRegistryBatchSnapshot(
+    [...pendingByAccount.values()].map(({ account, rows }) => ({
+      accountKey: `local:${account.id}`,
+      candidates: rows.map((candidate) => ({
+        productId: candidate.productId,
+        leafCategoryId: candidateLeafCategoryId(candidate)
+      }))
+    }))
+  )
+
+  for (const [targetIndex, account] of orderedTargets.entries()) {
+    const pending = pendingByAccount.get(account.id)
+    if (!pending) continue
+    const { settings, preview, quota, rows: rawRows, targetCount } = pending
+    const snapshot = registrySnapshots[`local:${account.id}`]
+    if (!snapshot) throw new Error(`账号「${account.name}」缺少本机商品 ID 查重结果；已停止本轮选品。`)
+    const registry = filterRowsByLocalRegistry(
+      rawRows,
+      snapshot,
       targetCount,
       settings.selectionMode === 'category' ? 'category' : 'general'
     )
-    rows = registry.candidates
+    let rows = registry.candidates
     if (account.id === reviewedAccountId && reviewedProducts) {
       rows = rows.filter((candidate) => reviewedProducts.has(candidate.productId))
     }
@@ -2091,7 +2337,7 @@ async function prepareBatchCandidatePlans(
       message: `账号剩余可加车容量 ${remainingCapacity} 个；每商品每日视频配额已读取。`
     })
     const productUsage = (quota.productUsage ?? {}) as Record<string, number>
-    const publishLocks = await loadProductPublishLocks(account.id)
+    const publishLocks = await loadProductPublishLocks(account.id, rows.map((candidate) => candidate.productId))
     rows = rows.filter((candidate) => {
       const lock = publishLocks.get(candidate.productId)
       const dailyVideos = Number(productUsage[candidate.productId] ?? 0)
@@ -2128,28 +2374,37 @@ async function prepareBatchCandidatePlans(
       accountIndex: targetIndex + 1,
       accountTotal: orderedTargets.length,
       completedAccounts: targetIndex + 1,
-      message: `账号 ${targetIndex + 1}/${orderedTargets.length}：来源候选 ${Array.isArray(preview.candidates) ? preview.candidates.length : 0} 个；本机/任务/配额排除 ${excluded.length} 个；可分配容量 ${remainingCapacity}`
+      message: `账号 ${targetIndex + 1}/${orderedTargets.length}：来源候选 ${rawRows.length} 个；本机/任务/配额排除 ${excluded.length} 个；可分配容量 ${remainingCapacity}`
     })
   }
 
   const scoredPools = scoreUnifiedCandidatePools(poolRows)
+  const rankedPools = new Map([...scoredPools].map(([accountId, candidates]) => [
+    accountId,
+    accountId === reviewedAccountId && reviewedProducts !== undefined
+      ? candidates
+      : rankCandidatesForBatch(candidates, batchSeed)
+  ] as const))
   const successfulTargets = targets.filter((account) => !accountSwitchFailures?.has(account.id))
   for (const account of successfulTargets) {
     const context = contexts.get(account.id)
     const settings = context?.settings ?? {}
     const requestedLimit = Number(settings.candidateLimit ?? 5)
     const targetCount = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(10, requestedLimit)) : 5
-    const ranked = rankByRecommendedCategories(scoredPools.get(account.id) ?? [], {}, targetCount)
+    const ranked = rankByRecommendedCategories(rankedPools.get(account.id) ?? [], {}, targetCount)
     recommendationsByAccount.set(account.id, ranked.recommendations)
   }
-  const allocations = allocateExclusiveCandidates([...scoredPools.entries()].map(([accountId, candidates]) => {
+  const allocations = allocateExclusiveCandidates([...rankedPools.entries()].map(([accountId, candidates]) => {
     const targetCapacity = capacities.get(accountId) ?? 0
-    // 预览后仍会在主进程原子登记一次；登记时遇到重复 ID/类目冲突需继续从备用候选补位。
-    // 候选池最多为目标的三倍（目标最多 10 个），全局分配器仍保证备用商品不会分给其他账号。
+    const manuallyReviewed = accountId === reviewedAccountId && reviewedProducts !== undefined
+    // 本地快照过滤后才做批次随机排序；自动模式保留最多 50 个候选供最终事务冲突时补位。
+    // 人工勾选仍按原有分数顺序和目标三倍上限处理，不随机替用户改选。
     return {
       accountId,
       accountName: names.get(accountId) ?? `账号 ${accountId}`,
-      capacity: Math.min(candidates.length, targetCapacity * 3),
+      capacity: Math.min(candidates.length, manuallyReviewed
+        ? targetCapacity * 3
+        : targetCapacity > 0 ? BATCH_FALLBACK_CANDIDATE_LIMIT : 0),
       candidates
     }
   }))
@@ -2160,11 +2415,15 @@ async function prepareBatchCandidatePlans(
     const mutualSkips = allocation?.skipped ?? []
     const recommendationOrder = new Map((recommendationsByAccount.get(account.id) ?? [])
       .map((row, index) => [row.categoryId, index]))
-    winners.sort((left, right) =>
-      (recommendationOrder.get(candidateLeafCategoryId(left)) ?? Number.MAX_SAFE_INTEGER) -
-        (recommendationOrder.get(candidateLeafCategoryId(right)) ?? Number.MAX_SAFE_INTEGER) ||
-      Number(right.unifiedScore ?? 0) - Number(left.unifiedScore ?? 0)
-    )
+    winners.sort((left, right) => {
+      const categoryOrder = (recommendationOrder.get(candidateLeafCategoryId(left)) ?? Number.MAX_SAFE_INTEGER) -
+        (recommendationOrder.get(candidateLeafCategoryId(right)) ?? Number.MAX_SAFE_INTEGER)
+      if (categoryOrder) return categoryOrder
+      const leftRandomKey = Number(left.batchRandomKey)
+      const rightRandomKey = Number(right.batchRandomKey)
+      if (Number.isFinite(leftRandomKey) && Number.isFinite(rightRandomKey)) return leftRandomKey - rightRandomKey
+      return Number(right.unifiedScore ?? 0) - Number(left.unifiedScore ?? 0)
+    })
     const sources = sourcesByAccount.get(account.id) ?? []
     const sourceIds = sourceIdsByAccount.get(account.id) ?? new Map<string, Set<string>>()
     const collectedSourceIds = collectedSourceIdsByAccount.get(account.id) ?? new Map<string, Set<string>>()
@@ -2179,7 +2438,7 @@ async function prepareBatchCandidatePlans(
       const sourceKey = source.sourceKey as CandidateSource
       const ids = sourceIds.get(sourceKey) ?? new Set<string>()
       const collectedIds = collectedSourceIds.get(sourceKey) ?? new Set<string>()
-      const eligibleRows = (scoredPools.get(account.id) ?? []).filter((candidate) => ids.has(candidate.productId))
+      const eligibleRows = (rankedPools.get(account.id) ?? []).filter((candidate) => ids.has(candidate.productId))
       source.passedCandidateCount = eligibleRows.length
       source.weightedHitCount = eligibleRows.filter((candidate) => (candidate.hotOrRankBoost ?? 0) > 0).length
       source.mutualExclusionSkippedCount = new Set([
@@ -2191,7 +2450,9 @@ async function prepareBatchCandidatePlans(
     }
     plans.set(account.id, {
       candidates: winners,
-      candidatePool: scoredPools.get(account.id) ?? [],
+      candidatePool: rankedPools.get(account.id) ?? [],
+      sharedCandidatePool: sharedPoolRowsByAccount.get(account.id) ?? [],
+      candidatePoolMeta: poolReuseMetaByAccount.get(account.id),
       registryExcluded: registryExcludedByAccount.get(account.id) ?? [],
       mutualExclusionSkipped: mutualSkips,
       rejectedCandidates: rejectedByAccount.get(account.id) ?? [],
@@ -2208,34 +2469,41 @@ async function prepareBatchCandidatePlans(
   return plans
 }
 
-function previewPoolFingerprint(accountId: number, context: AccountRunContext): string {
-  return stableJson({
-    accountId,
-    settings: context.settings,
-    profilePath: context.resolvedProfilePath ?? context.profilePath,
-    downloadPath: context.downloadPath
-  })
-}
-
 function reusablePreviewCandidatePlans(
   targets: readonly AccountRow[],
   contexts: ReadonlyMap<number, AccountRunContext>
 ): Map<number, AccountCandidatePlan> {
   const cache = previewCandidatePool.value
-  if (!cache || !targets.some((account) => account.id === cache.accountId)) return new Map()
-  const context = contexts.get(cache.accountId)
-  if (!context || cache.fingerprint !== previewPoolFingerprint(cache.accountId, context)) return new Map()
-  return new Map([[cache.accountId, cache.plan]])
-}
-
-function candidatePlansForBatchPayload(
-  plans: ReadonlyMap<number, AccountCandidatePlan>
-): Record<string, AccountCandidatePlan> {
-  return Object.fromEntries([...plans].map(([accountId, plan]) => {
-    const persistedPlan = { ...plan }
-    delete persistedPlan.candidatePool
-    return [String(accountId), persistedPlan]
-  }))
+  if (!cache) return new Map()
+  const matching = targets.filter((account) => {
+    const context = contexts.get(account.id)
+    if (!context) return false
+    return selectionFilterFingerprint(context.settings) === cache.filterFingerprint &&
+      selectionPoolVisibilityFingerprint(context.resolvedProfilePath ?? context.profilePath) === cache.visibilityFingerprint &&
+      Boolean(cache.visibilityFingerprint) &&
+      Date.now() - Date.parse(cache.dataCapturedAt) <= 10 * 60 * 1000
+  })
+  if (!matching.length) return new Map()
+  return new Map(matching.map((account) => [account.id, {
+    ...cache.plan,
+    candidatePoolMeta: {
+      ...(cache.plan.candidatePoolMeta ?? {
+        createdByAccountId: cache.createdByAccountId,
+        filterFingerprint: cache.filterFingerprint,
+        visibilityFingerprint: cache.visibilityFingerprint,
+        dataCapturedAt: cache.dataCapturedAt,
+        reuseStatus: 'created' as const
+      }),
+      createdByAccountId: cache.createdByAccountId,
+      filterFingerprint: cache.filterFingerprint,
+      visibilityFingerprint: cache.visibilityFingerprint,
+      dataCapturedAt: cache.dataCapturedAt,
+      reuseStatus: account.id === cache.createdByAccountId ? 'created' : 'reused',
+      reuseReason: account.id === cache.createdByAccountId
+        ? '复用当前账号刚建立的预览候选池。'
+        : `复用账号 ${cache.createdByAccountId} 的预览候选池。`
+    }
+  }]))
 }
 
 async function prepareAccountRunContext(
@@ -2250,7 +2518,9 @@ async function prepareAccountRunContext(
   const accountSettings = accountSettingsOverride ?? settingsRoot.account ?? {}
   const categoryTree = JSON.parse(JSON.stringify(categories.value)) as CategoryNode[]
   const globalCategory = (globalSnapshot.categorySelection ?? {}) as Record<string, string[]>
+  const globalExcludedCategory = (globalSnapshot.excludedCategorySelection ?? {}) as Record<string, string[]>
   const storedCategory = (accountSettings.categorySelection ?? {}) as Record<string, string[]>
+  const storedExcludedCategory = (accountSettings.excludedCategorySelection ?? {}) as Record<string, string[]>
   const accountCategory = normalizeCategorySelection({
     level1: [...(storedCategory.level1 ?? [])],
     level2: [...(storedCategory.level2 ?? [])],
@@ -2273,6 +2543,16 @@ async function prepareAccountRunContext(
     level2: [...(globalCategory.level2 ?? [])],
     level3: [...(globalCategory.level3 ?? [])]
   }, categoryTree)
+  const normalizedGlobalExcludedCategory = normalizeCategorySelection({
+    level1: [...(globalExcludedCategory.level1 ?? [])],
+    level2: [...(globalExcludedCategory.level2 ?? [])],
+    level3: [...(globalExcludedCategory.level3 ?? [])]
+  }, categoryTree)
+  const normalizedAccountExcludedCategory = normalizeCategorySelection({
+    level1: [...(storedExcludedCategory.level1 ?? [])],
+    level2: [...(storedExcludedCategory.level2 ?? [])],
+    level3: [...(storedExcludedCategory.level3 ?? [])]
+  }, categoryTree)
   const effectiveCategorySelection = accountCategoryMode === 'manual'
     ? accountCategory
     : accountCategoryMode === 'inherit' && globalCategoryMode === 'manual'
@@ -2288,6 +2568,11 @@ async function prepareAccountRunContext(
   settings.selectionMode = effectiveSelectionMode
   settings.categoryMode = effectiveCategoryMode
   settings.categorySelection = effectiveCategorySelection
+  settings.excludedCategorySelection = accountSelectionMode === 'inherit'
+    ? normalizedGlobalExcludedCategory
+    : (Object.prototype.hasOwnProperty.call(accountSettings, 'excludedCategorySelection')
+      ? normalizedAccountExcludedCategory
+      : normalizedGlobalExcludedCategory)
   if (effectiveSelectionMode === 'category' && effectiveCategoryMode === 'manual' && !hasSelectedCategory(effectiveCategorySelection)) {
     const accountName = accounts.value.find((account) => account.id === targetAccountId)?.name ?? `账号 ${targetAccountId}`
     throw new Error(`${accountName}处于手动选类目模式，但没有已选类目。请先选择类目或切回自动推荐。`)
@@ -2313,7 +2598,7 @@ async function prepareAccountRunContext(
   if (filterOverrides && typeof filterOverrides === 'object' && !Array.isArray(filterOverrides)) {
     Object.assign(settings, createSelectionFilterSettings(filterOverrides, createSelectionFilterSettings(globalSnapshot)))
   }
-  validateCommissionRateThreshold(
+  validateCommissionRateUpperBound(
     ((settings.thresholds ?? {}) as Record<string, number | null>).commissionRate,
     '账号运行设置'
   )
@@ -2337,7 +2622,7 @@ async function prepareAccountRunContext(
   if (!profileValidation.ok || !profileValidation.path) {
     throw new Error(profileValidation.error ?? '账号浏览器缓存路径校验失败')
   }
-  const rawDownloadPath = configuredDownloadPath || defaultRoot + '\\账号-' + targetAccountId
+  const rawDownloadPath = configuredDownloadPath || defaultRoot + '\\' + defaultAccountDownloadFolderName(targetAccountId)
   const downloadValidation = await window.api.dir.canonicalizePath(rawDownloadPath)
   if (!downloadValidation.ok || !downloadValidation.path) {
     throw new Error(downloadValidation.error ?? '账号下载路径解析失败')
@@ -2447,6 +2732,69 @@ async function executeAccountSelection(
       ? settingsForRecoveryCheckpoint(context.settings, recovery.state, accountLabel)
       : context.settings
     settings = { ...settings, _visibleSourcesOnly: true }
+    if (!previewOnly) {
+      const blockedCardIndexes = new Set<number>()
+      const loggedTitleIds = new Set<string>()
+      const newlyBlockedCompleted: Array<{ item: Record<string, unknown>; word: string }> = []
+      completed = completed.map((item) => {
+        const word = matchedSelectionTitleBannedWord(item.title, settings)
+        if (!word) return item
+        const productId = String(item.productId ?? '')
+        if (item.titleFilterExcluded !== true) newlyBlockedCompleted.push({ item, word })
+        return {
+          ...item,
+          titleBannedWord: word,
+          titleFilterExcluded: true,
+          cartAdded: item.cartAdded === true,
+          skipped: true,
+          status: `商品标题命中屏蔽词「${word}」；已停止本轮商品恢复处理。`
+        }
+      })
+      for (const { item, word } of newlyBlockedCompleted) {
+        const productId = String(item.productId ?? '')
+        loggedTitleIds.add(productId)
+        await recovery?.logEvent({
+          stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+          message: `${String(item.title ?? productId)}：商品标题命中屏蔽词「${word}」，已跳过。`,
+          detail: word, productId, productTitle: String(item.title ?? '')
+        })
+      }
+      const allowedCandidates: SelectionCandidate[] = []
+      for (const candidate of fetched) {
+        const word = matchedSelectionTitleBannedWord(candidate.title, settings)
+        if (!word) {
+          allowedCandidates.push(candidate)
+          continue
+        }
+        if (Number.isInteger(candidate.cardIndex)) blockedCardIndexes.add(candidate.cardIndex)
+        const productId = String(candidate.productId ?? '')
+        const prior = completed.find((item) => String(item.productId ?? '') === productId)
+        const blocked = {
+          ...prior,
+          ...candidate,
+          titleBannedWord: word,
+          titleFilterExcluded: true,
+          cartAdded: prior?.cartAdded === true || candidate.cartAdded === true,
+          skipped: true,
+          status: `商品标题命中屏蔽词「${word}」；已停止本轮商品处理。`
+        }
+        if (prior) {
+          completed = completed.map((item) => String(item.productId ?? '') === productId ? blocked : item)
+        } else {
+          completed.push(blocked)
+        }
+        if (!loggedTitleIds.has(productId)) {
+          loggedTitleIds.add(productId)
+          await recovery?.logEvent({
+            stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+            message: `${String(candidate.title ?? productId)}：商品标题命中屏蔽词「${word}」，已跳过。`,
+            detail: word, productId, productTitle: String(candidate.title ?? '')
+          })
+        }
+      }
+      fetched = allowedCandidates
+      selectedIndexes = selectedIndexes.filter((index) => !blockedCardIndexes.has(index))
+    }
     notice.value = settings.selectionMode === 'category' && settings.categoryMode === 'manual'
       ? '选品仍只读取百应当前可见商品，并按手动选择的类目范围筛选。'
       : settings.selectionMode === 'category'
@@ -2474,9 +2822,21 @@ async function executeAccountSelection(
       previewCandidatePoolCount.value = candidatePool.length
       previewCandidatePool.value = candidatePool.length
         ? {
-            accountId: targetAccountId,
-            fingerprint: previewPoolFingerprint(targetAccountId, context),
-            plan: previewPlan
+            createdByAccountId: targetAccountId,
+            filterFingerprint: selectionFilterFingerprint(context.settings),
+            visibilityFingerprint: selectionPoolVisibilityFingerprint(context.resolvedProfilePath ?? context.profilePath),
+            dataCapturedAt: new Date().toISOString(),
+            plan: {
+              ...previewPlan,
+              sharedCandidatePool: previewPlan.sharedCandidatePool ?? candidatePool,
+              candidatePoolMeta: previewPlan.candidatePoolMeta ?? {
+                createdByAccountId: targetAccountId,
+                filterFingerprint: selectionFilterFingerprint(context.settings),
+                visibilityFingerprint: selectionPoolVisibilityFingerprint(context.resolvedProfilePath ?? context.profilePath),
+                dataCapturedAt: new Date().toISOString(),
+                reuseStatus: 'created'
+              }
+            }
           }
         : null
       categoryRecommendations.value = previewPlan.recommendedCategories
@@ -2497,17 +2857,27 @@ async function executeAccountSelection(
       }
       const rejected = previewPlan.rejectedCandidates
       const excludedByCategoryCount = rejected.filter((candidate) =>
-        candidate.thresholdReasons?.includes('命中通用设置中排除的类目')
+        candidate.thresholdReasons?.includes('命中当前设置中排除的类目')
       ).length
-      const thresholdRejectedCount = Math.max(0, rejected.length - excludedByCategoryCount)
+      const titleFilteredCount = rejected.filter((candidate) =>
+        candidate.titleFilterExcluded === true || Boolean(candidate.titleBannedWord)
+      ).length
+      const thresholdRejectedCount = Math.max(0, rejected.length - excludedByCategoryCount - titleFilteredCount)
       const firstThresholdReason = rejected.find((candidate) =>
-        !candidate.thresholdReasons?.includes('命中通用设置中排除的类目')
+        !candidate.thresholdReasons?.includes('命中当前设置中排除的类目') &&
+        candidate.titleFilterExcluded !== true && !candidate.titleBannedWord
       )?.thresholdReasons?.[0]
+      const firstTitleFilter = rejected.find((candidate) =>
+        candidate.titleFilterExcluded === true || Boolean(candidate.titleBannedWord)
+      )
       const rejectionSummary = [
+        titleFilteredCount
+          ? `标题屏蔽排除 ${titleFilteredCount} 个候选${firstTitleFilter?.titleBannedWord ? `，示例命中词：${firstTitleFilter.titleBannedWord}` : ''}`
+          : '',
         thresholdRejectedCount
           ? `另有 ${thresholdRejectedCount} 个候选因列表实测数据未达阈值被排除${firstThresholdReason ? `，示例：${firstThresholdReason}` : ''}`
           : '',
-        excludedByCategoryCount ? `通用设置排除类目过滤 ${excludedByCategoryCount} 个候选` : ''
+        excludedByCategoryCount ? `排除类目过滤 ${excludedByCategoryCount} 个候选` : ''
       ].filter(Boolean).map((item) => `；${item}`).join('')
       const previewSourceResults = previewPlan.prioritySourceResults
       const categorySummary = previewPlan.recommendedCategories.length
@@ -2557,6 +2927,69 @@ async function executeAccountSelection(
       const candidateLimit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(10, requestedLimit)) : 5
       const hasExplicitPreviewSelection =
         reviewedPreviewAccountId === targetAccountId && reviewedProductIds !== undefined
+      const candidateReadFingerprint = (candidatesRead: unknown, rejectedRead: unknown): string => {
+        const rows = [
+          ...(Array.isArray(candidatesRead) ? candidatesRead : []),
+          ...(Array.isArray(rejectedRead) ? rejectedRead : [])
+        ]
+        return [...new Set(rows.map((row) =>
+          row && typeof row === 'object' ? String((row as { productId?: unknown }).productId ?? '').trim() : ''
+        ).filter(Boolean))].sort().join('|')
+      }
+      let lastReadFingerprint = candidateReadFingerprint(fetched, completed)
+      const refillCandidatePool = async (force = false): Promise<void> => {
+        if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
+        const retryDelays = [1_000, 2_500, 6_000]
+        for (let attempt = 0; attempt < retryDelays.length && fetched.length < candidateLimit; attempt += 1) {
+          const delayMs = retryDelays[attempt]
+          accountStatuses[targetAccountId] = `candidate_refilling（${fetched.length}/${candidateLimit}）`
+          reportSelectionProgress(targetAccountId, 'candidate_refilling', {
+            itemIndex: fetched.length,
+            itemTotal: candidateLimit,
+            message: `账号 ${targetAccountId}：已找到 ${fetched.length}/${candidateLimit}，第 ${attempt + 1} 次补充候选；${delayMs}ms 后继续读取已启用来源`
+          })
+          await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: '', candidates: fetched })
+          await recovery?.logEvent({
+            stage: '候选补充', code: 'INFO_CANDIDATE_REFILLING',
+            message: `候选不足 ${fetched.length}/${candidateLimit}，第 ${attempt + 1} 次补充；等待 ${delayMs}ms。`,
+            detail: `沿用当前账号页面和筛选指纹；不放宽条件，不推进下一个账号。`
+          })
+          await new Promise((resolve) => setTimeout(resolve, delayMs))
+          const refill = await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
+            ...profile,
+            settings: { ...settings, _candidatePoolLimit: Math.min(200, candidateLimit + (attempt + 1) * 40) },
+            accountId: targetAccountId,
+            downloadPath: context.downloadPath,
+            previewOnly: true,
+            closeAfterAutomation: !recovery
+          }))
+          if (refill.ok !== true) continue
+          const newRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
+          const readFingerprint = candidateReadFingerprint(refill.candidates, refill.rejectedCandidates)
+          const previousCount = fetched.length
+          const byProduct = new Map(fetched.map((row) => [row.productId, row]))
+          for (const row of newRows) if (!byProduct.has(row.productId)) byProduct.set(row.productId, row)
+          fetched = [...byProduct.values()].map((row, index) => ({ ...row, cardIndex: index }))
+          await recovery?.logEvent({
+            stage: '候选补充', code: 'INFO_CANDIDATE_REFILL_RESULT',
+            message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
+            detail: `本次新读取 ${newRows.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
+          })
+          if (fetched.length === previousCount && readFingerprint && readFingerprint === lastReadFingerprint) {
+            await recovery?.logEvent({
+              stage: '候选补充', code: 'WARNING_CANDIDATE_POOL_UNCHANGED',
+              message: '再次读取仍是同一批商品 ID，已停止本轮无效补读。',
+              detail: `当前可执行候选 ${fetched.length}/${candidateLimit}；保留缺额和检查点，不放宽条件。`
+            })
+            break
+          }
+          if (readFingerprint) lastReadFingerprint = readFingerprint
+        }
+        if (fetched.length < candidateLimit) {
+          await recovery?.persist({ state: 'in_progress', stage: 'candidate_refilling', error: `候选补充后仍只有 ${fetched.length}/${candidateLimit}，未放宽筛选条件。`, candidates: fetched })
+        }
+      }
+      await refillCandidatePool()
       if (resumeCart) {
         const allSelectedCandidates = fetched.filter((candidate) => selectedIndexes.includes(candidate.cardIndex))
         if (allSelectedCandidates.length !== new Set(selectedIndexes).size || allSelectedCandidates.length !== selectedIndexes.length) {
@@ -2568,7 +3001,10 @@ async function executeAccountSelection(
         const remainingCandidates = fetched.filter((candidate) =>
           selectedIndexes.includes(candidate.cardIndex) && !resolvedProductIds.has(candidate.productId)
         )
-        const productLocks = await loadProductPublishLocks(targetAccountId)
+        const productLocks = await loadProductPublishLocks(
+          targetAccountId,
+          remainingCandidates.map((candidate) => candidate.productId)
+        )
         const duplicateSkips = duplicateProductSkipItems(remainingCandidates, productLocks)
         await logDuplicateProductSkips(targetAccountId, duplicateSkips, recovery)
         completed = [...completed.filter((item) =>
@@ -2584,7 +3020,9 @@ async function executeAccountSelection(
           quotaSettings.perAccountVideos - (accountUsage.videos ?? 0)
         ))
         const alreadyAddedCount = completed.filter((item) => item.cartAdded === true).length
-        const remainingBatchTarget = Math.max(0, candidateLimit - alreadyAddedCount)
+        // candidateLimit controls candidate discovery; an account task must drain
+        // its complete remaining snapshot before the batch advances to the next account.
+        const remainingBatchTarget = Math.max(0, remainingAccountQuota)
         if (remainingBatchTarget > 0 && remainingAccountQuota <= 0 && remainingCandidates.length) {
           throw new Error('该账号当前剩余商品或视频配额为 0；恢复检查点已保留，配额恢复后再继续。')
         }
@@ -2633,9 +3071,10 @@ async function executeAccountSelection(
             }
           : await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
               ...profile, settings: candidateQuerySettings, accountId: targetAccountId,
-              downloadPath: context.downloadPath, previewOnly: true
+              downloadPath: context.downloadPath, previewOnly: true, closeAfterAutomation: !recovery
             }))
         if (preview.ok !== true) throw new Error(String(preview.error ?? '百应候选获取失败'))
+        lastReadFingerprint = candidateReadFingerprint(preview.candidates, preview.rejectedCandidates)
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
         const stableAccountKey = `local:${targetAccountId}`
         const targetCount = Number(settings.candidateLimit ?? 5)
@@ -2661,21 +3100,22 @@ async function executeAccountSelection(
             registryExcluded: true,
             status: reason
           })
-          await recovery?.logEvent({
+        }
+        const dedupeEvents: SelectionRunLogInput[] = allRegistryExcluded.map(({ candidate, reason }) => ({
             stage: '本机选品登记', code: 'INFO_REGISTRY_CANDIDATE_EXCLUDED',
             message: `${String(candidate.title ?? candidate.productId)}：${reason}`,
             detail: reason, productId: String(candidate.productId ?? ''), productTitle: String(candidate.title ?? '')
-          })
-        }
+        }))
         for (const candidate of candidatePlan?.mutualExclusionSkipped ?? []) {
           const reason = String(candidate.mutualExclusionReason || '商品已由统一分更高的账号占用')
           completed.push({ ...candidate, cartAdded: false, skipped: true, mutualExclusionSkipped: true, status: reason })
-          await recovery?.logEvent({
+          dedupeEvents.push({
             stage: '跨账号商品互斥', code: 'INFO_CROSS_ACCOUNT_PRODUCT_SKIPPED',
             message: `${String(candidate.title ?? candidate.productId)}：${reason}`,
             detail: reason, productId: String(candidate.productId ?? ''), productTitle: String(candidate.title ?? '')
           })
         }
+        await recovery?.logEvents(dedupeEvents)
         if (fetched.length && fetched[0]) {
           const topCategory = candidateLeafCategoryId(fetched[0])
           notice.value = topCategory
@@ -2750,11 +3190,45 @@ async function executeAccountSelection(
             ].filter(Boolean).join('；')
           })
         }
+        const poolMeta = candidatePlan?.candidatePoolMeta
+        if (poolMeta) {
+          const poolMessage = poolMeta.reuseStatus === 'reused'
+            ? `复用账号 ${poolMeta.createdByAccountId} 创建的候选池；筛选条件指纹 ${poolMeta.filterFingerprint.slice(0, 12)}；数据时间 ${poolMeta.dataCapturedAt}。`
+            : `账号 ${poolMeta.createdByAccountId} 创建候选池；筛选条件指纹 ${poolMeta.filterFingerprint.slice(0, 12)}；数据时间 ${poolMeta.dataCapturedAt}。`
+          await recovery?.logEvent({
+            stage: '候选池复用',
+            code: poolMeta.reuseStatus === 'reused' ? 'INFO_CANDIDATE_POOL_REUSED' : 'INFO_CANDIDATE_POOL_CREATED',
+            message: poolMessage,
+            detail: [
+              `来源可见范围指纹 ${poolMeta.visibilityFingerprint ? poolMeta.visibilityFingerprint.slice(-24) : '未确认'}`,
+              poolMeta.reuseReason || ''
+            ].filter(Boolean).join('；')
+          })
+        }
         for (const candidate of listRejected) {
           const productId = String(candidate.productId ?? '')
           if (!productId || completed.some((item) => String(item.productId ?? '') === productId)) continue
           const thresholdReasons = Array.isArray(candidate.thresholdReasons)
             ? candidate.thresholdReasons.map(String) : []
+          const titleBannedWord = String(candidate.titleBannedWord ?? '').trim()
+          if (titleBannedWord) {
+            const reason = `商品标题命中屏蔽词「${titleBannedWord}」`
+            completed.push({
+              ...candidate,
+              titleFilterExcluded: true,
+              analysisStatus: '商品标题命中屏蔽词',
+              thresholdReasons,
+              cartAdded: false,
+              skipped: true,
+              status: reason
+            })
+            await recovery?.logEvent({
+              stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+              message: `${String(candidate.title ?? productId)}：${reason}，已排除且未加车。`,
+              detail: reason, productId, productTitle: String(candidate.title ?? '')
+            })
+            continue
+          }
           const reason = thresholdReasons.join('；') || '候选列表实测数据未达到已设置阈值'
           completed.push({
             ...candidate,
@@ -2778,7 +3252,10 @@ async function executeAccountSelection(
           reviewedProductIds,
           fetched
         )
-        const productLocks = await loadProductPublishLocks(targetAccountId)
+        const productLocks = await loadProductPublishLocks(
+          targetAccountId,
+          fetched.filter((candidate) => chosenProducts.has(candidate.productId)).map((candidate) => candidate.productId)
+        )
         const lockedCandidates = fetched.filter((candidate) =>
           chosenProducts.has(candidate.productId) && productLocks.has(candidate.productId)
         )
@@ -2787,65 +3264,55 @@ async function executeAccountSelection(
         completed = [...completed.filter((item) =>
           !duplicateSkips.some((skipped) => String(item.productId ?? '') === skipped.productId)
         ), ...duplicateSkips]
-        maxSelectedProducts = Math.min(candidateLimit, maxProducts)
+        // Run every eligible product for this account in one account task. The
+        // account quota remains the hard upper bound; candidateLimit only limits
+        // how many candidates are discovered upstream.
+        maxSelectedProducts = maxProducts
         eligible = fetched.filter((candidate) =>
           chosenProducts.has(candidate.productId) && !productLocks.has(candidate.productId) &&
           (usage[candidate.productId] ?? 0) < quotaSettings.perProductVideos
         )
+        if (eligible.length < candidateLimit && !hasExplicitPreviewSelection && !candidatePlan) {
+          await refillCandidatePool(true)
+          const eligibleProductIds = new Set([...chosenProducts, ...fetched.map((candidate) => candidate.productId)])
+          eligible = fetched.filter((candidate) =>
+            eligibleProductIds.has(candidate.productId) && !productLocks.has(candidate.productId) &&
+            (usage[candidate.productId] ?? 0) < quotaSettings.perProductVideos
+          )
+        }
         if (!eligible.length) {
-          if (duplicateSkips.length) {
-            const skippedSummary = `本账号已有 ${duplicateSkips.length} 个已排队或已发布商品，已阻止重复选品：${duplicateSkips.map((item) => item.title).join('、')}`
-            accountStatuses[targetAccountId] = '已跳过账号内重复商品'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
+          const titleFilterSkipped = completed.filter((item) => item.titleFilterExcluded === true)
           const analysisSkipped = completed.filter((item) => item.analysisRejected === true)
-          if (analysisSkipped.length) {
-            const skippedSummary = `候选列表数据分析排除 ${analysisSkipped.length} 个商品，未执行加车；原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（筛选未通过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
           const globallySkipped = completed.filter((item) =>
             item.mutualExclusionSkipped === true || item.registryExcluded === true
           )
-          if (globallySkipped.length) {
-            const skippedSummary = `本机商品 ID 互斥/登记过滤 ${globallySkipped.length} 个候选，未执行加车；具体账号和原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（商品互斥跳过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
-          if (categoryWarnings.length) {
-            const skippedSummary = `本账号没有可执行候选；已跳过 ${categoryWarnings.length} 个可恢复的类目或来源读取问题，原因已记录。`
-            accountStatuses[targetAccountId] = '部分完成（类目/来源已跳过）'
-            await recovery?.persist({
-              state: 'completed', stage: 'completed', error: '', candidates: fetched,
-              selectedIndexes: [], completed
-            })
-            return { status: '部分完成', message: skippedSummary, continueBatch: true }
-          }
-          throw new Error(settings._visibleSourcesOnly === true
-            ? visibleSourceNoCandidateMessage(
-              prioritySourceResults,
-              '已读取百应当前可见商品，但当前没有可执行候选；请查看筛选条件、已选商品/类目和跳过原因。'
-            )
-            : '已查询全部已启用来源与选品广场兜底，仍没有符合条件的商品。')
+          const categoryUnknownCount = analysisSkipped.filter((item) =>
+            Array.isArray(item.thresholdReasons) && item.thresholdReasons.some((reason) => String(reason).startsWith('类目未知'))
+          ).length
+          const confirmedCartCount = completed.filter((item) => item.cartAdded === true).length
+          const reason = [
+            `当前可执行候选 0/${candidateLimit}，确认加车 ${confirmedCartCount}/${candidateLimit}；当前账号未达目标，保留检查点，不推进下一个账号。`,
+            categoryUnknownCount ? `类目无法核实 ${categoryUnknownCount} 个` : '',
+            analysisSkipped.length > categoryUnknownCount ? `其他数据筛选排除 ${analysisSkipped.length - categoryUnknownCount} 个` : '',
+            titleFilterSkipped.length ? `标题屏蔽 ${titleFilterSkipped.length} 个` : '',
+            globallySkipped.length ? `登记或互斥跳过 ${globallySkipped.length} 个` : '',
+            duplicateSkips.length ? `重复发布锁跳过 ${duplicateSkips.length} 个` : '',
+            categoryWarnings.length ? `来源读取问题 ${categoryWarnings.length} 项` : ''
+          ].filter(Boolean).join('；')
+          accountStatuses[targetAccountId] = `needs_retry（候选 0/${candidateLimit}，加车 ${confirmedCartCount}/${candidateLimit}）`
+          await recovery?.logEvent({
+            stage: '候选补充', code: 'WARNING_CANDIDATE_TARGET_UNMET',
+            message: `当前账号没有可执行候选，确认加车 ${confirmedCartCount}/${candidateLimit}，已保留缺额。`,
+            detail: reason
+          })
+          await recovery?.persist({
+            state: 'needs_retry', stage: 'candidate_refilling', error: reason,
+            candidates: fetched, selectedIndexes: [], completed
+          })
+          return { status: '部分完成', message: reason, continueBatch: false }
         }
         selectedIndexes = eligible.map((candidate) => candidate.cardIndex)
-        const maxIndexesToSend = hasExplicitPreviewSelection ? candidateLimit * 3 : candidateLimit
-        selectedIndexesToExecute = selectedIndexes.slice(0, Math.min(
-          selectedIndexes.length,
-          maxIndexesToSend
-        ))
+        selectedIndexesToExecute = selectedIndexes
         reportSelectionProgress(targetAccountId, '准备逐个处理选中商品', {
           itemIndex: 0,
           itemTotal: selectedIndexesToExecute.length,
@@ -2866,10 +3333,10 @@ async function executeAccountSelection(
           stage: '候选池准备', code: 'INFO_CANDIDATE_POOL_READY',
           message: hasExplicitPreviewSelection
             ? `已找到 ${selectedIndexesToExecute.length} 个用户勾选候选（含所选备用项）；登记冲突会跳过并尝试其他勾选项，最多加入 ${maxSelectedProducts} 个。`
-            : `已找到 ${selectedIndexesToExecute.length} 个主候选；遇到已选商品或登记冲突会跳过，并从完整候选池自动补位，单轮最多检查 30 个候选、加入 ${maxSelectedProducts} 个。`,
+            : `已找到 ${selectedIndexesToExecute.length} 个主候选；遇到登记冲突会按本批随机排序从候选快照补位，单轮最多检查 ${BATCH_FALLBACK_CANDIDATE_LIMIT} 个候选、加入 ${maxSelectedProducts} 个。`,
           detail: hasExplicitPreviewSelection
             ? '本次优先使用人工勾选的候选；本机登记拒绝时仍会尝试其他已选候选。'
-            : '候选池按全账号商品 ID 互斥分配；正式预留遇到已登记商品时跳过，并按候选排序继续从当前完整筛选快照补位，最多保留目标数量 3 倍的执行预留。'
+            : '先按本机登记、商品锁和配额过滤，再按批次 ID 对合格商品加权随机排序；候选池按全账号商品 ID 互斥分配。正式原子预留遇到并发冲突时会继续检查备用候选；筛选质量、账号归属和最终事务保护不变。'
         })
         stage = '加入选品车并取回商品 ID'
         accountStatuses[targetAccountId] = '加入选品车中'
@@ -2894,7 +3361,8 @@ async function executeAccountSelection(
           refreshCandidatesById: resumeCart,
           analyzeBeforeCart: !resumeAfterCart,
           maxSelectedProducts,
-          previewOnly: false
+          previewOnly: false,
+          closeAfterAutomation: !recovery
         }))
         if (result.ok !== true) throw new Error(String(result.error ?? '百应选品执行失败'))
 
@@ -2959,9 +3427,18 @@ async function executeAccountSelection(
         for (const item of returned) {
           const status = String(item.status ?? '')
           const analysisRejected = item.analysisRejected === true
+          const titleFilterExcluded = item.titleFilterExcluded === true
           const productId = String(item.productId ?? '')
           const productTitle = String(item.title ?? '')
-          if (analysisRejected) {
+          if (titleFilterExcluded) {
+            const reason = String(item.status || `商品标题命中屏蔽词「${String(item.titleBannedWord ?? '')}」`)
+            await recovery?.logEvent({
+              stage: '商品标题屏蔽', code: 'WARNING_TITLE_BANNED_WORD',
+              message: `${productTitle || productId}：${reason}`,
+              detail: Array.isArray(item.thresholdReasons) ? item.thresholdReasons.map(String).join('\n') : reason,
+              productId, productTitle
+            })
+          } else if (analysisRejected) {
             const reasons = Array.isArray(item.thresholdReasons) ? item.thresholdReasons.map(String) : []
             await recovery?.logEvent({
               stage: '商品数据分析', code: 'WARNING_PRODUCT_ANALYSIS_FILTERED',
@@ -3000,7 +3477,11 @@ async function executeAccountSelection(
         }
         const returnedIds = new Set(returned.map((item) => String(item.productId ?? '')))
         const priorById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
-        const mergedReturned = returned.map((item) => ({ ...(priorById.get(String(item.productId ?? '')) ?? {}), ...item }))
+        const mergedReturned = returned.map((item) => {
+          const prior = priorById.get(String(item.productId ?? ''))
+          // 重新通过筛选的商品不能继承上次“类目未知”等淘汰标记。
+          return { ...(prior?.skipped === true ? {} : prior ?? {}), ...item }
+        })
         completed = [...completed.filter((item) => !returnedIds.has(String(item.productId ?? ''))), ...mergedReturned]
         const returnedByProductId = new Map<string, Record<string, unknown>>(returned
           .filter((item) => String(item.productId ?? ''))
@@ -3042,7 +3523,9 @@ async function executeAccountSelection(
                 productTitle: String(switchItem.title ?? '')
               })
               await recovery.persist({
-                state: 'failed', stage: failedStage, error: reason,
+                // 登录失效不是商品本身失败；保留候选检查点，登录后可继续，避免整批被误标为已完成。
+                state: normalizedClassification === 'ACCOUNT_SWITCH_LOGIN' ? 'needs_retry' : 'failed',
+                stage: failedStage, error: reason,
                 candidates: fetched, selectedIndexes, completed
               })
             }
@@ -3246,7 +3729,8 @@ async function executeAccountSelection(
               : row),
             recoverExistingCart: true,
             refreshCandidatesById: true,
-            previewOnly: false
+            previewOnly: false,
+            closeAfterAutomation: !recovery
           }))
           if (detail.ok !== true) throw new Error(String(detail.error ?? '百应商品详情采集失败'))
           const returned = Array.isArray(detail.completed) ? detail.completed as Array<Record<string, unknown>> : []
@@ -3365,16 +3849,33 @@ async function executeAccountSelection(
       }
     }
 
+    const requestedCount = Number(settings.candidateLimit ?? 5)
+    const batchTarget = Number.isFinite(requestedCount) ? Math.max(1, Math.min(10, requestedCount)) : 5
+    const hasSkippedProduct = completed.some((item) => item.skipped === true)
+    const targetProductCount = batchTarget
+    const publishableItems = completed.filter((item) =>
+      item.skipped !== true && item.cartAdded === true && typeof item.video9x16 === 'string' && String(item.productId ?? '')
+    )
+    const publishedConfirmedCount = publishableItems.filter((item) => item.publishQueueStatus === 'published').length
+    const hasIncompletePublish = publishableItems.length < targetProductCount || publishableItems.some((item) => item.publishQueueStatus !== 'published')
     const hasIncompleteProduct = hasQuotaFailure || hasQueueFailure || completed.some((item) =>
       item.skipped !== true && (item.cartAdded !== true || typeof item.video9x16 !== 'string')
-    )
-    const productSummary = completed.map((item) =>
+    ) || hasIncompletePublish
+    const dedupeSkipped = completed.filter((item) => item.skipped === true && (
+      item.registryExcluded === true || item.mutualExclusionSkipped === true || Array.isArray(item.publishQueueTaskIds)
+    ))
+    const dedupeSkippedIds = new Set(dedupeSkipped.map((item) => String(item.productId ?? '')))
+    const productSummary = completed.filter((item) => !dedupeSkippedIds.has(String(item.productId ?? ''))).map((item) =>
       String(item.title ?? item.productId) + '：' + String(item.status ?? '已完成')
     ).join('；')
+    const dedupeSummary = dedupeSkipped.length
+      ? `商品 ID 防重跳过 ${dedupeSkipped.length} 个${dedupeSkipped.length ? `，例如：${dedupeSkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')}${dedupeSkipped.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志`
+      : ''
     const categorySummary = categoryWarnings.length
       ? `跳过可恢复的类目 / 来源读取问题 ${categoryWarnings.length} 项（原因已记录）`
       : ''
-    const summary = [categorySummary, productSummary, videoResults.length ? '处理结果：' + videoResults.join('；') : '']
+    const publishSummary = `抖音发布确认 ${publishedConfirmedCount}/${targetProductCount}`
+    const summary = [categorySummary, dedupeSummary, publishSummary, productSummary, videoResults.length ? '处理结果：' + videoResults.join('；') : '']
       .filter(Boolean).join('；')
     if (recovery) {
       if (hasCartFailure) {
@@ -3385,11 +3886,11 @@ async function executeAccountSelection(
         await recovery.persist({ state: 'completed', stage: 'completed', error: '', completed })
       }
     }
-    const requestedCount = Number(settings.candidateLimit ?? 5)
-    const batchTarget = Number.isFinite(requestedCount) ? Math.max(1, Math.min(10, requestedCount)) : 5
-    const partial = hasIncompleteProduct || quotaProducts.length < batchTarget
-    accountStatuses[targetAccountId] = partial ? '部分完成' : '完成'
-    reportSelectionProgress(targetAccountId, partial ? '当前账号处理结束，商品数量未补齐或存在待恢复商品' : '当前账号选品完成', {
+    const partial = hasIncompleteProduct || hasSkippedProduct || categoryWarnings.length > 0 || quotaProducts.length < batchTarget
+    accountStatuses[targetAccountId] = partial
+      ? `部分完成（选品 ${publishableItems.length}/${targetProductCount}，发布 ${publishedConfirmedCount}/${targetProductCount}）`
+      : `完成（选品 ${targetProductCount}/${targetProductCount}，发布 ${publishedConfirmedCount}/${targetProductCount}）`
+    reportSelectionProgress(targetAccountId, partial ? '当前账号处理结束，商品数量未补齐或存在跳过、待恢复商品' : '当前账号选品完成', {
       itemIndex: completed.length,
       itemTotal: completed.length,
       percent: partial ? null : 100,
@@ -3488,6 +3989,19 @@ async function previewCandidates(): Promise<void> {
 
 function normalizedResourcePath(value: string): string {
   return value.trim().replace(/\//g, '\\').replace(/[\\]+$/, '').toLowerCase()
+}
+
+function safePathSegment(value: unknown, fallback: string): string {
+  const segment = String(value ?? '').trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+    .replace(/[. ]+$/g, '')
+    .slice(0, 80)
+  return segment && segment !== '.' && segment !== '..' ? segment : fallback
+}
+
+function defaultAccountDownloadFolderName(accountId: number): string {
+  const accountName = accounts.value.find((account) => account.id === accountId)?.name
+  return safePathSegment(accountName, `账号-${accountId}`)
 }
 
 function stableJson(value: unknown): string {
@@ -3610,7 +4124,7 @@ async function resolveSavedEffectiveDownloadPath(accountId: number): Promise<str
   const settingsRoot = (saved.settings ?? {}) as { account?: Record<string, unknown> }
   const configuredPath = String(settingsRoot.account?.downloadPath ?? '').trim()
   const defaultRoot = (await window.api.dir.getDownloadDir()).replace(/[\\/]+$/, '')
-  const rawPath = configuredPath || `${defaultRoot}\\账号-${accountId}`
+  const rawPath = configuredPath || `${defaultRoot}\\${defaultAccountDownloadFolderName(accountId)}`
   const result = await window.api.dir.canonicalizePath(rawPath)
   if (!result.ok || !result.path) {
     throw new Error(result.error ?? `账号 ${accountId} 的当前下载目录无法解析`)
@@ -3648,7 +4162,18 @@ async function saveCandidateFetchRateLimitCheckpoint(
   pendingAccounts: Array<{ accountId: number; accountName: string }>,
   failedAccountId: number,
   reason: string
-): Promise<void> {
+): Promise<number> {
+  const previousLogs = await runRecovery(['batch', 'logs', '--batch-id', batchId])
+  const priorRateLimitCount = Array.isArray(previousLogs.runLogs)
+    ? previousLogs.runLogs.filter((entry) => {
+      const log = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {}
+      return Number(log.accountId) === failedAccountId && String(log.code ?? '') === 'BAIYING_RATE_LIMIT'
+    }).length
+    : 0
+  // 百应持续返回 11001 时避免每分钟重复请求。单账号阶梯等待，最高 15 分钟；
+  // 次数保存在批次日志里，应用重启后也能延续退避，不影响人工手动恢复。
+  const cooldownSeconds = Math.min(15 * 60, 60 * (2 ** Math.min(priorRateLimitCount, 4)))
+  const checkpointReason = `客户端自动续选冷却约 ${cooldownSeconds} 秒；${reason}`
   for (const account of pendingAccounts) {
     const isFailedAccount = account.accountId === failedAccountId
     await runRecovery([
@@ -3656,19 +4181,35 @@ async function saveCandidateFetchRateLimitCheckpoint(
     ], {
       state: isFailedAccount ? 'needs_retry' : 'queued',
       stage: 'candidate_fetch',
-      error: isFailedAccount ? reason : ''
+      error: isFailedAccount ? checkpointReason : ''
     })
   }
   await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', String(failedAccountId)], {
     stage: '获取候选',
     code: 'BAIYING_RATE_LIMIT',
-    message: toUserSelectionMessage(reason),
+    message: toUserSelectionMessage(checkpointReason),
     detail: reason
   })
   await runRecovery(['batch', 'update', '--batch-id', batchId, '--state', 'needs_retry'])
   const latest = await runRecovery(['batch', 'latest'])
   recoveryBatch.value = latest.batch as SelectionRecoveryBatch | null
   restoreSelectionCooldown(recoveryBatch.value)
+  return cooldownSeconds
+}
+
+function markSelectionWaitingForBaiyingRetry(cooldownSeconds: number): void {
+  error.value = ''
+  notice.value = `百应候选暂不可用。批次检查点已保存，约 ${cooldownSeconds} 秒后自动重试；连续失败会逐步延长等待时间。`
+  if (!selectionProgress.value) return
+  selectionProgress.value = {
+    ...selectionProgress.value,
+    state: 'finished',
+    stage: '等待百应恢复后自动续选',
+    message: notice.value,
+    itemIndex: null,
+    itemTotal: null,
+    percent: null
+  }
 }
 
 function setRecoveryAccountSelected(accountId: number, checked: boolean): void {
@@ -3751,7 +4292,25 @@ function decodeLoginPlatformResult(value: unknown, fallback: string): LoginPlatf
   }
 }
 
-async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<LoginPreflightAccount[]> {
+function appendUncheckedLoginTargets(
+  results: LoginPreflightAccount[],
+  targets: LoginPreflightTarget[],
+  startIndex: number,
+  reason: string
+): void {
+  for (const target of targets.slice(startIndex)) {
+    results.push({
+      ...target,
+      baiying: { state: 'unknown', message: reason },
+      creatorCenter: { state: 'unknown', message: reason }
+    })
+  }
+}
+
+async function checkLoginTargets(
+  targets: LoginPreflightTarget[],
+  closeAfterAutomation = true
+): Promise<LoginPreflightAccount[]> {
   const results: LoginPreflightAccount[] = []
   for (const [targetIndex, target] of targets.entries()) {
     reportSelectionProgress(target.accountId, '检查百应与创作者中心登录态', {
@@ -3771,13 +4330,26 @@ async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<Login
         baiying: { state: 'unknown', message },
         creatorCenter: { state: 'unknown', message }
       })
-      continue
+      appendUncheckedLoginTargets(
+        results,
+        targets,
+        targetIndex + 1,
+        `因账号「${target.accountName}」的浏览器配置无法确认，此账号尚未检查。`
+      )
+      reportSelectionProgress(target.accountId, '等待账号浏览器配置处理', {
+        accountIndex: targetIndex + 1,
+        accountTotal: targets.length,
+        completedAccounts: targetIndex,
+        message: `账号「${target.accountName}」的浏览器配置无法确认；已暂停后续账号检查。`
+      })
+      return results
     }
     const checkOnce = async (): Promise<LoginPreflightAccount> => {
       try {
         const response = await window.api.browser.checkAccountLogins({
           accountId: target.accountId,
-          profilePath: target.profilePath
+          profilePath: target.profilePath,
+          closeAfterAutomation
         })
         if (response.ok !== true) {
           const message = typeof response.error === 'string' ? response.error : '登录状态检查失败，无法确认。'
@@ -3821,6 +4393,21 @@ async function checkLoginTargets(targets: LoginPreflightTarget[]): Promise<Login
       percent: Math.floor((targetIndex + 1) * 100 / targets.length),
       message: `账号「${target.accountName}」登录状态检查完成（${targetIndex + 1}/${targets.length}）。`
     })
+    if (!loginTargetsPassed([checked.value])) {
+      appendUncheckedLoginTargets(
+        results,
+        targets,
+        targetIndex + 1,
+        `因账号「${target.accountName}」需要登录或验证，此账号尚未检查。`
+      )
+      reportSelectionProgress(target.accountId, '等待账号登录或验证', {
+        accountIndex: targetIndex + 1,
+        accountTotal: targets.length,
+        completedAccounts: targetIndex,
+        message: `账号「${target.accountName}」需要登录或验证；已暂停检查后续账号，窗口保留供处理。`
+      })
+      return results
+    }
   }
   return results
 }
@@ -3895,7 +4482,9 @@ function getAccountSwitchFailure(result: LoginPreflightAccount[]): AccountSwitch
 async function collectAccountSwitchFailures(
   targets: LoginPreflightTarget[],
   batchId: string | null,
-  scopeFingerprint?: string
+  scopeFingerprint?: string,
+  closeAfterAutomation = true,
+  batchAlreadyCreated = false
 ): Promise<Map<number, AccountSwitchFailure>> {
   const fingerprint = loginPreflightFingerprint(batchId, targets)
   if (verifiedLoginPreflight?.fingerprint === fingerprint && verifiedLoginPreflight.expiresAt > Date.now()) {
@@ -3903,7 +4492,7 @@ async function collectAccountSwitchFailures(
     return new Map()
   }
   verifiedLoginPreflight = null
-  const results = await checkLoginTargets(targets)
+  const results = await checkLoginTargets(targets, closeAfterAutomation)
   if (scopeFingerprint && results.some((item) => isUnconfirmedLoginFalseNegative(item))) {
     loginPreflight.value = {
       batchId,
@@ -3920,7 +4509,9 @@ async function collectAccountSwitchFailures(
         ...selectionProgress.value,
         state: 'finished',
         stage: '等待确认账号登录状态',
-        message: `账号「${unconfirmed}」页面已打开但工作台未能确认；请在账号专属浏览器核实后重新检查或手动确认。尚未创建或修改批次。`,
+        message: batchAlreadyCreated
+          ? `账号「${unconfirmed}」的登录状态暂时无法确认；批次已保存，当前账号暂停，后续账号未启动。请处理后重新检查。`
+          : `账号「${unconfirmed}」页面已打开但工作台未能确认；请在账号专属浏览器核实后重新检查或手动确认。尚未创建或修改批次。`,
         percent: null
       }
     }
@@ -3947,7 +4538,9 @@ async function collectAccountSwitchFailures(
         ...selectionProgress.value,
         state: 'finished',
         stage: '等待账号登录或验证',
-        message: `账号「${blockedAccounts}」的百应或创作者中心需要登录/验证；尚未创建或修改批次。请先处理后重新检查。`,
+        message: batchAlreadyCreated
+          ? `账号「${blockedAccounts}」的百应或创作者中心需要登录/验证；批次已保存，当前账号暂停，后续账号未启动。请先处理后重新检查。`
+          : `账号「${blockedAccounts}」的百应或创作者中心需要登录/验证；尚未创建或修改批次。请先处理后重新检查。`,
         percent: null
       }
     }
@@ -4018,7 +4611,9 @@ async function recheckSelectionLogins(): Promise<void> {
           percent: 100
         }
       }
-      notice.value = '所选账号的百应和创作者中心均已确认登录。请点击「继续选品」重新开始；客户端会再次展示账号范围确认。'
+      notice.value = current.batchId
+        ? '当前账号的百应和创作者中心均已确认登录。点击「继续选品」后会从该账号继续，其他账号仍按顺序等待。'
+        : '所选账号的百应和创作者中心均已确认登录。请点击「继续选品」重新开始；客户端会再次展示账号范围确认。'
     } else if (selectionProgress.value) {
       selectionProgress.value = {
         ...selectionProgress.value,
@@ -4365,39 +4960,6 @@ async function runSelectionBatch(): Promise<void> {
           '）；本次没有恢复或修改批次。'
         )
       }
-      let validationBatch = batch
-      if (Object.keys(recoveryDownloadPathUpdates).length) {
-        const validationContexts = {
-          ...((batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>)
-        }
-        for (const [accountId, downloadPath] of Object.entries(recoveryDownloadPathUpdates)) {
-          const context = validationContexts[accountId]
-          if (context) validationContexts[accountId] = { ...context, downloadPath }
-        }
-        validationBatch = {
-          ...batch,
-          payload: { ...batch.payload, accountContexts: validationContexts }
-        }
-      }
-      const storedValidation = refreshableUpdate ? null : await validateRecoveryContexts(validationBatch)
-      const storedContexts = (batch.payload.accountContexts ?? {}) as Record<string, AccountRunContext>
-      const preflightTargets = selectedPendingAccounts.map((item) => {
-        const currentAccount = currentById.get(item.accountId)
-        const context = refreshableUpdate?.freshContexts[String(item.accountId)] ?? storedValidation?.contexts.get(item.accountId) ?? storedContexts[String(item.accountId)]
-        return {
-          accountId: item.accountId,
-          accountName: currentAccount?.name ?? item.accountName,
-          profilePath: context?.profilePath,
-          resolvedProfilePath: context?.resolvedProfilePath,
-          contextError: storedValidation?.errors.get(item.accountId) ?? (!context ? '恢复批次缺少账号浏览器配置快照。' : undefined)
-        }
-      })
-      for (const [accountId, failure] of await collectAccountSwitchFailures(
-        preflightTargets, batch.batchId, recoveryScopeFingerprint
-      )) {
-        accountSwitchFailures.set(accountId, failure)
-      }
-      if (loginPreflight.value) return
       if (Object.keys(recoveryDownloadPathUpdates).length) {
         const updated = await runRecovery([
           'batch', 'update-download-paths', '--batch-id', batch.batchId
@@ -4406,72 +4968,22 @@ async function runSelectionBatch(): Promise<void> {
         recoveryBatch.value = batch
         notice.value = '已将所选待恢复账号的详情图补采和新视频输出目录更新为当前设置；已有素材文件保留原位。'
       }
-      const existingCandidatePlan = batch.payload.candidatePlan as Record<string, AccountCandidatePlan> | undefined
-      const candidatePlanAccounts = selectedPendingAccounts.filter((item) => !accountSwitchFailures.has(item.accountId))
-      const selectedPlanMissing = candidatePlanAccounts.some((item) =>
-        !existingCandidatePlan || !Object.prototype.hasOwnProperty.call(existingCandidatePlan, String(item.accountId))
-      )
-      const shouldRefreshCandidatePlan = Boolean(candidatePlanAccounts.length > 0 && refreshableUpdate &&
-        (refreshableUpdate.settingsChanged || selectedPlanMissing))
-      if (shouldRefreshCandidatePlan && refreshableUpdate) {
-        const pendingRows = candidatePlanAccounts.map((item) => {
-          const current = accounts.value.find((account) => account.id === item.accountId)
-          return { id: item.accountId, name: current?.name ?? item.accountName, status: 'active' }
-        })
-        const freshContextMap = new Map<number, AccountRunContext>(pendingRows.flatMap((account) => {
-          const context = refreshableUpdate.freshContexts[String(account.id)]
-          return context ? [[account.id, context] as const] : []
-        }))
-        let candidatePlans: Map<number, AccountCandidatePlan>
-        let reusedPreviewPool = false
-        try {
-          const reusablePlans = reusablePreviewCandidatePlans(pendingRows, freshContextMap)
-          reusedPreviewPool = reusablePlans.size > 0
-          candidatePlans = await prepareBatchCandidatePlans(
-            pendingRows, freshContextMap, undefined, undefined, accountSwitchFailures, reusablePlans
-          )
-        } catch (cause) {
-          if (toUserSelectionError(cause).classification === 'BAIYING_RATE_LIMIT') {
-            const reason = String(cause instanceof Error ? cause.message : cause)
-            const retryableCandidateAccounts = candidatePlanAccounts.filter((item) => !accountSwitchFailures.has(item.accountId))
-            const reportedAccountId = selectionProgress.value?.accountId
-            const failedAccountId = retryableCandidateAccounts.find((item) => item.accountId === reportedAccountId)?.accountId ??
-              retryableCandidateAccounts[0]?.accountId
-            if (failedAccountId !== undefined && retryableCandidateAccounts.length) {
-              await saveCandidateFetchRateLimitCheckpoint(
-                batch.batchId,
-                retryableCandidateAccounts.map((item) => ({ accountId: item.accountId, accountName: item.accountName })),
-                failedAccountId,
-                reason
-              )
-            }
-          }
-          throw cause
-        }
+      if (refreshableUpdate?.settingsChanged) {
         const payload = {
           ...batch.payload,
-          ...(refreshableUpdate.settingsChanged ? {
-            settingsSnapshot: refreshableUpdate.currentSnapshot,
-            accountContexts: refreshableUpdate.freshContexts,
-            reviewedAccountId: null,
-            reviewedProductIds: null
-          } : {}),
-          candidatePlan: {
-            ...(existingCandidatePlan ?? {}),
-            ...candidatePlansForBatchPayload(candidatePlans)
-          }
+          settingsSnapshot: refreshableUpdate.currentSnapshot,
+          accountContexts: refreshableUpdate.freshContexts,
+          reviewedAccountId: null,
+          reviewedProductIds: null,
+          candidatePlan: {}
         }
         const refreshed = await runRecovery([
           'batch', 'refresh-candidates', '--batch-id', batch.batchId
         ], payload)
         batch = refreshed.batch as SelectionRecoveryBatch
-        if (reusedPreviewPool) {
-          previewCandidatePool.value = null
-          previewCandidatePoolCount.value = 0
-        }
-        notice.value = refreshableUpdate.settingsChanged
-          ? '上次失败发生在候选查询，尚未加车；已按当前设置刷新检查点、候选计划和下载路径。'
-          : '旧批次尚未保存统一候选计划；已只读采集候选并写入跨账号互斥计划。'
+        previewCandidatePool.value = null
+        previewCandidatePoolCount.value = 0
+        notice.value = '上次失败发生在候选查询，尚未加车；已按当前设置刷新检查点。账号浏览器会在轮到该账号时再打开。'
       }
       snapshot = batch.payload.settingsSnapshot as Record<string, unknown>
       if (!snapshot || typeof snapshot !== 'object') throw new Error('恢复批次缺少设置快照，任务已保留。')
@@ -4528,7 +5040,7 @@ async function runSelectionBatch(): Promise<void> {
       if (!confirmSelectionScope(newBatchScopeFingerprint,
         `本批次将依次运行以下全部启用账号：\n\n${batchAccountSummary}\n\n` +
         `素材保存根目录（每账号独立，后续按日期和商品名称分层）：\n${batchPathSummary}\n\n` +
-        '请确认账号登录态和保存路径。重点类目将由系统按百应当前可见商品数据自动推荐。'
+        '每次只启动当前账号的浏览器；登录状态将在轮到该账号时检查，完成选品和发布处理并关闭浏览器后才会启动下一个账号。重点类目将由系统按百应当前可见商品数据自动推荐。'
       )) {
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '已取消启动',
@@ -4536,22 +5048,6 @@ async function runSelectionBatch(): Promise<void> {
         }
         return
       }
-      const preflightTargets = enabled.map((account) => {
-        const context = contexts.get(account.id)
-        return {
-          accountId: account.id,
-          accountName: account.name,
-          profilePath: context?.profilePath,
-          resolvedProfilePath: context?.resolvedProfilePath,
-          contextError: context ? undefined : '未能解析该账号专属浏览器配置。'
-        }
-      })
-      for (const [accountId, failure] of await collectAccountSwitchFailures(
-        preflightTargets, null, newBatchScopeFingerprint
-      )) {
-        accountSwitchFailures.set(accountId, failure)
-      }
-      if (loginPreflight.value) return
       reviewedAccountId = candidateSelectionCustomized.value &&
         previewAccountId.value !== null && previewAccountId.value === accountId.value
         ? previewAccountId.value : null
@@ -4564,55 +5060,16 @@ async function runSelectionBatch(): Promise<void> {
         accountContexts: Object.fromEntries([...contexts].map(([id, context]) => [String(id), context])),
         reviewedAccountId,
         reviewedProductIds: reviewedProducts ? [...reviewedProducts] : null,
-        candidatePlan: null,
+        candidatePlan: {},
         accounts: enabled.map((account) => ({ id: account.id, name: account.name }))
       }
-      let candidatePlans: Map<number, AccountCandidatePlan>
-      const candidatePlanAccounts = enabled.filter((account) => !accountSwitchFailures.has(account.id))
-      try {
-        const reusablePlans = reusablePreviewCandidatePlans(candidatePlanAccounts, contexts)
-        candidatePlans = candidatePlanAccounts.length
-          ? await prepareBatchCandidatePlans(
-            candidatePlanAccounts, contexts, reviewedAccountId, reviewedProducts, accountSwitchFailures, reusablePlans
-          )
-          : new Map()
-      } catch (cause) {
-        if (toUserSelectionError(cause).classification === 'BAIYING_RATE_LIMIT') {
-          const reason = String(cause instanceof Error ? cause.message : cause)
-          const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
-          batch = created.batch as SelectionRecoveryBatch
-          const retryableCandidateAccounts = candidatePlanAccounts.filter((account) => !accountSwitchFailures.has(account.id))
-          const reportedAccountId = selectionProgress.value?.accountId
-          const failedAccountId = retryableCandidateAccounts.find((account) => account.id === reportedAccountId)?.id ??
-            retryableCandidateAccounts[0]?.id
-          if (failedAccountId !== undefined && retryableCandidateAccounts.length) {
-            await saveCandidateFetchRateLimitCheckpoint(
-              batchId,
-              retryableCandidateAccounts.map((account) => ({ accountId: account.id, accountName: account.name })),
-              failedAccountId,
-              reason
-            )
-          }
-          for (const [accountId, failure] of accountSwitchFailures) {
-            await runRecovery(['account', 'update', '--batch-id', batchId, '--account-id', String(accountId)], {
-              state: 'failed', stage: 'account_preflight', error: failure.reason
-            })
-            await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', String(accountId)], {
-              stage: failure.stage, code: failure.classification,
-              message: failure.message, detail: failure.detail
-            })
-          }
-        }
-        throw cause
+      selectionProgress.value = {
+        ...selectionProgress.value!,
+        stage: '保存选品批次',
+        message: '账号和资源配置已核对；候选查询将在轮到每个账号时进行。'
       }
-      preparedCandidatePlans = candidatePlansForBatchPayload(candidatePlans)
-      payload.candidatePlan = preparedCandidatePlans
       const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
       batch = created.batch as SelectionRecoveryBatch
-      if (previewCandidatePool.value && candidatePlanAccounts.some((account) => account.id === previewCandidatePool.value?.accountId)) {
-        previewCandidatePool.value = null
-        previewCandidatePoolCount.value = 0
-      }
       recoveryBatch.value = batch
     }
 
@@ -4645,7 +5102,7 @@ async function runSelectionBatch(): Promise<void> {
       accountTotal: activeTaskAccounts.length,
       completedAccounts: 0,
       stage: '开始顺序处理账号',
-      message: `本轮将${resumePriorityAccountId !== null ? '优先恢复限流账号、再按账号 ID 顺序处理' : '按账号 ID 顺序处理'} ${activeTaskAccounts.length} 个启用账号。`,
+      message: `本轮将${resumePriorityAccountId !== null ? '优先恢复限流账号、再按账号 ID 顺序处理' : '按账号 ID 顺序处理'} ${activeTaskAccounts.length} 个启用账号；只启动当前账号浏览器，完成选品发布并关闭后再切换。`,
       itemIndex: null,
       itemTotal: null,
       percent: null
@@ -4700,7 +5157,6 @@ async function runSelectionBatch(): Promise<void> {
       async (account) => {
         const task = persistedAccounts.find((item) => item.accountId === account.id)
         if (!task) throw new Error('恢复批次中找不到该账号任务。')
-        if (task.state === 'completed') return { status: '完成' as const, message: '已完成，跳过重复执行' }
         const persist = async (patch: Record<string, unknown>): Promise<void> => {
           const saved = await runRecovery([
             'account', 'update', '--batch-id', batchId, '--account-id', String(account.id)
@@ -4716,18 +5172,17 @@ async function runSelectionBatch(): Promise<void> {
             runLogWarning.value = '选品过程日志写入失败：' + conciseFailureMessage(cause)
           }
         }
-        const logFailure = appendAccountLog
-        const switchFailure = accountSwitchFailures.get(account.id)
-        if (switchFailure) {
-          await logFailure({
-            stage: switchFailure.stage,
-            code: switchFailure.classification,
-            message: switchFailure.message,
-            detail: switchFailure.detail
-          })
-          await persist({ state: 'failed', stage: 'account_preflight', error: switchFailure.reason })
-          throw new Error(switchFailure.reason)
+        const appendAccountLogs = async (entries: SelectionRunLogInput[]): Promise<void> => {
+          if (!entries.length) return
+          try {
+            await runRecovery([
+              'log', 'append-batch', '--batch-id', batchId, '--account-id', String(account.id)
+            ], entries)
+          } catch (cause) {
+            runLogWarning.value = '选品过程日志批量写入失败：' + conciseFailureMessage(cause)
+          }
         }
+        const logFailure = appendAccountLog
         const contextError = contextErrors.get(account.id)
         if (contextError) {
           await logFailure({
@@ -4744,43 +5199,197 @@ async function runSelectionBatch(): Promise<void> {
           await persist({ state: 'needs_retry', stage: task.stage || 'profile_check', error: reason })
           throw new Error(reason)
         }
+        if (task.state === 'completed') {
+          try {
+            await window.api.browser.closeAccount({ accountId: account.id, profilePath: context.profilePath })
+          } catch (cause) {
+            const reason = String(cause instanceof Error ? cause.message : cause)
+            await appendAccountLog({
+              stage: '关闭账号浏览器', code: 'ACCOUNT_BROWSER_CLOSE_FAILED',
+              message: '已完成账号的专属浏览器未能关闭；为避免同时打开多个账号窗口，批次已暂停。',
+              detail: reason
+            })
+            return {
+              status: '部分完成' as const,
+              message: '已完成账号的浏览器未能关闭；后续账号尚未启动。',
+              continueBatch: false
+            }
+          }
+          return { status: '完成' as const, message: '已完成，跳过重复执行' }
+        }
+
+        let keepBrowserOpenForLogin = false
+        let accountOutcome: { status: '完成' | '部分完成'; message?: string; continueBatch?: boolean } | null = null
+        let accountFailure: unknown = null
+        let accountSkipped = false
+        let browserCloseFailure = ''
+        let pauseAfterAccount = false
         try {
-          await appendAccountLog({
-            stage: '账号选品', code: 'INFO_ACCOUNT_STARTED',
-            message: `开始处理账号「${account.name}」。`
+          await persist({ state: 'in_progress', stage: 'account_preflight', error: '' })
+          const target: LoginPreflightTarget = {
+            accountId: account.id,
+            accountName: account.name,
+            profilePath: context.profilePath,
+            resolvedProfilePath: context.resolvedProfilePath,
+            contextError: undefined
+          }
+          const accountScopeFingerprint = stableJson({
+            kind: 'batch-account-login',
+            batchId,
+            accountId: account.id,
+            profilePath: context.resolvedProfilePath ?? context.profilePath
           })
-          await persist({ state: 'in_progress', error: '' })
-          const outcome = await executeAccountSelection(
-            account.id,
-            false,
-            batchPayload.settingsSnapshot as Record<string, unknown>,
-            account.id === persistedReviewedAccountId ? persistedReviewedProducts : undefined,
-            context,
-            { batchId, state: task, persist, logFailure, logEvent: appendAccountLog },
-            persistedReviewedAccountId,
-            batchCandidatePlans[String(account.id)]
+          const loginFailures = await collectAccountSwitchFailures(
+            [target], batchId, accountScopeFingerprint, false, true
           )
-          await appendAccountLog({
-            stage: '账号选品',
-            code: outcome.status === '完成' ? 'SUCCESS_ACCOUNT_COMPLETED' : 'WARNING_ACCOUNT_PARTIAL',
-            message: `账号处理${outcome.status}。${outcome.message ? conciseFailureMessage(outcome.message) : ''}`,
-            detail: outcome.message ?? ''
-          })
-          return outcome
+          const waitingForLogin = loginPreflight.value?.batchId === batchId &&
+            loginPreflight.value.accounts.some((item) => item.accountId === account.id)
+          if (waitingForLogin) {
+            const reason = '当前账号需要完成登录或安全验证；批次已保存，后续账号尚未启动。'
+            await appendAccountLog({
+              stage: '账号登录预检', code: 'ACCOUNT_LOGIN_CONFIRMATION_REQUIRED',
+              message: reason, detail: reason
+            })
+            await persist({ state: 'needs_retry', stage: 'queued', error: reason })
+            keepBrowserOpenForLogin = false
+            accountOutcome = { status: '部分完成', message: reason, continueBatch: true }
+          } else {
+            const switchFailure = loginFailures.get(account.id) ?? accountSwitchFailures.get(account.id)
+            if (switchFailure) {
+              await logFailure({
+                stage: switchFailure.stage,
+                code: switchFailure.classification,
+                message: switchFailure.message,
+                detail: switchFailure.detail
+              })
+              await persist({ state: 'failed', stage: 'account_preflight', error: switchFailure.reason })
+              throw new Error(switchFailure.reason)
+            }
+            await appendAccountLog({
+              stage: '账号选品', code: 'INFO_ACCOUNT_STARTED',
+              message: `开始处理账号「${account.name}」；此前未启动其他账号浏览器。`
+            })
+            await persist({ state: 'in_progress', error: '' })
+            let candidatePlan: AccountCandidatePlan | undefined = batchCandidatePlans[String(account.id)]
+            if (!candidatePlan && !task.candidates?.length && !task.selectedIndexes?.length) {
+              await persist({ state: 'in_progress', stage: 'candidate_fetch', error: '' })
+              const reusablePlans = reusablePreviewCandidatePlans([account], contexts)
+              const plans = await prepareBatchCandidatePlans(
+                [account],
+                contexts,
+                account.id === persistedReviewedAccountId ? persistedReviewedAccountId : undefined,
+                account.id === persistedReviewedAccountId ? persistedReviewedProducts : undefined,
+                undefined,
+                reusablePlans,
+                batchId,
+                true
+              )
+              candidatePlan = plans.get(account.id)
+              if (previewCandidatePool.value?.createdByAccountId === account.id && reusablePlans.size) {
+                previewCandidatePool.value = null
+                previewCandidatePoolCount.value = 0
+              }
+            }
+            const executed = await executeAccountSelection(
+              account.id,
+              false,
+              batchPayload.settingsSnapshot as Record<string, unknown>,
+              account.id === persistedReviewedAccountId ? persistedReviewedProducts : undefined,
+              context,
+              { batchId, state: task, persist, logFailure, logEvent: appendAccountLog, logEvents: appendAccountLogs },
+              persistedReviewedAccountId,
+              candidatePlan
+            )
+            // 某个商品需要后续重试时，当前账号仍已处理完并关闭窗口；继续处理下一个账号。
+            // 保留账号任务对“当前账号必须停留/跳过”的决定；不能把候选不足、结果不明或账号级隔离强行改成继续。
+            accountOutcome = { ...executed, continueBatch: executed.continueBatch }
+            await appendAccountLog({
+              stage: '账号选品',
+              code: accountOutcome.status === '完成' ? 'SUCCESS_ACCOUNT_COMPLETED' : 'WARNING_ACCOUNT_PARTIAL',
+              message: `账号处理${accountOutcome.status}。${accountOutcome.message ? conciseFailureMessage(accountOutcome.message) : ''}`,
+              detail: accountOutcome.message ?? ''
+            })
+          }
         } catch (cause) {
           const reason = String(cause instanceof Error ? cause.message : cause)
+          accountFailure = cause
+          const classification = toUserSelectionError(cause).classification
+          pauseAfterAccount = classification === 'BAIYING_RATE_LIMIT'
+          accountSkipped = [
+            'ACCOUNT_SWITCH_CAPTCHA', 'ACCOUNT_SWITCH_LOGIN', 'ACCOUNT_SWITCH_DISCONNECT',
+            'LOGIN_OR_PAGE_STATE_UNCONFIRMED'
+          ].includes(String(classification ?? '')) || /权限不足|无权限|未授权|广告主.*不可见/.test(reason)
           if (task.state !== 'failed' && task.state !== 'needs_retry') {
-            await logFailure({
-              stage: task.stage || '账号任务', code: 'ACCOUNT_TASK_FAILED',
-              message: '账号任务失败：' + conciseFailureMessage(reason), detail: reason
-            })
-            await persist({ state: 'failed', stage: task.stage || 'account_run', error: reason })
+            if (classification === 'BAIYING_RATE_LIMIT') {
+              await logFailure({
+                stage: '获取候选', code: 'BAIYING_RATE_LIMIT',
+                message: toUserSelectionMessage(reason), detail: reason
+              })
+              await persist({ state: 'needs_retry', stage: task.stage || 'candidate_fetch', error: reason })
+            } else if (accountSkipped) {
+              await logFailure({
+                stage: '账号隔离跳过', code: String(classification || 'ACCOUNT_SKIPPED'),
+                message: '当前账号已隔离跳过，继续后续账号：' + conciseFailureMessage(reason), detail: reason
+              })
+              await persist({ state: 'failed', stage: 'account_skipped', error: reason })
+              accountFailure = null
+              accountOutcome = { status: '部分完成', message: `账号已隔离跳过：${reason}`, continueBatch: true }
+            } else {
+              await logFailure({
+                stage: task.stage || '账号任务', code: 'ACCOUNT_TASK_FAILED',
+                message: '账号任务失败：' + conciseFailureMessage(reason), detail: reason
+              })
+              await persist({ state: 'failed', stage: task.stage || 'account_run', error: reason })
+            }
           }
-          throw cause
         }
+        if (!keepBrowserOpenForLogin) {
+          try {
+            const closed = await window.api.browser.closeAccount({ accountId: account.id, profilePath: context.profilePath })
+            if (closed.ok !== true) throw new Error('客户端没有确认账号专属浏览器关闭')
+          } catch (cause) {
+            browserCloseFailure = String(cause instanceof Error ? cause.message : cause)
+            await appendAccountLog({
+              stage: '关闭账号浏览器', code: 'ACCOUNT_BROWSER_CLOSE_FAILED',
+              message: '当前账号的专属浏览器未能关闭；为避免同时打开多个账号窗口，批次已暂停。',
+              detail: browserCloseFailure
+            })
+          }
+        }
+        if (browserCloseFailure) {
+          const primaryFailure = accountFailure
+            ? String(accountFailure instanceof Error ? accountFailure.message : accountFailure)
+            : ''
+          if (task.state !== 'completed') {
+            await persist({
+              state: 'needs_retry',
+              stage: task.stage || 'queued',
+              error: [primaryFailure, '账号浏览器关闭失败：' + browserCloseFailure].filter(Boolean).join('；')
+            })
+          }
+          return {
+            status: accountFailure ? '失败' as const : '部分完成' as const,
+            message: [primaryFailure, '账号浏览器关闭失败：' + browserCloseFailure, '后续账号尚未启动。']
+              .filter(Boolean).join('；'),
+            continueBatch: false
+          }
+        }
+        if (accountFailure) {
+          if (pauseAfterAccount) {
+            return {
+              status: '失败',
+              message: String(accountFailure instanceof Error ? accountFailure.message : accountFailure),
+              continueBatch: false
+            }
+          }
+          throw accountFailure
+        }
+        return accountOutcome ?? { status: '部分完成' as const, message: '当前账号没有返回处理结果。' }
       },
       (account, status) => {
-        accountStatuses[account.id] = status
+        if (!(status === '部分完成' && accountStatuses[account.id]?.startsWith('needs_retry'))) {
+          accountStatuses[account.id] = status
+        }
         const accountIndex = activeTaskAccounts.findIndex((item) => item.id === account.id) + 1
         if (['完成', '部分完成', '失败'].includes(status)) handledAccountIds.add(account.id)
         const isCurrent = status === '执行中' || status === '失败' || status === '完成' || status === '部分完成'
@@ -4813,7 +5422,8 @@ async function runSelectionBatch(): Promise<void> {
           percent: stagePercent
         }
       },
-      resumePriorityAccountId
+      resumePriorityAccountId,
+      true
     )
     const finalBatchState = getSelectionBatchFinalState(persistedAccounts)
     const allComplete = finalBatchState === 'completed'
@@ -4824,14 +5434,23 @@ async function runSelectionBatch(): Promise<void> {
     const failed = outcomes.filter((item) => item.status === '失败')
     const skipped = outcomes.filter((item) => item.status === '未执行').length
     const waiting = persistedAccounts.filter((item) => item.state !== 'completed').length
+    const confirmedCartProductKeys = new Set<string>()
+    for (const account of persistedAccounts) {
+      for (const item of account.completed ?? []) {
+        const productId = String(item.productId ?? '').trim()
+        if (item.cartAdded === true && productId) confirmedCartProductKeys.add(`${account.accountId}:${productId}`)
+      }
+    }
+    const confirmedCartProductCount = confirmedCartProductKeys.size
     await appendBatchLog({
       stage: '批次结果',
       code: allComplete ? 'SUCCESS_BATCH_COMPLETED' : terminalFailed ? 'ERROR_BATCH_FAILED' : 'WARNING_BATCH_NEEDS_RETRY',
-      message: `本轮结束：完成 ${succeeded} 个账号，部分完成 ${partial} 个，失败 ${failed.length} 个，未执行 ${skipped} 个；${allComplete ? '批次已完成。' : terminalFailed ? '本批次已失败结束，原因已记录。' : `还有 ${waiting} 个账号待恢复。`}`
+      message: `本轮结束：确认加车 ${confirmedCartProductCount} 个商品；完成 ${succeeded} 个账号，部分完成 ${partial} 个，失败 ${failed.length} 个，未执行 ${skipped} 个；${allComplete ? '批次已完成。' : terminalFailed ? '本批次已失败结束，原因已记录。' : `还有 ${waiting} 个账号待恢复。`}`
     })
     notice.value = (allComplete ? '批次完成。' : terminalFailed ? '本批次失败结束，原因已记录，可修正后启动新批次。' : '批次已保存，尚有 ' + waiting + ' 个账号任务待恢复。') +
       '本批次账号 ' + outcomes.length + ' 个：完成 ' + succeeded +
       ' 个，部分完成 ' + partial + ' 个，失败 ' + failed.length + ' 个，未执行 ' + skipped + ' 个。' +
+      '确认加入选品车 ' + confirmedCartProductCount + ' 个商品。' +
       outcomes.map((item) => item.accountName + '：' + item.status).join('；')
     const rateLimitedAccount = persistedAccounts.find((item) =>
       item.state === 'needs_retry' &&
@@ -4863,11 +5482,12 @@ async function runSelectionBatch(): Promise<void> {
       accountIndex: activeTaskAccounts.length,
       accountTotal: activeTaskAccounts.length,
       completedAccounts: outcomes.filter((item) => item.status !== '未执行').length,
-      stage: allComplete ? '选品批次处理完成' : terminalFailed ? '选品批次失败结束' : '本轮处理结束，部分账号待恢复',
-      message: `已处理 ${outcomes.filter((item) => item.status !== '未执行').length}/${activeTaskAccounts.length} 个账号；完成 ${succeeded}，部分完成 ${partial}，失败 ${failed.length}，未执行 ${skipped}。${terminalFailed ? '本批次已结束，无待恢复任务。' : ''}`,
+      stage: allComplete ? '选品流程已结束' : terminalFailed ? '选品批次失败结束' : '本轮处理结束，部分账号待恢复',
+      message: `已处理 ${outcomes.filter((item) => item.status !== '未执行').length}/${activeTaskAccounts.length} 个账号；确认加入选品车 ${confirmedCartProductCount} 个商品；完成 ${succeeded}，部分完成 ${partial}，失败 ${failed.length}，未执行 ${skipped}。${terminalFailed ? '本批次已结束，无待恢复任务。' : ''}`,
       itemIndex: null,
       itemTotal: null,
-      percent: allComplete ? 100 : null
+      percent: allComplete ? 100 : null,
+      resultSummary: `本批次确认加入选品车 ${confirmedCartProductCount} 个商品；上方流程百分比表示步骤完成度。`
     }
     const latestAfterRun = await runRecovery(['batch', 'latest'])
     if (latestAfterRun.batch) {
@@ -4934,6 +5554,23 @@ async function runSelectionBatch(): Promise<void> {
 }
 
 const runSelectionBatchOnce = createSingleFlight(runSelectionBatch)
+
+function discardUnsavedAccountPaths(): void {
+  accountDraft.browserProfilePath = savedAccountPaths.browserProfilePath
+  accountDraft.downloadPath = savedAccountPaths.downloadPath
+  error.value = ''
+}
+
+async function startSelectionFromButton(): Promise<void> {
+  if (accountPathsHaveUnsavedChanges.value) {
+    if (accountId.value === null) {
+      error.value = '请先选择账号，再开始选品。'
+      return
+    }
+    if (!await saveAccount()) return
+  }
+  await startSelection()
+}
 
 async function startSelection(): Promise<boolean> {
   const autoStartBatchId = automaticResumeBatchId
@@ -5373,7 +6010,34 @@ onUnmounted(() => {
             <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode" value="category" :disabled="busy"> 品类模式</label>
           </div>
           <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目）' }}。</p>
-          <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用通用设置中的 {{ selectedCategoryCount(global.excludedCategorySelection) }} 个排除类目。</p>
+          <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用本账号设置中的 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 个排除类目。</p>
+          <p v-else class="hint">该账号使用品类模式；下方排除类目会在选定的品类范围内继续生效。</p>
+          <details v-if="accountDraft.selectionMode !== 'inherit'" class="category-picker">
+            <summary>排除类目（本账号）· 已选 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 项</summary>
+            <p class="hint">只影响当前账号；选中上级类目时会排除其下级。账号沿用通用模式时，请到通用设置调整排除类目。</p>
+            <div class="category-grid">
+              <div v-for="(group, index) in [level1Options, accountExcludedLevel2Options, accountExcludedLevel3Options]" :key="index" class="category-level">
+                <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
+                <div class="category-options">
+                  <label v-for="item in group" :key="item.id" class="category-option">
+                    <input
+                      type="checkbox"
+                      :checked="accountDraft.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
+                      :disabled="busy"
+                      @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', ($event.target as HTMLInputElement).checked)"
+                    >
+                    <span>{{ item.name }}</span>
+                  </label>
+                  <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                </div>
+                <div class="mini-actions">
+                  <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'all')">全选</button>
+                  <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'invert')">反选</button>
+                  <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'clear')">清空</button>
+                </div>
+              </div>
+            </div>
+          </details>
           <template v-if="accountDraft.selectionMode === 'category' || (accountDraft.selectionMode === 'inherit' && global.selectionMode === 'category')">
           <div class="category-mode-options" role="group" aria-label="账号品类筛选策略">
             <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode" value="inherit" :disabled="busy"> 沿用通用设置</label>
@@ -5445,8 +6109,11 @@ onUnmounted(() => {
         </section>
         <section class="card">
           <h2>账号路径</h2>
-          <label class="path-field">浏览器缓存路径<div><input v-model="accountDraft.browserProfilePath" :disabled="busy" placeholder="留空使用此账号的独立 profile"><button class="btn" :disabled="busy" @click="chooseProfilePath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
-          <label class="path-field">账号下载路径<div><input v-model="accountDraft.downloadPath" :disabled="busy" placeholder="留空使用此账号的独立下载目录"><button class="btn" :disabled="busy" @click="chooseDownloadPath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+          <label class="path-field">视频保存位置<div><input v-model="accountDraft.downloadPath" :disabled="busy" placeholder="留空使用软件默认位置"><button class="btn" :disabled="busy" @click="chooseDownloadPath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+          <details class="compact-help browser-profile-advanced" :open="Boolean(accountDraft.browserProfilePath) || undefined"><summary>浏览器登录资料（{{ accountDraft.browserProfilePath ? '已自定义' : '使用默认' }}，一般无需修改）</summary>
+            <label class="path-field">浏览器登录资料文件夹<div><input v-model="accountDraft.browserProfilePath" :disabled="busy" placeholder="留空使用软件默认位置"><button class="btn" :disabled="busy" @click="chooseProfilePath">选择文件夹</button><button class="btn" :disabled="busy" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
+            <p class="hint">这里不是视频保存位置。自定义文件夹必须包含 Chrome 的 Default 文件夹；不确定时请点“恢复默认”。</p>
+          </details>
           <p v-if="accountPathsHaveUnsavedChanges" class="hint warning">路径有未保存修改；新批次仍会使用上次保存的目录。点击下方“保存”后才生效；已有素材不会移动，已开始处理的恢复批次沿用原路径。</p>
           <p class="hint warning">百应、抖音授权与账号自动操作共用该账号 profile。自定义目录必须包含 Default；路径变更后先保存，再刷新类目或打开授权。账号下载目录与其他账号隔离。</p>
         </section>
@@ -5459,19 +6126,32 @@ onUnmounted(() => {
   </section>
 
   <section v-else class="selection-page">
+    <Teleport to="body">
+      <div v-if="selectionSettingsDialogOpen" class="selection-settings-dialog-backdrop" @click="closeSelectionSettingsDialog" @keydown.esc.window.stop="closeSelectionSettingsDialog"></div>
+    </Teleport>
     <header class="page-head">
       <div>
-        <h1>选品设置与自动选品</h1>
-        <p>三源候选去重 · 按账号设置路径和限额</p>
+        <h1>开始选品</h1>
+        <p>按已保存的规则，为启用账号自动挑选商品</p>
       </div>
       <div class="head-actions">
-        <button class="btn" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="activeTab === '通用设置' ? saveGlobal() : saveAccount()">{{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}</button>
-        <button class="btn" :disabled="busy" @click="previewCandidates">预览候选</button>
-        <button class="btn primary" :disabled="busy || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelection()">
-          {{ selectionCooldownRemaining > 0 ? `冷却中（${selectionCooldownRemaining} 秒）` : recoveryBatch?.state === 'needs_retry' ? '继续选品' : '自动选品一起工作' }}
+        <button class="btn" type="button" :disabled="busy" title="在当前客户端内打开居中设置面板" @click="openSelectionSettingsDialog">打开设置面板</button>
+        <button class="btn primary" :disabled="busy || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelectionFromButton">
+          {{ selectionCooldownRemaining > 0 ? `冷却中（${selectionCooldownRemaining} 秒）` : accountPathsHaveUnsavedChanges ? '保存设置并开始选品' : recoveryBatch?.state === 'needs_retry' ? '继续选品' : '自动选品一起工作' }}
         </button>
       </div>
     </header>
+    <div v-if="accountPathsHaveUnsavedChanges" class="selection-path-warning" role="status">
+      <span>账号路径有改动。点击上方按钮会先保存，再开始选品；如果路径填错，可撤销本次修改。</span>
+      <button class="btn" type="button" :disabled="busy" @click="discardUnsavedAccountPaths">撤销路径修改</button>
+    </div>
+    <p v-if="error" class="error selection-top-feedback" role="alert">{{ selectionErrorPresentation.userMessage }}</p>
+    <details v-if="error && selectionErrorPresentation.diagnostic" class="selection-diagnostic">
+      <summary>查看错误详情</summary><pre>{{ selectionErrorPresentation.diagnostic }}</pre>
+    </details>
+    <p v-if="notice" class="notice selection-top-feedback" role="status">{{ selectionNoticePresentation.userMessage }}</p>
+    <details class="client-advanced">
+      <summary>每日定时选品：{{ dailySelectionSchedule.enabled ? `已开启，每天 ${dailySelectionSchedule.time}` : '未开启' }}</summary>
     <section class="daily-selection-schedule" aria-label="每日定时选品">
       <div class="daily-selection-copy">
         <strong>每日定时选品</strong>
@@ -5494,6 +6174,7 @@ onUnmounted(() => {
         {{ dailySelectionSchedule.saving ? '保存中…' : '保存定时' }}
       </button>
     </section>
+    </details>
     <details v-if="accounts.length" class="account-statuses"><summary>账号选品状态（{{ accounts.length }}）</summary><span v-for="account in accounts" :key="account.id">{{ account.name }}：{{ accountStatuses[account.id] }}</span></details>
     <section v-if="selectionCooldownArmed" class="selection-cooldown" role="status" aria-live="polite">
       <strong>百应暂时限流</strong>
@@ -5521,6 +6202,7 @@ onUnmounted(() => {
         :aria-valuetext="`当前账号流程 ${selectionWorkflowPercent}%`">
         <span class="selection-progress-fill" :style="{ width: `${selectionWorkflowPercent}%` }"></span>
       </div>
+      <p v-if="selectionProgress.resultSummary" class="selection-progress-result">{{ selectionProgress.resultSummary }}</p>
       <div class="selection-progress-meta">
         <strong v-if="selectionProgress.itemTotal !== null">当前商品 {{ selectionProgress.itemIndex ?? 0 }}/{{ selectionProgress.itemTotal }}</strong>
         <span v-else>阶段 {{ selectionWorkflowStageIndex + 1 }}/{{ selectionWorkflowSteps.length }}</span>
@@ -5551,6 +6233,18 @@ onUnmounted(() => {
       </details>
     </section>
 
+    <details class="client-advanced selection-settings-advanced" :class="{ 'selection-settings-advanced--dialog': selectionSettingsDialogOpen }" :open="selectionSettingsDialogOpen || Boolean(error) || recoveryBatch?.state === 'needs_retry' || undefined">
+      <summary @click="selectionSettingsDialogOpen && $event.preventDefault()">
+        {{ selectionSettingsDialogOpen ? `选品设置 — ${activeTab === '通用设置' ? '通用' : accounts.find((item) => item.id === accountId)?.name ?? '账号'}` : '调整筛选条件与账号设置' }}
+      </summary>
+      <button v-if="selectionSettingsDialogOpen" class="selection-settings-dialog-close" type="button" aria-label="关闭选品设置" :disabled="busy" @click="closeSelectionSettingsDialog">×</button>
+      <div class="selection-settings-dialog-content">
+      <p v-if="selectionSettingsDialogOpen && error" class="error selection-settings-dialog-feedback" role="alert">{{ selectionErrorPresentation.userMessage }}</p>
+      <p v-else-if="selectionSettingsDialogOpen && notice" class="notice selection-settings-dialog-feedback" role="status">{{ selectionNoticePresentation.userMessage }}</p>
+      <div class="advanced-actions">
+        <button class="btn" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="activeTab === '通用设置' ? saveGlobal() : saveAccount()">{{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}</button>
+        <button class="btn" :disabled="busy" @click="previewCandidates">预览候选</button>
+      </div>
     <div class="tabs">
       <button :class="{ active: activeTab === '通用设置' }" @click="activeTab = '通用设置'">通用设置</button>
       <button :class="{ active: activeTab === '账号个性化' }" @click="activeTab = '账号个性化'">账号个性化选品</button>
@@ -5575,13 +6269,8 @@ onUnmounted(() => {
           </template>
           <button v-if="candidates.length" class="btn" type="button" @click="jumpToSelectionSection('candidate-pool')">候选池 {{ candidates.length }}</button>
         </nav>
-        <p v-if="notice" class="notice">{{ selectionNoticePresentation.userMessage }}</p>
         <details v-if="notice && selectionNoticePresentation.diagnostic" class="selection-diagnostic">
           <summary>查看诊断详情</summary><pre>{{ selectionNoticePresentation.diagnostic }}</pre>
-        </details>
-        <p v-if="error" class="error">{{ selectionErrorPresentation.userMessage }}</p>
-        <details v-if="error && selectionErrorPresentation.diagnostic" class="selection-diagnostic">
-          <summary>查看诊断详情</summary><pre>{{ selectionErrorPresentation.diagnostic }}</pre>
         </details>
         <section v-if="recoveryBatch?.state === 'needs_retry'" class="recovery-card">
           <div>
@@ -5650,16 +6339,16 @@ onUnmounted(() => {
                         type="checkbox"
                         :checked="global.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
                         :disabled="busy"
-                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), ($event.target as HTMLInputElement).checked)"
+                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', ($event.target as HTMLInputElement).checked)"
                       >
                       <span>{{ item.name }}</span>
                     </label>
                     <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
                   </div>
                   <div class="mini-actions">
-                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'all')">全选</button>
-                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'invert')">反选</button>
-                    <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'clear')">清空</button>
+                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'all')">全选</button>
+                    <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'invert')">反选</button>
+                    <button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'clear')">清空</button>
                   </div>
                 </div>
               </div>
@@ -5743,14 +6432,37 @@ onUnmounted(() => {
           <section id="account-mode" class="card">
             <div class="section-title"><h2>账号与品类</h2><select v-model.number="accountId" class="account-select" :disabled="busy"><option v-for="account in selectionScopeAccounts" :key="account.id" :value="account.id">{{ account.name }}（{{ account.status }}）</option></select></div>
             <p v-if="!accounts.length" class="hint">请先在账号管理中添加账号。</p>
-          <p class="hint">账号可继承通用数据/品类模式，也可单独切换；通用数据模式默认覆盖全部类目，并应用通用设置中的排除类目。</p>
+            <p class="hint">账号可继承通用数据/品类模式，也可单独切换；切换为单独模式后，可在下方配置本账号排除类目。</p>
             <div class="category-mode-options" role="group" aria-label="账号选品模式">
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="inherit" :disabled="busy"> 沿用通用模式</label>
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="general" :disabled="busy"> 通用数据模式</label>
               <label><input v-model="accountDraft.selectionMode" type="radio" name="account-selection-mode-settings" value="category" :disabled="busy"> 品类模式</label>
             </div>
             <p v-if="accountDraft.selectionMode === 'inherit'" class="hint">当前通用模式：{{ global.selectionMode === 'category' ? '品类模式' : '通用数据模式（全部类目，排除 ' + selectedCategoryCount(global.excludedCategorySelection) + ' 个类目）' }}。</p>
-            <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用通用设置中的 {{ selectedCategoryCount(global.excludedCategorySelection) }} 个排除类目。</p>
+            <p v-else-if="accountDraft.selectionMode === 'general'" class="hint">该账号使用通用数据模式，并应用本账号设置中的 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 个排除类目。</p>
+            <p v-else class="hint">该账号使用品类模式；下方排除类目会在选定的品类范围内继续生效。</p>
+            <details v-if="accountDraft.selectionMode !== 'inherit'" class="category-picker">
+              <summary>排除类目（本账号）· 已选 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 项</summary>
+              <p class="hint">只影响当前账号；选中上级类目时会排除其下级。账号沿用通用模式时，请到通用设置调整排除类目。</p>
+              <div class="category-grid">
+                <div v-for="(group, index) in [level1Options, accountExcludedLevel2Options, accountExcludedLevel3Options]" :key="index" class="category-level">
+                  <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
+                  <div class="category-options">
+                    <label v-for="item in group" :key="item.id" class="category-option">
+                      <input
+                        type="checkbox"
+                        :checked="accountDraft.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
+                        :disabled="busy"
+                        @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', ($event.target as HTMLInputElement).checked)"
+                      >
+                      <span>{{ item.name }}</span>
+                    </label>
+                    <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                  </div>
+                  <div class="mini-actions"><button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'all')">全选</button><button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'invert')">反选</button><button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'clear')">清空</button></div>
+                </div>
+              </div>
+            </details>
             <template v-if="accountDraft.selectionMode === 'category' || (accountDraft.selectionMode === 'inherit' && global.selectionMode === 'category')">
             <div class="category-mode-options" role="group" aria-label="账号品类筛选策略">
               <label><input v-model="accountDraft.categoryMode" type="radio" name="account-category-mode-settings" value="inherit" :disabled="busy"> 沿用通用设置</label>
@@ -5819,10 +6531,12 @@ onUnmounted(() => {
           </section>
           <section id="account-path" class="card">
             <div class="section-title"><h2>账号路径</h2><button class="btn" :disabled="busy" @click="resetAccountPaths">恢复两个路径默认值</button></div>
-            <label class="path-field">托管 Chrome profile 路径（目录须包含 Default）<div><input v-model="accountDraft.browserProfilePath" placeholder="留空使用客户端专用账号 profile"><button class="btn" @click="chooseProfilePath">选择文件夹</button><button class="btn" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
-            <label class="path-field">账号下载路径<div><input v-model="accountDraft.downloadPath" placeholder="留空使用账号独立默认目录"><button class="btn" @click="chooseDownloadPath">选择文件夹</button><button class="btn" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+            <label class="path-field">视频保存位置<div><input v-model="accountDraft.downloadPath" placeholder="留空使用软件默认位置"><button class="btn" @click="chooseDownloadPath">选择文件夹</button><button class="btn" @click="accountDraft.downloadPath = ''">恢复默认</button></div></label>
+            <details class="compact-help browser-profile-advanced" :open="Boolean(accountDraft.browserProfilePath) || undefined"><summary>浏览器登录资料（{{ accountDraft.browserProfilePath ? '已自定义' : '使用默认' }}，一般无需修改）</summary>
+              <label class="path-field">浏览器登录资料文件夹<div><input v-model="accountDraft.browserProfilePath" placeholder="留空使用软件默认位置"><button class="btn" @click="chooseProfilePath">选择文件夹</button><button class="btn" @click="accountDraft.browserProfilePath = ''">恢复默认</button></div></label>
+              <p class="hint">这里不是视频保存位置。自定义文件夹必须包含 Chrome 的 Default 文件夹；不确定时请点“恢复默认”。</p>
+            </details>
             <p v-if="accountPathsHaveUnsavedChanges" class="hint warning">路径有未保存修改；新批次仍会使用上次保存的目录。点击“保存账号设置”后才生效；已有素材不会移动，已开始处理的恢复批次沿用原路径。</p>
-            <details class="compact-help"><summary>浏览器路径说明</summary><p class="hint warning">留空时使用客户端独立 profile。已有 Chrome 默认目录或正在使用的目录不能作为托管 profile。</p></details>
           </section>
         </template>
 
@@ -5852,6 +6566,17 @@ onUnmounted(() => {
         <BrowserPane default-target="baiying" :profile-key="browserProfileKey" :profile-path="accountDraft.browserProfilePath || undefined" />
       </aside>
     </div>
+      <footer v-if="selectionSettingsDialogOpen" class="selection-settings-dialog-footer">
+        <span>设置保存后用于后续选品任务</span>
+        <div>
+          <button class="btn" type="button" :disabled="busy" @click="closeSelectionSettingsDialog">关闭</button>
+          <button class="btn primary" type="button" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="saveSelectionSettingsAndClose">
+            {{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}
+          </button>
+        </div>
+      </footer>
+      </div>
+    </details>
     <Teleport to="body">
       <section
         v-if="bannedWordsDialogOpen"
@@ -5864,7 +6589,7 @@ onUnmounted(() => {
             <h2 id="banned-words-title">屏蔽词</h2>
             <button class="btn" type="button" aria-label="关闭屏蔽词" @click="bannedWordsDialogOpen = false">×</button>
           </header>
-          <p class="hint">商品名称包含任一词即排除；每行一个词，可增删。屏蔽词全局生效。</p>
+          <p class="hint">商品名称包含任一词即排除；屏蔽词全局生效。封建迷信相关词由系统强制保留，其他屏蔽词可编辑。</p>
           <p class="hint">原型中的达人、账号和店铺名称已加入默认词表。当前按名称包含匹配；「小明、与辉、朱朱、亮亮、安安」等短词可能误排正常商品，可在列表中删除。</p>
           <textarea v-model="bannedWordsText" class="ban-words" spellcheck="false" aria-label="全局屏蔽词列表" :disabled="busy"></textarea>
           <section class="banned-words-suggestions" aria-label="商城推荐标题候选词">
@@ -5892,13 +6617,14 @@ onUnmounted(() => {
           <header class="login-preflight-head">
             <div>
               <h2 id="login-preflight-title">选品前请确认账号登录</h2>
-              <p>每个执行账号都需要分别登录百应和抖音创作者中心。两站任一未确认时，不会创建或恢复选品批次。</p>
+              <p v-if="loginPreflight.batchId">先处理当前账号的登录状态；批次已保存，其他账号浏览器不会提前启动。</p>
+              <p v-else>每个执行账号都需要分别登录百应和抖音创作者中心。两站任一未确认时，不会创建或恢复选品批次。</p>
             </div>
             <button class="btn" type="button" aria-label="关闭登录检查" :disabled="loginPreflight.checking" @click="loginPreflight = null">×</button>
           </header>
-          <p v-if="loginPreflight.checking" class="login-preflight-progress">正在逐个检查账号的两站登录状态，请稍候。</p>
-          <p v-else-if="loginPreflightReady(loginPreflight.accounts)" class="login-preflight-success">每个账号的百应和创作者中心均已自动或手动确认。点击「继续选品」后将进入选品流程。</p>
-          <p v-else class="login-preflight-warning">尚未创建或修改批次。请先打开未登录的平台完成登录/验证，再点击「重新检查登录状态」；显示“需要登录”或“需要人工验证”时必须重新检查通过，不能跳过。</p>
+          <p v-if="loginPreflight.checking" class="login-preflight-progress">{{ loginPreflight.batchId ? '正在检查当前账号的百应和创作者中心登录状态，请稍候。' : '正在逐个检查账号的两站登录状态，请稍候。' }}</p>
+          <p v-else-if="loginPreflightReady(loginPreflight.accounts)" class="login-preflight-success">{{ loginPreflight.batchId ? '当前账号的百应和创作者中心均已确认。点击「继续选品」后会从当前账号继续。' : '每个账号的百应和创作者中心均已自动或手动确认。点击「继续选品」后将进入选品流程。' }}</p>
+          <p v-else class="login-preflight-warning">{{ loginPreflight.batchId ? '批次已保存，当前账号尚未执行选品，后续账号也未启动。请先打开未登录的平台完成登录/验证，再点击「重新检查登录状态」。' : '尚未创建或修改批次。请先打开未登录的平台完成登录/验证，再点击「重新检查登录状态」。' }}显示“需要登录”或“需要人工验证”时必须重新检查通过，不能跳过。</p>
           <div class="login-preflight-list">
             <article v-for="item in loginPreflight.accounts" :key="item.accountId" class="login-preflight-account">
               <strong>{{ item.accountName }}（ID {{ item.accountId }}）</strong>
@@ -5962,13 +6688,14 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.account-settings-mask { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; padding: 24px; background: rgb(15 23 42 / 46%); }
-.account-settings-dialog { display: flex; flex-direction: column; width: min(1120px, 96vw); max-height: 92vh; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); box-shadow: 0 18px 56px rgb(15 23 42 / 24%); }
+.account-settings-mask { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; overflow: auto; padding: 16px; background: rgb(15 23 42 / 46%); }
+.account-settings-dialog { display: flex; flex: 0 1 auto; flex-direction: column; width: min(1120px, 96vw); height: min(92vh, 900px); max-height: calc(100vh - 32px); min-height: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); box-shadow: 0 18px 56px rgb(15 23 42 / 24%); }
 .account-settings-head, .account-settings-foot { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 15px 18px; border-bottom: 1px solid var(--border); }
+.account-settings-head, .account-settings-foot { flex: 0 0 auto; }
 .account-settings-head h2 { margin: 0; font-size: 18px; }
 .account-settings-head p { margin: 4px 0 0; color: var(--text-muted); font-size: 12px; }
 .account-settings-head-actions { display: flex; flex-wrap: wrap; gap: 7px; }
-.account-settings-body { min-height: 0; overflow: auto; padding: 14px 18px; }
+.account-settings-body { flex: 1 1 auto; height: 0; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 14px 18px; }
 .account-settings-body > .card { margin-top: 10px; }
 .account-settings-foot { justify-content: flex-end; border-top: 1px solid var(--border); border-bottom: 0; }
 .account-settings-dialog .category-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -5979,7 +6706,36 @@ onUnmounted(() => {
 .account-settings-dialog .path-field > div { display: flex; gap: 7px; }
 .account-settings-dialog .path-field input { flex: 1; min-width: 120px; }
 .account-settings-dialog .path-field button { white-space: nowrap; }
-.selection-page { display: flex; flex-direction: column; width: 100%; min-width: 0; min-height: 0; gap: 10px; color: var(--text); }
+.selection-page { display: flex; flex: 1 1 auto; flex-direction: column; width: 100%; height: 100%; min-width: 0; min-height: 0; gap: 10px; overflow: hidden; color: var(--text); }
+.selection-path-warning { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-shrink: 0; margin: 0; padding: 10px 12px; border: 1px solid #e8cf96; border-radius: var(--radius); background: #fff8e9; color: #74511c; font-size: 12px; line-height: 1.5; }
+.selection-path-warning .btn { flex-shrink: 0; }
+.selection-top-feedback { flex-shrink: 0; margin: 0; line-height: 1.5; }
+.client-advanced { flex-shrink: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
+.client-advanced > summary { cursor: pointer; padding: 12px 14px; color: var(--text); font-size: 13px; font-weight: 600; }
+.client-advanced[open] > summary { border-bottom: 1px solid var(--border); }
+.client-advanced .daily-selection-schedule { margin: 10px; }
+.selection-settings-advanced .advanced-actions { display: flex; gap: 8px; padding: 10px 12px 0; }
+.selection-settings-advanced .tabs { margin: 10px 12px 0; }
+.selection-settings-advanced[open] { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; overflow: hidden; }
+.selection-settings-advanced[open] > summary, .selection-settings-advanced[open] > .selection-settings-dialog-content > .advanced-actions, .selection-settings-advanced[open] > .selection-settings-dialog-content > .tabs { flex: 0 0 auto; }
+.selection-settings-advanced[open] > .selection-settings-dialog-content { display: flex; flex: 1 1 0; flex-direction: column; min-height: 0; overflow: hidden; }
+.selection-settings-advanced .body-layout { flex: 1 1 0; min-height: 0; max-height: none; padding: 10px 12px 12px; }
+.selection-settings-dialog-backdrop { position: fixed; inset: 0; z-index: 1199; background: rgb(15 23 42 / 48%); backdrop-filter: blur(1px); }
+.selection-settings-advanced--dialog { position: fixed; z-index: 1200; top: 50%; left: 50%; width: min(1680px, calc(100vw - 32px)); height: min(92vh, 900px); max-width: none; max-height: calc(100vh - 20px); min-height: 0; margin: 0; transform: translate(-50%, -50%); border-radius: 12px; box-shadow: 0 24px 72px rgb(15 23 42 / 30%); }
+.selection-settings-advanced--dialog[open] { flex: none; }
+.selection-settings-advanced--dialog > summary { flex: 0 0 auto; padding: 17px 58px 16px 20px; font-size: 17px; }
+.selection-settings-advanced--dialog > .selection-settings-dialog-content { position: absolute; inset: 58px 0 0; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.selection-settings-dialog-feedback { flex: 0 0 auto; margin: 8px 18px 0; }
+.selection-settings-dialog-close { position: absolute; z-index: 2; top: 10px; right: 14px; width: 34px; height: 34px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg-panel); color: var(--text-muted); font-size: 22px; line-height: 1; }
+.selection-settings-dialog-close:hover { border-color: var(--brand); color: var(--brand); }
+.selection-settings-advanced--dialog .advanced-actions { flex: 0 0 auto; padding: 8px 18px 0; }
+.selection-settings-advanced--dialog .advanced-actions > button:first-child { display: none; }
+.selection-settings-advanced--dialog .tabs { flex: 0 0 auto; margin: 8px 18px 0; }
+.selection-settings-advanced--dialog .body-layout { flex: 1 1 auto; height: 0; min-height: 0; padding: 8px 18px 12px; }
+.selection-settings-advanced--dialog .settings-scroll { flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; }
+.selection-settings-advanced--dialog .browser-panel { display: none; }
+.selection-settings-dialog-footer { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; border-top: 1px solid var(--border); background: var(--bg-panel); color: var(--text-muted); font-size: 12px; }
+.selection-settings-dialog-footer > div { display: flex; gap: 8px; }
 .page-head { position: relative; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 0; background: var(--bg-app); }
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .daily-selection-schedule { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 11px 14px; border: 1px solid #cfdef8; border-radius: var(--radius); background: linear-gradient(110deg, #f5f9ff, #ffffff); font-size: 12px; box-shadow: var(--shadow-card); }
@@ -6029,15 +6785,17 @@ onUnmounted(() => {
 .selection-progress-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 12px; margin-top: 6px; color: var(--text-muted); font-size: 11px; }
 .selection-progress-meta strong { color: inherit; font-size: 13px; }
 .selection-progress-message { margin: 6px 0 0; line-height: 1.45; }
+.selection-progress-result { margin: 7px 0 0; color: var(--text-muted); font-size: 12px; font-weight: 600; line-height: 1.45; }
+.selection-progress-card.failed .selection-progress-result { color: #991b1b; }
 .selection-progress-details { margin-top: 7px; color: var(--text-muted); font-size: 11px; }
 .selection-progress-details > summary, .category-recommendation-more > summary { width: fit-content; cursor: pointer; }
 .selection-progress-details[open] > summary { margin-bottom: 4px; }
 @keyframes selection-progress-slide { from { transform: translateX(-20%); } to { transform: translateX(210%); } }
 .body-layout { display: flex; flex: 1; min-height: 0; gap: 10px; }
 .settings-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior-y: contain; overflow-anchor: none; scrollbar-gutter: stable; padding: 1px 4px 12px 1px; scroll-padding-top: 48px; }
-.settings-jumps { position: sticky; top: 0; z-index: 2; display: flex; gap: 6px; overflow-x: auto; padding: 7px 2px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
+.settings-jumps { position: sticky; top: 0; z-index: 2; display: flex; flex-wrap: wrap; gap: 6px; padding: 7px 2px; border-bottom: 1px solid var(--border); background: var(--bg-app); }
 .settings-jumps .btn { flex: 0 0 auto; min-height: 28px; padding: 0 10px; white-space: nowrap; font-size: 12px; }
-.browser-panel { width: 43%; min-width: 420px; min-height: 0; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.browser-panel { width: 43%; min-width: 0; min-height: 0; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
 .card { margin-bottom: 10px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
 .card h2 { margin: 0 0 10px; font-size: 15px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -6048,6 +6806,8 @@ onUnmounted(() => {
 .filter-card[open] > summary { margin-bottom: 12px; }
 .account-filter-details { margin-top: 9px; }
 .compact-help { margin-top: 8px; }
+.browser-profile-advanced { padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-app); }
+.browser-profile-advanced .hint { margin: 8px 0 0; }
 .category-mode-options { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; }
 .category-mode-options label { display: inline-flex; align-items: center; gap: 6px; color: var(--text); font-size: 13px; cursor: pointer; }
 .category-mode-options input { margin: 0; accent-color: var(--brand); }
@@ -6185,5 +6945,20 @@ onUnmounted(() => {
 .failure-log-entry details { color: var(--text-muted); font-size: 11px; }
 .failure-log-entry summary { cursor: pointer; }
 .failure-log-entry pre { max-height: 240px; margin: 6px 0 0; padding: 8px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: var(--radius); background: var(--bg-app); font: 11px/1.45 Consolas, monospace; }
-@media (max-width: 1150px) { .browser-panel { width: 38%; min-width: 340px; } .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1150px) {
+  .browser-panel { width: 38%; min-width: 0; }
+  .form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+  .body-layout { display: flex; flex-direction: column; gap: 10px; }
+  .settings-scroll { order: 1; min-height: 0; }
+  .browser-panel { order: 2; flex: 0 1 180px; width: 100%; max-height: 240px; overflow: auto; }
+  .settings-jumps { position: static; }
+}
+@media (max-height: 700px) {
+  .browser-panel { max-height: 150px; }
+  .card { margin-bottom: 8px; padding: 11px; }
+  .account-settings-mask { padding: 8px; }
+  .account-settings-dialog { height: calc(100vh - 16px); max-height: calc(100vh - 16px); }
+}
 </style>

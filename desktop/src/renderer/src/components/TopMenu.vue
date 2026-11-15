@@ -7,8 +7,10 @@ const emit = defineEmits<{
   (e: 'update:active', value: string): void
 }>()
 
-// 顶部菜单项（需求 4）
-const MENU_ITEMS = ['百应工作台', '商品查询']
+const MENU_ITEMS = [
+  { value: '百应工作台', label: '工作台' },
+  { value: '商品查询', label: '按商品 ID 下载' }
+]
 const appVersion = ref('')
 
 onMounted(() => {
@@ -28,14 +30,14 @@ onMounted(() => {
     <nav class="menus">
       <button
         v-for="item in MENU_ITEMS"
-        :key="item"
+        :key="item.value"
         type="button"
         class="menu-item"
-        :class="{ active: item === props.active }"
-        :aria-current="item === props.active ? 'page' : undefined"
-        @click="emit('update:active', item)"
+        :class="{ active: item.value === props.active }"
+        :aria-current="item.value === props.active ? 'page' : undefined"
+        @click="emit('update:active', item.value)"
       >
-        {{ item }}
+        {{ item.label }}
       </button>
     </nav>
 
