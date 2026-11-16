@@ -60,7 +60,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "allianceRankEnabled": True,
         "priority": ["hotSpot", "allianceRank"],
     },
-    "thresholds": {"salesAmount": None, "salesCount": None, "conversionRate": None, "views": None, "commissionRate": None, "experienceScore": None},
+    "thresholds": {"salesAmount": None, "salesCount": None, "conversionRate": None, "views": None, "commissionRate": None, "minCommissionRate": None, "maxCommissionRate": None, "experienceScore": None},
     "trendPreference": "上升优先",
     "bannedWords": DEFAULT_BANNED_WORDS,
     "bannedWordsSeedVersion": BANNED_WORDS_SEED_VERSION,

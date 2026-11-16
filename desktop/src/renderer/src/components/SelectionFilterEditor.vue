@@ -36,10 +36,12 @@ const sections = computed(() => [
 ])
 
 const commissionHint = computed(() => {
-  const upper = props.modelValue.thresholds.commissionRate
-  if (upper === null || upper === undefined) return '留空时不限制佣金率。'
-  if (upper <= 10) return `目标佣金率为 0%–${upper}%；百应可用时自动选中“0%-10%”，最终按实际佣金率核验上限。`
-  return `目标佣金率为 0%–${upper}%；百应佣金档位为单选，无法覆盖整个范围，最终按实际佣金率核验上限。`
+  const lower = props.modelValue.thresholds.minCommissionRate ?? props.modelValue.thresholds.commissionRate
+  const upper = props.modelValue.thresholds.maxCommissionRate
+  if (lower === null && (upper === null || upper === undefined)) return '留空时不限制佣金率；填写后会在商品详情核验实际佣金率，缺失数据不会放行。'
+  const range = `${lower ?? 0}%–${upper ?? 100}%`
+  if (upper !== null && upper !== undefined && upper <= 10) return `目标佣金率为 ${range}；百应可用时自动选中“0%-10%”，最终按实际佣金率同时核验上下限。`
+  return `目标佣金率为 ${range}；平台档位无法覆盖全部范围时保留本地精确核验，不会因平台筛选缺失而放行。`
 })
 
 function update(change: (value: SelectionFilterSettings) => void): void {
@@ -85,7 +87,14 @@ function setCandidateLimit(value: string): void {
 }
 
 function setThreshold(key: keyof SelectionFilterSettings['thresholds'], value: string): void {
-  update((settings) => { settings.thresholds[key] = value.trim() === '' ? null : Number(value) })
+  update((settings) => {
+    const next = value.trim() === '' ? null : Number(value)
+    settings.thresholds[key] = next
+    if (key === 'minCommissionRate' || key === 'commissionRate') {
+      settings.thresholds.minCommissionRate = next
+      settings.thresholds.commissionRate = next
+    }
+  })
 }
 
 function setTrendPreference(value: string): void {
@@ -142,13 +151,14 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
       <label>销量阈值<input :value="modelValue.thresholds.salesCount ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('salesCount', ($event.target as HTMLInputElement).value)"></label>
       <label>转化率阈值（%）<input :value="modelValue.thresholds.conversionRate ?? ''" type="number" min="0" step="0.1" placeholder="不限制" :disabled="disabled" @input="setThreshold('conversionRate', ($event.target as HTMLInputElement).value)"></label>
       <label>浏览量阈值<input :value="modelValue.thresholds.views ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('views', ($event.target as HTMLInputElement).value)"></label>
-      <label>最高佣金率（%）<input :value="modelValue.thresholds.commissionRate ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最高佣金率百分比" :disabled="disabled" @input="setThreshold('commissionRate', ($event.target as HTMLInputElement).value)"></label>
+      <label>最低佣金率（%）<input :value="modelValue.thresholds.minCommissionRate ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最低佣金率百分比" :disabled="disabled" @input="setThreshold('minCommissionRate', ($event.target as HTMLInputElement).value)"></label>
+      <label>最高佣金率（%）<input :value="modelValue.thresholds.maxCommissionRate ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最高佣金率百分比" :disabled="disabled" @input="setThreshold('maxCommissionRate', ($event.target as HTMLInputElement).value)"></label>
     </div>
     <p class="hint">{{ commissionHint }}</p>
     <label class="check-row"><input type="checkbox" :checked="modelValue.poolFallback" :disabled="disabled" @change="setPoolFallback(($event.target as HTMLInputElement).checked)">四池不足时从池外兜底补足</label>
     <p class="hint">
       筛选目录保存在本机；{{ filterCatalogUpdatedAt ? `上次同步：${new Date(filterCatalogUpdatedAt).toLocaleString()}` : '尚无本地目录，首次同步时需要托管 Chrome 已登录百应' }}。
-      三个来源统一按下方数据条件在客户端筛选；佣金率按上限、体验分按下限核验。
+      三个来源统一按下方数据条件在客户端筛选；佣金率按上下限、体验分按下限核验。
     </p>
     <p class="hint">自动选品使用独立托管页面；执行期间请不要手动操作该页面，其他百应标签可继续使用。</p>
     <section class="platform-filter-section">

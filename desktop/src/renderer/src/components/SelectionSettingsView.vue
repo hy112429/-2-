@@ -162,6 +162,8 @@ interface PrioritySourceReadResult {
   detail?: string
   dataCapturedAt?: string
   visibilityFingerprint?: string
+  sourceCategoryOptions?: Array<{ label: string; id?: string; pathKey?: string; selected?: boolean }>
+  sourceCategorySelection?: { level1: string[]; level2: string[]; level3: string[] }
 }
 
 function visibleSourceNoCandidateMessage(
@@ -344,7 +346,7 @@ const DEFAULTS = {
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
   sources: { hotSpotEnabled: true, allianceRankEnabled: true, priority: ['hotSpot', 'allianceRank'] as Array<'hotSpot' | 'allianceRank'> },
-  thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, experienceScore: null as number | null },
+  thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, minCommissionRate: null as number | null, maxCommissionRate: null as number | null, experienceScore: null as number | null },
   trendPreference: '上升优先',
   bannedWords: [...DEFAULT_BANNED_WORDS],
   bannedWordsSeedVersion: 2,
@@ -952,7 +954,7 @@ function scheduleCandidateRefillAutoResume(batch: SelectionRecoveryBatch | null)
   }
   const account = batch.accounts.find((item) =>
     item.state !== 'completed' && item.stage === 'candidate_refilling' &&
-    !/未产生新商品|来源未变化|来源已耗尽/.test(String(item.error ?? ''))
+    !/未产生新商品|来源未变化|来源已耗尽|详情类目核验不可用|类目数据不可用|环境风险|DETAIL_ENVIRONMENT_RISK_REQUIRED|detail_entry_unavailable/i.test(String(item.error ?? ''))
   )
   if (!account) {
     if (candidateRefillAutoResumeIntent?.batchId === batch.batchId) clearCandidateRefillAutoResume()
@@ -1821,7 +1823,7 @@ async function saveGlobal(): Promise<void> {
     if (global.selectionMode === 'category' && global.categoryMode === 'manual' && !hasSelectedCategory(global.categorySelection)) {
       throw new Error('已选择手动选类目，请至少勾选一个类目；或切回自动推荐。')
     }
-    validateCommissionRateUpperBound(global.thresholds.commissionRate, '通用设置')
+    validateCommissionRateBounds(global.thresholds.minCommissionRate ?? global.thresholds.commissionRate, global.thresholds.maxCommissionRate, '通用设置')
     validateExperienceScoreThreshold(global.thresholds.experienceScore, '通用设置')
     for (const [label, value] of Object.entries({
       '每品视频上限': global.quota.perProductVideos,
@@ -1856,10 +1858,15 @@ function appendOptionalMallTitleBannedWords(): void {
   notice.value = `已将 ${additions.length} 个候选词加入编辑框；点击「保存通用设置」后生效。`
 }
 
-function validateCommissionRateUpperBound(value: number | null | undefined, scope: string): void {
-  if (value === null || value === undefined) return
-  if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) {
-    throw new Error(`${scope}佣金率上限须为 0–100 之间的百分数。`)
+function validateCommissionRateBounds(minimum: number | null | undefined, maximum: number | null | undefined, scope: string): void {
+  for (const [label, value] of [['最低佣金率', minimum], ['最高佣金率', maximum]] as const) {
+    if (value === null || value === undefined) continue
+    if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) {
+      throw new Error(`${scope}${label}须为 0–100 之间的百分数。`)
+    }
+  }
+  if (minimum !== null && minimum !== undefined && maximum !== null && maximum !== undefined && Number(minimum) > Number(maximum)) {
+    throw new Error(`${scope}最低佣金率不能高于最高佣金率。`)
   }
 }
 
@@ -1998,7 +2005,7 @@ async function saveAccount(): Promise<boolean> {
       throw new Error('账号候选上限须为 1–10 的整数。')
     }
     if (accountFilterOverridesEnabled.value) {
-      validateCommissionRateUpperBound(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
+      validateCommissionRateBounds(accountFilterDraft.value.thresholds.minCommissionRate ?? accountFilterDraft.value.thresholds.commissionRate, accountFilterDraft.value.thresholds.maxCommissionRate, '账号个性化')
       validateExperienceScoreThreshold(accountFilterDraft.value.thresholds.experienceScore, '账号个性化')
     }
     if (accountDraft.dailyQuotaOverride.enabled && (
@@ -2651,8 +2658,10 @@ async function prepareAccountRunContext(
   if (filterOverrides && typeof filterOverrides === 'object' && !Array.isArray(filterOverrides)) {
     Object.assign(settings, createSelectionFilterSettings(filterOverrides, createSelectionFilterSettings(globalSnapshot)))
   }
-  validateCommissionRateUpperBound(
-    ((settings.thresholds ?? {}) as Record<string, number | null>).commissionRate,
+  const runtimeThresholds = (settings.thresholds ?? {}) as Record<string, number | null>
+  validateCommissionRateBounds(
+    runtimeThresholds.minCommissionRate ?? runtimeThresholds.commissionRate,
+    runtimeThresholds.maxCommissionRate,
     '账号运行设置'
   )
   validateExperienceScoreThreshold(
@@ -2992,7 +3001,10 @@ async function executeAccountSelection(
       }
       let lastReadFingerprint = candidateReadFingerprint(fetched, completed)
       const refillCandidatePool = async (force = false): Promise<void> => {
-        if (hasExplicitPreviewSelection || candidatePlan || (!force && fetched.length >= candidateLimit)) return
+        const candidatePlanHasTarget = Boolean(candidatePlan && candidatePlan.candidates.length >= candidateLimit)
+        // 统一候选计划可能已经生成，但候选在详情、佣金、类目或本机登记阶段全部被淘汰。
+        // 只有计划已达到当前账号目标时才禁止补池；计划不足时仍需读取后续分页/来源。
+        if (hasExplicitPreviewSelection || (!force && candidatePlanHasTarget) || (!force && fetched.length >= candidateLimit)) return
         const retryDelays = [1_000, 2_500, 6_000]
         const observedProductIds = new Set<string>([
           ...fetched.map((row) => String(row.productId ?? '').trim()),
@@ -3218,7 +3230,8 @@ async function executeAccountSelection(
         categoryWarnings = Array.isArray(preview.warnings)
           ? preview.warnings.map(String).filter((warning) =>
             warning.startsWith('跳过失败类目：') ||
-            (!prioritySourceResults.length && warning.startsWith('跳过来源读取：')))
+            (!prioritySourceResults.length && warning.startsWith('跳过来源读取：')) ||
+            /类目数据不可用|详情类目补充|环境风险|DETAIL_ENVIRONMENT_RISK_REQUIRED|detail_entry_unavailable/i.test(warning))
           : []
         for (const warning of categoryWarnings) {
           await recovery?.logFailure({
@@ -3360,7 +3373,7 @@ async function executeAccountSelection(
           chosenProducts.has(candidate.productId) && !productLocks.has(candidate.productId) &&
           (usage[candidate.productId] ?? 0) < quotaSettings.perProductVideos
         )
-        if (eligible.length < candidateLimit && !hasExplicitPreviewSelection && !candidatePlan) {
+        if (eligible.length < candidateLimit && !hasExplicitPreviewSelection) {
           await refillCandidatePool(true)
           const eligibleProductIds = new Set([...chosenProducts, ...fetched.map((candidate) => candidate.productId)])
           eligible = fetched.filter((candidate) =>
@@ -3382,7 +3395,12 @@ async function executeAccountSelection(
           }
           const analysisSkipped = completed.filter((item) => item.analysisRejected === true)
           if (analysisSkipped.length) {
-            const skippedSummary = `候选列表数据分析排除 ${analysisSkipped.length} 个商品，未执行加车；原因已记录。`
+            const detailUnavailable = categoryWarnings.find((warning) =>
+              /类目数据不可用|详情类目补充|环境风险|DETAIL_ENVIRONMENT_RISK_REQUIRED|detail_entry_unavailable/i.test(warning)
+            )
+            const skippedSummary = detailUnavailable
+              ? `商品详情类目核验不可用，已跳过 ${analysisSkipped.length} 个候选；当前账号暂停自动补池，需先恢复百应详情环境。原因：${conciseFailureMessage(detailUnavailable)}`
+              : `候选列表数据分析排除 ${analysisSkipped.length} 个商品，未执行加车；原因已记录。`
             return holdAccountForCandidateRefill(skippedSummary)
           }
           const globallySkipped = completed.filter((item) =>

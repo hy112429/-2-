@@ -4876,6 +4876,35 @@ def _create_background_page(context: BrowserContext, browser: Browser) -> Page:
             pass
 
 
+def _reused_category_page(context: BrowserContext, browser: Browser, marker: str) -> Page:
+    """复用当前账号的详情/来源核验页，避免每个商品重复创建 CDP target。"""
+    for candidate in reversed(context.pages):
+        try:
+            if candidate.is_closed():
+                continue
+            if getattr(candidate, "_touguang_category_page_marker", "") == marker:
+                return candidate
+        except Exception:
+            continue
+    page = _create_background_page(context, browser)
+    setattr(page, "_touguang_category_page_marker", marker)
+    return page
+
+
+def _close_reused_category_pages(context: BrowserContext) -> None:
+    """只关闭本轮由客户端创建的详情核验页，不碰客户手动打开的标签页。"""
+    pages = getattr(context, "pages", None)
+    if not isinstance(pages, list):
+        return
+    for candidate in list(pages):
+        try:
+            marker = str(getattr(candidate, "_touguang_category_page_marker", "") or "")
+            if marker and not candidate.is_closed():
+                candidate.close()
+        except Exception:
+            continue
+
+
 def _login_preflight_page(context: BrowserContext, browser: Browser, account_id: int) -> Page:
     """每个账号只保留一个客户端专用登录检查页，依次检查百应和创作者中心。"""
     marker = f"__touguangLoginPreflight__account_{account_id}"
@@ -6521,7 +6550,10 @@ def _candidate_rows(
         }
         known_rejection_reasons: list[str] = []
         pending_thresholds: list[str] = []
+        commission_min, commission_max = _commission_rate_bounds(settings)
         for metric_name, threshold in thresholds.items():
+            if metric_name in {"commissionRate", "minCommissionRate", "maxCommissionRate"}:
+                continue
             if threshold is None or threshold == "":
                 continue
             actual = metrics.get(metric_name)
@@ -6551,6 +6583,20 @@ def _candidate_rows(
                     )
             except (TypeError, ValueError):
                 continue
+        if commission_min is not None or commission_max is not None:
+            if cos_ratio is None:
+                if commission_min is not None:
+                    known_rejection_reasons.append(f"缺少佣金率实测数据，无法核验下限 {commission_min:g}")
+                if commission_max is not None:
+                    known_rejection_reasons.append(f"缺少佣金率实测数据，无法核验上限 {commission_max:g}")
+                pending_thresholds.append("commissionRate")
+            elif not math.isfinite(cos_ratio) or not 0 <= cos_ratio <= 100:
+                known_rejection_reasons.append("佣金率数据超出 0–100%，无法核验设定范围")
+            else:
+                if commission_min is not None and cos_ratio < commission_min:
+                    known_rejection_reasons.append(f"佣金率 {cos_ratio:g} 低于设定下限 {commission_min:g}")
+                if commission_max is not None and cos_ratio > commission_max:
+                    known_rejection_reasons.append(f"佣金率 {cos_ratio:g} 超过设定上限 {commission_max:g}")
 
         tags = json.dumps({
             "tag_info": base.get("tag_info", {}),
@@ -6608,6 +6654,7 @@ def _candidate_rows(
                 "analysisReasons": [],
                 "poolRank": pool_rank,
                 "sources": sources,
+                "sourceCategorySelection": copy.deepcopy(row.get("_sourceCategorySelection")) if isinstance(row.get("_sourceCategorySelection"), dict) else {},
                 "selectionMode": str(settings.get("selectionMode") or "general"),
                 "categoryMode": str(settings.get("categoryMode") or "auto"),
                 "categoryIds": [str(category.get(key)) for key in ("first", "second", "third") if isinstance(category.get(key), (str, int))],
@@ -6659,10 +6706,15 @@ def _candidate_rows(
 
 def _enabled_threshold_names(settings: Dict[str, Any]) -> list[str]:
     thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
-    return [
+    names = [
         str(name) for name, value in thresholds.items()
+        if str(name) not in {"minCommissionRate", "maxCommissionRate"}
         if value is not None and value != "" and str(name)
     ]
+    minimum, maximum = _commission_rate_bounds(settings)
+    if (minimum is not None or maximum is not None) and "commissionRate" not in names:
+        names.append("commissionRate")
+    return names
 
 
 def _promotion_row_metric_values(row: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -6746,36 +6798,94 @@ def _merge_detail_metrics_into_promotion_row(
     return row
 
 
-def _commission_rate_upper_bound(settings: Dict[str, Any]) -> Optional[float]:
+def _commission_rate_bounds(settings: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
-    raw = settings.get("_platformCommissionRateUpperBound", thresholds.get("commissionRate"))
-    if raw is None or raw == "":
+    raw_min = thresholds.get("minCommissionRate")
+    if raw_min is None or raw_min == "":
+        raw_min = thresholds.get("commissionRate")
+    raw_max = settings.get("_platformCommissionRateUpperBound")
+    if raw_max is None or raw_max == "":
+        raw_max = thresholds.get("maxCommissionRate")
+    def parse(raw: Any, label: str) -> Optional[float]:
+        if raw is None or raw == "":
+            return None
+        try:
+            bound = float(raw)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"佣金率{label}须为 0–100 之间的百分数") from error
+        if not 0 <= bound <= 100:
+            raise RuntimeError(f"佣金率{label}须为 0–100 之间的百分数")
+        return bound
+    minimum = parse(raw_min, "下限")
+    maximum = parse(raw_max, "上限")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise RuntimeError("佣金率下限不能高于上限")
+    return minimum, maximum
+
+
+def _commission_rate_upper_bound(settings: Dict[str, Any]) -> Optional[float]:
+    """平台佣金控件只能表达上限；下限始终在本地统一候选核验。"""
+    return _commission_rate_bounds(settings)[1]
+
+
+def _commission_rate_platform_filter_option(settings: Dict[str, Any]) -> Optional[str]:
+    """返回能覆盖本地目标范围的平台佣金档位；无法安全覆盖时留空，避免漏掉候选。"""
+    minimum, maximum = _commission_rate_bounds(settings)
+    if minimum is None and maximum is None:
         return None
-    try:
-        bound = float(raw)
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("佣金率上限须为 0–100 之间的百分数") from error
-    if not 0 <= bound <= 100:
-        raise RuntimeError("佣金率上限须为 0–100 之间的百分数")
-    return bound
+    target_min = 0.0 if minimum is None else minimum
+    target_max = 100.0 if maximum is None else maximum
+    platform_options = (
+        ("0%-10%", 0.0, 10.0),
+        ("10%-20%", 10.0, 20.0),
+        ("20%-30%", 20.0, 30.0),
+        ("30%-40%", 30.0, 40.0),
+        ("40%-50%", 40.0, 50.0),
+        ("≥50%", 50.0, 100.0),
+    )
+    for label, option_min, option_max in platform_options:
+        if option_min <= target_min and option_max >= target_max:
+            return label
+    return None
+
+
+def _commission_rate_platform_filter_options(settings: Dict[str, Any]) -> list[str]:
+    """把目标佣金范围拆成平台单选档位的并集，供选品广场逐档读取后合并。"""
+    minimum, maximum = _commission_rate_bounds(settings)
+    if minimum is None and maximum is None:
+        return []
+    target_min = 0.0 if minimum is None else minimum
+    target_max = 100.0 if maximum is None else maximum
+    platform_options = (
+        ("0%-10%", 0.0, 10.0),
+        ("10%-20%", 10.0, 20.0),
+        ("20%-30%", 20.0, 30.0),
+        ("30%-40%", 30.0, 40.0),
+        ("40%-50%", 40.0, 50.0),
+        ("≥50%", 50.0, 100.0),
+    )
+    return [
+        label for label, option_min, option_max in platform_options
+        if option_max > target_min and option_min < target_max
+    ]
 
 
 def _effective_selection_filters(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """数字上限决定平台佣金档位，旧手选档位不得覆盖账号当前设置。"""
+    """数字佣金边界决定平台可表达的档位；完整上下限始终在本地统一核验。"""
     filters = copy.deepcopy(settings.get("filters") if isinstance(settings.get("filters"), dict) else {})
     for group in ("delivery", "product"):
         values = filters.get(group)
         if isinstance(values, dict):
             values.pop("佣金区间", None)
-    bound = _commission_rate_upper_bound(settings)
-    # 当前百应佣金档位为单选。只有 0–10 档覆盖全部目标范围；
-    # 其他上限保留平台不限，再以列表和精确详情中的实际佣金率核验。
-    if bound is not None and bound <= 10:
+    platform_option = str(settings.get("_platformCommissionRateOption") or "").strip() or _commission_rate_platform_filter_option(settings)
+    # 当前百应佣金档位是单选。只选择能够覆盖目标上下限的安全超集，
+    # 再由列表和精确详情中的实际佣金率做本地精确核验。
+    if platform_option:
         product_filters = filters.get("product")
         if not isinstance(product_filters, dict):
             product_filters = {}
             filters["product"] = product_filters
-        product_filters["佣金区间"] = "0%-10%"
+        product_filters["佣金区间"] = platform_option
     return filters
 
 
@@ -6784,7 +6894,9 @@ def _selection_filter_signature(settings: Dict[str, Any]) -> str:
     desired_settings = {
         "categorySelection": settings.get("categorySelection", {}),
         "filters": filters,
+        "commissionRateLowerBound": _commission_rate_bounds(settings)[0],
         "commissionRateUpperBound": _commission_rate_upper_bound(settings),
+        "commissionRatePlatformOption": str(settings.get("_platformCommissionRateOption") or ""),
         "searchKeyword": str(settings.get("searchKeyword") or "").strip(),
     }
     return json.dumps(desired_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -7536,6 +7648,47 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
           const ids = new Set();
           const rows = new Map();
           const categoryFieldSamples = [];
+          const sourceCategoryOptions = [];
+          const cleanText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+          const scalarCategoryId = (value) => {
+            if (typeof value !== 'string' && typeof value !== 'number') return '';
+            const text = String(value).trim();
+            return /^\d+(?:__RC_CASCADER_SPLIT__\d+)*$/.test(text) ? text : '';
+          };
+          const readReactCategoryIds = (element) => {
+            const found = [];
+            const seen = new WeakSet();
+            const walk = (node, depth) => {
+              if (!node || typeof node !== 'object' || depth > 4 || seen.has(node) || found.length >= 6) return;
+              seen.add(node);
+              for (const [key, child] of Object.entries(node)) {
+                if (/(category|cate|classify)/i.test(key)) {
+                  const id = scalarCategoryId(child);
+                  if (id) found.push(id);
+                }
+                if (child && typeof child === 'object' && key !== 'ownerDocument' && key !== 'stateNode') walk(child, depth + 1);
+              }
+            };
+            for (const key of Object.keys(element || {})) if (key.startsWith('__reactProps$')) walk(element[key], 0);
+            return [...new Set(found)];
+          };
+          const categoryOptionSelector = '[role="tab"], button, [class*="tab"], [class*="Tab"], [class*="category"], [class*="Category"], [class*="cate"], [class*="Cate"], [data-category-id], [data-cate-id], [data-path-key]';
+          for (const element of Array.from(document.querySelectorAll(categoryOptionSelector))) {
+            if (!visible(element)) continue;
+            const labelText = cleanText(element.innerText || element.textContent || element.getAttribute('aria-label'));
+            if (!labelText || labelText.length > 40 || /^(首页|经营|选品|创作|营销|体验|成长|数据|财账|关联平台|通知|消息|设置)$/.test(labelText)) continue;
+            const className = String(element.className || '').toLowerCase();
+            const contextText = cleanText(element.parentElement?.innerText || '').slice(0, 240);
+            if (!/(热点分类|榜单|分类|类目|category|cate|tab)/i.test(`${className} ${contextText}`)) continue;
+            const pathKey = String(element.getAttribute('data-path-key') || element.getAttribute('data-category-path') || '').trim();
+            const id = scalarCategoryId(element.getAttribute('data-category-id') || element.getAttribute('data-cate-id') || element.getAttribute('data-id')) || readReactCategoryIds(element)[0] || '';
+            const selected = element.getAttribute('aria-selected') === 'true' || element.getAttribute('data-selected') === 'true' || /active|selected|checked/.test(`${className} ${String(element.parentElement?.className || '').toLowerCase()}`);
+            const key = `${labelText}|${id}|${pathKey}`;
+            if (!sourceCategoryOptions.some((item) => item.key === key)) sourceCategoryOptions.push({
+              key, label: labelText, id, pathKey, selected,
+            });
+            if (sourceCategoryOptions.length >= 80) break;
+          }
           const visited = new WeakSet();
           let visitedCount = 0;
           const scan = (value, depth) => {
@@ -7738,6 +7891,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             ids: Array.from(ids),
             rows: Array.from(rows.values()).slice(0, 200),
             categoryFieldSamples,
+            sourceCategoryOptions,
             candidateSelector: selector,
             rootMatchCount: allRoots.length,
             visibleRowCount: roots.length,
@@ -7788,6 +7942,9 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             dict(row) for row in raw_rows
             if isinstance(row, dict) and str(row.get("product_id") or "").strip()
         ]
+        source_category_options = snapshot.get("sourceCategoryOptions") if isinstance(snapshot.get("sourceCategoryOptions"), list) else []
+        for row in product_rows:
+            row["_sourceCategoryOptions"] = source_category_options[:80]
         complete_category_path_count = 0
         for row in product_rows:
             base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
@@ -7823,6 +7980,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                 "firstProductIds": list(snapshot.get("ids", []))[:3],
                 "sourceOutcome": "① 滚动区出现商品",
                 "detail": json.dumps(recognized_detail, ensure_ascii=False),
+                "sourceCategoryOptions": source_category_options[:80],
             }
         evidence = _save_priority_source_dom_evidence(source_key, source_page, snapshot, readiness_reached)
         evidence_detail = {
@@ -7857,6 +8015,7 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
             "滚动区DOM文件": evidence.get("scrollContainerHtmlPath", "未找到滚动区容器"),
         }
         evidence["detail"] = json.dumps(evidence_detail, ensure_ascii=False)
+        evidence["sourceCategoryOptions"] = snapshot.get("sourceCategoryOptions", [])[:80]
         containers_visible = int(snapshot.get("listContainerVisibleCount", 0) or 0)
         containers_with_children = int(snapshot.get("listContainersWithChildren", 0) or 0)
         product_node_count = int(snapshot.get("visibleProductNodeCount", 0) or 0)
@@ -7950,6 +8109,54 @@ def _read_priority_source_product_ids(page: Page, source_key: str) -> tuple[set[
                 pass
 
 
+def _map_source_category_options_to_selection(options: Any, category_tree: Any) -> Dict[str, list[str]]:
+    """把来源页明确选中的类目页签映射到本地类目树；名称不唯一时保持未知。"""
+    mapped = {"level1": [], "level2": [], "level3": []}
+    if not isinstance(options, list) or not isinstance(category_tree, list):
+        return mapped
+    paths: list[list[tuple[str, str]]] = []
+
+    def walk(nodes: Any, parent: list[tuple[str, str]]) -> None:
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or "").strip()
+            node_name = str(node.get("name") or "").strip()
+            current = parent + ([(node_id, node_name)] if node_id else [])
+            if node_id:
+                paths.append(current)
+            walk(node.get("children", []), current)
+
+    walk(category_tree, [])
+    for option in options:
+        if not isinstance(option, dict) or option.get("selected") is not True:
+            continue
+        label = str(option.get("label") or "").strip()
+        if not label or label in {"全部", "全部分类", "不限"}:
+            continue
+        raw_ids = [str(option.get(key) or "").strip() for key in ("pathKey", "id")]
+        matches = []
+        for path in paths:
+            ids = [item[0] for item in path]
+            names = [item[1] for item in path]
+            if any(raw and (raw == ids[-1] or raw == CATEGORY_PATH_SEPARATOR.join(ids)) for raw in raw_ids):
+                matches.append(path)
+            elif names and names[-1] == label:
+                matches.append(path)
+        unique = {tuple(item) for item in matches}
+        if len(unique) != 1:
+            continue
+        path = list(next(iter(unique)))
+        for index, level in enumerate(("level1", "level2", "level3")):
+            if index < len(path) and path[index][0]:
+                value = path[index][0] if index < 2 else CATEGORY_PATH_SEPARATOR.join(item[0] for item in path[:index + 1])
+                if value not in mapped[level]:
+                    mapped[level].append(value)
+    return mapped
+
+
 def _collect_priority_source_ids(
     page: Page,
     settings: Dict[str, Any],
@@ -7971,6 +8178,7 @@ def _collect_priority_source_ids(
     warnings: list[str] = []
     source_results: list[Dict[str, Any]] = []
     source_candidates: dict[str, list[Dict[str, Any]]] = {}
+
     for index, source_key in enumerate(selected_sources, start=1):
         label = BAIYING_PRIORITY_SOURCES[source_key][0]
         _report_operation_progress(
@@ -7983,6 +8191,14 @@ def _collect_priority_source_ids(
         )
         try:
             product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key)
+            source_options = evidence.get("sourceCategoryOptions") if isinstance(evidence.get("sourceCategoryOptions"), list) else []
+            source_selection = _map_source_category_options_to_selection(
+                source_options,
+                settings.get("categoryTree") if isinstance(settings.get("categoryTree"), list) else [],
+            )
+            for row in product_rows:
+                row["_sourceCategoryOptions"] = source_options
+                row["_sourceCategorySelection"] = copy.deepcopy(source_selection)
             membership[source_key] = product_ids
             source_candidates[source_key] = product_rows
             source_results.append({
@@ -7997,6 +8213,8 @@ def _collect_priority_source_ids(
                 "sourceOutcome": str(evidence.get("sourceOutcome") or ""),
                 "pageListDiagnosis": str(evidence.get("pageListDiagnosis") or ""),
                 "detail": str(evidence.get("detail") or ""),
+                "sourceCategoryOptions": source_options[:80],
+                "sourceCategorySelection": source_selection,
                 "diagnosticId": str(evidence.get("diagnosticId") or ""),
             })
         except RecoverablePrioritySourceReadError as error:
@@ -8090,6 +8308,23 @@ def _candidate_matches_manual_categories(candidate: Dict[str, Any], selected_ids
                 selected_aliases.intersection(candidate_aliases))
 
 
+def _candidate_matches_source_categories(candidate: Dict[str, Any], selected_ids: set[str]) -> bool:
+    """仅按来源页面明确选中的类目页签预筛；页签为空/未映射时返回 False，不能把未知当达标。"""
+    selection = candidate.get("sourceCategorySelection")
+    if not isinstance(selection, dict):
+        return False
+    source_ids = {
+        str(value).strip()
+        for level in ("level1", "level2", "level3")
+        for value in (selection.get(level, []) if isinstance(selection.get(level), list) else [])
+        if str(value).strip()
+    }
+    if not source_ids:
+        return False
+    aliases = {value.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1] for value in selected_ids}
+    return bool(selected_ids.intersection(source_ids) or aliases.intersection({value.rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1] for value in source_ids}))
+
+
 def _excluded_category_selection_ids(settings: Dict[str, Any]) -> set[str]:
     selection = settings.get("excludedCategorySelection")
     if not isinstance(selection, dict):
@@ -8100,6 +8335,21 @@ def _excluded_category_selection_ids(settings: Dict[str, Any]) -> set[str]:
         for value in (selection.get(level, []) if isinstance(selection.get(level, []), list) else [])
         if str(value).strip()
     }
+
+
+def _category_verification_required(settings: Dict[str, Any]) -> bool:
+    """只有需要判断类目范围时才把完整三级类目作为硬门槛。
+
+    通用模式且没有排除类目时，来源列表缺少类目不应阻断候选；
+    通用模式一旦配置排除类目，或进入品类模式，未知类目仍必须拦截，
+    避免把无法核实的商品误当成不在排除范围内。
+    """
+    selection_mode = str(settings.get("selectionMode") or "general").strip().casefold()
+    if selection_mode == "category":
+        return True
+    if selection_mode != "general":
+        return False
+    return bool(_excluded_category_selection_ids(settings))
 
 
 def _category_name_path(category_tree: Any, leaf_category_id: str) -> str:
@@ -8235,9 +8485,19 @@ def _collect_selection_square_rows(
     query_base = copy.deepcopy(settings)
     if selection_mode != "category" or category_mode != "manual":
         query_base["categorySelection"] = {"level1": [], "level2": [], "level3": []}
-        queries = [query_base]
+        base_queries = [query_base]
     else:
-        queries = _category_query_settings(query_base)
+        base_queries = _category_query_settings(query_base)
+    commission_options = _commission_rate_platform_filter_options(settings)
+    queries: list[Dict[str, Any]] = []
+    for base_query in base_queries:
+        if commission_options:
+            for option in commission_options:
+                expanded_query = copy.deepcopy(base_query)
+                expanded_query["_platformCommissionRateOption"] = option
+                queries.append(expanded_query)
+        else:
+            queries.append(copy.deepcopy(base_query))
     rows_by_id: Dict[str, Dict[str, Any]] = {}
     category_selection_by_id: Dict[str, Dict[str, Any]] = {}
     warnings: list[str] = []
@@ -8247,7 +8507,7 @@ def _collect_selection_square_rows(
     page_fingerprints: list[str] = []
     for index, query in enumerate(queries, start=1):
         query_settings = copy.deepcopy(query)
-        # 三源采集先保留原始候选，实际指标稍后统一核验；平台佣金档位仍须按账号上限选择。
+        # 三源采集先保留原始候选，实际指标稍后统一核验；平台佣金档位按可安全覆盖的边界选择。
         query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
         query_settings["thresholds"] = {}
         query_settings["_unifiedSourceCollection"] = True
@@ -8256,7 +8516,7 @@ def _collect_selection_square_rows(
         _report_operation_progress(
             progress, "读取选品广场候选", index=index - 1, total=len(queries),
             percent=int((index - 1) * 100 / max(1, len(queries))),
-            message=f"采集选品广场当前可见商品（类目查询 {index}/{len(queries)}）",
+            message=f"采集选品广场当前可见商品（类目/佣金档位查询 {index}/{len(queries)}）",
         )
         result = _apply_one_category_and_collect_candidates(
             page,
@@ -8323,7 +8583,7 @@ def _collect_selection_square_rows(
     scroll_status = "已到列表末尾" if scroll_exhausted else "滚动未产生新数据"
     detail = (
         f"{label}读取 material_list {observed_rows} 行，去重后 {len(ids)} 个商品 ID；"
-        f"类目模式 {selection_mode}，手动类目查询 {len(queries)} 组；"
+        f"类目模式 {selection_mode}，类目/佣金档位查询 {len(queries)} 组；"
         f"读取滚动页 {pages_read} 页；{scroll_status}。"
     )
     return list(rows_by_id.values()), {
@@ -8409,11 +8669,11 @@ def _probe_source_card_category(
             if browser is None:
                 diagnostic["reason"] = "账号浏览器连接不可用"
                 return diagnostic
-            source_page = _create_background_page(page.context, browser)
+            source_page = _reused_category_page(page.context, browser, f"source:{source_key}")
             source_page.goto(BAIYING_PRIORITY_SOURCES[source_key][1], wait_until="commit", timeout=20_000)
         diagnostic["entryPath"] = _detail_diagnostic_path(source_page.url)
         prompt_kind, _ = _visible_baiying_prompt(source_page)
-        if prompt_kind in {"manual_verification", "login", "account_unavailable"}:
+        if prompt_kind in {"manual_verification", "login", "account_unavailable", "environment_risk"}:
             raise RuntimeError(f"百应来源页账号状态异常：{prompt_kind}")
         candidate = {"productId": product_id, "title": title, "sourceKey": source_key}
         if source_key != "selectionSquare" and not _ensure_priority_source_candidate_visible(
@@ -8463,11 +8723,7 @@ def _probe_source_card_category(
         return diagnostic
     finally:
         diagnostic.pop("_matchedPayloads", None)
-        if source_page is not None and source_page is not page:
-            try:
-                source_page.close()
-            except Exception:
-                pass
+        # 来源页属于本轮账号级复用页，由统一清理函数关闭；不在每个商品探针后重复创建/关闭。
 
 
 def _visible_source_candidate_result(
@@ -8489,7 +8745,7 @@ def _visible_source_candidate_result(
     source_urls = {key: value[1] for key, value in BAIYING_PRIORITY_SOURCES.items()}
     source_urls["selectionSquare"] = BAIYING_SELECTION_SQUARE_SOURCE[1]
     excluded_category_ids = _excluded_category_selection_ids(settings)
-    category_gate_enabled = settings.get("selectionMode") == "category" or bool(excluded_category_ids)
+    category_gate_enabled = _category_verification_required(settings)
     threshold_names = _enabled_threshold_names(settings)
     merged_raw: Dict[str, Dict[str, Any]] = {}
     sources_by_id: Dict[str, list[str]] = {}
@@ -8793,7 +9049,11 @@ def _visible_source_candidate_result(
         candidate["selectionMode"] = "category" if category_logic_enabled else "general"
         category_ids = [str(value) for value in candidate.get("categoryIds", []) if str(value)]
         candidate["leafCategoryId"] = category_ids[-1] if len(category_ids) >= 3 else ""
-        candidate["sourceCategorySelection"] = {}
+        candidate["sourceCategorySelection"] = (
+            copy.deepcopy(candidate.get("sourceCategorySelection"))
+            if isinstance(candidate.get("sourceCategorySelection"), dict)
+            else {}
+        )
         category_result = category_results.get(product_id, {})
         candidate["categoryStatus"] = "known" if candidate["leafCategoryId"] else "类目未知"
         candidate["categorySource"] = (
@@ -8803,6 +9063,38 @@ def _visible_source_candidate_result(
             candidate["categoryError"] = str(category_result.get("reason") or "详情页未返回完整三级类目 ID")
 
     category_filtered_ids: set[str] = set()
+    source_category_rejected: list[Dict[str, Any]] = []
+    selected_level1_ids = {
+        str(value).strip()
+        for value in ((settings.get("categorySelection") or {}).get("level1", []) if isinstance(settings.get("categorySelection"), dict) else [])
+        if str(value).strip()
+    }
+    for candidate in candidates:
+        source_selection = candidate.get("sourceCategorySelection")
+        source_level1 = set(source_selection.get("level1", [])) if isinstance(source_selection, dict) and isinstance(source_selection.get("level1"), list) else set()
+        source_ids = {
+            str(value).strip()
+            for level in ("level1", "level2", "level3")
+            for value in (source_selection.get(level, []) if isinstance(source_selection, dict) and isinstance(source_selection.get(level), list) else [])
+            if str(value).strip()
+        }
+        source_excluded = bool(source_ids and _candidate_matches_source_categories(candidate, excluded_category_ids))
+        source_outside_manual = bool(category_logic_enabled and settings.get("categoryMode") == "manual" and selected_level1_ids and source_level1 and not _candidate_matches_source_categories(candidate, selected_level1_ids))
+        if not source_excluded and not source_outside_manual:
+            continue
+        candidate["analysisRejected"] = True
+        candidate["thresholdReasons"] = [
+            "来源页明确类目命中当前设置中排除的类目" if source_excluded else "来源页明确类目不在手动选择的一级类目范围"
+        ]
+        candidate["status"] = candidate["thresholdReasons"][0]
+        candidate["cartAdded"] = False
+        candidate["skipped"] = True
+        source_category_rejected.append(candidate)
+        category_filtered_ids.add(str(candidate.get("productId") or ""))
+    if source_category_rejected:
+        rejected.extend(source_category_rejected)
+        source_rejected_ids = {str(candidate.get("productId") or "") for candidate in source_category_rejected}
+        candidates = [candidate for candidate in candidates if str(candidate.get("productId") or "") not in source_rejected_ids]
     if category_gate_enabled:
         invalid_category = [candidate for candidate in candidates if not candidate.get("leafCategoryId")]
         for candidate in invalid_category:
@@ -9023,7 +9315,12 @@ def _visible_source_candidate_result(
             for item in source_results
         },
     }
-    return _attach_priority_source_results(result, source_results)
+    try:
+        return _attach_priority_source_results(result, source_results)
+    finally:
+        context = getattr(page, "context", None)
+        if context is not None:
+            _close_reused_category_pages(context)
 
 
 class _MaterialListCollector:
@@ -10047,7 +10344,7 @@ def apply_filter_settings(
             except Exception as error:
                 if _selection_error_requires_pause(error):
                     raise
-                warnings.append(f"百应佣金区间未能应用；继续按商品实际佣金率上限筛选：{_safe_diagnostic_text(error, 180)}")
+                warnings.append(f"百应佣金区间未能应用；继续按商品实际佣金率上下限筛选：{_safe_diagnostic_text(error, 180)}")
                 continue
         else:
             _apply_configured_filter_field(page, label, selected, cached_options, warnings)
@@ -11511,8 +11808,15 @@ def _read_candidate_category_from_detail(
                 'reason': 'DETAIL_BACKGROUND_PAGE_UNAVAILABLE', 'fatal': True,
                 'diagnostics': diagnostics,
             }
-        detail_page = _create_background_page(context, active_browser)
+        detail_page = _reused_category_page(context, active_browser, "detail")
+        previous_handler = getattr(detail_page, "_touguang_category_response_handler", None)
+        if previous_handler is not None:
+            try:
+                detail_page.remove_listener("response", previous_handler)
+            except Exception:
+                pass
         detail_page.on('response', on_detail)
+        setattr(detail_page, "_touguang_category_response_handler", on_detail)
         diagnostics['navigationState'] = 'started'
         try:
             navigation_response = detail_page.goto(detail_url, wait_until='commit', timeout=20_000)
@@ -11557,12 +11861,12 @@ def _read_candidate_category_from_detail(
         deadline = time.monotonic() + DETAIL_CATEGORY_READ_TIMEOUT_SECONDS
         while time.monotonic() < deadline and not payloads:
             prompt_kind, _prompt_text = _visible_baiying_prompt(detail_page)
-            if prompt_kind == 'manual_verification':
+            if prompt_kind in {'manual_verification', 'environment_risk'}:
                 diagnostics['finalPagePath'] = _detail_diagnostic_path(getattr(detail_page, 'url', ''))
                 return {
                     'productId': product_id,
                     'categoryIds': [],
-                    'reason': 'DETAIL_MANUAL_VERIFICATION_REQUIRED',
+                    'reason': 'DETAIL_ENVIRONMENT_RISK_REQUIRED' if prompt_kind == 'environment_risk' else 'DETAIL_MANUAL_VERIFICATION_REQUIRED',
                     'fatal': True,
                     'diagnostics': diagnostics,
                 }
@@ -11652,11 +11956,8 @@ def _read_candidate_category_from_detail(
             reason = f"DETAIL_READ_FAILED ({type(error).__name__})"
         return {'productId': product_id, 'categoryIds': [], 'reason': reason, 'diagnostics': diagnostics}
     finally:
-        if detail_page is not None:
-            try:
-                detail_page.close()
-            except Exception:
-                pass
+        # 详情页属于当前账号复用页，由候选统一核验结束后的清理函数关闭。
+        pass
 
 
 def _detail_metrics(payload: Any, expected_product_id: str) -> Dict[str, Any]:
@@ -11920,6 +12221,8 @@ def _capture_candidate_detail(
     if not product_id:
         raise RuntimeError("商品数据分析缺少商品 ID，已停止后续操作")
     prompt_kind, prompt_text = _visible_baiying_prompt(page)
+    if prompt_kind == "environment_risk":
+        raise RuntimeError("百应详情页显示环境风险；已停止当前账号详情核验，需人工确认浏览器环境后再继续。")
     if prompt_kind == "manual_verification":
         raise RuntimeError("百应要求手动完成验证；商品分析已停止，未继续加车。")
     if prompt_kind in {"login", "account_unavailable"}:
@@ -12043,7 +12346,7 @@ def _capture_candidate_detail(
         while time.time() < deadline and not detail_payloads:
             for detail_page in [page, *opened_pages]:
                 prompt_kind, prompt_text = _visible_baiying_prompt(detail_page)
-                if prompt_kind == "manual_verification":
+                if prompt_kind in {"manual_verification", "environment_risk"}:
                     raise RuntimeError("打开商品详情时百应要求手动完成验证；未加车，任务已停止。")
                 if prompt_kind in {"login", "account_unavailable"}:
                     raise RuntimeError(f"打开商品详情时百应账号状态异常：{prompt_text or prompt_kind}；任务已停止。")
@@ -12254,6 +12557,8 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
     data = candidate.get("dataMetrics") if isinstance(candidate.get("dataMetrics"), dict) else {}
     reasons: list[str] = []
     for metric, threshold in thresholds.items():
+        if metric in {"commissionRate", "minCommissionRate", "maxCommissionRate"}:
+            continue
         if threshold is None or threshold == "":
             continue
         actual = _number(data.get(metric))
@@ -12271,6 +12576,21 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
                 reasons.append(f"佣金率 {actual:g} 超过设定上限 {boundary:g}")
         elif actual < boundary:
             reasons.append(f"{label} {actual:g} 低于设定阈值 {boundary:g}")
+    minimum, maximum = _commission_rate_bounds(settings)
+    if minimum is not None or maximum is not None:
+        actual = _number(data.get("commissionRate"))
+        if actual is None:
+            if minimum is not None:
+                reasons.append(f"缺少佣金率实测数据，无法核验下限 {minimum:g}")
+            if maximum is not None:
+                reasons.append(f"缺少佣金率实测数据，无法核验上限 {maximum:g}")
+        elif not math.isfinite(actual) or not 0 <= actual <= 100:
+            reasons.append("佣金率数据超出 0–100%，无法核验设定范围")
+        else:
+            if minimum is not None and actual < minimum:
+                reasons.append(f"佣金率 {actual:g} 低于设定下限 {minimum:g}")
+            if maximum is not None and actual > maximum:
+                reasons.append(f"佣金率 {actual:g} 超过设定上限 {maximum:g}")
     candidate["thresholdReasons"] = reasons
     candidate["eligible"] = not reasons
     return reasons
@@ -13518,6 +13838,8 @@ def _is_product_specific_cart_rejection(message: str) -> bool:
 def _classify_baiying_prompt(text: str) -> str:
     """将已识别的百应弹窗分为验证码、资质提醒、消费券推荐或普通加车错误。"""
     normalized = " ".join(str(text or "").split())
+    if re.search(r"环境危险|环境异常|当前环境存在风险|风险环境|请使用常用设备|请在常用设备", normalized):
+        return "environment_risk"
     if re.search(r"请完成下列验证|拖动完成上方拼图|按住左边按钮拖动|滑块验证|安全验证", normalized):
         return "manual_verification"
     if ("有开具发票能力的作者才可带货" in normalized or
@@ -13554,7 +13876,7 @@ def _visible_baiying_prompt(page: Page) -> tuple[str, str]:
             .filter(Boolean);
           if (dialogs.length) return dialogs;
           const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
-          if (/请完成下列验证|拖动完成上方拼图|按住左边按钮拖动/.test(bodyText)) {
+          if (/请完成下列验证|拖动完成上方拼图|按住左边按钮拖动|环境危险|环境异常|当前环境存在风险|风险环境|请使用常用设备|请在常用设备/.test(bodyText)) {
             return [bodyText.slice(0, 3000)];
           }
           return [];
@@ -13580,7 +13902,7 @@ def _visible_baiying_prompt(page: Page) -> tuple[str, str]:
             texts.extend(str(text) for text in result)
     prompts = [(kind, str(text).strip()) for text in texts
                if (kind := _classify_baiying_prompt(str(text)))]
-    for priority in ("manual_verification", "invoice_eligibility", "coupon_recommendation", "cart_error"):
+    for priority in ("environment_risk", "manual_verification", "invoice_eligibility", "coupon_recommendation", "cart_error"):
         match = next((prompt for prompt in prompts if prompt[0] == priority), None)
         if match:
             return match

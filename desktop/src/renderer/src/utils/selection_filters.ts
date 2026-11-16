@@ -17,7 +17,10 @@ export interface SelectionFilterSettings {
     salesCount: number | null
     conversionRate: number | null
     views: number | null
+    /** 兼容历史字段：保存时与 minCommissionRate 同步，按下限解释。 */
     commissionRate: number | null
+    minCommissionRate: number | null
+    maxCommissionRate: number | null
     experienceScore: number | null
   }
   trendPreference: string
@@ -29,7 +32,7 @@ export const DEFAULT_SELECTION_FILTER_SETTINGS: SelectionFilterSettings = {
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
   sources: { hotSpotEnabled: true, allianceRankEnabled: true, priority: ['hotSpot', 'allianceRank'] },
-  thresholds: { salesAmount: null, salesCount: null, conversionRate: null, views: null, commissionRate: null, experienceScore: null },
+  thresholds: { salesAmount: null, salesCount: null, conversionRate: null, views: null, commissionRate: null, minCommissionRate: null, maxCommissionRate: null, experienceScore: null },
   trendPreference: '上升优先'
 }
 
@@ -73,7 +76,7 @@ export function createSelectionFilterSettings(
   const candidateLimit = Number(source.candidateLimit)
   const deliveryFilters = normalizeFilterGroup(sourceFilters.delivery, fallbackFilters.delivery)
   const productFilters = normalizeFilterGroup(sourceFilters.product, fallbackFilters.product)
-  // 数字佣金上限是唯一设置入口；旧版手选的百应档位不能继续覆盖它。
+  // 数字佣金边界是唯一设置入口；旧版手选的百应档位不能继续覆盖它。
   delete deliveryFilters['佣金区间']
   delete productFilters['佣金区间']
   const sourceSources = asRecord(source.sources)
@@ -84,6 +87,22 @@ export function createSelectionFilterSettings(
   for (const item of fallbackSources.priority) {
     if (!normalizedSourcePriority.includes(item)) normalizedSourcePriority.push(item)
   }
+  const fallbackMinCommissionRate = normalizeThreshold(
+    fallbackThresholds.minCommissionRate ?? fallbackThresholds.commissionRate,
+    null
+  )
+  const fallbackMaxCommissionRate = normalizeThreshold(fallbackThresholds.maxCommissionRate, null)
+  const hasExplicitMinCommissionRate = Object.prototype.hasOwnProperty.call(sourceThresholds, 'minCommissionRate')
+  const hasExplicitMaxCommissionRate = Object.prototype.hasOwnProperty.call(sourceThresholds, 'maxCommissionRate')
+  const hasExplicitLegacyCommissionRate = Object.prototype.hasOwnProperty.call(sourceThresholds, 'commissionRate')
+  const minCommissionRate = hasExplicitMinCommissionRate
+    ? normalizeThreshold(sourceThresholds.minCommissionRate, null)
+    : hasExplicitLegacyCommissionRate
+      ? normalizeThreshold(sourceThresholds.commissionRate, fallbackMinCommissionRate)
+      : fallbackMinCommissionRate
+  const maxCommissionRate = hasExplicitMaxCommissionRate
+    ? normalizeThreshold(sourceThresholds.maxCommissionRate, null)
+    : fallbackMaxCommissionRate
   return {
     candidateLimit: Number.isFinite(candidateLimit) ? candidateLimit : fallback.candidateLimit,
     filters: {
@@ -103,7 +122,10 @@ export function createSelectionFilterSettings(
       salesCount: normalizeThreshold(sourceThresholds.salesCount, fallbackThresholds.salesCount),
       conversionRate: normalizeThreshold(sourceThresholds.conversionRate, fallbackThresholds.conversionRate),
       views: normalizeThreshold(sourceThresholds.views, fallbackThresholds.views),
-      commissionRate: normalizeThreshold(sourceThresholds.commissionRate, fallbackThresholds.commissionRate),
+      // `commissionRate` is retained for old engine/database payloads and always mirrors the lower bound.
+      commissionRate: minCommissionRate,
+      minCommissionRate,
+      maxCommissionRate,
       experienceScore: normalizeThreshold(sourceThresholds.experienceScore, fallbackThresholds.experienceScore)
     },
     trendPreference: typeof source.trendPreference === 'string' ? source.trendPreference : fallback.trendPreference

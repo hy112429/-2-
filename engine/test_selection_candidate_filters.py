@@ -39,12 +39,41 @@ class SelectionCandidateFilterTests(unittest.TestCase):
             "poolPriority": [],
             "poolFallback": True,
             "sources": {"hotSpotEnabled": True, "allianceRankEnabled": True, "priority": ["hotSpot", "allianceRank"]},
-            "thresholds": {"commissionRate": 10, "experienceScore": 4.5},
+            "thresholds": {"maxCommissionRate": 10, "experienceScore": 4.5},
             "trendPreference": "不限走势",
             "categoryTree": [],
         }
         value.update(overrides)
         return value
+
+    def test_category_verification_scope_is_narrowed_to_needed_modes(self):
+        self.assertFalse(browser_cdp._category_verification_required({
+            "selectionMode": "general",
+            "excludedCategorySelection": {"level1": [], "level2": [], "level3": []},
+        }))
+        self.assertTrue(browser_cdp._category_verification_required({
+            "selectionMode": "general",
+            "excludedCategorySelection": {"level1": ["blocked"], "level2": [], "level3": []},
+        }))
+        self.assertTrue(browser_cdp._category_verification_required({
+            "selectionMode": "category",
+            "excludedCategorySelection": {"level1": [], "level2": [], "level3": []},
+        }))
+
+    def test_general_mode_without_exclusions_keeps_unknown_category_candidate(self):
+        rows = {"hotSpot": [promotion_row("unknown-category", None, 25, 4.8)]}
+        result = browser_cdp._visible_source_candidate_result(
+            None,
+            rows,
+            {"hotSpot": {"unknown-category"}},
+            [{"sourceKey": "hotSpot", "label": "热点", "status": "read", "productCount": 1}],
+            [],
+            {},
+            [],
+            {**self.settings(), "thresholds": {}, "excludedCategorySelection": {"level1": [], "level2": [], "level3": []}},
+        )
+        self.assertEqual([item["productId"] for item in result["candidates"]], ["unknown-category"])
+        self.assertEqual(result["rejectedCandidates"], [])
 
     def test_three_sources_share_exclusion_and_thresholds(self):
         rows = {
@@ -140,6 +169,60 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         category_ids, reason = browser_cdp._read_detail_category_from_dom(page, "p1", tree)
         self.assertEqual(category_ids, ["1", "2", "2__RC_CASCADER_SPLIT__3"])
         self.assertEqual(reason, "")
+
+    def test_commission_lower_and_upper_bounds_are_both_enforced(self):
+        rows = [
+            promotion_row("commission-good", ("root", "beauty", "ok-leaf"), 25, 4.8),
+            promotion_row("commission-low", ("root", "beauty", "ok-leaf"), 5, 4.8),
+            promotion_row("commission-high", ("root", "beauty", "ok-leaf"), 40, 4.8),
+            promotion_row("commission-missing", ("root", "beauty", "ok-leaf"), None, 4.8),
+        ]
+        candidates, _, rejected = browser_cdp._candidate_rows(
+            {"data": {"summary_promotions": rows}},
+            {**self.settings(), "thresholds": {"minCommissionRate": 10, "maxCommissionRate": 30}},
+            10,
+        )
+        self.assertEqual([item["productId"] for item in candidates], ["commission-good"])
+        reasons = {item["productId"]: item["thresholdReasons"] for item in rejected}
+        self.assertIn("佣金率 5 低于设定下限 10", reasons["commission-low"])
+        self.assertIn("佣金率 40 超过设定上限 30", reasons["commission-high"])
+        self.assertIn("缺少佣金率实测数据，无法核验下限 10", reasons["commission-missing"])
+
+    def test_source_category_selection_can_exclude_explicit_source_tab(self):
+        candidate = {"sourceCategorySelection": {"level1": ["1"], "level2": [], "level3": []}}
+        self.assertTrue(browser_cdp._candidate_matches_source_categories(candidate, {"1"}))
+        self.assertFalse(browser_cdp._candidate_matches_source_categories(candidate, {"2"}))
+
+    def test_source_category_tab_maps_only_unique_local_category(self):
+        tree = [{
+            "id": "1", "name": "服饰内衣", "children": [{
+                "id": "2", "name": "女装", "children": [{"id": "3", "name": "连衣裙", "children": []}]
+            }]
+        }]
+        mapped = browser_cdp._map_source_category_options_to_selection(
+            [{"label": "服饰内衣", "id": "1", "selected": True}], tree
+        )
+        self.assertEqual(mapped, {"level1": ["1"], "level2": [], "level3": []})
+        unknown = browser_cdp._map_source_category_options_to_selection(
+            [{"label": "不存在类目", "id": "", "selected": True}], tree
+        )
+        self.assertEqual(unknown, {"level1": [], "level2": [], "level3": []})
+
+    def test_platform_commission_filter_is_applied_before_candidate_read(self):
+        base = self.settings()
+        base["thresholds"] = {"commissionRate": 10}
+        self.assertEqual(browser_cdp._commission_rate_platform_filter_options(base), ["10%-20%", "20%-30%", "30%-40%", "40%-50%", "≥50%"])
+        base["_platformCommissionRateOption"] = "10%-20%"
+        self.assertEqual(browser_cdp._effective_selection_filters(base)["product"]["佣金区间"], "10%-20%")
+        base["thresholds"] = {"minCommissionRate": 20, "maxCommissionRate": 30}
+        base.pop("_platformCommissionRateOption", None)
+        self.assertEqual(browser_cdp._commission_rate_platform_filter_options(base), ["20%-30%"])
+        self.assertEqual(browser_cdp._effective_selection_filters(base)["product"]["佣金区间"], "20%-30%")
+        base["thresholds"] = {"minCommissionRate": 50}
+        self.assertEqual(browser_cdp._effective_selection_filters(base)["product"]["佣金区间"], "≥50%")
+
+    def test_environment_risk_page_is_classified_as_account_detail_stop(self):
+        self.assertEqual(browser_cdp._classify_baiying_prompt("环境危险，请使用常用设备打开"), "environment_risk")
 
 
 if __name__ == "__main__":
