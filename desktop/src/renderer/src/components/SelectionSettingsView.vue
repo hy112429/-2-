@@ -2191,6 +2191,7 @@ async function collectBatchCandidatePool(
           message: `采集账号 ${collectorId}：候选池 ${before}/${target}，第 ${round + 1} 轮读取。`
         })
         try {
+        try {
           const preview = await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
             profileKey: context.profileKey, profilePath: context.profilePath,
             accountId: collectorId, downloadPath: context.downloadPath,
@@ -2243,6 +2244,15 @@ async function collectBatchCandidatePool(
           })
           if (/11001|RATE_LIMIT|限流|验证码|安全验证|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) break
           break
+        }
+        } finally {
+          try {
+            const closed = await window.api.browser.closeAccount({ accountId: collectorId, profilePath: context.profilePath })
+            if (closed.ok !== true) throw new Error('客户端未确认采集账号浏览器关闭')
+          } catch {
+            await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
+            throw new Error(`采集账号 ${collectorId} 浏览器关闭未确认；为避免同时打开两个账号，已停止后续采集。`)
+          }
         }
       }
     }
