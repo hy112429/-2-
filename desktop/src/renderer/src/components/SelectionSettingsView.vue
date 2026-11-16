@@ -2659,7 +2659,9 @@ async function prepareBatchCandidatePlans(
         [...classFilteredIds].filter((productId) => collectedIds.has(productId)).length
     }
     plans.set(account.id, {
-      candidates: winners,
+      candidates: collectorPool
+        ? winners.map((candidate, index) => ({ ...candidate, cardIndex: index }))
+        : winners,
       candidatePool: rankedPools.get(account.id) ?? [],
       sharedCandidatePool: sharedPoolRowsByAccount.get(account.id) ?? [],
       candidatePoolMeta: poolReuseMetaByAccount.get(account.id),

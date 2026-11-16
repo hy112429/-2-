@@ -336,7 +336,7 @@ def create_batch(connection: sqlite3.Connection, batch_id: str, payload: Any) ->
 
 
 POOL_CANDIDATE_FIELDS = frozenset({
-    "productId", "commodityId", "title", "price", "monthSales", "saleAmount",
+    "cardIndex", "productId", "commodityId", "title", "price", "monthSales", "saleAmount",
     "estimatedSalesAmount", "conversionRate", "views", "commissionRate", "shopScore",
     "trendRising", "trendKnown", "trendStatus", "trendSlope", "trendPoints",
     "dataMetrics", "metricSources", "poolRank", "sources", "sourceKey",
