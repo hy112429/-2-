@@ -340,7 +340,7 @@ POOL_CANDIDATE_FIELDS = frozenset({
     "estimatedSalesAmount", "conversionRate", "views", "commissionRate", "shopScore",
     "trendRising", "trendKnown", "trendStatus", "trendSlope", "trendPoints",
     "dataMetrics", "metricSources", "poolRank", "sources", "sourceKey",
-    "categoryIds", "leafCategoryId", "categoryStatus", "categorySource",
+    "categoryIds", "leafCategoryId", "categoryStatus", "categorySource", "sourceCategoryIds",
     "analysisScore", "unifiedScore",
 })
 
@@ -364,7 +364,12 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         raise ValueError("批次缺少有效的候选采集账号或池目标数")
     if value.get("target") != target or value.get("collectorAccountIds") != collector_ids:
         raise ValueError("候选池配置与批次启动快照不一致")
+    fingerprint = value.get("filterFingerprint")
+    if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 100_000:
+        raise ValueError("候选池缺少有效的筛选指纹")
     previous = payload.get("candidatePool") if isinstance(payload.get("candidatePool"), dict) else {}
+    if previous.get("filterFingerprint") != fingerprint:
+        previous = {}
     existing_rows = previous.get("rows") if isinstance(previous.get("rows"), list) else []
     incoming_rows = value.get("rows")
     if not isinstance(incoming_rows, list):
@@ -407,6 +412,7 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
     pool = {
         "target": target,
         "collectorAccountIds": collector_ids,
+        "filterFingerprint": fingerprint,
         "rows": list(by_product.values()),
         "sourceState": {"collectors": clean_collectors},
         "status": "ready" if len(by_product) >= target else "collecting",

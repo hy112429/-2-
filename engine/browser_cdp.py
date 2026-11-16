@@ -187,8 +187,8 @@ BAIYING_ROW_METADATA_SCRIPT = r"""(element, expected) => {
   };
 }"""
 BAIYING_PRIORITY_SOURCES = {
-    "hotSpot": ("热点趋势", "https://buyin.jinritemai.com/dashboard/merch-picking-utils/hot-spot"),
-    "allianceRank": ("联盟榜单", "https://buyin.jinritemai.com/dashboard/merch-picking-hall/rank"),
+    "hotSpot": ("选品热点", "https://buyin.jinritemai.com/dashboard/merch-picking-utils/hot-spot"),
+    "allianceRank": ("带货商品榜", "https://buyin.jinritemai.com/dashboard/merch-picking-hall/rank"),
 }
 BAIYING_SELECTION_SQUARE_SOURCE = (
     "选品广场", "https://buyin.jinritemai.com/dashboard/merch-picking-library"
@@ -6268,6 +6268,16 @@ def _number(value: Any) -> Optional[float]:
     return None
 
 
+def _source_count(value: Any) -> Optional[float]:
+    """仅用于热点主题数量，保留页面上的万/千/亿单位。"""
+    if not isinstance(value, str):
+        return _number(value)
+    match = re.fullmatch(r"\s*([\d,]+(?:\.\d+)?)\s*([千亿万]?)\+?\s*", value)
+    if not match:
+        return None
+    return float(match.group(1).replace(",", "")) * {"": 1, "千": 1_000, "万": 10_000, "亿": 100_000_000}[match.group(2)]
+
+
 def _find_metric(value: Any, keys: Sequence[str], depth: int = 0) -> Optional[float]:
     if depth > 8 or not isinstance(value, (dict, list)):
         return None
@@ -6556,7 +6566,10 @@ def _candidate_rows(
         }
         known_rejection_reasons: list[str] = []
         pending_thresholds: list[str] = []
+        commission_lower, commission_upper = _commission_rate_bounds(settings)
         for metric_name, threshold in thresholds.items():
+            if metric_name in {"commissionRate", "commissionRateMax"}:
+                continue
             if threshold is None or threshold == "":
                 continue
             actual = metrics.get(metric_name)
@@ -6568,24 +6581,27 @@ def _candidate_rows(
                     continue
                 known_rejection_reasons.append(
                     f"缺少{metric_labels.get(metric_name, metric_name)}实测数据，无法核验"
-                    f"{'上限' if metric_name == 'commissionRate' else '阈值'} {boundary:g}"
+                    f"阈值 {boundary:g}"
                 )
                 continue
             try:
                 boundary = float(threshold)
-                if metric_name == "commissionRate":
-                    if not math.isfinite(actual) or not 0 <= actual <= 100:
-                        known_rejection_reasons.append("佣金率数据超出 0–100%，无法核验设定上限")
-                    elif actual > boundary:
-                        known_rejection_reasons.append(
-                            f"佣金率 {actual:g} 超过设定上限 {boundary:g}"
-                        )
-                elif actual < boundary:
+                if actual < boundary:
                     known_rejection_reasons.append(
                         f"{metric_labels.get(metric_name, metric_name)} {actual:g} 低于设定阈值 {boundary:g}"
                     )
             except (TypeError, ValueError):
                 continue
+        if commission_lower is not None or commission_upper is not None:
+            if cos_ratio is None:
+                pending_thresholds.append("commissionRate")
+                known_rejection_reasons.append("缺少佣金率实测数据，无法核验设定区间")
+            elif not math.isfinite(cos_ratio) or not 0 <= cos_ratio <= 100:
+                known_rejection_reasons.append("佣金率数据超出 0–100%，无法核验设定区间")
+            elif commission_lower is not None and cos_ratio < commission_lower:
+                known_rejection_reasons.append(f"佣金率 {cos_ratio:g} 低于设定下限 {commission_lower:g}")
+            elif commission_upper is not None and cos_ratio > commission_upper:
+                known_rejection_reasons.append(f"佣金率 {cos_ratio:g} 超过设定上限 {commission_upper:g}")
 
         tags = json.dumps({
             "tag_info": base.get("tag_info", {}),
@@ -6694,10 +6710,10 @@ def _candidate_rows(
 
 def _enabled_threshold_names(settings: Dict[str, Any]) -> list[str]:
     thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
-    return [
-        str(name) for name, value in thresholds.items()
+    return list(dict.fromkeys(
+        "commissionRate" if str(name) == "commissionRateMax" else str(name) for name, value in thresholds.items()
         if value is not None and value != "" and str(name)
-    ]
+    ))
 
 
 def _promotion_row_metric_values(row: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -6778,36 +6794,69 @@ def _merge_detail_metrics_into_promotion_row(
     return row
 
 
-def _commission_rate_upper_bound(settings: Dict[str, Any]) -> Optional[float]:
+def _commission_rate_bounds(settings: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
-    raw = settings.get("_platformCommissionRateUpperBound", thresholds.get("commissionRate"))
-    if raw is None or raw == "":
-        return None
+    platform_bounds = settings.get("_platformCommissionRateBounds")
+    raw_bounds = platform_bounds if isinstance(platform_bounds, (list, tuple)) and len(platform_bounds) == 2 else (
+        thresholds.get("commissionRate"), thresholds.get("commissionRateMax")
+    )
+    bounds: list[Optional[float]] = []
+    for raw in raw_bounds:
+        if raw is None or raw == "":
+            bounds.append(None)
+            continue
+        try:
+            bound = float(raw)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("佣金率须为 0–100 之间的百分数") from error
+        if not math.isfinite(bound) or not 0 <= bound <= 100:
+            raise RuntimeError("佣金率须为 0–100 之间的百分数")
+        bounds.append(bound)
+    lower, upper = bounds
+    if lower is not None and upper is not None and lower > upper:
+        raise RuntimeError("最低佣金率不能超过最高佣金率")
+    return lower, upper
+
+
+def _apply_square_commission_range(page: Page, settings: Dict[str, Any]) -> None:
+    """选品广场自定义佣金区间；提交后回读两个输入框，最终仍按商品实测值核验。"""
+    lower, upper = _commission_rate_bounds(settings)
+    if lower is None and upper is None:
+        return
+    control, menu = _open_filter_dropdown(page, "佣金区间")
     try:
-        bound = float(raw)
-    except (TypeError, ValueError) as error:
-        raise RuntimeError("佣金率上限须为 0–100 之间的百分数") from error
-    if not 0 <= bound <= 100:
-        raise RuntimeError("佣金率上限须为 0–100 之间的百分数")
-    return bound
+        minimum = menu.locator('input[placeholder*="最低"]')
+        maximum = menu.locator('input[placeholder*="最高"]')
+        if minimum.count() != 1 or maximum.count() != 1:
+            raise RuntimeError("选品广场自定义佣金输入框未唯一定位")
+        expected_min, expected_max = f"{lower if lower is not None else 0:g}", f"{upper if upper is not None else 100:g}"
+        minimum.fill(expected_min)
+        maximum.fill(expected_max)
+        confirm = menu.get_by_text("确定", exact=True)
+        if not confirm.count():
+            confirm = menu.get_by_text("确 定", exact=True)
+        if confirm.count() != 1:
+            raise RuntimeError("选品广场佣金区间确认控件未唯一定位")
+        confirm.click(timeout=5_000)
+    finally:
+        _close_filter_dropdown(page, control)
+    control, menu = _open_filter_dropdown(page, "佣金区间")
+    try:
+        minimum = menu.locator('input[placeholder*="最低"]')
+        maximum = menu.locator('input[placeholder*="最高"]')
+        if minimum.count() != 1 or maximum.count() != 1 or minimum.input_value() != expected_min or maximum.input_value() != expected_max:
+            raise RuntimeError("选品广场佣金自定义区间提交后回读不一致")
+    finally:
+        _close_filter_dropdown(page, control)
 
 
 def _effective_selection_filters(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """数字上限决定平台佣金档位，旧手选档位不得覆盖账号当前设置。"""
+    """数字佣金区间由专门的页面筛选处理，旧手选档位不得覆盖当前设置。"""
     filters = copy.deepcopy(settings.get("filters") if isinstance(settings.get("filters"), dict) else {})
     for group in ("delivery", "product"):
         values = filters.get(group)
         if isinstance(values, dict):
             values.pop("佣金区间", None)
-    bound = _commission_rate_upper_bound(settings)
-    # 当前百应佣金档位为单选。只有 0–10 档覆盖全部目标范围；
-    # 其他上限保留平台不限，再以列表和精确详情中的实际佣金率核验。
-    if bound is not None and bound <= 10:
-        product_filters = filters.get("product")
-        if not isinstance(product_filters, dict):
-            product_filters = {}
-            filters["product"] = product_filters
-        product_filters["佣金区间"] = "0%-10%"
     return filters
 
 
@@ -6816,7 +6865,7 @@ def _selection_filter_signature(settings: Dict[str, Any]) -> str:
     desired_settings = {
         "categorySelection": settings.get("categorySelection", {}),
         "filters": filters,
-        "commissionRateUpperBound": _commission_rate_upper_bound(settings),
+        "commissionRateBounds": _commission_rate_bounds(settings),
         "searchKeyword": str(settings.get("searchKeyword") or "").strip(),
     }
     return json.dumps(desired_settings, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -7124,7 +7173,7 @@ def _can_reuse_applied_non_category_filters(applied_signature: str, settings: Di
     current_keyword = _configured_search_keyword(settings)
     return (
         applied_filters == current_filters
-        and applied.get("commissionRateUpperBound") == _commission_rate_upper_bound(settings)
+        and applied.get("commissionRateBounds") == list(_commission_rate_bounds(settings))
         and applied_keyword == current_keyword
     )
 
@@ -7362,9 +7411,61 @@ def _source_category_tabs(page: Page, source_key: str, category_tree: Sequence[A
     return tabs
 
 
+def _rank_option_selected(option: Any) -> bool:
+    return bool(option.evaluate("""node => {
+      for (let item = node, depth = 0; item && depth < 4; item = item.parentElement, depth++) {
+        if (item.getAttribute('aria-selected') === 'true' || item.getAttribute('aria-checked') === 'true') return true;
+        if (/(?:active|selected|checked|current)/i.test(String(item.className || ''))) return true;
+      }
+      return false;
+    }"""))
+
+
+def _select_rank_source_options(page: Page, settings: Dict[str, Any]) -> Dict[str, str]:
+    config = settings.get("sources") if isinstance(settings.get("sources"), dict) else {}
+    try:
+        page.get_by_text("爆款榜", exact=True).first.wait_for(state="visible", timeout=8_000)
+    except PlaywrightTimeoutError as error:
+        raise RecoverablePrioritySourceReadError("带货商品榜选项未加载，不能确认榜单类型") from error
+    selected: Dict[str, str] = {}
+    groups = (
+        ("rankBoard", "爆款榜", ("爆款榜", "趋势榜", "带货榜", "常销榜")),
+        ("rankPeriod", "昨日", ("实时", "昨日", "近7日", "近30日")),
+        ("rankCarrier", "不限载体", ("不限载体", "短视频", "直播", "橱窗", "图文")),
+    )
+    for key, expected, labels in groups:
+        label = str(config.get(key) or expected)
+        choices = page.get_by_text(label, exact=True)
+        visible = [choices.nth(i) for i in range(min(choices.count(), 12)) if choices.nth(i).is_visible()]
+        if len(visible) != 1:
+            raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」控件未唯一定位，不能确认榜单筛选")
+        option = visible[0]
+        if not _rank_option_selected(option):
+            try:
+                option.click(timeout=8_000)
+            except PlaywrightTimeoutError as error:
+                raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」控件未能选中") from error
+            page.wait_for_timeout(700)
+            choices = page.get_by_text(label, exact=True)
+            visible = [choices.nth(i) for i in range(min(choices.count(), 12)) if choices.nth(i).is_visible()]
+            if len(visible) != 1 or not _rank_option_selected(visible[0]):
+                raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」点击后未回读到选中状态")
+        selected_labels = []
+        for item_label in labels:
+            matches = page.get_by_text(item_label, exact=True)
+            matches_visible = [matches.nth(i) for i in range(min(matches.count(), 12)) if matches.nth(i).is_visible()]
+            if len(matches_visible) == 1 and _rank_option_selected(matches_visible[0]):
+                selected_labels.append(item_label)
+        if selected_labels != [label]:
+            raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」选中状态不唯一，未采集当前页")
+        selected[key] = label
+    return selected
+
+
 def _read_priority_source_product_ids(
     page: Page, source_key: str, category_tree: Sequence[Any] = (),
     category_tab: Optional[Dict[str, Any]] = None,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> tuple[set[str], list[Dict[str, Any]], Dict[str, Any]]:
     """只读取热点/榜单当前可见行的商品数据；不搜索、加车或翻页。"""
     source = BAIYING_PRIORITY_SOURCES.get(source_key)
@@ -7425,6 +7526,8 @@ def _read_priority_source_product_ids(
             raise RuntimeError("百应要求验证码或安全验证，已停止当前账号")
         if prompt_kind:
             raise RuntimeError(f"百应来源页面存在待处理提示，商品身份无法唯一确认：{prompt_text[:160]}")
+
+        rank_selection = _select_rank_source_options(source_page, settings or {}) if source_key == "allianceRank" else {}
 
         tab_read_error = ""
         try:
@@ -7648,6 +7751,7 @@ def _read_priority_source_product_ids(
           const categoryFieldSamples = [];
           const visited = new WeakSet();
           let visitedCount = 0;
+          let currentTopicMetrics = null;
           const scan = (value, depth) => {
             if (!value || typeof value !== 'object' || depth > 9 || visited.has(value) || visitedCount > 12000) return;
             visited.add(value);
@@ -7731,7 +7835,8 @@ def _read_priority_source_product_ids(
                       marketing_info: safeJson(base.marketing_info || base.marketingInfo || {}),
                       extend_info: safeJson(base.extend_info || base.extendInfo || {})
                     },
-                    custom_model: safeJson(value.custom_model || value.customModel || {})
+                    custom_model: safeJson(value.custom_model || value.customModel || {}),
+                    _topicMetrics: currentTopicMetrics
                   });
                 }
               }
@@ -7742,6 +7847,19 @@ def _read_priority_source_product_ids(
             }
           };
           for (const root of roots) {
+            currentTopicMetrics = null;
+            if (sourceKey === 'hotSpot') {
+              for (let ancestor = root, depth = 0; ancestor && depth < 7; ancestor = ancestor.parentElement, depth++) {
+                const text = String(ancestor.innerText || '').replace(/\\s+/g, ' ');
+                if (text.length > 2200) break;
+                const exposure = text.match(/曝光热度\\s*([\\d.]+\\s*[万千亿]?)/);
+                const related = text.match(/关联商品数\\s*([\\d.]+\\s*[万千亿]?\\+?)/);
+                if (exposure && related) {
+                  currentTopicMetrics = { exposure: exposure[1], relatedProducts: related[1] };
+                  break;
+                }
+              }
+            }
             let element = root;
             for (let level = 0; element && level < 6; level += 1, element = element.parentElement) {
               for (const key of Object.keys(element)) {
@@ -7902,6 +8020,24 @@ def _read_priority_source_product_ids(
             dict(row) for row in raw_rows
             if isinstance(row, dict) and str(row.get("product_id") or "").strip()
         ]
+        if source_key == "hotSpot":
+            config = settings.get("sources") if isinstance(settings, dict) and isinstance(settings.get("sources"), dict) else {}
+            min_exposure = config.get("hotSpotMinExposure")
+            min_related = config.get("hotSpotMinRelatedProducts")
+            if min_exposure is not None or min_related is not None:
+                filtered_rows: list[Dict[str, Any]] = []
+                for row in product_rows:
+                    metrics = row.get("_topicMetrics") if isinstance(row.get("_topicMetrics"), dict) else {}
+                    exposure = _source_count(metrics.get("exposure"))
+                    related = _source_count(metrics.get("relatedProducts"))
+                    if min_exposure is not None and (exposure is None or exposure < float(min_exposure) * 10_000):
+                        continue
+                    if min_related is not None and (related is None or related < float(min_related)):
+                        continue
+                    filtered_rows.append(row)
+                snapshot["sourceFilterRejected"] = len(product_rows) - len(filtered_rows)
+                product_rows = filtered_rows
+                ids = {str(row["product_id"]) for row in product_rows}
         if selected_tab and selected_tab.get("status") == "mapped":
             for row in product_rows:
                 row["_sourceCategory"] = {
@@ -7912,6 +8048,7 @@ def _read_priority_source_product_ids(
         snapshot["sourceCategoryTabs"] = tabs
         snapshot["sourceCategoryReadError"] = tab_read_error
         snapshot["selectedSourceCategory"] = selected_tab
+        snapshot["rankSelection"] = rank_selection
         snapshot["readAt"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
         complete_category_path_count = 0
         for row in product_rows:
@@ -8122,7 +8259,7 @@ def _collect_priority_source_ids(
             message=f"正在读取{label}当前页；不会触发搜索、加车或发布",
         )
         try:
-            product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key, category_tree)
+            product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key, category_tree, settings=settings)
             by_product = {str(row["product_id"]): row for row in product_rows}
             for row in by_product.values():
                 source_category = row.get("_sourceCategory")
@@ -8146,7 +8283,7 @@ def _collect_priority_source_ids(
             for tab in tab_batch:
                 try:
                     tab_ids, tab_rows, tab_evidence = _read_priority_source_product_ids(
-                        page, source_key, category_tree, category_tab=tab
+                        page, source_key, category_tree, category_tab=tab, settings=settings
                     )
                     product_ids.update(tab_ids)
                     tab_reads.append({"categoryId": tab.get("categoryId"), "productCount": len(tab_ids),
@@ -8204,6 +8341,8 @@ def _collect_priority_source_ids(
                     for tab in tabs if isinstance(tab, dict)
                 ],
                 "unmappedCategoryTabs": evidence.get("unmappedCategoryTabs", 0),
+                "rankSelection": evidence.get("rankSelection", {}),
+                "sourceFilterRejected": evidence.get("sourceFilterRejected", 0),
                 "productIdFingerprint": evidence.get("productIdFingerprint", ""),
                 "readAt": evidence.get("readAt", ""),
                 "pagePath": evidence.get("pagePath", ""),
@@ -8509,8 +8648,8 @@ def _collect_selection_square_rows(
     page_reads: list[Dict[str, Any]] = []
     for index, query in enumerate(queries, start=1):
         query_settings = copy.deepcopy(query)
-        # 三源采集先保留原始候选，实际指标稍后统一核验；平台佣金档位仍须按账号上限选择。
-        query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
+        # 来源原始行先保留，平台自定义佣金区间单独应用；商品数据随后统一核验。
+        query_settings["_platformCommissionRateBounds"] = list(_commission_rate_bounds(settings))
         query_settings["thresholds"] = {}
         query_settings["_unifiedSourceCollection"] = True
         query_settings["_candidatePoolLimit"] = 200
@@ -8774,7 +8913,7 @@ def _collector_candidate_pool_result(
     warnings: list[str],
     settings: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """只读汇总商品 ID；采集账号不执行详情、加车或账号配额操作。"""
+    """按采集条件只读汇总商品；采集账号不执行加车或账号配额操作。"""
     by_product: Dict[str, Dict[str, Any]] = {}
     for source_key in [*_enabled_priority_source_order(settings), "selectionSquare"]:
         for row in source_candidates.get(source_key, []):
@@ -8790,28 +8929,57 @@ def _collector_candidate_pool_result(
                 by_product[product_id] = _merge_candidate_source_rows(by_product[product_id], row)
             else:
                 by_product[product_id] = copy.deepcopy(row)
-    broad_settings = {
-        **settings,
-        "selectionMode": "general",
-        "categoryMode": "auto",
-        "categorySelection": {"level1": [], "level2": [], "level3": []},
-        "excludedCategorySelection": {"level1": [], "level2": [], "level3": []},
-        "filters": {"delivery": {}, "product": {}, "features": []},
-        "thresholds": {},
-        "bannedWords": [],
-        "_sourceMembership": source_membership,
-    }
+    broad_settings = {**settings, "_sourceMembership": source_membership}
     candidates, parse_messages, rejected = _candidate_rows(
         {"data": {"summary_promotions": list(by_product.values())}},
         broad_settings, min(2000, len(by_product)),
     )
     source_order = [*_enabled_priority_source_order(settings), "selectionSquare"]
-    for index, candidate in enumerate(candidates):
+    for candidate in [*candidates, *rejected]:
         product_id = str(candidate.get("productId") or "")
         sources = [key for key in source_order if product_id in source_membership.get(key, set())]
         candidate["sources"] = sources
-        candidate["sourceKey"] = sources[0] if sources else "selectionSquare"
-        candidate["categoryStatus"] = "known" if len(candidate.get("categoryIds") or []) == 3 else "unknown"
+        candidate["sourceKey"] = sources[0] if sources else ""
+    excluded_categories = _excluded_category_selection_ids(settings)
+    included_categories = _manual_category_selection_ids(settings) if settings.get("selectionMode") == "category" and settings.get("categoryMode") == "manual" else set()
+    category_required = bool(excluded_categories) or settings.get("selectionMode") == "category"
+    excluded_selection = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+    only_root_exclusions = bool(excluded_selection.get("level1")) and not excluded_selection.get("level2") and not excluded_selection.get("level3")
+    if category_required:
+        ready: list[Dict[str, Any]] = []
+        for candidate in candidates:
+            category_ids = candidate.get("categoryIds") or []
+            raw_source_categories = by_product.get(str(candidate.get("productId") or ""), {}).get("_sourceCategories")
+            source_categories = raw_source_categories if isinstance(raw_source_categories, list) else []
+            source_roots = {
+                str(item["categoryIds"][0]) for item in source_categories if isinstance(item, dict)
+                and isinstance(item.get("categoryIds"), list) and item["categoryIds"]
+            }
+            if len(category_ids) != 3:
+                if settings.get("selectionMode") == "general" and only_root_exclusions and len(source_roots) == 1:
+                    source_root = next(iter(source_roots))
+                    if any(_category_id_matches(source_root, _category_id_scalar(item)) for item in excluded_selection.get("level1", [])):
+                        candidate["thresholdReasons"] = ["来源分类属于已排除一级类目"]
+                        rejected.append(candidate)
+                    else:
+                        candidate["categoryStatus"] = "source_level"
+                        candidate["sourceCategoryIds"] = [source_root]
+                        ready.append(candidate)
+                else:
+                    candidate["thresholdReasons"] = ["采集阶段缺少足以判断排除条件的类目数据；不计入达标池量"]
+                    rejected.append(candidate)
+            elif _candidate_matches_manual_categories(candidate, excluded_categories):
+                candidate["thresholdReasons"] = ["商品属于已排除类目"]
+                rejected.append(candidate)
+            elif included_categories and not _candidate_matches_manual_categories(candidate, included_categories):
+                candidate["thresholdReasons"] = ["商品不在选定的类目范围"]
+                rejected.append(candidate)
+            else:
+                ready.append(candidate)
+        candidates = ready
+    for index, candidate in enumerate(candidates):
+        product_id = str(candidate.get("productId") or "")
+        candidate["categoryStatus"] = "known" if len(candidate.get("categoryIds") or []) == 3 else candidate.get("categoryStatus") or "unknown"
         candidate["leafCategoryId"] = str((candidate.get("categoryIds") or [""])[-1]) if candidate["categoryStatus"] == "known" else ""
         candidate["cardIndex"] = index
         candidate["selected"] = False
@@ -8823,8 +8991,10 @@ def _collector_candidate_pool_result(
         "rejectedCandidates": rejected,
         "warnings": list(dict.fromkeys([*warnings, *parse_messages])),
         "prioritySourceResults": source_results,
-        "selectionStrategy": "collector_raw_pool",
+        "selectionStrategy": "collector_filtered_pool",
         "sourceProductCount": len(by_product),
+        "sourceFilteredCount": len(candidates),
+        "sourceRejectedCount": len(rejected),
     }
 
 
@@ -10693,11 +10863,17 @@ def apply_filter_settings(
             except Exception as error:
                 if _selection_error_requires_pause(error):
                     raise
-                warnings.append(f"百应佣金区间未能应用；继续按商品实际佣金率上限筛选：{_safe_diagnostic_text(error, 180)}")
+                warnings.append(f"百应佣金区间未能应用；继续按商品实际佣金率筛选：{_safe_diagnostic_text(error, 180)}")
                 continue
         else:
             _apply_configured_filter_field(page, label, selected, cached_options, warnings)
         page.wait_for_timeout(80)
+    try:
+        _apply_square_commission_range(page, settings)
+    except Exception as error:
+        if _selection_error_requires_pause(error):
+            raise
+        warnings.append(f"选品广场佣金区间未确认应用；将按商品实际佣金率在客户端核验：{_safe_diagnostic_text(error, 180)}")
     if feature_catalog:
         states = page.evaluate("""(labels) => {
           const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
@@ -11119,26 +11295,34 @@ def apply_settings_and_collect_candidates(
     if force_refresh:
         _clear_page_material_cache(id(page))
     settings = copy.deepcopy(settings)
+    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    if thresholds.get("commissionRate") is not None and settings.get("commissionRateRule") != "minimum":
+        raise RuntimeError("旧佣金率设置按上限保存；请核对最低值并重新保存后再采集，检查点不改写")
     if settings.get("_visibleSourcesOnly") is True:
         source_membership, source_warnings, source_results, source_candidates = _collect_priority_source_ids(
             page, settings, progress
         )
-        try:
-            selection_square_rows, selection_square_result = _collect_selection_square_rows(page, settings, progress)
-        except Exception as error:
-            if _selection_error_requires_pause(error):
-                raise
-            label, _ = BAIYING_SELECTION_SQUARE_SOURCE
+        source_config = settings.get("sources") if isinstance(settings.get("sources"), dict) else {}
+        if source_config.get("selectionSquareEnabled", True) is False:
             selection_square_rows = []
-            selection_square_result = {
-                "sourceKey": "selectionSquare",
-                "label": label,
-                "status": "skipped",
-                "productCount": 0,
-                "parsedCandidateCount": 0,
-                "detail": f"{type(error).__name__}: {str(error)[:900]}",
-            }
-            source_warnings.append(f"跳过来源读取：{label}页面读取失败；原因：{selection_square_result['detail']}")
+            selection_square_result = {"sourceKey": "selectionSquare", "label": "选品广场", "status": "disabled", "productCount": 0}
+        else:
+            try:
+                selection_square_rows, selection_square_result = _collect_selection_square_rows(page, settings, progress)
+            except Exception as error:
+                if _selection_error_requires_pause(error):
+                    raise
+                label, _ = BAIYING_SELECTION_SQUARE_SOURCE
+                selection_square_rows = []
+                selection_square_result = {
+                    "sourceKey": "selectionSquare",
+                    "label": label,
+                    "status": "skipped",
+                    "productCount": 0,
+                    "parsedCandidateCount": 0,
+                    "detail": f"{type(error).__name__}: {str(error)[:900]}",
+                }
+                source_warnings.append(f"跳过来源读取：{label}页面读取失败；原因：{selection_square_result['detail']}")
         square_ids = {str(row.get("product_id") or "").strip() for row in selection_square_rows}
         square_ids.discard("")
         source_membership["selectionSquare"] = square_ids
@@ -12620,6 +12804,7 @@ def _candidate_quality_scores(candidates: list[Dict[str, Any]], settings: Option
 
 def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str, Any]) -> list[str]:
     thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    commission_lower, commission_upper = _commission_rate_bounds(settings)
     metric_labels = {
         "salesAmount": "销售额",
         "salesCount": "销量",
@@ -12631,6 +12816,8 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
     data = candidate.get("dataMetrics") if isinstance(candidate.get("dataMetrics"), dict) else {}
     reasons: list[str] = []
     for metric, threshold in thresholds.items():
+        if metric in {"commissionRate", "commissionRateMax"}:
+            continue
         if threshold is None or threshold == "":
             continue
         actual = _number(data.get(metric))
@@ -12640,17 +12827,17 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
         except (TypeError, ValueError):
             continue
         if actual is None:
-            direction = '下限' if metric == 'commissionRate' and settings.get('_poolConsumerOnly') is True else '上限' if metric == 'commissionRate' else '阈值'
-            reasons.append(f"缺少{label}实测数据，无法核验{direction} {boundary:g}")
-        elif metric == "commissionRate":
-            if not math.isfinite(actual) or not 0 <= actual <= 100:
-                reasons.append("佣金率数据超出 0–100%，无法核验设定阈值")
-            elif settings.get('_poolConsumerOnly') is True and actual < boundary:
-                reasons.append(f"佣金率 {actual:g} 低于设定下限 {boundary:g}")
-            elif settings.get('_poolConsumerOnly') is not True and actual > boundary:
-                reasons.append(f"佣金率 {actual:g} 超过设定上限 {boundary:g}")
+            reasons.append(f"缺少{label}实测数据，无法核验阈值 {boundary:g}")
         elif actual < boundary:
             reasons.append(f"{label} {actual:g} 低于设定阈值 {boundary:g}")
+    if commission_lower is not None or commission_upper is not None:
+        actual = _number(data.get("commissionRate"))
+        if actual is None or not math.isfinite(actual) or not 0 <= actual <= 100:
+            reasons.append("缺少有效佣金率实测数据，无法核验设定区间")
+        elif commission_lower is not None and actual < commission_lower:
+            reasons.append(f"佣金率 {actual:g} 低于设定下限 {commission_lower:g}")
+        elif commission_upper is not None and actual > commission_upper:
+            reasons.append(f"佣金率 {actual:g} 超过设定上限 {commission_upper:g}")
     candidate["thresholdReasons"] = reasons
     candidate["eligible"] = not reasons
     return reasons
@@ -14738,8 +14925,7 @@ def _execute_pool_consumer_candidates(
             raise RuntimeError("当前账号百应选品广场未正常打开；请检查登录和选品权限")
         search_settings = copy.deepcopy(settings)
         thresholds = search_settings.get("thresholds") if isinstance(search_settings.get("thresholds"), dict) else {}
-        search_settings["thresholds"] = {**thresholds, "commissionRate": None}
-        search_settings["_platformCommissionRateUpperBound"] = None
+        search_settings["thresholds"] = {**thresholds, "commissionRate": None, "commissionRateMax": None}
         filter_warnings = apply_filter_settings(page, search_settings)
         if filter_warnings:
             raise RuntimeError("当前账号百应筛选条件未全部确认应用；保留检查点：" + "；".join(filter_warnings[:3]))
@@ -14835,7 +15021,7 @@ def _execute_visible_source_candidates(
                                          and any(row["sourceCategorySelection"].get(level) for level in ("level1", "level2", "level3"))), None)
                 if isinstance(source_selection, dict):
                     query_settings["categorySelection"] = source_selection
-                query_settings["_platformCommissionRateUpperBound"] = _commission_rate_upper_bound(settings)
+                query_settings["_platformCommissionRateBounds"] = list(_commission_rate_bounds(settings))
                 query_settings["thresholds"] = {}
                 query_settings["_candidatePoolLimit"] = 200
                 query_settings["candidateLimit"] = 200

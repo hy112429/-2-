@@ -153,7 +153,7 @@ interface SelectionRunLogInput {
 interface PrioritySourceReadResult {
   sourceKey: string
   label: string
-  status: 'read' | 'empty' | 'skipped'
+  status: 'read' | 'empty' | 'skipped' | 'disabled'
   productCount: number
   candidateNodeCount?: number
   productNodeCount?: number
@@ -176,6 +176,8 @@ interface PrioritySourceReadResult {
   pageReads?: Array<{ query?: number; step: number; scrollTop?: number; newProductIds?: number }>
   categoryTabNextOffset?: number
   categoryTabTotal?: number
+  sourceFilterRejected?: number
+  rankSelection?: Record<string, string>
   sourceCategoryTabs?: Array<{ name?: string; categoryId?: string; status?: string; level?: number; selected?: boolean }>
 }
 
@@ -248,6 +250,7 @@ interface AccountCandidatePlan {
 interface BatchCandidatePool {
   target: number
   collectorAccountIds: number[]
+  filterFingerprint: string
   rows: SelectionCandidate[]
   sourceState: { collectors: Record<string, { tabOffsets: Record<string, number>; samePoolCount: number; nextRetryAt?: string }> }
   status: 'collecting' | 'ready'
@@ -362,6 +365,7 @@ const DEFAULTS = {
   candidateLimit: 5,
   candidatePoolTarget: 300,
   candidateCollectorAccountIds: [] as number[],
+  commissionRateRule: 'minimum' as const,
   selectionMode: 'general' as 'general' | 'category',
   categoryMode: 'auto' as 'auto' | 'manual',
   categorySelection: { level1: [] as string[], level2: [] as string[], level3: [] as string[] },
@@ -369,8 +373,8 @@ const DEFAULTS = {
   filters: { delivery: {} as Record<string, unknown>, product: {} as Record<string, unknown>, features: [] as string[] },
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
-  sources: { hotSpotEnabled: true, allianceRankEnabled: true, priority: ['hotSpot', 'allianceRank'] as Array<'hotSpot' | 'allianceRank'> },
-  thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, experienceScore: null as number | null },
+  sources: { hotSpotEnabled: true, allianceRankEnabled: true, selectionSquareEnabled: true, rankBoard: '爆款榜' as SelectionFilterSettings['sources']['rankBoard'], rankPeriod: '昨日' as SelectionFilterSettings['sources']['rankPeriod'], rankCarrier: '不限载体' as SelectionFilterSettings['sources']['rankCarrier'], hotSpotMinExposure: null as number | null, hotSpotMinRelatedProducts: null as number | null, priority: ['hotSpot', 'allianceRank'] as Array<'hotSpot' | 'allianceRank'> },
+  thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, commissionRateMax: null as number | null, experienceScore: null as number | null },
   trendPreference: '上升优先',
   bannedWords: [...DEFAULT_BANNED_WORDS],
   bannedWordsSeedVersion: 2,
@@ -379,6 +383,7 @@ const DEFAULTS = {
 }
 
 const busy = ref(false)
+const commissionRuleMigrationRequired = ref(false)
 const error = ref('')
 const notice = ref('')
 const selectionInitialized = ref(false)
@@ -1456,7 +1461,10 @@ function pruneCurrentCategorySelections(): number {
 async function loadGlobal(): Promise<void> {
   const result = await runEngine('selection_settings.py', ['--db', DB_PATH, 'get'])
   const settings = (result.settings ?? {}) as Record<string, unknown>
+  const savedThresholds = (settings.thresholds ?? {}) as Record<string, unknown>
+  commissionRuleMigrationRequired.value = savedThresholds.commissionRate != null && settings.commissionRateRule !== 'minimum'
   Object.assign(global, cloneDefault(), settings)
+  global.commissionRateRule = 'minimum'
   global.candidatePoolTarget = Number.isInteger(Number(settings.candidatePoolTarget)) &&
     Number(settings.candidatePoolTarget) >= 1 && Number(settings.candidatePoolTarget) <= 2000
     ? Number(settings.candidatePoolTarget) : cloneDefault().candidatePoolTarget
@@ -1806,7 +1814,8 @@ async function saveGlobal(): Promise<void> {
     if (global.selectionMode === 'category' && global.categoryMode === 'manual' && !hasSelectedCategory(global.categorySelection)) {
       throw new Error('已选择手动选类目，请至少勾选一个类目；或切回自动推荐。')
     }
-    validateCommissionRateUpperBound(global.thresholds.commissionRate, '通用设置')
+    validateCommissionRange(global.thresholds.commissionRate, global.thresholds.commissionRateMax, '通用设置')
+    validateCandidateSources(global.sources, '通用设置')
     validateExperienceScoreThreshold(global.thresholds.experienceScore, '通用设置')
     for (const [label, value] of Object.entries({
       '每品视频上限': global.quota.perProductVideos,
@@ -1816,6 +1825,7 @@ async function saveGlobal(): Promise<void> {
       if (!Number.isInteger(value) || value < 1) throw new Error(`${label}必须是大于 0 的整数。`)
     }
     global.execution.publishMode = '自动'
+    global.commissionRateRule = 'minimum'
     global.bannedWords = Array.from(new Set([
       ...bannedWordsText.value.split(/\r?\n/).map((word) => word.trim()).filter(Boolean),
       ...SUPERSTITION_BANNED_WORDS
@@ -1823,6 +1833,7 @@ async function saveGlobal(): Promise<void> {
     global.bannedWordsSeedVersion = 2
     bannedWordsText.value = global.bannedWords.join('\n')
     await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify(global)))
+    commissionRuleMigrationRequired.value = false
     notice.value = '通用选品设置已保存；账号未单独配置的条件会继承此设置。'
   } catch (cause) {
     error.value = String(cause instanceof Error ? cause.message : cause)
@@ -1841,10 +1852,19 @@ function appendOptionalMallTitleBannedWords(): void {
   notice.value = `已将 ${additions.length} 个候选词加入编辑框；点击「保存通用设置」后生效。`
 }
 
-function validateCommissionRateUpperBound(value: number | null | undefined, scope: string): void {
-  if (value === null || value === undefined) return
-  if (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100) {
-    throw new Error(`${scope}佣金率须为 0–100 之间的百分数。`)
+function validateCommissionRange(lower: number | null | undefined, upper: number | null | undefined, scope: string): void {
+  for (const value of [lower, upper]) {
+    if (value !== null && value !== undefined && (!Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > 100)) {
+      throw new Error(`${scope}佣金率须为 0–100 之间的百分数。`)
+    }
+  }
+  if (lower != null && upper != null && lower > upper) throw new Error(`${scope}最低佣金率不能超过最高佣金率。`)
+}
+
+function validateCandidateSources(sources: SelectionFilterSettings['sources'], scope: string): void {
+  if (!sources.hotSpotEnabled && !sources.allianceRankEnabled && !sources.selectionSquareEnabled) throw new Error(`${scope}至少启用一个候选来源。`)
+  for (const value of [sources.hotSpotMinExposure, sources.hotSpotMinRelatedProducts]) {
+    if (value != null && (!Number.isFinite(value) || value < 0)) throw new Error(`${scope}热点条件须为非负数。`)
   }
 }
 
@@ -1983,7 +2003,8 @@ async function saveAccount(): Promise<boolean> {
       throw new Error('每轮每账号新增商品目标数须为 1–10 的整数。')
     }
     if (accountFilterOverridesEnabled.value) {
-      validateCommissionRateUpperBound(accountFilterDraft.value.thresholds.commissionRate, '账号个性化')
+      validateCommissionRange(accountFilterDraft.value.thresholds.commissionRate, accountFilterDraft.value.thresholds.commissionRateMax, '账号个性化')
+      validateCandidateSources(accountFilterDraft.value.sources, '账号个性化')
       validateExperienceScoreThreshold(accountFilterDraft.value.thresholds.experienceScore, '账号个性化')
     }
     if (accountDraft.dailyQuotaOverride.enabled && (
@@ -2011,7 +2032,7 @@ async function saveAccount(): Promise<boolean> {
           ? accountDraft.dailyQuotaOverride.perAccountVideos : global.quota.perAccountVideos
       },
       ...(accountFilterOverridesEnabled.value
-        ? { filterOverrides: createSelectionFilterSettings(accountFilterDraft.value, globalFilterSettings.value) }
+        ? { filterOverrides: { ...createSelectionFilterSettings(accountFilterDraft.value, globalFilterSettings.value), commissionRateRule: 'minimum' } }
         : {})
     }
     const snapshot = JSON.parse(JSON.stringify(global)) as Record<string, unknown>
@@ -2131,8 +2152,8 @@ function categoryName(categoryId: string): string {
 
 function candidateSourceLabels(candidate: SelectionCandidate): string {
   const labels: Record<'hotSpot' | 'allianceRank' | 'selectionSquare', string> = {
-    hotSpot: '热点趋势',
-    allianceRank: '联盟榜单',
+    hotSpot: '选品热点',
+    allianceRank: '带货商品榜',
     selectionSquare: '选品广场'
   }
   return (candidate.sources ?? []).map((source) => labels[source]).filter(Boolean).join('、')
@@ -2146,8 +2167,14 @@ async function collectBatchCandidatePool(
   const target = Number(snapshot?.candidatePoolTarget)
   const collectorIds = Array.isArray(snapshot?.candidateCollectorAccountIds)
     ? (snapshot?.candidateCollectorAccountIds as unknown[]).map(Number) : []
+  const filterFingerprint = stableJson({
+    sources: snapshot?.sources, thresholds: snapshot?.thresholds, filters: snapshot?.filters,
+    bannedWords: snapshot?.bannedWords, selectionMode: snapshot?.selectionMode,
+    categoryMode: snapshot?.categoryMode, categorySelection: snapshot?.categorySelection,
+    excludedCategorySelection: snapshot?.excludedCategorySelection
+  })
   const oldPool = batch.payload.candidatePool as BatchCandidatePool | undefined
-  const poolConfigMatches = oldPool?.target === target && oldPool.collectorAccountIds?.join(',') === collectorIds.join(',')
+  const poolConfigMatches = oldPool?.target === target && oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') && oldPool.filterFingerprint === filterFingerprint
   const poolAlreadyReady = Boolean(oldPool && poolConfigMatches &&
     Array.isArray(oldPool.rows) && oldPool.rows.length >= target)
   if (!Number.isInteger(target) || target < 1 || target > 2000 || ![1, 2].includes(collectorIds.length) ||
@@ -2166,7 +2193,7 @@ async function collectBatchCandidatePool(
   const savePool = async (rows: SelectionCandidate[], collectorAccountId: number): Promise<void> => {
     const capturedAt = new Date().toISOString()
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
-      target, collectorAccountIds: collectorIds, collectorAccountId, capturedAt,
+      target, collectorAccountIds: collectorIds, collectorAccountId, capturedAt, filterFingerprint,
       rows: rows.map((row) => ({ ...row, collectedByAccountId: collectorAccountId, capturedAt })),
       sourceState
     })
@@ -2197,13 +2224,14 @@ async function collectBatchCandidatePool(
             accountId: collectorId, downloadPath: context.downloadPath,
             settings: {
               ...context.settings,
+              sources: snapshot?.sources, thresholds: snapshot?.thresholds,
+              filters: snapshot?.filters, bannedWords: snapshot?.bannedWords,
+              selectionMode: snapshot?.selectionMode, categoryMode: snapshot?.categoryMode,
+              categorySelection: snapshot?.categorySelection,
+              excludedCategorySelection: snapshot?.excludedCategorySelection,
               _visibleSourcesOnly: true, _candidatePoolCollectOnly: true,
               _candidatePoolScrollSteps: Math.min(24, Math.max(6, Math.ceil(target / 20))),
-              _sourceCategoryTabOffsets: collectorState.tabOffsets,
-              thresholds: {}, bannedWords: [], filters: { delivery: {}, product: {}, features: [] },
-              selectionMode: 'general', categoryMode: 'auto',
-              categorySelection: { level1: [], level2: [], level3: [] },
-              excludedCategorySelection: { level1: [], level2: [], level3: [] }
+              _sourceCategoryTabOffsets: collectorState.tabOffsets
             },
             previewOnly: true, closeAfterAutomation: true
           }))
@@ -2217,6 +2245,18 @@ async function collectBatchCandidatePool(
           }
           const results = Array.isArray(preview.prioritySourceResults)
             ? preview.prioritySourceResults as PrioritySourceReadResult[] : []
+          const sourceSummary = results.map((result) =>
+            `${result.label}${result.status === 'disabled' ? '关闭' : `读取${result.productCount}、来源过滤${result.sourceFilterRejected ?? 0}`}`
+          ).join('；')
+          const rejectedRows = Array.isArray(preview.rejectedCandidates) ? preview.rejectedCandidates as SelectionCandidate[] : []
+          const rejectedCount = rejectedRows.length
+          const rejectionCounts = new Map<string, number>()
+          for (const row of rejectedRows) {
+            const reason = row.thresholdReasons?.[0] ?? row.analysisStatus ?? '条件未通过'
+            rejectionCounts.set(reason, (rejectionCounts.get(reason) ?? 0) + 1)
+          }
+          const rejectionSummary = [...rejectionCounts].sort((a, b) => b[1] - a[1]).slice(0, 3)
+            .map(([reason, count]) => `${reason} ${count} 件`).join('；')
           for (const result of results) {
             if (Number.isInteger(result.categoryTabNextOffset)) {
               collectorState.tabOffsets[result.sourceKey] = Number(result.categoryTabNextOffset)
@@ -2232,7 +2272,7 @@ async function collectBatchCandidatePool(
           await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
             stage: '候选池采集', code: 'INFO_CANDIDATE_POOL_COLLECTED',
             message: `采集账号 ${collectorId} 本轮新增 ${newRows.length} 件，池内 ${rowsById.size}/${target}。`,
-            detail: `来源分类游标已保存；只读采集，未加车或计入账号配额。`
+            detail: `${sourceSummary}；统一条件淘汰或待核验 ${rejectedCount} 件：${rejectionSummary}。来源分类游标已保存；只读采集，未加车或计入账号配额。`
           })
           if (!newRows.length && priorOffsets === JSON.stringify(collectorState.tabOffsets)) break
         } catch (cause) {
@@ -2728,6 +2768,10 @@ async function prepareAccountRunContext(
   ])
   const settingsRoot = (saved.settings ?? {}) as { account?: Record<string, unknown> }
   const accountSettings = accountSettingsOverride ?? settingsRoot.account ?? {}
+  const globalThresholds = (globalSnapshot.thresholds ?? {}) as Record<string, unknown>
+  if (globalThresholds.commissionRate != null && globalSnapshot.commissionRateRule !== 'minimum') {
+    throw new Error('旧批次佣金率曾按上限保存；请核对新最低值并新建批次，旧检查点已保留。')
+  }
   const categoryTree = JSON.parse(JSON.stringify(categories.value)) as CategoryNode[]
   const globalCategory = (globalSnapshot.categorySelection ?? {}) as Record<string, string[]>
   const globalExcludedCategory = (globalSnapshot.excludedCategorySelection ?? {}) as Record<string, string[]>
@@ -2808,12 +2852,19 @@ async function prepareAccountRunContext(
   }
   const filterOverrides = accountSettings.filterOverrides
   if (filterOverrides && typeof filterOverrides === 'object' && !Array.isArray(filterOverrides)) {
+    const override = filterOverrides as Record<string, unknown>
+    const overrideThresholds = (override.thresholds ?? {}) as Record<string, unknown>
+    if (overrideThresholds.commissionRate != null && override.commissionRateRule !== 'minimum') {
+      throw new Error('该账号旧佣金率按上限保存；请在账号个性化设置中核对最低值并重新保存。')
+    }
     Object.assign(settings, createSelectionFilterSettings(filterOverrides, createSelectionFilterSettings(globalSnapshot)))
   }
-  validateCommissionRateUpperBound(
+  validateCommissionRange(
     ((settings.thresholds ?? {}) as Record<string, number | null>).commissionRate,
+    ((settings.thresholds ?? {}) as Record<string, number | null>).commissionRateMax,
     '账号运行设置'
   )
+  validateCandidateSources(createSelectionFilterSettings(settings).sources, '账号运行设置')
   validateExperienceScoreThreshold(
     ((settings.thresholds ?? {}) as Record<string, number | null>).experienceScore,
     '账号运行设置'
@@ -4393,6 +4444,10 @@ async function validateRecoveryContexts(batch: SelectionRecoveryBatch): Promise<
       continue
     }
     try {
+      const savedThresholds = (context.settings?.thresholds ?? {}) as Record<string, unknown>
+      if (savedThresholds.commissionRate != null && context.settings?.commissionRateRule !== 'minimum') {
+        throw new Error('旧检查点佣金率按上限保存，不能按新最低值规则自动恢复。')
+      }
       const profile = await window.api.browser.validateProfilePath({
         profileKey: context.profileKey,
         profilePath: context.profilePath || undefined
@@ -5294,6 +5349,10 @@ async function runSelectionBatch(): Promise<void> {
       }
       snapshot = batch.payload.settingsSnapshot as Record<string, unknown>
       if (!snapshot || typeof snapshot !== 'object') throw new Error('恢复批次缺少设置快照，任务已保留。')
+      const savedThresholds = (snapshot.thresholds ?? {}) as Record<string, unknown>
+      if (savedThresholds.commissionRate != null && snapshot.commissionRateRule !== 'minimum') {
+        throw new Error('旧批次佣金率按上限保存，不能按新最低值规则自动恢复；检查点已保留。')
+      }
       reviewedAccountId = typeof batch.payload.reviewedAccountId === 'number' ? batch.payload.reviewedAccountId : null
       const reviewedIds = batch.payload.reviewedProductIds
       reviewedProducts = Array.isArray(reviewedIds) ? new Set(reviewedIds.map(String)) : undefined
@@ -5316,6 +5375,7 @@ async function runSelectionBatch(): Promise<void> {
       )
       if (!enabled.length) throw new Error('没有启用的账号可执行自动选品。')
       snapshot = JSON.parse(JSON.stringify(global)) as Record<string, unknown>
+      if (commissionRuleMigrationRequired.value) throw new Error('旧佣金设置按上限保存；请核对最低佣金率并保存通用设置后再新建批次。')
       const collectorIds = Array.isArray(snapshot.candidateCollectorAccountIds)
         ? snapshot.candidateCollectorAccountIds.map(Number) : []
       if (!Number.isInteger(Number(snapshot.candidatePoolTarget)) ||
@@ -6756,6 +6816,7 @@ onUnmounted(() => {
 
           <details id="global-filters" class="card filter-card">
             <summary>选品条件 · 每轮每账号目标 {{ global.candidateLimit }} 个商品</summary>
+            <p v-if="commissionRuleMigrationRequired" class="warning">旧设置把佣金率当上限；请核对现在显示的最低佣金率并保存通用设置，旧批次不会自动改写。</p>
             <SelectionFilterEditor
               v-model="globalFilterSettings"
               title="选品条件"

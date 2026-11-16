@@ -36,10 +36,10 @@ const sections = computed(() => [
 ])
 
 const commissionHint = computed(() => {
-  const upper = props.modelValue.thresholds.commissionRate
-  if (upper === null || upper === undefined) return '留空时不限制佣金率。'
-  if (upper <= 10) return `目标佣金率为 0%–${upper}%；百应可用时自动选中“0%-10%”，最终按实际佣金率核验上限。`
-  return `目标佣金率为 0%–${upper}%；百应佣金档位为单选，无法覆盖整个范围，最终按实际佣金率核验上限。`
+  const lower = props.modelValue.thresholds.commissionRate
+  const upper = props.modelValue.thresholds.commissionRateMax
+  if (lower === null && upper === null) return '留空时不限制佣金率。'
+  return `目标佣金率：${lower ?? 0}%–${upper ?? 100}%。选品广场填写精确区间；榜单选择不遗漏目标商品的档位；热点按商品实际数据核验。`
 })
 
 function update(change: (value: SelectionFilterSettings) => void): void {
@@ -105,11 +105,16 @@ function movePool(index: number, delta: number): void {
   })
 }
 
-function setSourceEnabled(source: 'hotSpot' | 'allianceRank', checked: boolean): void {
+function setSourceEnabled(source: 'hotSpot' | 'allianceRank' | 'selectionSquare', checked: boolean): void {
   update((settings) => {
     if (source === 'hotSpot') settings.sources.hotSpotEnabled = checked
-    else settings.sources.allianceRankEnabled = checked
+    else if (source === 'allianceRank') settings.sources.allianceRankEnabled = checked
+    else settings.sources.selectionSquareEnabled = checked
   })
+}
+
+function setSourceOption<K extends keyof SelectionFilterSettings['sources']>(key: K, value: SelectionFilterSettings['sources'][K]): void {
+  update((settings) => { settings.sources[key] = value })
 }
 
 function moveSource(index: number, delta: number): void {
@@ -142,28 +147,40 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
       <label>销量阈值<input :value="modelValue.thresholds.salesCount ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('salesCount', ($event.target as HTMLInputElement).value)"></label>
       <label>转化率阈值（%）<input :value="modelValue.thresholds.conversionRate ?? ''" type="number" min="0" step="0.1" placeholder="不限制" :disabled="disabled" @input="setThreshold('conversionRate', ($event.target as HTMLInputElement).value)"></label>
       <label>浏览量阈值<input :value="modelValue.thresholds.views ?? ''" type="number" min="0" placeholder="不限制" :disabled="disabled" @input="setThreshold('views', ($event.target as HTMLInputElement).value)"></label>
-      <label>最高佣金率（%）<input :value="modelValue.thresholds.commissionRate ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最高佣金率百分比" :disabled="disabled" @input="setThreshold('commissionRate', ($event.target as HTMLInputElement).value)"></label>
+      <label>最低佣金率（%）<input :value="modelValue.thresholds.commissionRate ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最低佣金率百分比" :disabled="disabled" @input="setThreshold('commissionRate', ($event.target as HTMLInputElement).value)"></label>
+      <label>最高佣金率（%）<input :value="modelValue.thresholds.commissionRateMax ?? ''" type="number" min="0" max="100" step="0.1" placeholder="不限制" aria-label="最高佣金率百分比" :disabled="disabled" @input="setThreshold('commissionRateMax', ($event.target as HTMLInputElement).value)"></label>
     </div>
     <p class="hint">{{ commissionHint }}</p>
     <label class="check-row"><input type="checkbox" :checked="modelValue.poolFallback" :disabled="disabled" @change="setPoolFallback(($event.target as HTMLInputElement).checked)">四池不足时从池外兜底补足</label>
     <p class="hint">
       筛选目录保存在本机；{{ filterCatalogUpdatedAt ? `上次同步：${new Date(filterCatalogUpdatedAt).toLocaleString()}` : '尚无本地目录，首次同步时需要托管 Chrome 已登录百应' }}。
-      三个来源统一按下方数据条件在客户端筛选；佣金率按上限、体验分按下限核验。
+      三个来源统一按下方数据条件在客户端筛选；佣金率按最低值及可选最高值、体验分按下限核验。
     </p>
     <p class="hint">自动选品使用独立托管页面；执行期间请不要手动操作该页面，其他百应标签可继续使用。</p>
     <section class="platform-filter-section">
-      <div class="editor-title"><h3>参考加权来源</h3><span class="hint">选品广场始终采集；热点和联盟榜单可选，命中后参与统一分加权。</span></div>
+      <div class="editor-title"><h3>共享候选池来源</h3><span class="hint">至少启用一处来源；同一商品跨来源去重并保留来源记录。</span></div>
       <div class="platform-filter-multi source-toggles">
-        <label class="check-row"><input type="checkbox" :checked="modelValue.sources.hotSpotEnabled" :disabled="disabled" @change="setSourceEnabled('hotSpot', ($event.target as HTMLInputElement).checked)">热点趋势</label>
-        <label class="check-row"><input type="checkbox" :checked="modelValue.sources.allianceRankEnabled" :disabled="disabled" @change="setSourceEnabled('allianceRank', ($event.target as HTMLInputElement).checked)">联盟榜单</label>
+        <label class="check-row"><input type="checkbox" :checked="modelValue.sources.hotSpotEnabled" :disabled="disabled" @change="setSourceEnabled('hotSpot', ($event.target as HTMLInputElement).checked)">选品热点</label>
+        <label class="check-row"><input type="checkbox" :checked="modelValue.sources.allianceRankEnabled" :disabled="disabled" @change="setSourceEnabled('allianceRank', ($event.target as HTMLInputElement).checked)">带货商品榜</label>
+        <label class="check-row"><input type="checkbox" :checked="modelValue.sources.selectionSquareEnabled" :disabled="disabled" @change="setSourceEnabled('selectionSquare', ($event.target as HTMLInputElement).checked)">选品广场</label>
       </div>
+      <div v-if="modelValue.sources.allianceRankEnabled" class="form-grid">
+        <label>榜单<select :value="modelValue.sources.rankBoard" :disabled="disabled" @change="setSourceOption('rankBoard', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankBoard'])"><option>爆款榜</option><option>趋势榜</option><option>带货榜</option><option>常销榜</option></select></label>
+        <label>榜单数据周期<select :value="modelValue.sources.rankPeriod" :disabled="disabled" @change="setSourceOption('rankPeriod', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankPeriod'])"><option>实时</option><option>昨日</option><option>近7日</option><option>近30日</option></select></label>
+        <label>榜单载体<select :value="modelValue.sources.rankCarrier" :disabled="disabled" @change="setSourceOption('rankCarrier', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankCarrier'])"><option>不限载体</option><option>短视频</option><option>直播</option><option>橱窗</option><option>图文</option></select></label>
+      </div>
+      <div v-if="modelValue.sources.hotSpotEnabled" class="form-grid">
+        <label>热点最低曝光热度（万次）<input :value="modelValue.sources.hotSpotMinExposure ?? ''" type="number" min="0" step="0.01" placeholder="不限" :disabled="disabled" @input="setSourceOption('hotSpotMinExposure', ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value))"></label>
+        <label>热点最低关联商品数<input :value="modelValue.sources.hotSpotMinRelatedProducts ?? ''" type="number" min="0" placeholder="不限" :disabled="disabled" @input="setSourceOption('hotSpotMinRelatedProducts', ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value))"></label>
+      </div>
+      <p class="hint">热点分类遵循下方类目范围和排除类目。榜单默认爆款榜，可改选其他三榜；页面筛选必须回读确认。平台未提供某项必需数据时，该商品不计入达标池量。</p>
       <ol class="pool-list source-priority-list">
         <li v-for="(source, index) in modelValue.sources.priority" :key="source">
           <span>{{ index + 1 }}. {{ sourceLabels[source] }}</span>
           <span><button :disabled="disabled || index === 0" @click="moveSource(index, -1)">↑</button><button :disabled="disabled || index === modelValue.sources.priority.length - 1" @click="moveSource(index, 1)">↓</button></span>
         </li>
       </ol>
-      <p class="hint">来源只影响统一评分加权，不要求候选必须来自热点或榜单；选品广场达到数据门槛同样可以入选。</p>
+      <p class="hint">来源影响采集范围；来源和商品筛选结果都记录在候选池中。</p>
     </section>
     <div v-if="!Object.values(filterGroups).some((items) => items.length)" class="empty-hint">本机尚无筛选目录。首次使用时保持托管 Chrome 已登录百应并同步；以后进入本页会直接使用本地缓存。</div>
     <section v-for="section in sections" :key="section.title" class="platform-filter-section">

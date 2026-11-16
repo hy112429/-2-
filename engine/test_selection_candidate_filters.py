@@ -30,6 +30,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
     def settings(self, **overrides):
         value = {
             "candidateLimit": 5,
+            "commissionRateRule": "minimum",
             "selectionMode": "general",
             "categoryMode": "auto",
             "categorySelection": {"level1": [], "level2": [], "level3": []},
@@ -48,7 +49,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
     def test_three_sources_share_exclusion_and_thresholds(self):
         rows = {
             "hotSpot": [promotion_row("hot-good", ("1", "201", "301"), 10, 4.8)],
-            "allianceRank": [promotion_row("rank-bad", ("1", "201", "302"), 25, 4.8)],
+            "allianceRank": [promotion_row("rank-bad", ("1", "201", "302"), 5, 4.8)],
             "selectionSquare": [promotion_row("square-blocked", ("1", "202", "309"), 10, 4.9)],
         }
         membership = {key: {row["product_id"] for row in values} for key, values in rows.items()}
@@ -65,7 +66,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual([item["productId"] for item in result["candidates"]], ["hot-good"])
         rejected = {item["productId"]: item for item in result["rejectedCandidates"]}
         self.assertIn("rank-bad", rejected)
-        self.assertIn("佣金率 25 超过设定上限 10", rejected["rank-bad"]["thresholdReasons"])
+        self.assertIn("佣金率 5 低于设定下限 10", rejected["rank-bad"]["thresholdReasons"])
         self.assertIn("square-blocked", rejected)
         self.assertIn("命中当前设置中排除的类目", rejected["square-blocked"]["thresholdReasons"])
 
@@ -87,7 +88,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
             )
         self.assertEqual(result["candidates"], [])
         reasons = result["rejectedCandidates"][0]["thresholdReasons"]
-        self.assertIn("缺少佣金率实测数据，无法核验上限 10", reasons)
+        self.assertIn("缺少有效佣金率实测数据，无法核验设定区间", reasons)
         self.assertIn("缺少体验分实测数据，无法核验阈值 4.5", reasons)
 
     def test_detail_metrics_are_written_back_to_common_candidate_shape(self):
