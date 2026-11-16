@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import browser_cdp
 
@@ -45,6 +45,26 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         }
         value.update(overrides)
         return value
+
+    def test_commission_confirm_click_waits_for_stable_button(self):
+        page = MagicMock()
+        confirm = MagicMock()
+        confirm.is_visible.return_value = True
+        confirm.is_enabled.return_value = True
+        confirm.bounding_box.return_value = {"x": 10, "y": 20, "width": 60, "height": 24}
+        browser_cdp._click_filter_confirm_stably(page, confirm)
+        confirm.scroll_into_view_if_needed.assert_called_once()
+        confirm.click.assert_called_once_with(timeout=2500, no_wait_after=True)
+
+    def test_commission_confirm_accepts_applied_chip_after_click_timeout(self):
+        page = MagicMock()
+        confirm = MagicMock()
+        confirm.is_visible.return_value = True
+        confirm.is_enabled.return_value = True
+        confirm.bounding_box.return_value = {"x": 10, "y": 20, "width": 60, "height": 24}
+        confirm.click.side_effect = TimeoutError("element is not stable after click")
+        browser_cdp._click_filter_confirm_stably(page, confirm, confirmation_check=lambda: True)
+        self.assertGreaterEqual(confirm.click.call_count, 1)
 
     def test_three_sources_share_exclusion_and_thresholds(self):
         rows = {

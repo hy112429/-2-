@@ -5552,6 +5552,25 @@ def _wait_filter_applied_chip(page: Page, label: str, value: str, timeout_ms: in
         return False
 
 
+def _wait_filter_summary_text(page: Page, label: str, value: str, timeout_ms: int = 1_000) -> bool:
+    """回读页面可见文本，兼容百应更换“已筛选”摘要 DOM 层级的情况。"""
+    try:
+        page.wait_for_function("""({label, value}) => {
+          const clean = (text) => String(text || '').replace(/\\s+/g, '').replace(/[：:]/g, ':');
+          const wanted = `${clean(label)}:${clean(value)}`;
+          const visible = (node) => {
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          return Array.from(document.querySelectorAll('body *')).some((node) =>
+            visible(node) && clean(node.innerText || node.textContent).includes(wanted));
+        }""", {"label": label, "value": value}, timeout=timeout_ms, polling=100)
+        return True
+    except Exception:
+        return False
+
+
 def _is_retryable_filter_apply_error(error: BaseException) -> bool:
     message = str(error).lower()
     if any(marker in message for marker in ("11001", "验证码", "安全验证", "登录失效", "连接断开", "没有选项")):
@@ -5684,6 +5703,77 @@ def _wait_filter_dropdown_closed(page: Page, timeout_ms: int = 1_500) -> None:
         !node.classList.contains('aurora-select-dropdown-hidden') &&
         !String(node.className).includes('aurora-slide-up-leave'))""",
       timeout=timeout_ms, polling=100)
+
+
+def _wait_filter_confirm_stable(page: Page, confirm: Any, timeout_ms: int = 2_500) -> None:
+    """等待 Aurora 确认按钮完成入场/布局动画，再执行真实点击。"""
+    deadline = time.monotonic() + timeout_ms / 1000
+    previous_box: Optional[tuple[float, float, float, float]] = None
+    stable_since: Optional[float] = None
+    while time.monotonic() < deadline:
+        try:
+            if not confirm.is_visible(timeout=300) or not confirm.is_enabled(timeout=300):
+                stable_since = None
+                previous_box = None
+            else:
+                box = confirm.bounding_box()
+                if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                    current_box = tuple(round(float(box.get(key, 0)), 1) for key in ("x", "y", "width", "height"))
+                    if current_box == previous_box:
+                        if stable_since is None:
+                            stable_since = time.monotonic()
+                        if time.monotonic() - stable_since >= 0.18:
+                            return
+                    else:
+                        stable_since = None
+                    previous_box = current_box
+        except Exception:
+            stable_since = None
+            previous_box = None
+        page.wait_for_timeout(60)
+    raise RuntimeError("选品广场佣金区间确认按钮连续 2.5 秒未稳定；未执行重复点击")
+
+
+def _click_filter_confirm_stably(
+    page: Page,
+    confirm: Any,
+    confirmation_check: Optional[Callable[[], bool]] = None,
+) -> None:
+    """确认按钮稳定后点击并核对菜单关闭；短暂动画抖动只在控件层重试。"""
+    last_error: Optional[BaseException] = None
+    for attempt in range(3):
+        try:
+            _wait_filter_confirm_stable(page, confirm, timeout_ms=2_500)
+            try:
+                confirm.scroll_into_view_if_needed(timeout=1_000)
+            except Exception:
+                pass
+            confirm.click(timeout=2_500, no_wait_after=True)
+            try:
+                _wait_filter_dropdown_closed(page, timeout_ms=2_000)
+            except PlaywrightTimeoutError:
+                # 点击可能已提交但弹层正在离场；只有按钮仍可见时才继续重试。
+                try:
+                    if not confirm.is_visible(timeout=300):
+                        return
+                except Exception:
+                    return
+                raise RuntimeError("选品广场佣金区间确认后下拉菜单仍在动画中")
+            return
+        except Exception as error:
+            last_error = error
+            # Playwright 可能在点击事件已经提交、页面开始重绘后，
+            # 卡在 click 的收尾稳定性检查；优先回读页面已应用摘要，避免把成功误报成失败。
+            if confirmation_check is not None:
+                try:
+                    if confirmation_check():
+                        return
+                except Exception:
+                    pass
+            if attempt >= 2:
+                break
+            page.wait_for_timeout(180 * (attempt + 1))
+    raise RuntimeError(f"选品广场佣金区间确认按钮点击未稳定：{last_error}") from last_error
 
 
 def _stabilize_background_filter_dropdown(page: Page) -> None:
@@ -6837,7 +6927,19 @@ def _apply_square_commission_range(page: Page, settings: Dict[str, Any]) -> None
             confirm = menu.get_by_text("确 定", exact=True)
         if confirm.count() != 1:
             raise RuntimeError("选品广场佣金区间确认控件未唯一定位")
-        confirm.click(timeout=5_000)
+        expected_chip_values = (
+            f"{expected_min}%-{expected_max}%",
+            f"{expected_min}%–{expected_max}%",
+        )
+        _click_filter_confirm_stably(
+            page,
+            confirm,
+            confirmation_check=lambda: any(
+                _wait_filter_applied_chip(page, "佣金区间", value, timeout_ms=800) or
+                _wait_filter_summary_text(page, "佣金区间", value, timeout_ms=800)
+                for value in expected_chip_values
+            ),
+        )
     finally:
         _close_filter_dropdown(page, control)
     control, menu = _open_filter_dropdown(page, "佣金区间")

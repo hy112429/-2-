@@ -21,6 +21,9 @@ type TriggerSource = 'upload-finish' | 'submit-finish' | 'mark-published' | 'ren
 const activeQueueIds = new Set<number>()
 let reconcileTimer: ReturnType<typeof setInterval> | null = null
 let reconcileRunning = false
+let lastGateLogKey = ''
+let lastGateLogAt = 0
+const GATE_LOG_DEDUPE_MS = 10 * 60_000
 const PRODUCT_ID = /^\d{1,20}$/
 
 function object(value: unknown): Json {
@@ -480,9 +483,17 @@ async function reconcileTick(): Promise<void> {
   try {
     const gate = await douyinBatchGate()
     if (!gate.ready) {
-      console.info(`[发布后素材] 千川全局闸门未通过：${gate.reason}`)
+      const gateKey = gate.reason.trim() || '全账号抖音选品/发布批次尚未完成'
+      const now = Date.now()
+      if (gateKey !== lastGateLogKey || now - lastGateLogAt >= GATE_LOG_DEDUPE_MS) {
+        console.info(`[发布后素材] 千川全局闸门未通过：${gateKey}`)
+        lastGateLogKey = gateKey
+        lastGateLogAt = now
+      }
       return
     }
+    lastGateLogKey = ''
+    lastGateLogAt = 0
     const due = await stateCommand('due', '--limit', '30')
     for (const row of rows(due['rows'])) {
       const queueId = Number(row['publishQueueId'])
