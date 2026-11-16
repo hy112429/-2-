@@ -8544,7 +8544,13 @@ def _collect_selection_square_rows(
         for row in raw_rows:
             row["_sourceReadPage"] = f"query:{index}:initial"
         visible_ids = {str(row.get("product_id") or "").strip() for row in raw_rows}
-        more_rows, scroll_reads = _scroll_selection_square_rows(page, query_settings, visible_ids)
+        try:
+            scroll_steps = max(1, min(24, int(settings.get("_candidatePoolScrollSteps", 6))))
+        except (TypeError, ValueError):
+            scroll_steps = 6
+        more_rows, scroll_reads = _scroll_selection_square_rows(
+            page, query_settings, visible_ids, max_steps=scroll_steps
+        )
         raw_rows.extend(more_rows)
         page_reads.extend({"query": index, **entry} for entry in scroll_reads)
         observed_rows += len(raw_rows)
@@ -8759,6 +8765,67 @@ def _category_probe_sample_rows(rows: Sequence[Dict[str, Any]], limit: int = 3) 
                 if len(sampled) >= limit:
                     break
     return sampled, len(groups)
+
+
+def _collector_candidate_pool_result(
+    source_candidates: Dict[str, list[Dict[str, Any]]],
+    source_membership: Dict[str, set[str]],
+    source_results: list[Dict[str, Any]],
+    warnings: list[str],
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    """只读汇总商品 ID；采集账号不执行详情、加车或账号配额操作。"""
+    by_product: Dict[str, Dict[str, Any]] = {}
+    for source_key in [*_enabled_priority_source_order(settings), "selectionSquare"]:
+        for row in source_candidates.get(source_key, []):
+            product_id = str(row.get("product_id") or "").strip()
+            if not product_id or not product_id.isdigit():
+                continue
+            row = copy.deepcopy(row)
+            base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+            info = base.get("product_info") if isinstance(base.get("product_info"), dict) else {}
+            if not str(info.get("name") or row.get("title") or "").strip():
+                row["title"] = product_id
+            if product_id in by_product:
+                by_product[product_id] = _merge_candidate_source_rows(by_product[product_id], row)
+            else:
+                by_product[product_id] = copy.deepcopy(row)
+    broad_settings = {
+        **settings,
+        "selectionMode": "general",
+        "categoryMode": "auto",
+        "categorySelection": {"level1": [], "level2": [], "level3": []},
+        "excludedCategorySelection": {"level1": [], "level2": [], "level3": []},
+        "filters": {"delivery": {}, "product": {}, "features": []},
+        "thresholds": {},
+        "bannedWords": [],
+        "_sourceMembership": source_membership,
+    }
+    candidates, parse_messages, rejected = _candidate_rows(
+        {"data": {"summary_promotions": list(by_product.values())}},
+        broad_settings, min(2000, len(by_product)),
+    )
+    source_order = [*_enabled_priority_source_order(settings), "selectionSquare"]
+    for index, candidate in enumerate(candidates):
+        product_id = str(candidate.get("productId") or "")
+        sources = [key for key in source_order if product_id in source_membership.get(key, set())]
+        candidate["sources"] = sources
+        candidate["sourceKey"] = sources[0] if sources else "selectionSquare"
+        candidate["categoryStatus"] = "known" if len(candidate.get("categoryIds") or []) == 3 else "unknown"
+        candidate["leafCategoryId"] = str((candidate.get("categoryIds") or [""])[-1]) if candidate["categoryStatus"] == "known" else ""
+        candidate["cardIndex"] = index
+        candidate["selected"] = False
+        candidate["sourceCategorySelection"] = by_product.get(product_id, {}).get("_sourceCategorySelection", {})
+    return {
+        "ok": True,
+        "candidateCount": len(candidates),
+        "candidates": candidates,
+        "rejectedCandidates": rejected,
+        "warnings": list(dict.fromkeys([*warnings, *parse_messages])),
+        "prioritySourceResults": source_results,
+        "selectionStrategy": "collector_raw_pool",
+        "sourceProductCount": len(by_product),
+    }
 
 
 def _visible_source_candidate_result(
@@ -11080,6 +11147,10 @@ def apply_settings_and_collect_candidates(
             str(value) for value in selection_square_result.get("warnings", []) if str(value)
         )
         source_results.append(selection_square_result)
+        if settings.get("_candidatePoolCollectOnly") is True:
+            return _collector_candidate_pool_result(
+                source_candidates, source_membership, source_results, source_warnings, settings
+            )
         result = _visible_source_candidate_result(
             page, source_candidates, source_membership, source_results,
             selection_square_rows, selection_square_result, source_warnings, settings,
@@ -12569,11 +12640,14 @@ def _evaluate_candidate_thresholds(candidate: Dict[str, Any], settings: Dict[str
         except (TypeError, ValueError):
             continue
         if actual is None:
-            reasons.append(f"缺少{label}实测数据，无法核验{'上限' if metric == 'commissionRate' else '阈值'} {boundary:g}")
+            direction = '下限' if metric == 'commissionRate' and settings.get('_poolConsumerOnly') is True else '上限' if metric == 'commissionRate' else '阈值'
+            reasons.append(f"缺少{label}实测数据，无法核验{direction} {boundary:g}")
         elif metric == "commissionRate":
             if not math.isfinite(actual) or not 0 <= actual <= 100:
-                reasons.append("佣金率数据超出 0–100%，无法核验设定上限")
-            elif actual > boundary:
+                reasons.append("佣金率数据超出 0–100%，无法核验设定阈值")
+            elif settings.get('_poolConsumerOnly') is True and actual < boundary:
+                reasons.append(f"佣金率 {actual:g} 低于设定下限 {boundary:g}")
+            elif settings.get('_poolConsumerOnly') is not True and actual > boundary:
                 reasons.append(f"佣金率 {actual:g} 超过设定上限 {boundary:g}")
         elif actual < boundary:
             reasons.append(f"{label} {actual:g} 低于设定阈值 {boundary:g}")
@@ -12819,6 +12893,18 @@ def execute_selected_candidates(
                     page, context, candidate, settings, progress
                 )
                 _apply_detail_metrics(candidate, payload, detail_error)
+                if settings.get("_poolConsumerOnly") is True:
+                    candidate["_poolDetailVerified"] = payload is not None and not detail_error
+                    category_ids = candidate.get("categoryIds") if isinstance(candidate.get("categoryIds"), list) else []
+                    if len(category_ids) != 3 and payload is not None:
+                        category_ids, _ = _detail_category_path(
+                            payload, product_id,
+                            settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else [],
+                        )
+                        if len(category_ids) == 3:
+                            candidate["categoryIds"] = category_ids
+                            candidate["leafCategoryId"] = category_ids[-1]
+                            candidate["categoryStatus"] = "known"
             except CandidateCartSkip as error:
                 skipped = _candidate_skip_result(candidate, error)
                 candidate.update(skipped)
@@ -12899,6 +12985,21 @@ def execute_selected_candidates(
                 )
                 continue
             reasons = _evaluate_candidate_thresholds(candidate, settings)
+            if settings.get("_poolConsumerOnly") is True:
+                if candidate.pop("_poolDetailVerified", False) is not True:
+                    reasons.append("当前账号商品详情未成功打开并核对；不能加车")
+                category_ids = candidate.get("categoryIds") if isinstance(candidate.get("categoryIds"), list) else []
+                needs_category = bool(_excluded_category_selection_ids(settings)) or settings.get("selectionMode") == "category"
+                if needs_category and (len(category_ids) != 3 or not all(_category_id_scalar(value) for value in category_ids)):
+                    reasons.append("类目未知：当前账号列表及详情均未返回可核实的三级类目")
+                elif len(category_ids) == 3:
+                    excluded = _excluded_category_selection_ids(settings)
+                    if _candidate_matches_manual_categories(candidate, excluded):
+                        reasons.append("商品属于当前账号设置的排除类目")
+                    if settings.get("selectionMode") == "category" and settings.get("categoryMode") == "manual" and not _candidate_matches_manual_categories(candidate, _manual_category_selection_ids(settings)):
+                        reasons.append("商品不属于当前账号手动选择的类目范围")
+                candidate["thresholdReasons"] = reasons
+                candidate["eligible"] = not reasons
             if reasons:
                 candidate["analysisRejected"] = True
                 candidate["thresholdReasons"] = reasons
@@ -14519,6 +14620,168 @@ def remap_selected_candidate_indexes(
     return [unique[value] for value in wanted if value in unique], [value for value in wanted if value not in unique]
 
 
+def _search_pool_product_on_account(page: Page, candidate: Dict[str, Any], settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """在消费账号的选品广场按商品 ID 搜索，只接受平台响应与可见卡片双重确认。"""
+    product_id = str(candidate.get("productId") or "").strip()
+    if not product_id.isdigit():
+        raise RuntimeError("候选池商品 ID 无效；未执行加车")
+    field = page.locator('.searchInput__input input[role="combobox"]')
+    field.first.wait_for(state="visible", timeout=15_000)
+    if field.count() != 1:
+        raise RuntimeError("当前账号百应搜索框不唯一；未执行加车")
+    buttons = page.get_by_text("搜 索", exact=True)
+    if buttons.count() != 1:
+        buttons = page.get_by_text("搜索", exact=True)
+    if buttons.count() != 1:
+        raise RuntimeError("当前账号百应搜索按钮不唯一；未执行加车")
+    terms = (product_id, f"https://haohuo.jinritemai.com/views/product/item2?id={product_id}")
+    for term in terms:
+        observations: list[Dict[str, Any]] = []
+        last_response = [0.0]
+
+        def on_response(response: Any) -> None:
+            parsed = urlparse(str(getattr(response, "url", "")))
+            if parsed.hostname != "buyin.jinritemai.com" or "material_list" not in parsed.path:
+                return
+            try:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    return
+                if str(payload.get("code")) == "11001":
+                    observations.append({"rateLimited": True})
+                elif response.status != 200 or payload.get("code") not in (None, 0, "0"):
+                    observations.append({"failed": True})
+                else:
+                    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                    rows = data.get("summary_promotions")
+                    if isinstance(rows, list):
+                        observations.append({"rows": [row for row in rows if isinstance(row, dict) and
+                            str(row.get("product_id") or "").strip() == product_id]})
+                    else:
+                        observations.append({"formatUnknown": True})
+                last_response[0] = time.monotonic()
+            except Exception:
+                observations.append({"failed": True})
+                last_response[0] = time.monotonic()
+
+        page.on("response", on_response)
+        try:
+            field.fill(term, timeout=5_000)
+            if field.input_value(timeout=2_000).strip() != term:
+                raise RuntimeError("百应搜索框没有保留当前商品 ID；未执行加车")
+            buttons.click(timeout=8_000, no_wait_after=True)
+            started = time.monotonic()
+            while time.monotonic() - started < 15:
+                page.wait_for_timeout(250)
+                if observations and time.monotonic() - started >= 2 and time.monotonic() - last_response[0] >= 1:
+                    break
+        finally:
+            page.remove_listener("response", on_response)
+        if any(item.get("rateLimited") for item in observations):
+            raise RuntimeError("百应商品搜索返回 11001 限流；已停止当前账号请求")
+        if not observations or all(item.get("failed") for item in observations):
+            return None
+        if any(item.get("formatUnknown") for item in observations):
+            return None
+        matches = [row for item in observations for row in item.get("rows", [])]
+        promotion_ids = {str(row.get("promotion_id") or row.get("commodity_id") or "").strip() for row in matches}
+        promotion_ids.discard("")
+        if len(promotion_ids) > 1:
+            return None
+        if not matches or not promotion_ids:
+            continue
+        raw = matches[-1]
+        broad = {**settings, "thresholds": {}, "selectionMode": "general", "filters": {}}
+        parsed, _, _ = _candidate_rows({"data": {"summary_promotions": [raw]}}, broad, 1)
+        if not parsed:
+            return None
+        live = parsed[0]
+        live["cardIndex"] = candidate["cardIndex"]
+        live["productId"] = product_id
+        live["commodityId"] = next(iter(promotion_ids))
+        live["sourceKey"] = "selectionSquare"
+        live["sources"] = list(candidate.get("sources") or [])
+        live["sourceCategorySelection"] = {}
+        live_category = _promotion_row_category_ids(raw)
+        live["categoryIds"] = live_category if len(live_category) == 3 else []
+        live["leafCategoryId"] = live_category[-1] if len(live_category) == 3 else ""
+        live["categoryStatus"] = "known" if len(live_category) == 3 else "unknown"
+        try:
+            _locate_candidate_card(page, live)
+        except (CandidateCartSkip, RuntimeError):
+            return None
+        return live
+    return None
+
+
+def _execute_pool_consumer_candidates(
+    context: BrowserContext,
+    candidates: list[Dict[str, Any]],
+    selected_indexes: list[int],
+    download_root: str,
+    settings: Dict[str, Any],
+    max_selected_products: Optional[int],
+    progress: Optional[Callable[[Dict[str, Any]], None]],
+) -> list[Dict[str, Any]]:
+    selected = [row for row in candidates if row.get("cardIndex") in set(selected_indexes)]
+    if len(selected) != len(set(selected_indexes)):
+        raise RuntimeError("候选池消费快照不完整；未执行加车")
+    target = max(0, int(max_selected_products)) if max_selected_products is not None else len(selected)
+    completed: list[Dict[str, Any]] = []
+    page = _create_selection_work_page(context)
+    try:
+        url = BAIYING_SELECTION_SQUARE_SOURCE[1]
+        page.goto(url, wait_until="commit", timeout=45_000)
+        actual = urlparse(page.url)
+        expected = urlparse(url)
+        if actual.hostname != expected.hostname or actual.path.rstrip("/") != expected.path.rstrip("/"):
+            raise RuntimeError("当前账号百应选品广场未正常打开；请检查登录和选品权限")
+        search_settings = copy.deepcopy(settings)
+        thresholds = search_settings.get("thresholds") if isinstance(search_settings.get("thresholds"), dict) else {}
+        search_settings["thresholds"] = {**thresholds, "commissionRate": None}
+        search_settings["_platformCommissionRateUpperBound"] = None
+        filter_warnings = apply_filter_settings(page, search_settings)
+        if filter_warnings:
+            raise RuntimeError("当前账号百应筛选条件未全部确认应用；保留检查点：" + "；".join(filter_warnings[:3]))
+        for position, candidate in enumerate(selected, start=1):
+            if sum(row.get("cartAdded") is True for row in completed) >= target:
+                break
+            product_id = str(candidate.get("productId") or "")
+            _report_operation_progress(progress, "候选池按商品 ID 核验", index=position, total=len(selected),
+                                       message=f"当前账号按商品 ID 查找 {position}/{len(selected)}", product_id=product_id)
+            prompt_kind, prompt_text = _visible_baiying_prompt(page)
+            if prompt_kind in {"manual_verification", "login", "account_unavailable", "invoice_eligibility"}:
+                raise RuntimeError(f"当前账号百应状态待处理（{prompt_text or prompt_kind}）；保留检查点")
+            live = _search_pool_product_on_account(page, candidate, settings)
+            if live is None:
+                completed.append(_visible_source_candidate_skip(candidate, "选品广场 ID 搜索", "当前账号未能唯一确认该商品 ID 与可见卡片"))
+                continue
+            if candidate.get("cartAttempted") is True:
+                live["cartAttempted"] = True
+            if candidate.get("cartAdded") is True:
+                live["cartAdded"] = True
+            try:
+                item_results = execute_selected_candidates(
+                    page, context, [live], [int(live["cardIndex"])], download_root,
+                    settings, progress=progress, analyze_before_cart=live.get("cartAdded") is not True,
+                    max_selected_products=1,
+                )
+                completed.extend(item_results)
+                if any(item.get("cartAttempted") is True and item.get("cartAdded") is not True and
+                       item.get("skipped") is not True for item in item_results):
+                    break
+            except Exception as error:
+                if _selection_error_requires_pause(error):
+                    raise
+                completed.append(_visible_source_candidate_skip(candidate, "选品广场 ID 搜索", f"当前商品核验异常（{_safe_diagnostic_text(error, 240)}）"))
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+    return completed
+
+
 def _execute_visible_source_candidates(
     context: BrowserContext,
     candidates: list[Dict[str, Any]],
@@ -14661,7 +14924,7 @@ def run_selection_command(
             if isinstance(item, dict) and str(item.get("productId", "")) and str(item.get("title", ""))
             and isinstance(item.get("cardIndex"), int)
         ]
-        if category_logic_enabled and settings.get("categoryMode") == "manual":
+        if category_logic_enabled and settings.get("categoryMode") == "manual" and settings.get("_poolConsumerOnly") is not True:
             outside_manual_scope = [
                 candidate for candidate in candidates
                 if not _candidate_matches_manual_categories(candidate, manual_category_ids)
@@ -14807,7 +15070,8 @@ def run_selection_command(
                 ) from error
 
     if visible_sources_only and selected:
-        completed = _execute_visible_source_candidates(
+        executor = _execute_pool_consumer_candidates if settings.get("_poolConsumerOnly") is True else _execute_visible_source_candidates
+        completed = executor(
             context,
             candidates,
             selected,

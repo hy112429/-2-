@@ -75,7 +75,7 @@ export function candidateLeafCategoryId(candidate: SelectionCandidateRankInput):
 export function filterCandidatesByRegistry<T extends SelectionCandidateRankInput>(
   rows: T[],
   snapshot: SelectionRegistrySnapshot,
-  _allowUnknownCategory = false,
+  allowUnknownCategory = false,
   enforceCategoryUniqueness = true
 ): { eligible: T[]; excluded: Array<{ candidate: T; reason: string }> } {
   const usedProducts = new Set(snapshot.usedProductIds.map(String))
@@ -88,7 +88,7 @@ export function filterCandidatesByRegistry<T extends SelectionCandidateRankInput
       excluded.push({ candidate, reason: '来源数据缺少商品 ID' })
     } else if (usedProducts.has(candidate.productId)) {
       excluded.push({ candidate, reason: '商品 ID 已在全账号池登记' })
-    } else if (!categoryId) {
+    } else if (!categoryId && !allowUnknownCategory) {
       excluded.push({ candidate, reason: '品类模式下来源数据缺少三级类目 ID' })
     } else if (enforceCategoryUniqueness && categoryId && usedCategories.has(categoryId)) {
       excluded.push({ candidate, reason: '该账号历史或本轮已使用此末级类目' })

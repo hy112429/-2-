@@ -48,6 +48,8 @@ DEFAULT_BANNED_WORDS = list(dict.fromkeys([
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "candidateLimit": 5,
+    "candidatePoolTarget": 300,
+    "candidateCollectorAccountIds": [],
     "selectionMode": "general",
     "categoryMode": "auto",
     "categorySelection": {"level1": [], "level2": [], "level3": []},
@@ -198,6 +200,14 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
         value["categoryMode"] = "manual" if value.get("categoryMode") == "manual" else "auto"
         if not isinstance(value.get("candidateLimit"), int) or not 1 <= value["candidateLimit"] <= 10:
             raise ValueError("候选上限必须是 1–10 的整数")
+        if not isinstance(value.get("candidatePoolTarget"), int) or isinstance(value["candidatePoolTarget"], bool) or not 1 <= value["candidatePoolTarget"] <= 2000:
+            raise ValueError("共享候选池目标数必须是 1–2000 的整数")
+        collector_ids = value.get("candidateCollectorAccountIds")
+        if not isinstance(collector_ids, list) or len(collector_ids) > 2 or any(
+            not isinstance(account_id, int) or isinstance(account_id, bool) or account_id <= 0
+            for account_id in collector_ids
+        ) or len(set(collector_ids)) != len(collector_ids):
+            raise ValueError("候选采集账号须从现有账号中指定最多两个不同的账号 ID")
         if not isinstance(value.get("bannedWords"), list):
             raise ValueError("屏蔽词必须是列表")
         value["bannedWords"] = list(dict.fromkeys(str(w).strip() for w in value["bannedWords"] if str(w).strip()))

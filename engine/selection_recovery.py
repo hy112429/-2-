@@ -335,6 +335,92 @@ def create_batch(connection: sqlite3.Connection, batch_id: str, payload: Any) ->
     return batch_dict(connection, row)
 
 
+POOL_CANDIDATE_FIELDS = frozenset({
+    "productId", "commodityId", "title", "price", "monthSales", "saleAmount",
+    "estimatedSalesAmount", "conversionRate", "views", "commissionRate", "shopScore",
+    "trendRising", "trendKnown", "trendStatus", "trendSlope", "trendPoints",
+    "dataMetrics", "metricSources", "poolRank", "sources", "sourceKey",
+    "categoryIds", "leafCategoryId", "categoryStatus", "categorySource",
+    "analysisScore", "unifiedScore",
+})
+
+
+def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: Any) -> Dict[str, Any]:
+    """按商品 ID 增量保存本批只读候选；不保存账号凭证、原始响应或加车状态。"""
+    if not isinstance(value, dict):
+        raise ValueError("候选池检查点格式无效")
+    row = connection.execute(
+        "SELECT state,payload_json FROM selection_run_batches WHERE batch_id=?", (batch_id,)
+    ).fetchone()
+    if not row or row["state"] not in {"in_progress", "needs_retry"}:
+        raise ValueError("候选池所属批次不存在或已经结束")
+    payload = decode_json(row["payload_json"], {})
+    if not isinstance(payload, dict):
+        raise ValueError("选品批次快照无效")
+    settings = payload.get("settingsSnapshot") if isinstance(payload.get("settingsSnapshot"), dict) else {}
+    collector_ids = settings.get("candidateCollectorAccountIds")
+    target = settings.get("candidatePoolTarget")
+    if not isinstance(collector_ids, list) or not 1 <= len(collector_ids) <= 2 or not isinstance(target, int) or not 1 <= target <= 2000:
+        raise ValueError("批次缺少有效的候选采集账号或池目标数")
+    if value.get("target") != target or value.get("collectorAccountIds") != collector_ids:
+        raise ValueError("候选池配置与批次启动快照不一致")
+    previous = payload.get("candidatePool") if isinstance(payload.get("candidatePool"), dict) else {}
+    existing_rows = previous.get("rows") if isinstance(previous.get("rows"), list) else []
+    incoming_rows = value.get("rows")
+    if not isinstance(incoming_rows, list):
+        raise ValueError("候选池商品列表格式无效")
+    by_product: dict[str, dict[str, Any]] = {}
+    for candidate in [*existing_rows, *incoming_rows]:
+        if not isinstance(candidate, dict):
+            continue
+        product_id = str(candidate.get("productId") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if not product_id.isdigit() or not title:
+            continue
+        safe = {key: candidate[key] for key in POOL_CANDIDATE_FIELDS if key in candidate}
+        safe["productId"] = product_id
+        safe["title"] = title[:512]
+        safe["collectedByAccountId"] = int(candidate.get("collectedByAccountId") or value.get("collectorAccountId") or 0)
+        safe["capturedAt"] = str(candidate.get("capturedAt") or value.get("capturedAt") or now_text())[:40]
+        if safe["collectedByAccountId"] not in collector_ids:
+            raise ValueError("候选商品来源账号不属于本批采集账号")
+        by_product.setdefault(product_id, safe)
+    if len(by_product) > 2000:
+        raise ValueError("候选池超过 2000 件上限")
+    state = value.get("sourceState")
+    if not isinstance(state, dict):
+        raise ValueError("候选池采集游标无效")
+    collectors = state.get("collectors") if isinstance(state.get("collectors"), dict) else {}
+    clean_collectors: dict[str, dict[str, Any]] = {}
+    for account_id in collector_ids:
+        collector = collectors.get(str(account_id))
+        if not isinstance(collector, dict):
+            continue
+        offsets = collector.get("tabOffsets") if isinstance(collector.get("tabOffsets"), dict) else {}
+        clean_offsets = {str(key): max(0, int(number)) for key, number in offsets.items()
+                         if str(key) in {"hotSpot", "allianceRank"} and str(number).isdigit()}
+        clean_collectors[str(account_id)] = {
+            "tabOffsets": clean_offsets,
+            "samePoolCount": max(0, int(collector.get("samePoolCount") or 0)),
+            "nextRetryAt": str(collector.get("nextRetryAt") or "")[:40],
+        }
+    pool = {
+        "target": target,
+        "collectorAccountIds": collector_ids,
+        "rows": list(by_product.values()),
+        "sourceState": {"collectors": clean_collectors},
+        "status": "ready" if len(by_product) >= target else "collecting",
+        "capturedAt": str(value.get("capturedAt") or now_text())[:40],
+    }
+    payload["candidatePool"] = pool
+    with connection:
+        connection.execute(
+            "UPDATE selection_run_batches SET payload_json=?,updated_at=? WHERE batch_id=? AND state IN ('in_progress','needs_retry')",
+            (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), now_text(), batch_id),
+        )
+    return {"status": pool["status"], "count": len(by_product), "target": target}
+
+
 def latest_incomplete_batch(connection: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     row = connection.execute(
         "SELECT * FROM selection_run_batches WHERE state IN ('in_progress', 'needs_retry') "
@@ -1092,6 +1178,7 @@ def refresh_candidate_fetch_batch(
                 raise ValueError("任务已保存候选或执行结果，不能刷新原批次设置")
 
     refreshed_payload = dict(payload)
+    refreshed_payload.pop("candidatePool", None)
     # 同一批次保留原账号集合和幂等事件键；新设置只替换尚未执行账号的输入快照。
     refreshed_payload["accounts"] = previous_accounts
     timestamp = now_text()
@@ -1295,6 +1382,8 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--batch-id", required=True)
     refresh = batch_sub.add_parser("refresh-candidates")
     refresh.add_argument("--batch-id", required=True)
+    save_pool = batch_sub.add_parser("pool-save")
+    save_pool.add_argument("--batch-id", required=True)
     update_paths = batch_sub.add_parser("update-download-paths")
     update_paths.add_argument("--batch-id", required=True)
     abandon = batch_sub.add_parser("abandon")
@@ -1384,6 +1473,9 @@ def main() -> int:
             if args.command == "batch" and args.action == "refresh-candidates":
                 payload = json.load(sys.stdin)
                 return emit({"batch": refresh_candidate_fetch_batch(connection, args.batch_id, payload)})
+            if args.command == "batch" and args.action == "pool-save":
+                payload = json.load(sys.stdin)
+                return emit({"pool": save_candidate_pool(connection, args.batch_id, payload)})
             if args.command == "batch" and args.action == "update-download-paths":
                 payload = json.load(sys.stdin)
                 paths = payload.get("downloadPaths") if isinstance(payload, dict) else None
