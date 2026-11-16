@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import sqlite3
 import sys
 from datetime import datetime
@@ -48,6 +49,11 @@ DEFAULT_BANNED_WORDS = list(dict.fromkeys([
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "candidateLimit": 5,
+    "candidatePoolTarget": 300,
+    "candidatePoolMode": "total",
+    "candidatePoolQuotas": [],
+    "candidateCollectorAccountIds": [],
+    "commissionRateRule": "minimum",
     "selectionMode": "general",
     "categoryMode": "auto",
     "categorySelection": {"level1": [], "level2": [], "level3": []},
@@ -58,9 +64,15 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "sources": {
         "hotSpotEnabled": True,
         "allianceRankEnabled": True,
+        "selectionSquareEnabled": True,
+        "rankBoard": "爆款榜",
+        "rankPeriod": "昨日",
+        "rankCarrier": "不限载体",
+        "hotSpotMinExposure": None,
+        "hotSpotMinRelatedProducts": None,
         "priority": ["hotSpot", "allianceRank"],
     },
-    "thresholds": {"salesAmount": None, "salesCount": None, "conversionRate": None, "views": None, "commissionRate": None, "minCommissionRate": None, "maxCommissionRate": None, "experienceScore": None},
+    "thresholds": {"salesAmount": None, "salesCount": None, "conversionRate": None, "views": None, "commissionRate": None, "commissionRateMax": None, "experienceScore": None},
     "trendPreference": "上升优先",
     "bannedWords": DEFAULT_BANNED_WORDS,
     "bannedWordsSeedVersion": BANNED_WORDS_SEED_VERSION,
@@ -172,7 +184,11 @@ def load_settings(connection: sqlite3.Connection, account_id: Optional[int]) -> 
         "SELECT settings_json FROM selection_settings WHERE scope_key = 'global'"
     ).fetchone()
     if global_row:
-        global_settings = {**DEFAULT_SETTINGS, **json.loads(global_row["settings_json"])}
+        stored_global = json.loads(global_row["settings_json"])
+        global_settings = {**DEFAULT_SETTINGS, **stored_global}
+        stored_thresholds = stored_global.get("thresholds") if isinstance(stored_global.get("thresholds"), dict) else {}
+        if stored_thresholds.get("commissionRate") is not None and stored_global.get("commissionRateRule") != "minimum":
+            global_settings["commissionRateRule"] = "legacy_upper"
     else:
         global_settings = DEFAULT_SETTINGS
     if account_id is None:
@@ -189,6 +205,16 @@ def load_settings(connection: sqlite3.Connection, account_id: Optional[int]) -> 
 def save_settings(connection: sqlite3.Connection, account_id: Optional[int], value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("设置内容必须是 JSON 对象")
+    incoming_thresholds = value.get("thresholds") if account_id is None else (
+        value.get("filterOverrides", {}).get("thresholds")
+        if isinstance(value.get("filterOverrides"), dict) else None
+    )
+    rule = value.get("commissionRateRule") if account_id is None else (
+        value.get("filterOverrides", {}).get("commissionRateRule")
+        if isinstance(value.get("filterOverrides"), dict) else None
+    )
+    if isinstance(incoming_thresholds, dict) and incoming_thresholds.get("commissionRate") is not None and rule != "minimum":
+        raise ValueError("旧佣金率上限设置不能自动解释为最低值；请核对后重新保存")
     key = scope_key(account_id)
     if account_id is None:
         merged = dict(DEFAULT_SETTINGS)
@@ -198,8 +224,81 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
         value["categoryMode"] = "manual" if value.get("categoryMode") == "manual" else "auto"
         if not isinstance(value.get("candidateLimit"), int) or not 1 <= value["candidateLimit"] <= 10:
             raise ValueError("候选上限必须是 1–10 的整数")
+        if not isinstance(value.get("candidatePoolTarget"), int) or isinstance(value["candidatePoolTarget"], bool) or not 1 <= value["candidatePoolTarget"] <= 2000:
+            raise ValueError("共享候选池目标数必须是 1–2000 的整数")
+        mode = value.get("candidatePoolMode", "total")
+        rules = value.get("candidatePoolQuotas", [])
+        if mode not in {"total", "quota"} or not isinstance(rules, list):
+            raise ValueError("候选池配额模式或规则格式无效")
+        if mode == "quota":
+            if not rules:
+                raise ValueError("按品类配额模式至少需要一条规则")
+            keys: set[tuple[str, str, tuple[str, ...]]] = set()
+            ids: set[str] = set()
+            total = 0
+            excluded = value.get("excludedCategorySelection", {})
+            excluded = excluded if isinstance(excluded, dict) else {}
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    raise ValueError("品类配额规则格式无效")
+                rule_id, source = rule.get("id"), rule.get("sourceKey")
+                board, path, count = rule.get("rankBoard"), rule.get("categoryPath"), rule.get("target")
+                if not isinstance(rule_id, str) or not rule_id or rule_id in ids or source not in {"hotSpot", "allianceRank", "selectionSquare"}:
+                    raise ValueError("品类配额规则 ID 或来源无效")
+                if board not in {"爆款榜", "趋势榜", "带货榜", "常销榜"}:
+                    raise ValueError("品类配额榜单类型无效")
+                if not isinstance(path, list) or not 1 <= len(path) <= 3 or any(not isinstance(part, str) or not part.strip() for part in path) or rule.get("categoryId") != path[-1]:
+                    raise ValueError("品类配额必须提供稳定类目 ID 路径")
+                if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 2000:
+                    raise ValueError("品类配额数量必须是 1–2000 的整数")
+                for level, category_id in enumerate(path, start=1):
+                    excluded_ids = excluded.get(f"level{level}", [])
+                    if isinstance(excluded_ids, list) and any(
+                        str(category_id).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                        str(blocked).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                        for blocked in excluded_ids
+                    ):
+                        raise ValueError("品类配额不能选择已排除的类目")
+                key = (source, board if source == "allianceRank" else "", tuple(path))
+                if key in keys:
+                    raise ValueError("来源、榜单和类目重复的品类配额")
+                keys.add(key)
+                ids.add(rule_id)
+                total += count
+            if total > 2000:
+                raise ValueError("品类配额合计不能超过 2000 件")
+        collector_ids = value.get("candidateCollectorAccountIds")
+        if not isinstance(collector_ids, list) or len(collector_ids) > 2 or any(
+            not isinstance(account_id, int) or isinstance(account_id, bool) or account_id <= 0
+            for account_id in collector_ids
+        ) or len(set(collector_ids)) != len(collector_ids):
+            raise ValueError("候选采集账号须从现有账号中指定最多两个不同的账号 ID")
         if not isinstance(value.get("bannedWords"), list):
             raise ValueError("屏蔽词必须是列表")
+        sources = value.get("sources")
+        if not isinstance(sources, dict) or not any(sources.get(key, True) is True for key in ("hotSpotEnabled", "allianceRankEnabled", "selectionSquareEnabled")):
+            raise ValueError("至少启用一个候选来源")
+        if mode == "quota" and any(sources.get(f"{rule['sourceKey']}Enabled") is not True for rule in rules):
+            raise ValueError("品类配额引用了未启用的候选来源")
+        if sources.get("rankBoard", "爆款榜") not in {"爆款榜", "趋势榜", "带货榜", "常销榜"}:
+            raise ValueError("榜单类型无效")
+        if sources.get("rankPeriod", "昨日") not in {"实时", "昨日", "近7日", "近30日"}:
+            raise ValueError("榜单周期无效")
+        if sources.get("rankCarrier", "不限载体") not in {"不限载体", "短视频", "直播", "橱窗", "图文"}:
+            raise ValueError("榜单载体无效")
+        for key in ("hotSpotMinExposure", "hotSpotMinRelatedProducts"):
+            threshold = sources.get(key)
+            if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold < 0):
+                raise ValueError("热点筛选阈值须为非负数")
+        thresholds = value.get("thresholds", {})
+        if not isinstance(thresholds, dict):
+            raise ValueError("数据阈值格式无效")
+        lower, upper = thresholds.get("commissionRate"), thresholds.get("commissionRateMax")
+        for bound in (lower, upper):
+            if bound is not None and (isinstance(bound, bool) or not isinstance(bound, (int, float)) or not math.isfinite(bound) or not 0 <= bound <= 100):
+                raise ValueError("佣金率须为 0–100 之间的百分数")
+        if lower is not None and upper is not None and lower > upper:
+            raise ValueError("最低佣金率不能超过最高佣金率")
         value["bannedWords"] = list(dict.fromkeys(str(w).strip() for w in value["bannedWords"] if str(w).strip()))
     else:
         value.setdefault("selectionMode", "inherit")

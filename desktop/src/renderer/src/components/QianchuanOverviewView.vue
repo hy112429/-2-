@@ -32,6 +32,7 @@ const postPublishRuns = ref<PostPublishRun[]>([])
 const limits = reactive<Limits>({ perProductVideos: 10, perAccountProducts: 5, perAccountVideos: 50, perGroupProducts: 25, perGroupVideos: 250, maxConcurrentUploads: 1, minStepDelayMs: 800, maxStepDelayMs: 2000 })
 const accounts = computed(() => [...new Map(targets.value.map(row => [row.account_id, { id: row.account_id, name: row.account_name }])).values()])
 const linked = computed(() => targets.value.filter(row => row.account_id === accountId.value && row.qianchuan_account_id != null))
+const linkedQianchuanAccounts = computed(() => qianchuanAccounts.value.filter(row => linked.value.some(target => target.qianchuan_account_id === row.id)))
 const qcBoundToSelectedAccount = computed(() => linked.value.some(row => row.qianchuan_account_id === qcId.value))
 const eligible = computed(() => assets.value.filter(row => row.eligible))
 const due = computed(() => jobs.value.filter(row => row.status === 'queued' && row.scheduledDate <= today() && (!row.nextRetryAt || row.nextRetryAt <= localNow())))
@@ -92,10 +93,14 @@ async function loadQianchuanAccounts(): Promise<void> {
   qianchuanAccounts.value = Array.isArray(data.qianchuan_accounts) ? data.qianchuan_accounts as QianchuanAccount[] : []
 }
 async function loadJobs(): Promise<void> { jobs.value = rows<Job>(checked(await window.api.qianchuan.uploadJobs(accountId.value))) }
+function syncQianchuanSelection(): void {
+  if (!linkedQianchuanAccounts.value.some(row => row.id === qcId.value)) {
+    qcId.value = linkedQianchuanAccounts.value[0]?.id ?? 0
+  }
+}
 async function loadAccount(): Promise<void> {
   selected.value = new Set()
-  const selectedQcBound = linked.value.some(row => row.qianchuan_account_id === qcId.value)
-  qcId.value = selectedQcBound ? qcId.value : linked.value[0]?.qianchuan_account_id ?? qianchuanAccounts.value[0]?.id ?? 0
+  syncQianchuanSelection()
   if (!accountId.value) { assets.value = []; jobs.value = []; return }
   loading.value = true
   try {
@@ -118,7 +123,7 @@ async function refresh(): Promise<void> {
     if (!previous && postPublishRuns.value.length && accounts.value.some(row => row.id === postPublishRuns.value[0].accountId)) {
       accountId.value = postPublishRuns.value[0].accountId
     }
-    if (!linked.value.some(row => row.qianchuan_account_id === qcId.value)) qcId.value = linked.value[0]?.qianchuan_account_id ?? qianchuanAccounts.value[0]?.id ?? 0
+    syncQianchuanSelection()
     if (previous === accountId.value) await loadAccount()
   } catch (error) { message.value = String(error) }
 }
@@ -126,7 +131,7 @@ watch(accountId, () => { void loadAccount() })
 function toggle(row: Asset): void { if (!row.eligible) return; const next = new Set(selected.value); if (next.has(row.assetId)) next.delete(row.assetId); else next.add(row.assetId); selected.value = next }
 function selectAll(): void { selected.value = selected.value.size === eligible.value.length ? new Set() : new Set(eligible.value.map(row => row.assetId)) }
 async function openBrowser(): Promise<void> {
-  if (!qcId.value) return
+  if (!qcId.value || !qcBoundToSelectedAccount.value) return
   const result = await window.api.qianchuan.openLogin(qcId.value)
   const account = qianchuanAccounts.value.find(row => row.id === qcId.value)
   const name = account?.qc_name || account?.qc_id || `档案 #${qcId.value}`
@@ -268,8 +273,8 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
     <header class="heading"><div><h1>千川素材</h1><p>查看自动上传进度</p></div><div class="heading-actions"><button class="btn" @click="emit('navigate', '商品列表')">查看商品素材</button><button class="btn" @click="emit('open-qianchuan-accounts')">账号与登录</button><button class="btn" @click="emit('navigate', '素材与工具')">素材库</button></div></header>
     <div class="toolbar">
       <label>抖音账号 <select v-model.number="accountId"><option :value="0">选择账号</option><option v-for="account in accounts" :key="account.id" :value="account.id">{{ account.name }}</option></select></label>
-      <label>千川账户 <select v-model.number="qcId" :disabled="!qianchuanAccounts.length"><option :value="0">选择已建档账户</option><option v-for="qc in qianchuanAccounts" :key="qc.id" :value="qc.id">{{ qc.qc_name || qc.qc_id || `千川档案 #${qc.id}` }}</option></select></label>
-      <button class="btn primary" :disabled="!qcId" @click="openBrowser">打开专属浏览器</button><button class="btn" @click="refresh">刷新</button>
+      <label>千川账户 <select v-model.number="qcId" :disabled="!linkedQianchuanAccounts.length"><option :value="0">选择已绑定账户</option><option v-for="qc in linkedQianchuanAccounts" :key="qc.id" :value="qc.id">{{ qc.qc_name || `千川档案 #${qc.id}` }}{{ qc.qc_id ? `（ID ${qc.qc_id}）` : '' }}</option></select></label>
+      <button class="btn primary" :disabled="!qcId || !qcBoundToSelectedAccount" @click="openBrowser">打开专属浏览器</button><button class="btn" @click="refresh">刷新</button>
     </div>
     <div v-if="!qianchuanAccounts.length" class="setup-callout"><div><strong>还没有千川账户档案</strong><p>先新增一个千川账户档案，再从这里打开独立登录页。登录后可绑定到抖音账号用于素材上传。</p></div><button class="btn primary" @click="emit('open-qianchuan-accounts')">新增千川账户并登录</button></div>
     <p v-if="accountId && !linked.length" class="hint">此账号尚未绑定千川账户，请先在账号管理完成关联。</p>

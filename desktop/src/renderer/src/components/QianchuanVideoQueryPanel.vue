@@ -12,6 +12,7 @@ const awemeId = ref('')
 const awemeAccounts = ref<Array<{ id: string; name: string }>>([])
 const productId = ref('')
 const configured = ref(false)
+const editingCredentials = ref(false)
 const authorized = ref(false)
 const requiresQianchuanAuthorization = ref(false)
 const authorizedIds = ref<string[]>([])
@@ -51,6 +52,9 @@ function watchAuthCallback(previousRevision: number): void {
           stopAuthPoll()
           await refresh()
           message.value = `本机已收到新授权回调。${message.value}`
+        } else if (!state.authorizationPending) {
+          stopAuthPoll()
+          message.value = '本机授权回调服务已停止，当前浏览器授权页无法完成本次授权。请保持客户端打开，从这里重新点击「首次授权」或「重新授权 / 补充账户」，并在新打开的页面确认授权；不要继续使用旧标签页。'
         } else if (Date.now() >= deadline) {
           stopAuthPoll()
           message.value = '本机 15 分钟内未收到授权回调。请在 Google Chrome 授权页确认当前登录用户有权访问目标千川广告主，并在授权范围中勾选该广告主后点“确认授权”；浏览器须跳转到本机回调成功页。'
@@ -106,6 +110,7 @@ async function configure(): Promise<void> {
   try {
     await window.api.qianchuan.apiConfigure({ appId: appId.value, secret: secret.value })
     secret.value = ''
+    editingCredentials.value = false
     await refresh()
   } catch (error) { message.value = errText(error) }
   finally { busy.value = false }
@@ -371,7 +376,11 @@ onBeforeUnmount(() => { stopAuthPoll(); offEngine?.() })
     <details class="qc-setup" :open="!configured || !authorized || requiresQianchuanAuthorization">
       <summary>首次设置 / 应用授权</summary>
       <p class="hint">App Secret 仅在本机输入并加密保存，不要发到聊天或截图。平台显示旧账户“已授权”不代表当前客户端已收到 Token。</p>
-      <div class="qc-row">
+      <div v-if="configured && !editingCredentials" class="qc-row">
+        <span class="hint">应用凭证已保存在本机（App ID：{{ appId }}），日常使用无需重新输入 App Secret。</span>
+        <button :disabled="busy" @click="editingCredentials = true">更换应用凭证</button>
+      </div>
+      <div v-else class="qc-row">
         <input v-model="appId" class="qc-input" placeholder="App ID" inputmode="numeric" aria-label="千川 App ID" />
         <input v-model="secret" class="qc-input" type="password" autocomplete="off" placeholder="App Secret（仅本机加密保存）" aria-label="千川 App Secret" />
         <button :disabled="busy || !appId || !secret" @click="configure">保存应用凭证</button>
@@ -380,7 +389,7 @@ onBeforeUnmount(() => { stopAuthPoll(); offEngine?.() })
         <input v-model="authUrl" class="qc-input wide" placeholder="粘贴开放平台应用详情里生成的授权 URL" aria-label="千川授权 URL" />
         <button :disabled="busy || !configured || !authUrl" @click="authorize">{{ authorized ? '重新授权 / 补充账户' : '首次授权' }}</button>
       </div>
-      <p class="hint">首次授权会在客户端专属 Chrome 资料中单独打开新窗口，页面初始未登录。请登录目标账号并确认授权；之后资料会保留登录态，OAuth Token 在本机加密保存并自动刷新，正常查询不用再次执行授权。只有授权被撤销/过期或需要补充授权账户时，才重新授权。请勿直接粘贴原始授权 URL。</p>
+      <p class="hint">把开放平台提供的授权 URL 粘贴到上方输入框，再点击「首次授权」或「重新授权 / 补充账户」；不要把原始 URL 粘贴到 Chrome 地址栏。客户端会先启动本机回调，再把 URL 中示例 state 替换为随机值，并在专属 Chrome 窗口打开授权页。请在 15 分钟内登录目标账号并确认授权；之后浏览器保留登录态，Token 在本机加密保存并自动刷新，正常查询不用重复授权。</p>
       <p v-if="authBrowserPath" class="hint">千川专用浏览器资料目录：{{ authBrowserPath }}</p>
       <p v-if="authWaiting" class="qc-message" role="status">正在等待本机授权回调（最多 15 分钟）…</p>
       <p class="hint">本机回调：{{ callback }} · {{ authorized ? 'OAuth 已授权' : '未授权' }}<span v-if="authorizedIds.length"> · 千川广告主：{{ authorizedIds.join('、') }}</span><span v-else-if="authorized"> · {{ requiresQianchuanAuthorization ? '本次授权未包含千川广告主' : '千川业务账户待确认' }}</span></p>

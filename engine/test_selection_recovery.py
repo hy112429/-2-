@@ -68,6 +68,8 @@ class SelectionRecoveryTests(unittest.TestCase):
             "stage": "cart_pending",
             "candidates": [{"productId": "product-1", "cardIndex": 3}],
             "selectedIndexes": [3],
+            "sourcePoolState": {"sources": {"hotSpot": {"fingerprint": "abc", "productCount": 10}},
+                                "samePoolCount": 1, "nextRetryAt": "2026-11-15T12:00:00"},
         })
         self.connection.close()
 
@@ -77,6 +79,7 @@ class SelectionRecoveryTests(unittest.TestCase):
         self.assertEqual(batch["accounts"][0]["stage"], "cart_pending")
         self.assertEqual(batch["accounts"][0]["candidates"][0]["productId"], "product-1")
         self.assertEqual(batch["accounts"][0]["selectedIndexes"], [3])
+        self.assertEqual(batch["accounts"][0]["sourcePoolState"]["sources"]["hotSpot"]["fingerprint"], "abc")
 
     def test_quota_events_are_idempotent_on_recovery(self):
         first_cart = selection_recovery.record_quota_once(

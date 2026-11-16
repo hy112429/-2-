@@ -48,9 +48,7 @@ CREATE TABLE IF NOT EXISTS publish_queue (
     published_at TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
-    cancelled_at TEXT,
-    selection_batch_id TEXT NOT NULL DEFAULT '',
-    selection_sequence_no INTEGER NOT NULL DEFAULT 0
+    cancelled_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_publish_queue_schedule
     ON publish_queue(schedule_at, status, account_id);
@@ -159,8 +157,6 @@ def ensure_schema(connection: sqlite3.Connection, *, initialize_auto_publish_def
         "platform_updated_at": "TEXT",
         "published_at": "TEXT",
         "auto_publish": "INTEGER NOT NULL DEFAULT 0",
-        "selection_batch_id": "TEXT NOT NULL DEFAULT ''",
-        "selection_sequence_no": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, ddl in migrations.items():
         if name not in columns:
@@ -542,8 +538,6 @@ def add_task(
     planned_at: str,
     mode: str,
     auto_publish: bool = False,
-    selection_batch_id: str = "",
-    selection_sequence_no: int = 0,
 ) -> Dict[str, Any]:
     account = require_active_account(connection, account_id)
     normalized_product = product_id.strip()
@@ -605,13 +599,12 @@ def add_task(
         status = "awaiting_confirmation" if mode == "manual" else "scheduled"
         timestamp = now_text()
         cursor = connection.execute(
-            "INSERT INTO publish_queue(account_id, product_id, product_name, product_url, video_path, video_key, title, description, schedule_at, mode, status, auto_publish, selection_batch_id, selection_sequence_no, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO publish_queue(account_id, product_id, product_name, product_url, video_path, video_key, title, description, schedule_at, mode, status, auto_publish, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 account_id, normalized_product, selected_product["product_name"], selected_product["product_url"], path,
                 file_key, clean_title, clean_description, chosen.isoformat(timespec="minutes"),
-                mode, status, int(auto_publish), selection_batch_id.strip(), max(0, int(selection_sequence_no)),
-                timestamp, timestamp,
+                mode, status, int(auto_publish), timestamp, timestamp,
             ),
         )
         result = {
@@ -676,25 +669,6 @@ def add_generated_task(
     if not product:
         raise ValueError("该账号的本地选品记录中找不到此商品；请先确认商品已加车")
 
-    selection_batch_id = ""
-    selection_sequence_no = 0
-    try:
-        batch_row = connection.execute(
-            "SELECT batch_id FROM product_list_rows WHERE account_id=? AND product_id=? AND deleted_at IS NULL",
-            (account_id, normalized_product),
-        ).fetchone()
-        selection_batch_id = str(batch_row["batch_id"] or "") if batch_row else ""
-        if selection_batch_id:
-            sequence_row = connection.execute(
-                "SELECT sequence_no FROM selection_run_accounts WHERE batch_id=? AND account_id=?",
-                (selection_batch_id, account_id),
-            ).fetchone()
-            selection_sequence_no = int(sequence_row["sequence_no"] or 0) if sequence_row else 0
-    except sqlite3.Error:
-        # 旧数据库尚未建立选品恢复表时，继续沿用原发布队列语义；千川闸门会把缺少批次的任务置为等待核对。
-        selection_batch_id = ""
-        selection_sequence_no = 0
-
     # 新选品视频始终登记为自动任务；全局暂停只阻止执行，不把任务降级为人工任务。
     # A-63 阻塞解除后可继续执行，配额顺延仍由 add_task 保留为未来计划时间。
     planned_at = datetime.now().replace(second=0, microsecond=0)
@@ -710,8 +684,6 @@ def add_generated_task(
             planned_at.isoformat(timespec="minutes"),
             "scheduled",
             auto_publish=auto_publish,
-            selection_batch_id=selection_batch_id,
-            selection_sequence_no=selection_sequence_no,
         )
     except ValueError:
         # 并发触发时，另一调用可能已先完成插入；只将同商品同视频视为幂等成功。

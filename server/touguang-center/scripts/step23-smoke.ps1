@@ -1,4 +1,6 @@
 # 隔离联测：只启动本脚本专属 MySQL/Redis/JAR，使用独立端口和数据目录。
+param([switch] $UseDockerRedis7)
+
 $ErrorActionPreference = 'Stop'
 $mysqlHome = 'D:\mysql-8.0.29-winx64'
 $mysqlExe = Join-Path $mysqlHome 'bin\mysqld.exe'
@@ -13,6 +15,7 @@ $redisPort = 16387
 $appPort = 18091
 $mysqlProcess = $null
 $redisProcess = $null
+$redisContainerName = $null
 $appProcess = $null
 $dbPassword = [guid]::NewGuid().ToString('N') + 'Aa1!'
 $adminPassword = [guid]::NewGuid().ToString('N') + 'Bb2!'
@@ -38,20 +41,37 @@ function Assert-Result([bool] $condition, [string] $message) {
 }
 
 try {
-    foreach ($file in @($mysqlExe, $mysqlClient, $redisExe, $javaExe, $jar)) {
+    $requiredFiles = @($mysqlExe, $mysqlClient, $javaExe, $jar)
+    if (-not $UseDockerRedis7) { $requiredFiles += $redisExe }
+    foreach ($file in $requiredFiles) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "缺少隔离联测依赖：$file" }
+    }
+    if ($UseDockerRedis7) {
+        & docker image inspect redis:7-alpine --format '{{.Id}}' 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '本机没有 redis:7-alpine 镜像，请先准备 Redis 7 镜像' }
     }
     foreach ($port in @($mysqlPort, $redisPort, $appPort)) {
         if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) { throw "隔离端口 $port 已被占用" }
     }
     $dataDir = Join-Path $root 'mysql-data'
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-    $redisConf = Join-Path $root 'redis.conf'
-    "bind 127.0.0.1`nport $redisPort`nsave `"`"`nappendonly no`n" | Set-Content -LiteralPath $redisConf -Encoding ASCII
     & $mysqlExe --no-defaults --initialize-insecure "--basedir=$mysqlHome" "--datadir=$dataDir" 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw '隔离 MySQL 初始化失败' }
     $mysqlProcess = Start-Process -FilePath $mysqlExe -ArgumentList @('--no-defaults', "--basedir=$mysqlHome", "--datadir=$dataDir", "--port=$mysqlPort", '--bind-address=127.0.0.1', '--mysqlx=OFF', '--console') -WorkingDirectory $mysqlHome -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root 'mysql.stdout.log') -RedirectStandardError (Join-Path $root 'mysql.stderr.log')
-    $redisProcess = Start-Process -FilePath $redisExe -ArgumentList @($redisConf) -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root 'redis.stdout.log') -RedirectStandardError (Join-Path $root 'redis.stderr.log')
+    if ($UseDockerRedis7) {
+        $redisDataDir = Join-Path $root 'redis-data'
+        New-Item -ItemType Directory -Path $redisDataDir -Force | Out-Null
+        $redisContainerName = 'touguang-step23-redis7-' + [guid]::NewGuid().ToString('N')
+        $containerId = & docker run --detach --rm --name $redisContainerName --publish "127.0.0.1:${redisPort}:6379" --mount "type=bind,source=$redisDataDir,target=/data" redis:7-alpine redis-server --appendonly no
+        if ($LASTEXITCODE -ne 0 -or -not $containerId) { throw '隔离 Redis 7 容器启动失败' }
+        $redisVersion = & docker exec $redisContainerName redis-server --version
+        Assert-Result ($LASTEXITCODE -eq 0 -and $redisVersion -match 'v=7\.') '隔离容器不是 Redis 7'
+    } else {
+        $redisConf = Join-Path $root 'redis.conf'
+        "bind 127.0.0.1`nport $redisPort`nsave `"`"`nappendonly no`n" | Set-Content -LiteralPath $redisConf -Encoding ASCII
+        $redisProcess = Start-Process -FilePath $redisExe -ArgumentList @($redisConf) -WorkingDirectory $root -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $root 'redis.stdout.log') -RedirectStandardError (Join-Path $root 'redis.stderr.log')
+        $redisVersion = 'Redis 5 (Windows)'
+    }
     for ($i = 0; $i -lt 40; $i++) {
         if ((Get-NetTCPConnection -State Listen -LocalPort $mysqlPort -ErrorAction SilentlyContinue) -and (Get-NetTCPConnection -State Listen -LocalPort $redisPort -ErrorAction SilentlyContinue)) { break }
         Start-Sleep -Seconds 1
@@ -126,10 +146,13 @@ try {
     $logout = Send-Request 'POST' '/api/auth/logout' $null $adminToken
     $revoked = Send-Request 'GET' '/api/users/me' $null $adminToken
     Assert-Result ($logout.Status -eq 200 -and $revoked.Status -eq 403) '退出登录后 Token 未失效'
-    [pscustomobject]@{ Result = 'PASS'; Health = 'UP'; Mysql = 'UP'; Redis = 'UP'; NoTokenStatus = $noToken.Status; UnboundLoginStatus = $readerBeforeBinding.Status; MachineHeaderMissingStatus = $readerNoMachineHeader.Status; ReadOnlyDeniedStatus = $readerDenied.Status; RegisteredStatus = $registered.Body.data.status; BoundStatus = $bound.Body.data.status; DuplicateRegistrationSameId = ($again.Body.data.id -eq $clientId); LogoutRevokedStatus = $revoked.Status; IsolatedRoot = $root } | ConvertTo-Json -Compress
+    [pscustomobject]@{ Result = 'PASS'; Health = 'UP'; Mysql = 'UP'; Redis = 'UP'; RedisVersion = $redisVersion; NoTokenStatus = $noToken.Status; UnboundLoginStatus = $readerBeforeBinding.Status; MachineHeaderMissingStatus = $readerNoMachineHeader.Status; ReadOnlyDeniedStatus = $readerDenied.Status; RegisteredStatus = $registered.Body.data.status; BoundStatus = $bound.Body.data.status; DuplicateRegistrationSameId = ($again.Body.data.id -eq $clientId); LogoutRevokedStatus = $revoked.Status; IsolatedRoot = $root } | ConvertTo-Json -Compress
 } finally {
     foreach ($process in @($appProcess, $redisProcess, $mysqlProcess)) {
         if ($null -ne $process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+    }
+    if ($redisContainerName) {
+        try { & docker stop $redisContainerName 2>$null | Out-Null } catch { }
     }
     # Windows mysqld 可能由启动器派生工作进程，只清理本次独立数据目录的子进程。
     if ($dataDir) {

@@ -1,3 +1,14 @@
+export type CandidatePoolSource = 'hotSpot' | 'allianceRank' | 'selectionSquare'
+export type CandidatePoolRankBoard = '爆款榜' | '趋势榜' | '带货榜' | '常销榜'
+export interface CandidatePoolQuotaRule {
+  id: string
+  sourceKey: CandidatePoolSource
+  rankBoard: CandidatePoolRankBoard
+  categoryId: string
+  categoryPath: string[]
+  target: number
+}
+
 export interface SelectionFilterSettings {
   candidateLimit: number
   filters: {
@@ -10,6 +21,12 @@ export interface SelectionFilterSettings {
   sources: {
     hotSpotEnabled: boolean
     allianceRankEnabled: boolean
+    selectionSquareEnabled: boolean
+    rankBoard: '爆款榜' | '趋势榜' | '带货榜' | '常销榜'
+    rankPeriod: '实时' | '昨日' | '近7日' | '近30日'
+    rankCarrier: '不限载体' | '短视频' | '直播' | '橱窗' | '图文'
+    hotSpotMinExposure: number | null
+    hotSpotMinRelatedProducts: number | null
     priority: Array<'hotSpot' | 'allianceRank'>
   }
   thresholds: {
@@ -17,10 +34,8 @@ export interface SelectionFilterSettings {
     salesCount: number | null
     conversionRate: number | null
     views: number | null
-    /** 兼容历史字段：保存时与 minCommissionRate 同步，按下限解释。 */
     commissionRate: number | null
-    minCommissionRate: number | null
-    maxCommissionRate: number | null
+    commissionRateMax: number | null
     experienceScore: number | null
   }
   trendPreference: string
@@ -31,8 +46,8 @@ export const DEFAULT_SELECTION_FILTER_SETTINGS: SelectionFilterSettings = {
   filters: { delivery: {}, product: {}, features: [] },
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
-  sources: { hotSpotEnabled: true, allianceRankEnabled: true, priority: ['hotSpot', 'allianceRank'] },
-  thresholds: { salesAmount: null, salesCount: null, conversionRate: null, views: null, commissionRate: null, minCommissionRate: null, maxCommissionRate: null, experienceScore: null },
+  sources: { hotSpotEnabled: true, allianceRankEnabled: true, selectionSquareEnabled: true, rankBoard: '爆款榜', rankPeriod: '昨日', rankCarrier: '不限载体', hotSpotMinExposure: null, hotSpotMinRelatedProducts: null, priority: ['hotSpot', 'allianceRank'] },
+  thresholds: { salesAmount: null, salesCount: null, conversionRate: null, views: null, commissionRate: null, commissionRateMax: null, experienceScore: null },
   trendPreference: '上升优先'
 }
 
@@ -76,7 +91,7 @@ export function createSelectionFilterSettings(
   const candidateLimit = Number(source.candidateLimit)
   const deliveryFilters = normalizeFilterGroup(sourceFilters.delivery, fallbackFilters.delivery)
   const productFilters = normalizeFilterGroup(sourceFilters.product, fallbackFilters.product)
-  // 数字佣金边界是唯一设置入口；旧版手选的百应档位不能继续覆盖它。
+  // 数字佣金上下限是唯一设置入口；旧版手选的百应档位不能继续覆盖它。
   delete deliveryFilters['佣金区间']
   delete productFilters['佣金区间']
   const sourceSources = asRecord(source.sources)
@@ -87,22 +102,6 @@ export function createSelectionFilterSettings(
   for (const item of fallbackSources.priority) {
     if (!normalizedSourcePriority.includes(item)) normalizedSourcePriority.push(item)
   }
-  const fallbackMinCommissionRate = normalizeThreshold(
-    fallbackThresholds.minCommissionRate ?? fallbackThresholds.commissionRate,
-    null
-  )
-  const fallbackMaxCommissionRate = normalizeThreshold(fallbackThresholds.maxCommissionRate, null)
-  const hasExplicitMinCommissionRate = Object.prototype.hasOwnProperty.call(sourceThresholds, 'minCommissionRate')
-  const hasExplicitMaxCommissionRate = Object.prototype.hasOwnProperty.call(sourceThresholds, 'maxCommissionRate')
-  const hasExplicitLegacyCommissionRate = Object.prototype.hasOwnProperty.call(sourceThresholds, 'commissionRate')
-  const minCommissionRate = hasExplicitMinCommissionRate
-    ? normalizeThreshold(sourceThresholds.minCommissionRate, null)
-    : hasExplicitLegacyCommissionRate
-      ? normalizeThreshold(sourceThresholds.commissionRate, fallbackMinCommissionRate)
-      : fallbackMinCommissionRate
-  const maxCommissionRate = hasExplicitMaxCommissionRate
-    ? normalizeThreshold(sourceThresholds.maxCommissionRate, null)
-    : fallbackMaxCommissionRate
   return {
     candidateLimit: Number.isFinite(candidateLimit) ? candidateLimit : fallback.candidateLimit,
     filters: {
@@ -115,6 +114,12 @@ export function createSelectionFilterSettings(
     sources: {
       hotSpotEnabled: typeof sourceSources.hotSpotEnabled === 'boolean' ? sourceSources.hotSpotEnabled : fallbackSources.hotSpotEnabled,
       allianceRankEnabled: typeof sourceSources.allianceRankEnabled === 'boolean' ? sourceSources.allianceRankEnabled : fallbackSources.allianceRankEnabled,
+      selectionSquareEnabled: typeof sourceSources.selectionSquareEnabled === 'boolean' ? sourceSources.selectionSquareEnabled : fallbackSources.selectionSquareEnabled,
+      rankBoard: ['爆款榜', '趋势榜', '带货榜', '常销榜'].includes(String(sourceSources.rankBoard)) ? sourceSources.rankBoard as SelectionFilterSettings['sources']['rankBoard'] : fallbackSources.rankBoard,
+      rankPeriod: ['实时', '昨日', '近7日', '近30日'].includes(String(sourceSources.rankPeriod)) ? sourceSources.rankPeriod as SelectionFilterSettings['sources']['rankPeriod'] : fallbackSources.rankPeriod,
+      rankCarrier: ['不限载体', '短视频', '直播', '橱窗', '图文'].includes(String(sourceSources.rankCarrier)) ? sourceSources.rankCarrier as SelectionFilterSettings['sources']['rankCarrier'] : fallbackSources.rankCarrier,
+      hotSpotMinExposure: normalizeThreshold(sourceSources.hotSpotMinExposure, fallbackSources.hotSpotMinExposure),
+      hotSpotMinRelatedProducts: normalizeThreshold(sourceSources.hotSpotMinRelatedProducts, fallbackSources.hotSpotMinRelatedProducts),
       priority: normalizedSourcePriority
     },
     thresholds: {
@@ -122,10 +127,8 @@ export function createSelectionFilterSettings(
       salesCount: normalizeThreshold(sourceThresholds.salesCount, fallbackThresholds.salesCount),
       conversionRate: normalizeThreshold(sourceThresholds.conversionRate, fallbackThresholds.conversionRate),
       views: normalizeThreshold(sourceThresholds.views, fallbackThresholds.views),
-      // `commissionRate` is retained for old engine/database payloads and always mirrors the lower bound.
-      commissionRate: minCommissionRate,
-      minCommissionRate,
-      maxCommissionRate,
+      commissionRate: normalizeThreshold(sourceThresholds.commissionRate, fallbackThresholds.commissionRate),
+      commissionRateMax: normalizeThreshold(sourceThresholds.commissionRateMax, fallbackThresholds.commissionRateMax),
       experienceScore: normalizeThreshold(sourceThresholds.experienceScore, fallbackThresholds.experienceScore)
     },
     trendPreference: typeof source.trendPreference === 'string' ? source.trendPreference : fallback.trendPreference

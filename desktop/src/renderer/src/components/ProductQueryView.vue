@@ -19,8 +19,6 @@ interface CachedProduct {
   cos_ratio?: number | null
   video_url?: string | null
   video_urls?: string[] | null
-  video_source_type?: string | null
-  watermark_status?: 'unknown' | 'clean' | 'needs_review' | null
   captured_at: string
 }
 
@@ -210,17 +208,7 @@ async function search(): Promise<void> {
     queryAccountSource.value = result.accountSource || '选品记录'
     queryAccountDownloadPath.value = result.downloadPath || ''
     if (Number.isSafeInteger(result.limit) && result.limit && result.limit >= 10) queryQuota.value = result.limit
-    const resultSourceType = result.sourceType ?? product.video_source_type
-    const resultWatermarkStatus = resultSourceType === 'baiying_pack_detail_media'
-      ? result.watermarkStatus === 'clean' ? 'clean' : product.watermark_status ?? 'unknown'
-      : result.watermarkStatus === 'needs_review' ? 'needs_review' : 'unknown'
-    foundProduct.value = {
-      ...product,
-      account_id: result.accountId,
-      commodity_id: result.commodityId ?? product.commodity_id,
-      video_source_type: resultSourceType,
-      watermark_status: resultWatermarkStatus
-    }
+    foundProduct.value = { ...product, account_id: result.accountId, commodity_id: result.commodityId ?? product.commodity_id }
     promotionVideos.value = result.videos ?? []
     promotionAvailable.value = result.available ?? promotionVideos.value.length
     if (!promotionVideos.value.length) throw new Error('百应带货内容没有可下载的同款视频')
@@ -411,7 +399,7 @@ interface QueueTaskItem {
   id: string
   url: string
   dest: string
-  status: 'pending' | 'running' | 'retrying' | 'success' | 'failed' | 'skipped' | 'needs_review'
+  status: 'pending' | 'running' | 'retrying' | 'success' | 'failed' | 'skipped'
   percent: number
   attempts: number
   message: string
@@ -420,12 +408,7 @@ interface QueueTaskItem {
   /** 下载来源明确提供平台无水印视频；只有这类素材可自动进入发布队列 */
   sourceNoWatermark?: boolean
   /** 下载后素材处理状态，仅保存在本次页面会话 */
-  watermarkStatus?: 'not_checked' | 'clean' | 'no_watermark' | 'processed' | 'needs_review' | 'failed' | 'not_required'
-  source_type?: string
-  product_id?: string
-  account_id?: number | null
-  watermark_mode?: 'none' | 'auto'
-  watermark_workers?: number
+  watermarkStatus?: 'clean' | 'needs_review' | 'failed'
 }
 
 /** 去水印半自动标注用的一帧（由 watermark:getFrames 返回） */
@@ -453,8 +436,7 @@ const STATUS_TEXT: Record<string, string> = {
   retrying: '重试中',
   success: '成功',
   failed: '失败',
-  skipped: '跳过',
-  needs_review: '待核查'
+  skipped: '跳过'
 }
 
 function statusText(s: string): string {
@@ -747,21 +729,17 @@ async function handleDownloadedAsset(task: QueueTaskItem): Promise<void> {
   finalizedDownloadIds.add(task.id)
   task.percent = 100
 
-  if (task.sourceNoWatermark !== true && !['clean', 'no_watermark', 'processed'].includes(task.watermarkStatus ?? '')) {
+  if (task.sourceNoWatermark !== true) {
     task.watermarkStatus = 'needs_review'
     task.message = '来源未确认无平台水印；原视频已保留，未加入发布队列'
     return
   }
 
-  if (task.watermarkStatus === 'processed') {
-    task.message = '自动去水印成品已通过完整性检查，已关联待确认发布队列…'
-  } else {
-    task.watermarkStatus = 'clean'
-    task.message = '已确认使用平台无水印源，保留原视频并关联待确认发布队列…'
-  }
+  task.watermarkStatus = 'clean'
+  task.message = '已确认使用平台无水印源，保留原视频并关联待确认发布队列…'
   try {
     const queued = await runEngineResult('publish_queue.py', [
-      '--db', DB_PATH, 'add-downloaded', '--product-id', task.product_id ?? task.id, '--video-path', task.file_path
+      '--db', DB_PATH, 'add-downloaded', '--product-id', task.id, '--video-path', task.file_path
     ])
     const entries = Array.isArray(queued.queued) ? queued.queued as Array<Record<string, unknown>> : []
     const accepted = entries.filter((entry) => entry.ok === true)
@@ -804,27 +782,17 @@ function bindQueueEvents(): void {
         t.attempts = e.attempts ?? t.attempts
         t.message = e.message ?? ''
         t.file_path = e.file_path ?? t.file_path
-        const metadata = e as EngineEventPayload & {
-          watermark_status?: string
-          source_type?: string
-          product_id?: string
-          account_id?: number | null
-        }
-        t.watermarkStatus = metadata.watermark_status as QueueTaskItem['watermarkStatus'] ?? t.watermarkStatus
-        t.source_type = metadata.source_type ?? t.source_type
-        t.product_id = metadata.product_id ?? t.product_id
-        t.account_id = metadata.account_id ?? t.account_id
-        if ((t.status === 'success' || t.status === 'skipped' || t.status === 'needs_review') && t.file_path) {
+        if ((t.status === 'success' || t.status === 'skipped') && t.file_path) {
           void handleDownloadedAsset(t)
         }
       }
     } else if (e.type === 'result') {
       const d = e.data as
-        | { total?: number; success?: number; failed?: number; skipped?: number; needsReview?: number; canceled?: boolean }
+        | { total?: number; success?: number; failed?: number; skipped?: number; canceled?: boolean }
         | undefined
       queueRunning.value = false
       queueSummary.value = d
-        ? `队列结束：共 ${d.total ?? 0}，成功 ${d.success ?? 0} / 待核查 ${d.needsReview ?? 0} / 失败 ${d.failed ?? 0} / 跳过 ${d.skipped ?? 0}${d.canceled ? '（已取消）' : ''}`
+        ? `队列结束：共 ${d.total ?? 0}，成功 ${d.success ?? 0} / 失败 ${d.failed ?? 0} / 跳过 ${d.skipped ?? 0}${d.canceled ? '（已取消）' : ''}`
         : '队列结束'
       void loadQueueHistory()
     } else if (e.type === 'error') {
@@ -866,7 +834,7 @@ function queryDb(query: string): Promise<{ rows?: unknown[] } | null> {
 async function loadQueueHistory(): Promise<void> {
   try {
     const data = await queryDb(
-      "SELECT id, status, attempts, progress, message, product_id, account_id, source_type, file_path, watermark_status FROM tasks WHERE task_type='download' ORDER BY id DESC LIMIT 8"
+      "SELECT id, status, attempts, progress, message FROM tasks WHERE task_type='download' ORDER BY id DESC LIMIT 8"
     )
     if (data?.rows) queueHistory.value = data.rows as QueueTaskItem[]
   } catch (err) {
@@ -1127,16 +1095,12 @@ async function downloadCached(): Promise<void> {
   const tasks = rows.flatMap((p) => videoUrlsOf(p).map((url, index) => ({
     id: `${p.product_id}-${index + 1}`,
     product_id: p.product_id,
-    account_id: p.account_id ?? null,
-    source_type: p.video_source_type ?? 'baiying_cached_unknown',
-    watermark_mode: (p.video_source_type === 'baiying_pack_detail_media' && p.watermark_status === 'clean' ? 'none' : 'auto') as 'none' | 'auto',
-    watermark_workers: 2,
     url,
     dest: `${downloadDir.value}\\${baiyingAccountFolder(p)}\\${date}\\${p.product_id}\\${p.product_id}_${videoIdFromUrl(url, index)}_${String(index + 1).padStart(3, '0')}_${timestamp}.mp4`
   })))
   queueTasks.value = tasks.map((t) => ({
     ...t,
-    sourceNoWatermark: t.watermark_mode === 'none',
+    sourceNoWatermark: true,
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -1163,22 +1127,17 @@ async function downloadFound(): Promise<boolean> {
   if (!downloadDir.value) downloadDir.value = await window.api.dir.getDownloadDir()
   const accountRoot = queryAccountDownloadPath.value || `${downloadDir.value}\\账号-${queryAccountId.value}`
   const date = localDate()
-  const sourceType = p.video_source_type ?? 'baiying_content_list'
-  const sourceNoWatermark = p.watermark_status === 'clean' && sourceType === 'baiying_pack_detail_media'
   const tasks = promotionVideos.value.map((video, index) => ({
     id: `${p.product_id}-${video.videoId}`,
     product_id: p.product_id,
     account_id: queryAccountId.value,
-    source_type: sourceType,
-    watermark_mode: (sourceNoWatermark ? 'none' : 'auto') as 'none' | 'auto',
-    watermark_workers: 2,
     verify_video: true,
     url: video.url,
     dest: `${accountRoot}\\${date}\\${p.product_id}\\${p.product_id}_${video.videoId}_${String(index + 1).padStart(3, '0')}_${video.publishTime ? fileTimestampFromSeconds(video.publishTime) : fileTimestamp()}.mp4`
   }))
   queueTasks.value = tasks.map((t) => ({
     ...t,
-    sourceNoWatermark,
+    sourceNoWatermark: false,
     status: 'pending' as const,
     percent: 0,
     attempts: 0,
@@ -1777,7 +1736,7 @@ onBeforeUnmount(() => {
           <span class="q-pct">{{ t.percent }}%</span>
           <span class="q-attempts">重试 {{ t.attempts }}</span>
           <span class="q-msg">{{ t.message }}</span>
-          <template v-if="(t.status === 'success' || t.status === 'skipped' || t.status === 'needs_review') && t.file_path">
+          <template v-if="(t.status === 'success' || t.status === 'skipped') && t.file_path">
             <button class="btn tiny" title="打开所在文件夹" @click="openQueueFolder(t.file_path!)">📁</button>
             <button class="btn tiny" :disabled="wmRunning" title="手动校正移动水印位置" @click="openWatermark(t)">手动去水印</button>
             <span class="q-path mono" :title="t.file_path">{{ t.file_path }}</span>
@@ -1791,11 +1750,7 @@ onBeforeUnmount(() => {
         <ul>
           <li v-for="h in queueHistory" :key="h.id">
             <span class="q-status" :class="h.status">{{ statusText(h.status) }}</span>
-            <span class="q-id mono">{{ h.product_id || '商品 ID 未记录' }}</span>
-            <span v-if="h.account_id" class="q-source">账号-{{ h.account_id }}</span>
-            <span class="q-source">{{ h.source_type || '来源未知' }}</span>
-            <span class="q-msg" :title="String(h.message)">{{ h.message }}</span>
-            <span v-if="h.file_path" class="q-path mono" :title="h.file_path">{{ h.file_path }}</span>
+            <span class="q-id mono" :title="String(h.message)">{{ h.message }}</span>
             <span class="q-h-meta">尝试 {{ h.attempts }} 次</span>
           </li>
         </ul>

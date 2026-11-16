@@ -132,12 +132,6 @@ async function runWorkflow(): Promise<void> {
 
     // 一键流程明确要求自动下载；下载器本身仍按账号、商品、额度和远端去重规则运行。
     checked(await window.api.qianchuan.setPostPublishEnabled(true))
-    const gateSettings = checked(await window.api.qianchuan.postPublishSettings())
-    const gate = gateSettings.gate as { ready?: boolean; reason?: string } | undefined
-    if (gate?.ready !== true) {
-      workflowMessage.value = gate?.reason || '等待全账号选品和抖音发布完成；千川阶段尚未启动。'
-      return
-    }
     const runs = rows<WorkflowRun>(checked(await window.api.qianchuan.postPublishRuns()))
 
     // 先启动发布成功后的自动下载。已有上传队列或正在处理的任务不重复启动。

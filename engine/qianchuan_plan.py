@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from db import DEFAULT_DB_PATH, connect, emit, now_text
-from publish_queue import ensure_schema as ensure_publish_queue_schema
 from qianchuan_upload import ensure_schema as ensure_upload_schema
 
 SCHEMA = """
@@ -24,8 +23,6 @@ CREATE TABLE IF NOT EXISTS qianchuan_plan_settings (
   long_running INTEGER NOT NULL DEFAULT 1,
   smart_coupon INTEGER NOT NULL DEFAULT 1,
   aigc_enabled INTEGER NOT NULL DEFAULT 0,
-  schedule_enabled INTEGER NOT NULL DEFAULT 0,
-  schedule_time TEXT NOT NULL DEFAULT '09:00',
   activated_at TEXT NOT NULL DEFAULT '',
   updated_at TEXT NOT NULL
 );
@@ -43,10 +40,6 @@ CREATE TABLE IF NOT EXISTS qianchuan_plan_jobs (
   daily_budget_yuan INTEGER NOT NULL DEFAULT 0,
   commission_rate REAL NOT NULL DEFAULT 0,
   roi_target REAL NOT NULL DEFAULT 0,
-  selection_batch_id TEXT NOT NULL DEFAULT '',
-  selection_sequence_no INTEGER NOT NULL DEFAULT 0,
-  planned_at TEXT NOT NULL DEFAULT '',
-  started_at TEXT NOT NULL DEFAULT '',
   material_ids_json TEXT NOT NULL DEFAULT '[]',
   selected_material_ids_json TEXT NOT NULL DEFAULT '[]',
   applied_material_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -96,7 +89,6 @@ CREATE INDEX IF NOT EXISTS idx_qc_plan_events_type_time
 
 
 def ensure_schema(db: sqlite3.Connection) -> None:
-    ensure_publish_queue_schema(db)
     ensure_upload_schema(db)
     db.executescript(SCHEMA)
     columns = {row["name"] for row in db.execute("PRAGMA table_info(qianchuan_plan_settings)")}
@@ -108,21 +100,6 @@ def ensure_schema(db: sqlite3.Connection) -> None:
     for name in ("selected_material_ids_json", "applied_material_ids_json"):
         if name not in plan_columns:
             db.execute(f"ALTER TABLE qianchuan_plan_jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT '[]'")
-    settings_columns = {row["name"] for row in db.execute("PRAGMA table_info(qianchuan_plan_settings)")}
-    for name, definition in (
-        ("schedule_enabled", "INTEGER NOT NULL DEFAULT 0"),
-        ("schedule_time", "TEXT NOT NULL DEFAULT '09:00'"),
-    ):
-        if name not in settings_columns:
-            db.execute(f"ALTER TABLE qianchuan_plan_settings ADD COLUMN {name} {definition}")
-    for name, definition in (
-        ("selection_batch_id", "TEXT NOT NULL DEFAULT ''"),
-        ("selection_sequence_no", "INTEGER NOT NULL DEFAULT 0"),
-        ("planned_at", "TEXT NOT NULL DEFAULT ''"),
-        ("started_at", "TEXT NOT NULL DEFAULT ''"),
-    ):
-        if name not in plan_columns:
-            db.execute(f"ALTER TABLE qianchuan_plan_jobs ADD COLUMN {name} {definition}")
     if "commission_rate" not in plan_columns:
         db.execute("ALTER TABLE qianchuan_plan_jobs ADD COLUMN commission_rate REAL NOT NULL DEFAULT 0")
     if "roi_target" not in plan_columns:
@@ -208,20 +185,16 @@ def _settings(db: sqlite3.Connection, qc_id: int) -> dict[str, Any]:
     row = _row(db.execute("SELECT * FROM qianchuan_plan_settings WHERE qianchuan_account_id=?", (qc_id,)).fetchone())
     return row or {"qianchuan_account_id": qc_id, "enabled": 0, "daily_budget_yuan": 0,
                    "video_source": "both", "delivery_mode": "控成本投放", "long_running": 1,
-                   "smart_coupon": 1, "aigc_enabled": 0, "schedule_enabled": 0,
-                   "schedule_time": "09:00", "activated_at": ""}
+                   "smart_coupon": 1, "aigc_enabled": 0, "activated_at": ""}
 
 
 def save_settings(db: sqlite3.Connection, qc_id: int, budget: int, source: str,
-                  enabled: bool, long_running: bool, coupon: bool, aigc: bool,
-                  schedule_enabled: bool = False, schedule_time: str = "09:00") -> dict[str, Any]:
+                  enabled: bool, long_running: bool, coupon: bool, aigc: bool) -> dict[str, Any]:
     previous = _settings(db, qc_id)
     if not 0 <= budget <= 10000000 or (enabled and budget < 50):
         raise ValueError("启用自动发布时须设置每账户日预算，至少 50 元")
     if source not in {"uploaded", "my_video", "both"}:
         raise ValueError("视频来源无效")
-    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(schedule_time)):
-        raise ValueError("千川定时时间无效")
     if not long_running:
         raise ValueError("当前只支持从今天起长期投放；自定义结束日期尚未配置")
     activated_at = (str(previous.get("activated_at") or "") if previous["enabled"] and enabled
@@ -229,106 +202,17 @@ def save_settings(db: sqlite3.Connection, qc_id: int, budget: int, source: str,
     with db:
         db.execute("""INSERT INTO qianchuan_plan_settings
             (qianchuan_account_id,enabled,daily_budget_yuan,video_source,delivery_mode,
-             long_running,smart_coupon,aigc_enabled,schedule_enabled,schedule_time,activated_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             long_running,smart_coupon,aigc_enabled,activated_at,updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(qianchuan_account_id) DO UPDATE SET
             enabled=excluded.enabled,daily_budget_yuan=excluded.daily_budget_yuan,
             video_source=excluded.video_source,delivery_mode=excluded.delivery_mode,
             long_running=excluded.long_running,smart_coupon=excluded.smart_coupon,
-            aigc_enabled=excluded.aigc_enabled,schedule_enabled=excluded.schedule_enabled,
-            schedule_time=excluded.schedule_time,activated_at=excluded.activated_at,
+            aigc_enabled=excluded.aigc_enabled,activated_at=excluded.activated_at,
             updated_at=excluded.updated_at""",
             (qc_id, int(enabled), budget, source, "控成本投放", int(long_running),
-             int(coupon), int(aigc), int(schedule_enabled), str(schedule_time), activated_at, now_text()))
+             int(coupon), int(aigc), activated_at, now_text()))
     return _settings(db, qc_id)
-
-
-def selection_batch_gate(db: sqlite3.Connection, batch_id: str) -> tuple[bool, str]:
-    """千川阶段唯一前置闸门：选品批次及每个账号的抖音发布都必须完成。"""
-    batch_id = str(batch_id or '').strip()
-    if not batch_id:
-        return False, '缺少选品批次 ID，等待选品发布批次关联'
-    tables = {
-        str(row["name"]) for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
-    }
-    if not {'selection_run_batches', 'selection_run_accounts'}.issubset(tables):
-        return False, '选品批次检查表尚未就绪，等待选品发布完成'
-    batch = db.execute(
-        "SELECT state FROM selection_run_batches WHERE batch_id=?", (batch_id,)
-    ).fetchone()
-    if not batch:
-        return False, '找不到关联的选品批次，等待检查点恢复'
-    if str(batch["state"] or '') != 'completed':
-        return False, f'等待选品发布完成（批次状态：{str(batch["state"] or "未知")}）'
-    accounts = db.execute(
-        "SELECT account_id,state,completed_json FROM selection_run_accounts "
-        "WHERE batch_id=? ORDER BY sequence_no,account_id", (batch_id,)
-    ).fetchall()
-    if not accounts:
-        return False, '选品批次没有账号检查点，等待选品发布完成'
-    for account in accounts:
-        account_id = int(account["account_id"])
-        if str(account["state"] or '') != 'completed':
-            return False, f'等待账号 {account_id} 完成选品和抖音发布'
-        try:
-            completed = json.loads(account["completed_json"] or '[]')
-        except (TypeError, json.JSONDecodeError):
-            completed = []
-        if not isinstance(completed, list) or not completed:
-            return False, f'账号 {account_id} 没有可核对的选品结果'
-        for item in completed:
-            if not isinstance(item, dict):
-                return False, f'账号 {account_id} 的商品结果格式无法核对'
-            if item.get('cartAdded') is not True or item.get('publishQueueStatus') != 'published':
-                product_id = str(item.get('productId') or '未知商品')
-                return False, f'账号 {account_id} 商品 {product_id} 尚未确认抖音发布成功'
-            product_id = str(item.get('productId') or '').strip()
-            if product_id:
-                latest_queue = db.execute(
-                    "SELECT platform_status FROM publish_queue WHERE account_id=? AND product_id=? "
-                    "ORDER BY id DESC LIMIT 1", (account_id, product_id)
-                ).fetchone()
-                if not latest_queue or str(latest_queue["platform_status"] or '') != 'published':
-                    return False, f'账号 {account_id} 商品 {product_id} 的抖音发布回执尚未确认'
-    return True, '全账号选品和抖音发布已确认完成'
-
-
-def qianchuan_sequence_gate(db: sqlite3.Connection, batch_id: str,
-                            sequence_no: int, account_id: int) -> tuple[bool, str]:
-    """只允许当前选品账号顺序进入千川；前序账号计划未完成时保留等待状态。"""
-    if sequence_no <= 0:
-        return True, ''
-    previous = db.execute(
-        "SELECT DISTINCT account_id FROM publish_queue "
-        "WHERE selection_batch_id=? AND selection_sequence_no>0 AND selection_sequence_no<? "
-        "AND platform_status='published' ORDER BY account_id", (batch_id, sequence_no)
-    ).fetchall()
-    for row in previous:
-        previous_account = int(row["account_id"])
-        plans = db.execute(
-            "SELECT status FROM qianchuan_plan_jobs WHERE selection_batch_id=? AND account_id=?",
-            (batch_id, previous_account),
-        ).fetchall()
-        if not plans or any(str(plan["status"] or '') != 'published' for plan in plans):
-            return False, f'等待前序账号 {previous_account} 千川计划完成'
-    return True, ''
-
-
-def schedule_gate(settings: dict[str, Any], now: datetime | None = None) -> tuple[bool, str, str]:
-    """返回是否到千川定时时间、计划时间和等待原因。"""
-    current = now or datetime.now()
-    schedule_time = str(settings.get('schedule_time') or '09:00')
-    if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', schedule_time):
-        schedule_time = '09:00'
-    if not bool(int(settings.get('schedule_enabled') or 0)):
-        return True, current.isoformat(timespec='minutes'), ''
-    hour, minute = (int(part) for part in schedule_time.split(':'))
-    planned = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if current < planned:
-        return False, planned.isoformat(timespec='minutes'), f'等待千川定时时间 {schedule_time}'
-    return True, planned.isoformat(timespec='minutes'), ''
 
 
 def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
@@ -352,7 +236,6 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
         filters.append("q.id=?")
         params.append(qianchuan_account_id)
     query = f"""SELECT p.id publish_queue_id,p.account_id,p.product_id,p.product_name,p.title,
-        p.selection_batch_id,p.selection_sequence_no,
         q.id qianchuan_account_id,q.qc_id advertiser_id,
         COALESCE(s.daily_budget_yuan,0) daily_budget_yuan,{commission} commission_rate
         FROM publish_queue p JOIN accounts a ON a.id=p.account_id
@@ -385,18 +268,7 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
             WHERE account_id=? AND qianchuan_account_id=? AND product_id=?""",
             (account, qc_id, product_id)).fetchone()
         reason = ""
-        batch_id = str(row["selection_batch_id"] or '')
-        gate_ready, gate_reason = selection_batch_gate(db, batch_id)
-        if not gate_ready:
-            reason = gate_reason
-        sequence_ready, sequence_reason = qianchuan_sequence_gate(
-            db, batch_id, int(row["selection_sequence_no"] or 0), account
-        )
-        if not reason and not sequence_ready:
-            reason = sequence_reason
-        if reason:
-            pass
-        elif not re.fullmatch(r"\d{8,20}", advertiser):
+        if not re.fullmatch(r"\d{8,20}", advertiser):
             reason = "所选千川档案的广告主 ID 未填写或格式无效（需 8–20 位数字）；请核对账号管理中的千川账户档案并刷新。"
         elif not settled:
             reason = "素材上传或发布后素材处理尚未完成，暂不可建计划"
@@ -414,7 +286,6 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
             "publishQueueId": queue_id, "accountId": account,
             "qianchuanAccountId": qc_id, "advertiserId": advertiser,
             "productId": product_id, "productName": str(row["product_name"] or ""),
-            "selectionBatchId": batch_id, "selectionSequenceNo": int(row["selection_sequence_no"] or 0),
             "publishedVideoTitle": str(row["title"] or ""),
             "dailyBudgetYuan": int(row["daily_budget_yuan"] or 0),
             "commissionRate": rate, "roiTarget": roi,
@@ -438,7 +309,6 @@ def create_manual_plan(db: sqlite3.Connection, publish_queue_id: int,
     commission_join = ("LEFT JOIN baiying_products b ON b.product_id=p.product_id AND b.account_id=p.account_id"
                        if commission_column != "NULL" else "")
     row = db.execute(f"""SELECT p.id publish_queue_id,p.account_id,p.product_id,p.product_name,p.title,
-        p.selection_batch_id,p.selection_sequence_no,
         q.id qianchuan_account_id,q.qc_id advertiser_id,{commission_column} commission_rate
         FROM publish_queue p JOIN accounts a ON a.id=p.account_id
         JOIN account_qianchuan aq ON aq.account_row_id=p.account_id
@@ -451,15 +321,6 @@ def create_manual_plan(db: sqlite3.Connection, publish_queue_id: int,
     account_id = int(row["account_id"])
     qc_id = int(row["qianchuan_account_id"])
     product_id = str(row["product_id"])
-    selection_batch_id = str(row["selection_batch_id"] or '')
-    gate_ready, gate_reason = selection_batch_gate(db, selection_batch_id)
-    if not gate_ready:
-        raise ValueError(gate_reason)
-    sequence_ready, sequence_reason = qianchuan_sequence_gate(
-        db, selection_batch_id, int(row["selection_sequence_no"] or 0), account_id
-    )
-    if not sequence_ready:
-        raise ValueError(sequence_reason)
     advertiser = str(row["advertiser_id"] or "")
     settings = _settings(db, qc_id)
     if int(settings["daily_budget_yuan"] or 0) < 50:
@@ -491,12 +352,10 @@ def create_manual_plan(db: sqlite3.Connection, publish_queue_id: int,
         cursor = db.execute("""INSERT INTO qianchuan_plan_jobs
             (publish_queue_id,account_id,qianchuan_account_id,advertiser_id,product_id,
              product_name,published_video_title,plan_name,creation_source,daily_budget_yuan,commission_rate,
-             selection_batch_id,selection_sequence_no,
              roi_target,material_ids_json,status,reason,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ready','',?,?)""",
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'ready','',?,?)""",
             (publish_queue_id, account_id, qc_id, advertiser, product_id,
              row["product_name"], row["title"], name, "manual", int(settings["daily_budget_yuan"]), commission_rate,
-             selection_batch_id, int(row["selection_sequence_no"] or 0),
              roi_target, json.dumps(material_ids), now_text(), now_text()))
         if cursor.rowcount != 1:
             raise ValueError("计划任务未能创建，请刷新列表后核对")
@@ -707,8 +566,7 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
     commission_join = ("LEFT JOIN baiying_products b ON b.product_id=p.product_id "
                        "AND b.account_id=p.account_id") if has_baiying_products else ""
     candidates = db.execute(f"""SELECT p.id publish_queue_id,p.account_id,p.product_id,
-        p.product_name,p.title,p.selection_batch_id,p.selection_sequence_no,
-        q.id qianchuan_account_id,q.qc_id advertiser_id,
+        p.product_name,p.title,q.id qianchuan_account_id,q.qc_id advertiser_id,
         s.video_source,s.daily_budget_yuan,{commission_column} commission_rate FROM publish_queue p
         JOIN accounts a ON a.id=p.account_id
         JOIN account_qianchuan aq ON aq.account_row_id=p.account_id
@@ -720,8 +578,7 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
         WHERE p.platform_status='published' AND a.status='active' AND s.enabled=1 AND s.daily_budget_yuan>=50
         AND s.activated_at<>'' AND p.published_at>s.activated_at
         AND p.product_id<>'' AND (existing.id IS NULL OR
-            (existing.creation_source='auto' AND existing.status IN ('ready','blocked','waiting_selection','scheduled')
-             AND existing.submit_attempted=0))
+            (existing.status IN ('ready','blocked') AND existing.submit_attempted=0))
         ORDER BY p.id""").fetchall()
     created = 0
     for row in candidates:
@@ -729,15 +586,6 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
         advertiser_id = str(row["advertiser_id"] or "")
         if not re.fullmatch(r"\d{8,20}", advertiser_id):
             continue
-        selection_batch_id = str(row["selection_batch_id"] or '')
-        selection_sequence_no = int(row["selection_sequence_no"] or 0)
-        gate_ready, gate_reason = selection_batch_gate(db, selection_batch_id)
-        sequence_ready, sequence_reason = qianchuan_sequence_gate(
-            db, selection_batch_id, selection_sequence_no, account_id
-        )
-        settings = _settings(db, qc_id)
-        schedule_ready, planned_at, schedule_reason = schedule_gate(settings)
-        waiting_reason = gate_reason if not gate_ready else sequence_reason if not sequence_ready else schedule_reason
         if duplicate_material_ids(db, account_id, qc_id, product_id):
             with db:
                 db.execute("""UPDATE qianchuan_plan_jobs SET status='blocked',
@@ -747,18 +595,13 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
                     (now_text(), account_id, qc_id, product_id))
             continue
         ids = usable_material_ids(db, account_id, qc_id, product_id)
-        if waiting_reason:
-            ids = []
         if row["video_source"] == "uploaded" and not ids:
-            if gate_ready and sequence_ready and schedule_ready:
-                continue
+            continue
         if row["video_source"] == "both" and not ids:
-            if gate_ready and sequence_ready and schedule_ready:
-                continue
+            continue
         if row["video_source"] in ("uploaded", "both") and not uploads_settled(
                 db, account_id, qc_id, product_id, int(row["publish_queue_id"])):
-            if gate_ready and sequence_ready and schedule_ready:
-                continue
+            continue
         if row["video_source"] == "my_video" and not str(row["title"] or "").strip():
             continue
         try:
@@ -769,35 +612,29 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
         name = f"{date.today().isoformat()}_商品全域投放_{product_id}"[:50]
         status = "ready" if roi_target > 0 else "blocked"
         reason = "" if roi_target > 0 else "无法计算保本 ROI：百应商品佣金率缺失或无效，请先同步商品数据。"
-        if waiting_reason and roi_target > 0:
-            status = "waiting_selection" if not gate_ready or not sequence_ready else "scheduled"
-            reason = waiting_reason
         with db:
             cursor = db.execute("""INSERT OR IGNORE INTO qianchuan_plan_jobs
                 (publish_queue_id,account_id,qianchuan_account_id,advertiser_id,product_id,
-                 product_name,published_video_title,plan_name,creation_source,daily_budget_yuan,commission_rate,
-                 selection_batch_id,selection_sequence_no,planned_at,roi_target,material_ids_json,status,reason,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 product_name,published_video_title,plan_name,daily_budget_yuan,commission_rate,roi_target,
+                 material_ids_json,status,reason,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (row["publish_queue_id"], account_id, qc_id, advertiser_id, product_id,
-                 row["product_name"], row["title"], name, "auto", int(row["daily_budget_yuan"]), commission_rate,
-                 selection_batch_id, selection_sequence_no, planned_at, roi_target, json.dumps(ids), status, reason, now_text(), now_text()))
+                 row["product_name"], row["title"], name, int(row["daily_budget_yuan"]), commission_rate, roi_target,
+                 json.dumps(ids), status, reason, now_text(), now_text()))
             created += int(cursor.rowcount > 0)
             if cursor.rowcount > 0:
                 record_event(db, int(cursor.lastrowid), "PLAN_DRAFT_CREATED", "draft", status,
                              "自动调度已生成千川计划待发布任务",
-                              f"来源=auto; 选品批次={selection_batch_id}; 账号顺序={selection_sequence_no}; "
-                              f"商品 ID={product_id}; 计划时间={planned_at}; 等待原因={reason}; "
-                              f"素材上传结果=已确认 {len(ids)} 条; "
+                              f"来源=auto; 商品 ID={product_id}; 素材上传结果=已确认 {len(ids)} 条; "
                               f"远端素材 ID={','.join(ids)}; 日预算={int(row['daily_budget_yuan'])}; "
                               f"保本 ROI={roi_target:.2f}")
             if roi_target > 0:
                 db.execute("""UPDATE qianchuan_plan_jobs SET daily_budget_yuan=?,commission_rate=?,roi_target=?,
-                    selection_batch_id=?,selection_sequence_no=?,planned_at=?,status=?,reason=?,updated_at=?
-                    WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
-                    AND creation_source='auto' AND status IN ('ready','blocked','waiting_selection','scheduled')
-                    AND submit_attempted=0""",
-                    (int(row["daily_budget_yuan"]), commission_rate, roi_target, selection_batch_id,
-                     selection_sequence_no, planned_at, status, reason, now_text(), account_id, qc_id, product_id))
+                    status=CASE WHEN status='blocked' AND reason LIKE '无法计算保本 ROI：%' THEN 'ready' ELSE status END,
+                    reason=CASE WHEN status='blocked' AND reason LIKE '无法计算保本 ROI：%' THEN '' ELSE reason END,
+                    updated_at=? WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
+                    AND status IN ('ready','blocked') AND submit_attempted=0""",
+                    (int(row["daily_budget_yuan"]), commission_rate, roi_target, now_text(), account_id, qc_id, product_id))
             else:
                 db.execute("""UPDATE qianchuan_plan_jobs SET commission_rate=0,roi_target=0,
                     status='blocked',reason=?,updated_at=?
@@ -815,21 +652,6 @@ def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int =
         if not row or row["status"] != "ready":
             raise ValueError("计划任务不存在或已执行；不会重复发布")
         settings = _settings(db, int(row["qianchuan_account_id"]))
-        gate_ready, gate_reason = selection_batch_gate(db, str(row["selection_batch_id"] or ''))
-        if not gate_ready:
-            raise ValueError(gate_reason)
-        sequence_ready, sequence_reason = qianchuan_sequence_gate(
-            db, str(row["selection_batch_id"] or ''), int(row["selection_sequence_no"] or 0),
-            int(row["account_id"])
-        )
-        if not sequence_ready:
-            raise ValueError(sequence_reason)
-        schedule_ready, planned_at, schedule_reason = (
-            (True, now_text(), '') if str(row["creation_source"] or "auto") == "manual"
-            else schedule_gate(settings)
-        )
-        if not schedule_ready:
-            raise ValueError(schedule_reason)
         if (not settings["enabled"] and str(row["creation_source"] or "auto") != "manual") or int(settings["daily_budget_yuan"]) < 50:
             raise ValueError("该千川账户未启用自动发布或未配置至少 50 元日预算")
         current_budget = int(settings["daily_budget_yuan"])
@@ -867,8 +689,8 @@ def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int =
                 db, int(row["account_id"]), int(row["qianchuan_account_id"]),
                 str(row["product_id"]), int(row["publish_queue_id"])):
             raise ValueError("该商品上传或自动补位仍在进行")
-        db.execute("UPDATE qianchuan_plan_jobs SET status='submitting',daily_budget_yuan=?,material_ids_json=?,planned_at=?,started_at=?,reason='',updated_at=? WHERE id=?",
-                   (current_budget, json.dumps(ids), planned_at, now_text(), now_text(), job_id))
+        db.execute("UPDATE qianchuan_plan_jobs SET status='submitting',daily_budget_yuan=?,material_ids_json=?,reason='',updated_at=? WHERE id=?",
+                   (current_budget, json.dumps(ids), now_text(), job_id))
         record_event(db, job_id, "PLAN_SUBMIT_STARTED", "submit", "submitting",
                      "已通过发布前校验，开始进入千川计划提交页面",
                      f"广告主 ID={row['advertiser_id']}; 日预算={current_budget}; "
@@ -1021,8 +843,6 @@ def main() -> int:
     parser.add_argument("--long-running", type=int, choices=[0, 1], default=1)
     parser.add_argument("--smart-coupon", type=int, choices=[0, 1], default=1)
     parser.add_argument("--aigc-enabled", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--schedule-enabled", type=int, choices=[0, 1], default=0)
-    parser.add_argument("--schedule-time", default="09:00")
     parser.add_argument("--id", type=int, default=0)
     parser.add_argument("--status", default="")
     parser.add_argument("--due-only", action="store_true")
@@ -1046,8 +866,7 @@ def main() -> int:
             elif args.command == "set-settings":
                 result = {"ok": True, "settings": save_settings(db, args.qianchuan_account_id,
                     args.daily_budget_yuan, args.video_source, bool(args.enabled), bool(args.long_running),
-                    bool(args.smart_coupon), bool(args.aigc_enabled), bool(args.schedule_enabled),
-                    args.schedule_time)}
+                    bool(args.smart_coupon), bool(args.aigc_enabled))}
             elif args.command == "sync":
                 result = sync(db)
             elif args.command == "candidates":

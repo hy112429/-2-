@@ -7,10 +7,25 @@ import * as nodePath from 'node:path'
 import * as nodeHttp from 'node:http'
 import * as nodeCrypto from 'node:crypto'
 import * as nodeChild from 'node:child_process'
+import { createServer } from 'node:net'
 import ts from 'typescript'
 
 const source = readFileSync(new URL('../src/main/qianchuan_api.ts', import.meta.url), 'utf8')
-const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+const testPort = await new Promise((resolvePort, rejectPort) => {
+  const probe = createServer()
+  probe.once('error', rejectPort)
+  probe.listen(0, '127.0.0.1', () => {
+    const address = probe.address()
+    probe.close(() => resolvePort(address.port))
+  })
+})
+const callbackUrl = `http://127.0.0.1:${testPort}/callback`
+const isolatedSource = source
+  .replace("const CALLBACK = 'http://127.0.0.1:8899/callback'", `const CALLBACK = '${callbackUrl}'`)
+  .replace("listener!.listen(8899, '127.0.0.1', resolve)", `listener!.listen(${testPort}, '127.0.0.1', resolve)`)
+assert.notEqual(isolatedSource, source)
+assert.ok(!isolatedSource.includes("listener!.listen(8899, '127.0.0.1', resolve)"))
+const compiled = ts.transpileModule(isolatedSource, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
 const handlers = new Map()
 const root = mkdtempSync('D:\\software\\codex\\qianchuan-api-test-')
 let openedUrl = ''
@@ -94,12 +109,20 @@ test('千川 OAuth 校验 state、保留长 ID、刷新 Token 后继续按商品
     assert.notEqual(state, 'your_custom_params')
     assert.equal(firstOpen.profilePath, openedProfilePath)
     assert.equal(new URL(openedUrl).searchParams.get('rid'), 'test-rid')
-    const bad = await globalThis.fetch('http://127.0.0.1:8899/callback?auth_code=test-code&state=wrong')
+    assert.equal(handlers.get('qianchuan:api:status')().authorizationPending, true)
+    const bad = await globalThis.fetch(`${callbackUrl}?auth_code=test-code&state=wrong`)
     assert.equal(bad.status, 400)
+    assert.match(await bad.text(), /state 与本次客户端授权请求不一致/)
+    const placeholder = await globalThis.fetch(`${callbackUrl}?auth_code=test-code&state=your_custom_params`)
+    assert.equal(placeholder.status, 400)
+    assert.match(await placeholder.text(), /平台返回了授权链接中的示例 state/)
     assert.equal(handlers.get('qianchuan:api:status')().authorizationRevision, 0)
-    const good = await globalThis.fetch(`http://127.0.0.1:8899/callback?auth_code=test-code&state=${state}`)
+    const good = await globalThis.fetch(`${callbackUrl}?auth_code=test-code&state=${state}`)
     assert.equal(good.status, 200)
     assert.equal(handlers.get('qianchuan:api:status')().authorizationRevision, 1)
+    assert.equal(handlers.get('qianchuan:api:status')().authorizationPending, false)
+    handlers.get('qianchuan:api:configure')(null, { appId: '1880896897289216', secret: 'local-secret' })
+    assert.equal(handlers.get('qianchuan:api:status')().authorized, true)
     assert.deepEqual(handlers.get('qianchuan:api:status')().advertiserIds, [])
     const discovered = await handlers.get('qianchuan:api:accounts')()
     assert.deepEqual(discovered.accounts.map((account) => account.id), ['16761573861161'])

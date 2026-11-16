@@ -82,7 +82,6 @@ const runLogs = ref<SelectionRunLog[]>([])
 const databaseAvailable = ref<boolean | null>(null)
 const listLoading = ref(false)
 const detailsLoading = ref(false)
-const abandonBusy = ref(false)
 const pageError = ref('')
 const detailsError = ref('')
 const logAccountId = ref('')
@@ -274,29 +273,6 @@ async function loadBatches(): Promise<void> {
   }
 }
 
-async function abandonSelectedBatch(): Promise<void> {
-  const batch = selectedBatch.value
-  if (abandonBusy.value || !batch || batch.state !== 'needs_retry') return
-  const accepted = window.confirm(
-    `结束待恢复批次 ${batch.batchId}？\n\n` +
-    '结束后不会再自动恢复此批次；候选、商品结果和配额检查点会保留，批次不会被标记为成功。'
-  )
-  if (!accepted) return
-  abandonBusy.value = true
-  detailsError.value = ''
-  try {
-    await runRecovery([
-      'batch', 'abandon', '--batch-id', batch.batchId,
-      '--reason', '用户在选品日志页面确认结束待恢复批次；保留检查点，不标记成功。'
-    ])
-    await loadBatches()
-  } catch (error) {
-    detailsError.value = error instanceof Error ? error.message : String(error)
-  } finally {
-    abandonBusy.value = false
-  }
-}
-
 function search(): void {
   currentPage.value = 1
   void loadBatches()
@@ -335,7 +311,7 @@ onUnmounted(() => {
     <header class="page-header">
       <div>
         <h1>选品日志</h1>
-        <p>按批次查看本机保存的选品过程、账号状态和技术原因；待恢复批次可在详情中安全结束并保留检查点。</p>
+        <p>按批次查看本机保存的选品过程、账号状态和技术原因。此页面只读，不会恢复或更改任务。</p>
       </div>
       <button class="btn" type="button" :disabled="listLoading || !databaseAvailable" @click="loadBatches">刷新</button>
     </header>
@@ -412,13 +388,6 @@ onUnmounted(() => {
               <p>{{ selectedBatch.batchId }}</p>
               <small>创建：{{ formatDateTime(selectedBatch.createdAt) }}　最近更新：{{ formatDateTime(selectedBatch.updatedAt) }}</small>
             </div>
-            <button
-              v-if="selectedBatch.state === 'needs_retry'"
-              class="btn danger"
-              type="button"
-              :disabled="abandonBusy || detailsLoading"
-              @click="abandonSelectedBatch"
-            >{{ abandonBusy ? '结束中…' : '结束旧批次并保留检查点' }}</button>
           </header>
 
           <section class="accounts-section">
@@ -484,7 +453,6 @@ onUnmounted(() => {
 .filter-actions { display: flex; gap: 7px; }
 .btn { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); color: var(--text); cursor: pointer; }
 .btn.primary { border-color: var(--brand); background: var(--brand); color: #fff; }
-.btn.danger { border-color: #d9534f; color: #a33125; }
 .btn:disabled { cursor: default; opacity: .5; }
 .logs-layout { display: grid; flex: 1; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 12px; min-height: 420px; }
 .batch-panel, .detail-panel { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); box-shadow: var(--shadow-card); }
@@ -509,7 +477,7 @@ onUnmounted(() => {
 .pagination .btn { min-height: 28px; padding: 0 8px; font-size: 11px; }
 .detail-panel { min-height: 420px; overflow: auto; }
 .batch-detail { padding: 14px; }
-.detail-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+.detail-header { padding-bottom: 12px; border-bottom: 1px solid var(--border); }
 .detail-title { display: flex; align-items: center; gap: 9px; }
 .detail-title h2 { margin: 0; font-size: 16px; }
 .detail-header p { margin: 6px 0; overflow-wrap: anywhere; font: 11px Consolas, monospace; color: var(--text-muted); }
@@ -547,5 +515,5 @@ onUnmounted(() => {
   .batch-panel { max-height: 260px; }
   .detail-panel { min-height: 300px; }
 }
-@media (max-width: 760px) { .logs-layout { grid-template-columns: 1fr; } .batch-panel { max-height: 330px; } .detail-header { flex-direction: column; } }
+@media (max-width: 760px) { .logs-layout { grid-template-columns: 1fr; } .batch-panel { max-height: 330px; } }
 </style>

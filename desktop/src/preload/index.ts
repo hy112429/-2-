@@ -318,9 +318,6 @@ const baiying = {
     downloadPath?: string
     commodityId?: string
     cacheWarning?: string
-    sourceType?: string
-    sourceField?: string
-    watermarkStatus?: string
     available?: number
     limit?: number
     videos?: Array<{ videoId: string; url: string; title: string; author: string; duration?: number; publishTime?: number; shareUrl?: string }>
@@ -418,7 +415,7 @@ const account = {
 
 /** 千川账户登录态：独立分区（persist:qc-{id}），与抖音账号分区互不共用（A-12 多开隔离） */
 const qianchuan = {
-  apiStatus: (): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number }> => ipcRenderer.invoke('qianchuan:api:status'),
+  apiStatus: (): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number; authorizationPending: boolean }> => ipcRenderer.invoke('qianchuan:api:status'),
   apiConfigure: (params: { appId: string; secret: string }): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:api:configure', toPlainIpcPayload(params)),
   apiAuthorize: (url: string): Promise<{ ok: boolean; callback: string; profilePath: string }> => ipcRenderer.invoke('qianchuan:api:authorize', url),
   apiVideos: (params: { advertiserId: string; productId: string; awemeId: string; cursor?: string }): Promise<{ videos: Array<{ videoId: string; awemeItemId: string; title: string; url: string; duration: number | null }>; hasMore: boolean; cursor: string; totalReturned: number }> => ipcRenderer.invoke('qianchuan:api:videos', toPlainIpcPayload(params)),
@@ -469,7 +466,7 @@ const qianchuan = {
   retryPostPublishRun: (queueId: number): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:postPublish:retry', queueId),
   planSettings: (qcId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:settings', qcId),
-  savePlanSettings: (params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean; scheduleEnabled: boolean; scheduleTime: string }): Promise<Record<string, unknown>> =>
+  savePlanSettings: (params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:plan:saveSettings', toPlainIpcPayload(params)),
   planJobs: (params?: { qianchuanAccountId?: number; accountId?: number; status?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:plan:jobs', toPlainIpcPayload(params)),

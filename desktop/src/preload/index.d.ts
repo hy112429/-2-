@@ -493,9 +493,6 @@ declare global {
           downloadPath?: string
           commodityId?: string
           cacheWarning?: string
-          sourceType?: string
-          sourceField?: string
-          watermarkStatus?: string
           available?: number
           limit?: number
           videos?: Array<{ videoId: string; url: string; title: string; author: string; duration?: number; publishTime?: number; shareUrl?: string }>
@@ -538,7 +535,7 @@ declare global {
       }
       /** 千川账户登录态（Step 11：独立分区多开隔离，SRS A-12） */
       qianchuan: {
-        apiStatus(): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number }>
+        apiStatus(): Promise<{ configured: boolean; authorized: boolean; appId: string; advertiserIds: string[]; callback: string; expiresAt: number | null; authorizationRevision: number; authorizationPending: boolean }>
         apiConfigure(params: { appId: string; secret: string }): Promise<Record<string, unknown>>
         apiAuthorize(url: string): Promise<{ ok: boolean; callback: string; profilePath: string }>
         apiVideos(params: { advertiserId: string; productId: string; awemeId: string; cursor?: string }): Promise<{ videos: Array<{ videoId: string; awemeItemId: string; title: string; url: string; duration: number | null }>; hasMore: boolean; cursor: string; totalReturned: number }>
@@ -568,7 +565,7 @@ declare global {
         postPublishRuns(): Promise<Record<string, unknown>>
         retryPostPublishRun(queueId: number): Promise<Record<string, unknown>>
         planSettings(qcId: number): Promise<Record<string, unknown>>
-        savePlanSettings(params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean; scheduleEnabled: boolean; scheduleTime: string }): Promise<Record<string, unknown>>
+        savePlanSettings(params: { qianchuanAccountId: number; dailyBudgetYuan: number; videoSource: string; enabled: boolean; longRunning: boolean; smartCoupon: boolean; aigcEnabled: boolean }): Promise<Record<string, unknown>>
         planJobs(params?: { qianchuanAccountId?: number; accountId?: number; status?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
         planLogs(params?: { id?: number; qianchuanAccountId?: number; accountId?: number; status?: string; startDate?: string; endDate?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
         planCandidates(params: { accountId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>

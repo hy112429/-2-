@@ -2,6 +2,7 @@ export interface SelectionCandidateRankInput {
   productId: string
   leafCategoryId?: string
   categoryIds?: string[]
+  categoryStatus?: string
   unifiedScore?: number | null
   analysisScore?: number | null
   analysisRawScore?: number | null
@@ -63,7 +64,12 @@ export function selectionPoolVisibilityFingerprint(profilePath?: string): string
 }
 
 export function candidateLeafCategoryId(candidate: SelectionCandidateRankInput): string {
-  return String(candidate.leafCategoryId ?? candidate.categoryIds?.at(-1) ?? '').trim()
+  if (candidate.categoryStatus === 'unknown' || candidate.categoryStatus === 'ambiguous') return ''
+  const path = candidate.categoryIds?.map((value) => String(value).trim()) ?? []
+  if (path.length !== 3 || path.some((value) => !/^\d+(?:__RC_CASCADER_SPLIT__\d+)*$/.test(value) ||
+    value.split('__RC_CASCADER_SPLIT__').some((part) => Number(part) <= 0))) return ''
+  const explicit = String(candidate.leafCategoryId ?? '').trim()
+  return explicit && explicit !== path[2] ? '' : path[2]
 }
 
 export function filterCandidatesByRegistry<T extends SelectionCandidateRankInput>(

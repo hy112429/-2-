@@ -70,11 +70,8 @@ async function douyinBatchGate(): Promise<{ ready: boolean; reason: string }> {
   for (const account of accounts) {
     if (String(account['state']) !== 'completed') return { ready: false, reason: `账号 ${String(account['accountId'] ?? '')} 尚未完成` }
     const completed = Array.isArray(account['completed']) ? account['completed'].map(object) : []
-    if (!completed.length) return { ready: false, reason: `账号 ${String(account['accountId'] ?? '')} 没有可核对的选品结果` }
-    const unconfirmed = completed.find((item) => item['cartAdded'] !== true || item['publishQueueStatus'] !== 'published')
-    if (unconfirmed) {
-      return { ready: false, reason: `账号 ${String(account['accountId'] ?? '')} 仍有商品未确认抖音发布成功` }
-    }
+    const confirmed = completed.filter((item) => item['cartAdded'] === true && item['publishQueueStatus'] === 'published')
+    if (confirmed.length < 5) return { ready: false, reason: `账号 ${String(account['accountId'] ?? '')} 抖音发布确认不足 5/5` }
   }
   return { ready: true, reason: '全账号抖音发布已确认完成' }
 }
@@ -550,10 +547,7 @@ export function registerPostPublishQianchuanMaterialIpc(): void {
     markQueuePublishedAndTrigger(safeId(queueId, '发布队列 ID')))
   ipcMain.handle('publish:postPublish:notify', (_event, params: { queueId: unknown; platformStatus: unknown }) =>
     notifyPostPublishFinished(safeId(params?.queueId, '发布队列 ID'), params?.platformStatus, 'renderer-submit-finish'))
-  ipcMain.handle('qianchuan:postPublish:settings', async () => ({
-    ...(await stateCommand('settings-get')),
-    gate: await douyinBatchGate()
-  }))
+  ipcMain.handle('qianchuan:postPublish:settings', () => stateCommand('settings-get'))
   ipcMain.handle('qianchuan:postPublish:setEnabled', async (_event, value: unknown) => {
     if (typeof value !== 'boolean') throw new Error('自动下视频开关值无效')
     return stateCommand('settings-set', '--enabled', value ? '1' : '0')

@@ -208,21 +208,18 @@ export function registerSelectionScheduleIpc(): void {
   })
   ipcMain.handle('selection-schedule:trace', (_event, input: unknown) => {
     if (!input || typeof input !== 'object') return { ok: false }
-    const value = input as { date?: unknown; stage?: unknown; attempt?: unknown; delayMs?: unknown; batchId?: unknown; actualStartAt?: unknown; waitReason?: unknown }
+    const value = input as { date?: unknown; stage?: unknown; attempt?: unknown; delayMs?: unknown }
     if (typeof value.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value.date) || typeof value.stage !== 'string') {
       return { ok: false }
     }
     const allowedStages = new Set([
-      'attempt_started', 'batch_started', 'retry_scheduled', 'login_blocked', 'run_completed', 'schedule_disabled', 'attempt_error'
+      'attempt_started', 'retry_scheduled', 'login_blocked', 'run_completed', 'schedule_disabled', 'attempt_error'
     ])
     if (!allowedStages.has(value.stage)) return { ok: false }
     writeDiagnostic(`renderer_${value.stage}`, {
       date: value.date,
       attempt: Number.isInteger(value.attempt) ? value.attempt : undefined,
-      delayMs: Number.isFinite(value.delayMs) ? value.delayMs : undefined,
-      batchId: typeof value.batchId === 'string' ? value.batchId : undefined,
-      actualStartAt: Number.isFinite(value.actualStartAt) ? value.actualStartAt : undefined,
-      waitReason: typeof value.waitReason === 'string' ? value.waitReason : undefined
+      delayMs: Number.isFinite(value.delayMs) ? value.delayMs : undefined
     })
     return { ok: true }
   })
