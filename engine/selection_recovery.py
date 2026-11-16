@@ -341,6 +341,7 @@ POOL_CANDIDATE_FIELDS = frozenset({
     "trendRising", "trendKnown", "trendStatus", "trendSlope", "trendPoints",
     "dataMetrics", "metricSources", "poolRank", "sources", "sourceKey",
     "categoryIds", "leafCategoryId", "categoryStatus", "categorySource", "sourceCategoryIds",
+    "quotaRuleId",
     "analysisScore", "unifiedScore",
 })
 
@@ -364,6 +365,20 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         raise ValueError("批次缺少有效的候选采集账号或池目标数")
     if value.get("target") != target or value.get("collectorAccountIds") != collector_ids:
         raise ValueError("候选池配置与批次启动快照不一致")
+    mode = settings.get("candidatePoolMode", "total")
+    if mode not in {"total", "quota"} or value.get("mode", "total") != mode:
+        raise ValueError("候选池模式与批次快照不一致")
+    quota_rules = settings.get("candidatePoolQuotas") if mode == "quota" else []
+    if mode == "quota":
+        if not isinstance(quota_rules, list) or not quota_rules or value.get("quotaRules") != quota_rules:
+            raise ValueError("品类配额与批次快照不一致")
+        if any(not isinstance(rule, dict) or not isinstance(rule.get("target"), int) or
+               isinstance(rule.get("target"), bool) or rule["target"] < 1 for rule in quota_rules):
+            raise ValueError("品类配额数量无效")
+        if sum(rule["target"] for rule in quota_rules) != target:
+            raise ValueError("品类配额合计与批次目标不一致")
+    rule_targets = {str(rule["id"]): rule["target"] for rule in quota_rules} if mode == "quota" else {}
+    rules_by_id = {str(rule["id"]): rule for rule in quota_rules} if mode == "quota" else {}
     fingerprint = value.get("filterFingerprint")
     if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 100_000:
         raise ValueError("候选池缺少有效的筛选指纹")
@@ -385,6 +400,36 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         safe = {key: candidate[key] for key in POOL_CANDIDATE_FIELDS if key in candidate}
         safe["productId"] = product_id
         safe["title"] = title[:512]
+        if mode == "quota" and safe.get("quotaRuleId") not in rule_targets:
+            raise ValueError("候选商品没有有效的品类配额归属")
+        if mode == "quota":
+            rule = rules_by_id[safe["quotaRuleId"]]
+            path = rule["categoryPath"]
+            category_ids = safe.get("categoryIds") if isinstance(safe.get("categoryIds"), list) else []
+            source_ids = safe.get("sourceCategoryIds") if isinstance(safe.get("sourceCategoryIds"), list) else []
+            matches_exact = len(category_ids) >= len(path) and all(
+                str(category_ids[index]).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                str(expected).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                for index, expected in enumerate(path)
+            )
+            matches_source_path = (safe.get("categoryStatus") == "source_level" and
+                                   len(source_ids) >= len(path) and all(
+                str(source_ids[index]).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                str(expected).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                for index, expected in enumerate(path)
+            ))
+            if safe.get("sourceKey") != rule["sourceKey"] or not (matches_exact or matches_source_path):
+                raise ValueError("候选商品来源或类目与所归属配额不一致")
+            known_path = category_ids if len(category_ids) == 3 else source_ids
+            excluded = settings.get("excludedCategorySelection")
+            excluded = excluded if isinstance(excluded, dict) else {}
+            if any(
+                str(category_id).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                str(blocked).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                for index, category_id in enumerate(known_path[:3], start=1)
+                for blocked in (excluded.get(f"level{index}") if isinstance(excluded.get(f"level{index}"), list) else [])
+            ) or (len(known_path) < 3 and any(excluded.get(f"level{level}") for level in range(len(known_path) + 1, 4))):
+                raise ValueError("候选商品命中排除品类或缺少判断排除条件的类目")
         safe["collectedByAccountId"] = int(candidate.get("collectedByAccountId") or value.get("collectorAccountId") or 0)
         safe["capturedAt"] = str(candidate.get("capturedAt") or value.get("capturedAt") or now_text())[:40]
         if safe["collectedByAccountId"] not in collector_ids:
@@ -392,6 +437,12 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         by_product.setdefault(product_id, safe)
     if len(by_product) > 2000:
         raise ValueError("候选池超过 2000 件上限")
+    quota_counts = {rule_id: 0 for rule_id in rule_targets}
+    for candidate in by_product.values():
+        if mode == "quota":
+            quota_counts[candidate["quotaRuleId"]] += 1
+    if any(quota_counts[rule_id] > limit for rule_id, limit in rule_targets.items()):
+        raise ValueError("候选商品超过单条品类配额")
     state = value.get("sourceState")
     if not isinstance(state, dict):
         raise ValueError("候选池采集游标无效")
@@ -408,14 +459,30 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
             "tabOffsets": clean_offsets,
             "samePoolCount": max(0, int(collector.get("samePoolCount") or 0)),
             "nextRetryAt": str(collector.get("nextRetryAt") or "")[:40],
+            "ruleStates": {
+                str(rule_id): {
+                    "samePoolCount": max(0, min(100, int(rule_state.get("samePoolCount") or 0))),
+                    "nextRetryAt": str(rule_state.get("nextRetryAt") or "")[:40],
+                }
+                for rule_id, rule_state in (collector.get("ruleStates") or {}).items()
+                if rule_id in rule_targets and isinstance(rule_state, dict)
+            } if isinstance(collector.get("ruleStates"), dict) else {},
         }
+    quota_progress = [
+        {"ruleId": rule["id"], "collected": quota_counts[rule["id"]], "target": rule["target"],
+         "deficit": rule["target"] - quota_counts[rule["id"]]}
+        for rule in quota_rules
+    ]
     pool = {
         "target": target,
+        "mode": mode,
+        "quotaRules": quota_rules,
+        "quotaProgress": quota_progress,
         "collectorAccountIds": collector_ids,
         "filterFingerprint": fingerprint,
         "rows": list(by_product.values()),
         "sourceState": {"collectors": clean_collectors},
-        "status": "ready" if len(by_product) >= target else "collecting",
+        "status": "ready" if (all(item["deficit"] == 0 for item in quota_progress) if mode == "quota" else len(by_product) >= target) else "collecting",
         "capturedAt": str(value.get("capturedAt") or now_text())[:40],
     }
     payload["candidatePool"] = pool

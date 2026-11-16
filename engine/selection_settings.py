@@ -50,6 +50,8 @@ DEFAULT_BANNED_WORDS = list(dict.fromkeys([
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "candidateLimit": 5,
     "candidatePoolTarget": 300,
+    "candidatePoolMode": "total",
+    "candidatePoolQuotas": [],
     "candidateCollectorAccountIds": [],
     "commissionRateRule": "minimum",
     "selectionMode": "general",
@@ -224,6 +226,47 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
             raise ValueError("候选上限必须是 1–10 的整数")
         if not isinstance(value.get("candidatePoolTarget"), int) or isinstance(value["candidatePoolTarget"], bool) or not 1 <= value["candidatePoolTarget"] <= 2000:
             raise ValueError("共享候选池目标数必须是 1–2000 的整数")
+        mode = value.get("candidatePoolMode", "total")
+        rules = value.get("candidatePoolQuotas", [])
+        if mode not in {"total", "quota"} or not isinstance(rules, list):
+            raise ValueError("候选池配额模式或规则格式无效")
+        if mode == "quota":
+            if not rules:
+                raise ValueError("按品类配额模式至少需要一条规则")
+            keys: set[tuple[str, str, tuple[str, ...]]] = set()
+            ids: set[str] = set()
+            total = 0
+            excluded = value.get("excludedCategorySelection", {})
+            excluded = excluded if isinstance(excluded, dict) else {}
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    raise ValueError("品类配额规则格式无效")
+                rule_id, source = rule.get("id"), rule.get("sourceKey")
+                board, path, count = rule.get("rankBoard"), rule.get("categoryPath"), rule.get("target")
+                if not isinstance(rule_id, str) or not rule_id or rule_id in ids or source not in {"hotSpot", "allianceRank", "selectionSquare"}:
+                    raise ValueError("品类配额规则 ID 或来源无效")
+                if board not in {"爆款榜", "趋势榜", "带货榜", "常销榜"}:
+                    raise ValueError("品类配额榜单类型无效")
+                if not isinstance(path, list) or not 1 <= len(path) <= 3 or any(not isinstance(part, str) or not part.strip() for part in path) or rule.get("categoryId") != path[-1]:
+                    raise ValueError("品类配额必须提供稳定类目 ID 路径")
+                if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 2000:
+                    raise ValueError("品类配额数量必须是 1–2000 的整数")
+                for level, category_id in enumerate(path, start=1):
+                    excluded_ids = excluded.get(f"level{level}", [])
+                    if isinstance(excluded_ids, list) and any(
+                        str(category_id).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                        str(blocked).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                        for blocked in excluded_ids
+                    ):
+                        raise ValueError("品类配额不能选择已排除的类目")
+                key = (source, board if source == "allianceRank" else "", tuple(path))
+                if key in keys:
+                    raise ValueError("来源、榜单和类目重复的品类配额")
+                keys.add(key)
+                ids.add(rule_id)
+                total += count
+            if total > 2000:
+                raise ValueError("品类配额合计不能超过 2000 件")
         collector_ids = value.get("candidateCollectorAccountIds")
         if not isinstance(collector_ids, list) or len(collector_ids) > 2 or any(
             not isinstance(account_id, int) or isinstance(account_id, bool) or account_id <= 0
@@ -235,6 +278,8 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
         sources = value.get("sources")
         if not isinstance(sources, dict) or not any(sources.get(key, True) is True for key in ("hotSpotEnabled", "allianceRankEnabled", "selectionSquareEnabled")):
             raise ValueError("至少启用一个候选来源")
+        if mode == "quota" and any(sources.get(f"{rule['sourceKey']}Enabled") is not True for rule in rules):
+            raise ValueError("品类配额引用了未启用的候选来源")
         if sources.get("rankBoard", "爆款榜") not in {"爆款榜", "趋势榜", "带货榜", "常销榜"}:
             raise ValueError("榜单类型无效")
         if sources.get("rankPeriod", "昨日") not in {"实时", "昨日", "近7日", "近30日"}:

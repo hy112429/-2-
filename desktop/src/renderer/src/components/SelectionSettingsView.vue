@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import BrowserPane from './BrowserPane.vue'
 import SelectionFilterEditor from './SelectionFilterEditor.vue'
 import { createSelectionFilterSettings } from '../utils/selection_filters'
-import type { SelectionFilterSettings } from '../utils/selection_filters'
+import type { CandidatePoolQuotaRule, SelectionFilterSettings } from '../utils/selection_filters'
 import {
   allocateExclusiveCandidates,
   candidateLeafCategoryId,
@@ -249,10 +249,13 @@ interface AccountCandidatePlan {
 
 interface BatchCandidatePool {
   target: number
+  mode?: 'total' | 'quota'
+  quotaRules?: CandidatePoolQuotaRule[]
+  quotaProgress?: Array<{ ruleId: string; collected: number; target: number; deficit: number }>
   collectorAccountIds: number[]
   filterFingerprint: string
   rows: SelectionCandidate[]
-  sourceState: { collectors: Record<string, { tabOffsets: Record<string, number>; samePoolCount: number; nextRetryAt?: string }> }
+  sourceState: { collectors: Record<string, { tabOffsets: Record<string, number>; samePoolCount: number; nextRetryAt?: string; ruleStates?: Record<string, { samePoolCount: number; nextRetryAt?: string }> }> }
   status: 'collecting' | 'ready'
   capturedAt: string
 }
@@ -313,6 +316,7 @@ interface SelectionCandidate {
   categoryIds?: string[]
   leafCategoryId?: string
   sourceKey?: string
+  quotaRuleId?: string
   sourceUrl?: string
   selectionMode?: 'general' | 'category'
   categoryMode?: 'auto' | 'manual'
@@ -364,6 +368,8 @@ function matchedSelectionTitleBannedWord(title: unknown, settings: Record<string
 const DEFAULTS = {
   candidateLimit: 5,
   candidatePoolTarget: 300,
+  candidatePoolMode: 'total' as 'total' | 'quota',
+  candidatePoolQuotas: [] as CandidatePoolQuotaRule[],
   candidateCollectorAccountIds: [] as number[],
   commissionRateRule: 'minimum' as const,
   selectionMode: 'general' as 'general' | 'category',
@@ -854,6 +860,15 @@ watch(error, (message) => {
 })
 
 const recoveryBatch = ref<SelectionRecoveryBatch | null>(null)
+const activeQuotaPool = computed(() => recoveryBatch.value?.payload.candidatePool as BatchCandidatePool | undefined)
+function formatQuotaRule(rule: CandidatePoolQuotaRule): string {
+  const category = quotaCategoryOptions.value.find((item) => item.path.join('|') === rule.categoryPath.join('|'))
+  return `${rule.sourceKey === 'allianceRank' ? `联盟榜单·${rule.rankBoard}` : rule.sourceKey === 'hotSpot' ? '选品热点' : '选品广场'} · ${category?.label ?? rule.categoryId}`
+}
+function quotaProgressLabel(ruleId: string): string {
+  const rule = activeQuotaPool.value?.quotaRules?.find((item) => item.id === ruleId)
+  return rule ? formatQuotaRule(rule) : ruleId
+}
 const recoverySelectionBatchId = ref<string | null>(null)
 const recoverySelectedAccountIds = ref<number[]>([])
 const pendingRecoveryAccounts = computed(() =>
@@ -1468,6 +1483,11 @@ async function loadGlobal(): Promise<void> {
   global.candidatePoolTarget = Number.isInteger(Number(settings.candidatePoolTarget)) &&
     Number(settings.candidatePoolTarget) >= 1 && Number(settings.candidatePoolTarget) <= 2000
     ? Number(settings.candidatePoolTarget) : cloneDefault().candidatePoolTarget
+  global.candidatePoolMode = settings.candidatePoolMode === 'quota' ? 'quota' : 'total'
+  global.candidatePoolQuotas = Array.isArray(settings.candidatePoolQuotas)
+    ? settings.candidatePoolQuotas.filter((item): item is CandidatePoolQuotaRule =>
+      Boolean(item && typeof item === 'object' && typeof item.id === 'string' && typeof item.categoryId === 'string' && Array.isArray(item.categoryPath)))
+    : []
   global.candidateCollectorAccountIds = Array.isArray(settings.candidateCollectorAccountIds)
     ? [...new Set(settings.candidateCollectorAccountIds.map(Number).filter((id) => Number.isSafeInteger(id) && id > 0))].slice(0, 2)
     : []
@@ -1714,6 +1734,72 @@ function hasSelectedPlatformFilters(value: unknown): boolean {
 }
 
 const level1Options = computed(() => categories.value)
+const quotaCategoryOptions = computed(() => {
+  const options: Array<{ id: string; path: string[]; label: string }> = []
+  const visit = (nodes: CategoryNode[], path: string[], names: string[]): void => {
+    for (const node of nodes) {
+      const nextPath = [...path, node.id]
+      const nextNames = [...names, node.name]
+      options.push({ id: node.id, path: nextPath, label: nextNames.join(' / ') })
+      if (nextPath.length < 3) visit(node.children ?? [], nextPath, nextNames)
+    }
+  }
+  visit(categories.value, [], [])
+  return options
+})
+const quotaPoolTarget = computed(() => global.candidatePoolQuotas.reduce((sum, rule) => sum + Number(rule.target || 0), 0))
+function addQuotaRule(): void {
+  const category = quotaCategoryOptions.value[0]
+  global.candidatePoolQuotas.push({
+    id: crypto.randomUUID(), sourceKey: 'allianceRank', rankBoard: '爆款榜',
+    categoryId: category?.id ?? '', categoryPath: category?.path ?? [], target: 10
+  })
+}
+function moveQuotaRule(index: number, step: number): void {
+  const next = index + step
+  if (next < 0 || next >= global.candidatePoolQuotas.length) return
+  const [rule] = global.candidatePoolQuotas.splice(index, 1)
+  global.candidatePoolQuotas.splice(next, 0, rule)
+}
+function setQuotaCategory(rule: CandidatePoolQuotaRule, pathKey: string): void {
+  const category = quotaCategoryOptions.value.find((item) => item.path.join('|') === pathKey)
+  rule.categoryId = category?.id ?? ''
+  rule.categoryPath = category?.path ?? []
+}
+function categoryIdMatches(left: string, right: string): boolean {
+  return left === right || left.split('__RC_CASCADER_SPLIT__').at(-1) === right.split('__RC_CASCADER_SPLIT__').at(-1)
+}
+function validateQuotaRules(
+  mode: 'total' | 'quota', rules: CandidatePoolQuotaRule[],
+  sourceSettings: SelectionFilterSettings['sources'], excluded: typeof DEFAULTS.excludedCategorySelection
+): number {
+  if (mode === 'total') return global.candidatePoolTarget
+  if (!Array.isArray(rules) || !rules.length) throw new Error('按品类配额模式至少需要一条规则。')
+  const seen = new Set<string>()
+  let total = 0
+  for (const [index, rule] of rules.entries()) {
+    const name = `第 ${index + 1} 条配额`
+    if (!['hotSpot', 'allianceRank', 'selectionSquare'].includes(rule.sourceKey) ||
+        sourceSettings[`${rule.sourceKey}Enabled` as keyof typeof sourceSettings] !== true) throw new Error(`${name}的来源未启用。`)
+    if (rule.sourceKey === 'allianceRank' && !['爆款榜', '趋势榜', '带货榜', '常销榜'].includes(rule.rankBoard)) {
+      throw new Error(`${name}的榜单类型无效。`)
+    }
+    if (!Number.isInteger(rule.target) || rule.target < 1 || rule.target > 2000) throw new Error(`${name}的目标数须为 1–2000。`)
+    const category = quotaCategoryOptions.value.find((item) => item.id === rule.categoryId &&
+      item.path.join('|') === rule.categoryPath?.join('|'))
+    if (!category || !category.path.length) throw new Error(`${name}缺少可核实的百应类目 ID；请刷新类目并重新选择。`)
+    if (category.path.some((id, level) => excluded[`level${level + 1}` as keyof typeof excluded]
+      .some((excludedId) => categoryIdMatches(id, excludedId)))) {
+      throw new Error(`${name}选择的品类已经被排除，不能计入配额。`)
+    }
+    const key = `${rule.sourceKey}|${rule.sourceKey === 'allianceRank' ? rule.rankBoard : ''}|${category.path.join('|')}`
+    if (seen.has(key)) throw new Error(`${name}与前面的来源、榜单及品类重复。`)
+    seen.add(key)
+    total += rule.target
+  }
+  if (total > 2000) throw new Error('各品类目标之和不能超过 2000 件。')
+  return total
+}
 const level2Options = computed(() => categories.value.filter((item) => global.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const level3Options = computed(() => level2Options.value.filter((item) => global.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
 const excludedLevel2Options = computed(() => categories.value.filter((item) => global.excludedCategorySelection.level1.includes(item.id)).flatMap((item) => item.children))
@@ -1805,6 +1891,7 @@ function excludedCategoryAction(level: CategoryLevel, scope: 'global' | 'account
 async function saveGlobal(): Promise<void> {
   error.value = ''
   try {
+    global.candidatePoolTarget = validateQuotaRules(global.candidatePoolMode, global.candidatePoolQuotas, global.sources, global.excludedCategorySelection)
     if (!Number.isInteger(global.candidatePoolTarget) || global.candidatePoolTarget < 1 || global.candidatePoolTarget > 2000) {
       throw new Error('共享候选池目标数须为 1–2000 的整数。')
     }
@@ -2159,11 +2246,164 @@ function candidateSourceLabels(candidate: SelectionCandidate): string {
   return (candidate.sources ?? []).map((source) => labels[source]).filter(Boolean).join('、')
 }
 
+async function collectBatchCandidatePoolByQuota(
+  batch: SelectionRecoveryBatch,
+  contexts: Map<number, AccountRunContext>
+): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean }> {
+  const snapshot = batch.payload.settingsSnapshot as Record<string, unknown>
+  const rules = snapshot.candidatePoolQuotas as CandidatePoolQuotaRule[]
+  const target = Number(snapshot.candidatePoolTarget)
+  const collectorIds = (snapshot.candidateCollectorAccountIds as number[]).map(Number)
+  if (!Array.isArray(rules) || !rules.length || rules.reduce((sum, rule) => sum + rule.target, 0) !== target ||
+      ![1, 2].includes(collectorIds.length) || new Set(collectorIds).size !== collectorIds.length) {
+    throw new Error('批次品类配额与采集账号快照无效，未开始消费账号选品。')
+  }
+  const filterFingerprint = stableJson({
+    mode: 'quota', rules, sources: snapshot.sources, thresholds: snapshot.thresholds,
+    filters: snapshot.filters, bannedWords: snapshot.bannedWords,
+    excludedCategorySelection: snapshot.excludedCategorySelection
+  })
+  const oldPool = batch.payload.candidatePool as BatchCandidatePool | undefined
+  const matches = oldPool?.mode === 'quota' && oldPool.target === target &&
+    oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') && oldPool.filterFingerprint === filterFingerprint
+  const rowsById = new Map<string, SelectionCandidate>()
+  if (matches) for (const row of oldPool?.rows ?? []) {
+    if (/^\d+$/.test(row.productId) && rules.some((rule) => rule.id === row.quotaRuleId)) rowsById.set(row.productId, row)
+  }
+  const sourceState: BatchCandidatePool['sourceState'] = matches && oldPool?.sourceState?.collectors
+    ? structuredClone(oldPool.sourceState) : { collectors: {} }
+  const countFor = (ruleId: string): number => [...rowsById.values()].filter((row) => row.quotaRuleId === ruleId).length
+  const ready = (): boolean => rules.every((rule) => countFor(rule.id) >= rule.target)
+  if (!ready() && collectorIds.some((id) => !contexts.has(id))) {
+    throw new Error('采集账号缺少可用的本地资源，已保留品类配额检查点。')
+  }
+  const savePool = async (newRows: SelectionCandidate[], collectorId: number): Promise<void> => {
+    const capturedAt = new Date().toISOString()
+    const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
+      mode: 'quota', quotaRules: rules, target, collectorAccountIds: collectorIds,
+      collectorAccountId: collectorId, capturedAt, filterFingerprint,
+      rows: newRows.map((row) => ({ ...row, collectedByAccountId: collectorId, capturedAt })), sourceState
+    })
+    const result = saved.pool as { count?: number } | undefined
+    if (Number(result?.count) !== rowsById.size) throw new Error('品类配额候选池落盘数量不一致，未进入消费阶段。')
+  }
+  let lastError = ''
+  for (const collectorId of collectorIds) {
+    if (ready()) break
+    const context = contexts.get(collectorId)!
+    const collectorState = sourceState.collectors[String(collectorId)] ?? { tabOffsets: {}, samePoolCount: 0, ruleStates: {} }
+    collectorState.ruleStates ??= {}
+    sourceState.collectors[String(collectorId)] = collectorState
+    let browserUsed = false
+    try {
+      for (const rule of rules) {
+        if (countFor(rule.id) >= rule.target) continue
+        const state: { samePoolCount: number; nextRetryAt?: string } = collectorState.ruleStates[rule.id] ?? { samePoolCount: 0 }
+        collectorState.ruleStates[rule.id] = state
+        if (state.nextRetryAt && Date.parse(state.nextRetryAt) > Date.now()) continue
+        for (let round = 0; round < 3 && countFor(rule.id) < rule.target; round += 1) {
+          const newRows: SelectionCandidate[] = []
+          let persisted = false
+          reportSelectionProgress(collectorId, '按品类只读采集共享候选池', {
+            itemIndex: countFor(rule.id), itemTotal: rule.target,
+            message: `${formatQuotaRule(rule)}：${countFor(rule.id)}/${rule.target}，第 ${round + 1} 轮。`
+          })
+          try {
+            browserUsed = true
+            const sources = snapshot.sources as SelectionFilterSettings['sources']
+            const selection = {
+              level1: rule.categoryPath.slice(0, 1), level2: rule.categoryPath.slice(1, 2),
+              level3: rule.categoryPath.slice(2, 3)
+            }
+            const preview = await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
+              profileKey: context.profileKey, profilePath: context.profilePath,
+              accountId: collectorId, downloadPath: context.downloadPath,
+              settings: {
+                ...context.settings, sources: {
+                  ...sources, hotSpotEnabled: rule.sourceKey === 'hotSpot',
+                  allianceRankEnabled: rule.sourceKey === 'allianceRank',
+                  selectionSquareEnabled: rule.sourceKey === 'selectionSquare', rankBoard: rule.rankBoard
+                },
+                thresholds: snapshot.thresholds, filters: snapshot.filters, bannedWords: snapshot.bannedWords,
+                excludedCategorySelection: snapshot.excludedCategorySelection,
+                selectionMode: rule.sourceKey === 'selectionSquare' ? 'category' : 'general',
+                categoryMode: rule.sourceKey === 'selectionSquare' ? 'manual' : 'auto',
+                categorySelection: selection,
+                _quotaCategoryPath: rule.categoryPath, _visibleSourcesOnly: true, _candidatePoolCollectOnly: true,
+                _candidatePoolScrollSteps: Math.min(24, Math.max(6, Math.ceil(rule.target / 20)))
+              }, previewOnly: true, closeAfterAutomation: true
+            }))
+            if (preview.ok !== true) throw new Error(String(preview.error ?? '品类采集失败'))
+            const capturedRows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
+            for (const row of capturedRows) {
+              if (countFor(rule.id) >= rule.target) break
+              if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() || rowsById.has(row.productId)) continue
+              const assigned = { ...row, quotaRuleId: rule.id }
+              rowsById.set(row.productId, assigned)
+              newRows.push(assigned)
+            }
+            state.samePoolCount = newRows.length ? 0 : state.samePoolCount + 1
+            state.nextRetryAt = newRows.length ? undefined : new Date(Date.now() + Math.min(30, 5 * 2 ** (state.samePoolCount - 1)) * 60_000).toISOString()
+            await savePool(newRows, collectorId)
+            persisted = true
+            await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
+              stage: '候选池采集', code: 'INFO_CANDIDATE_POOL_QUOTA',
+              message: `${formatQuotaRule(rule)} ${countFor(rule.id)}/${rule.target}，本轮新增 ${newRows.length} 件。`,
+              detail: '只读采集，未加车；商品 ID 跨规则去重。'
+            })
+            if (!newRows.length) break
+          } catch (cause) {
+            if (!persisted) for (const row of newRows) rowsById.delete(row.productId)
+            const rawError = String(cause instanceof Error ? cause.message : cause)
+            lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
+            await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
+              stage: '候选池采集', code: 'WARNING_CANDIDATE_POOL_QUOTA_READ',
+              message: `${formatQuotaRule(rule)} 本轮未能读取。`, detail: lastError
+            })
+            if (/11001|RATE_LIMIT|限流|验证码|安全验证|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) throw cause
+            break
+          }
+        }
+      }
+    } finally {
+      if (browserUsed) {
+        const closed = await window.api.browser.closeAccount({ accountId: collectorId, profilePath: context.profilePath })
+        if (closed.ok !== true) {
+          await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
+          throw new Error(`采集账号 ${collectorId} 浏览器关闭未确认，已停止后续账号。`)
+        }
+      }
+    }
+  }
+  if (!matches && rowsById.size === 0) await savePool([], collectorIds[0])
+  const refreshed = await runRecovery(['batch', 'latest'])
+  const currentBatch = refreshed.batch as SelectionRecoveryBatch | null
+  if (!currentBatch || currentBatch.batchId !== batch.batchId) throw new Error('品类配额检查点发生变化。')
+  const pool = currentBatch.payload.candidatePool as BatchCandidatePool
+  if (!pool || pool.status !== 'ready') {
+    const deficit = pool?.quotaProgress?.filter((item) => item.deficit > 0)
+      .map((item) => `${formatQuotaRule(rules.find((rule) => rule.id === item.ruleId)!)} 缺 ${item.deficit} 件`).join('；') ?? ''
+    await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
+      stage: '候选池采集', code: 'WARNING_CANDIDATE_POOL_TARGET_UNMET',
+      message: `品类配额未达标：${deficit}。消费账号尚未开始。`,
+      detail: lastError || '已保存逐行配额及商品 ID；等待来源产生可核实的新商品。'
+    })
+    const updated = await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
+    return { batch: updated.batch as SelectionRecoveryBatch, pool, ready: false }
+  }
+  if (currentBatch.state === 'needs_retry') {
+    const updated = await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'in_progress'])
+    return { batch: updated.batch as SelectionRecoveryBatch, pool, ready: true }
+  }
+  return { batch: currentBatch, pool, ready: true }
+}
+
 async function collectBatchCandidatePool(
   batch: SelectionRecoveryBatch,
   contexts: Map<number, AccountRunContext>
 ): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean }> {
   const snapshot = batch.payload.settingsSnapshot as Record<string, unknown> | undefined
+  if (snapshot?.candidatePoolMode === 'quota') return collectBatchCandidatePoolByQuota(batch, contexts)
   const target = Number(snapshot?.candidatePoolTarget)
   const collectorIds = Array.isArray(snapshot?.candidateCollectorAccountIds)
     ? (snapshot?.candidateCollectorAccountIds as unknown[]).map(Number) : []
@@ -5378,6 +5618,13 @@ async function runSelectionBatch(): Promise<void> {
       if (commissionRuleMigrationRequired.value) throw new Error('旧佣金设置按上限保存；请核对最低佣金率并保存通用设置后再新建批次。')
       const collectorIds = Array.isArray(snapshot.candidateCollectorAccountIds)
         ? snapshot.candidateCollectorAccountIds.map(Number) : []
+      const selectedPoolTarget = validateQuotaRules(
+        snapshot.candidatePoolMode === 'quota' ? 'quota' : 'total',
+        snapshot.candidatePoolQuotas as CandidatePoolQuotaRule[],
+        snapshot.sources as SelectionFilterSettings['sources'],
+        snapshot.excludedCategorySelection as typeof DEFAULTS.excludedCategorySelection
+      )
+      snapshot.candidatePoolTarget = selectedPoolTarget
       if (!Number.isInteger(Number(snapshot.candidatePoolTarget)) ||
           Number(snapshot.candidatePoolTarget) < 1 || Number(snapshot.candidatePoolTarget) > 2000 ||
           ![1, 2].includes(collectorIds.length) || new Set(collectorIds).size !== collectorIds.length ||
@@ -5415,7 +5662,7 @@ async function runSelectionBatch(): Promise<void> {
       if (!confirmSelectionScope(newBatchScopeFingerprint,
         `本批次将依次运行以下全部启用账号：\n\n${batchAccountSummary}\n\n` +
         `素材保存根目录（每账号独立，后续按日期和商品名称分层）：\n${batchPathSummary}\n\n` +
-        `先由采集账号 ${collectorIds.join('、')} 顺序只读采集，候选池达到 ${snapshot.candidatePoolTarget} 件后才开始消费账号。每次只启动当前账号的浏览器；消费账号按池内商品 ID 用自身百应登录态核验详情和加车，完成选品发布并关闭浏览器后才会启动下一个账号。`
+        `先由采集账号 ${collectorIds.join('、')} 顺序只读采集，${snapshot.candidatePoolMode === 'quota' ? '每条品类配额分别达标' : `候选池达到 ${snapshot.candidatePoolTarget} 件`}后才开始消费账号。每次只启动当前账号的浏览器；消费账号按池内商品 ID 用自身百应登录态核验详情和加车，完成选品发布并关闭浏览器后才会启动下一个账号。`
       )) {
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '已取消启动',
@@ -5496,7 +5743,12 @@ async function runSelectionBatch(): Promise<void> {
       batchPayload = batch.payload
       collectorPool = collected.pool
       if (!collected.ready) {
-        notice.value = `候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}，尚未达到设定目标；已保存检查点，消费账号未启动。`
+        const quotaDeficits = collectorPool?.mode === 'quota'
+          ? collectorPool.quotaProgress?.filter((item) => item.deficit > 0)
+            .map((item) => `${quotaProgressLabel(item.ruleId)} 缺 ${item.deficit} 件`).join('；') : ''
+        notice.value = quotaDeficits
+          ? `候选池品类配额尚未达标：${quotaDeficits}。已保存检查点，消费账号未启动。`
+          : `候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}，尚未达到设定目标；已保存检查点，消费账号未启动。`
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '候选池待补充',
           message: notice.value, percent: null
@@ -6832,8 +7084,39 @@ onUnmounted(() => {
           <section id="candidate-collector-pool" class="card">
             <h2>共享候选池采集</h2>
             <div class="form-grid">
-              <label>采集目标商品数<input v-model.number="global.candidatePoolTarget" type="number" min="1" max="2000" step="1"></label>
+              <label>池量设置方式<select v-model="global.candidatePoolMode" :disabled="busy">
+                <option value="total">总数目标</option><option value="quota">按来源和品类逐项配额</option>
+              </select></label>
             </div>
+            <div class="form-grid">
+              <label v-if="global.candidatePoolMode === 'total'">采集目标商品数<input v-model.number="global.candidatePoolTarget" type="number" min="1" max="2000" step="1"></label>
+            </div>
+            <template v-if="global.candidatePoolMode === 'quota'">
+              <p class="hint">每行分别达标后才开始各账号选品。规则按显示顺序分配，同一商品只计一次；被排除品类和缺少可核实类目 ID 的商品不计数。</p>
+              <div v-for="(rule, index) in global.candidatePoolQuotas" :key="rule.id" class="form-grid">
+                <label>来源<select v-model="rule.sourceKey" :disabled="busy">
+                  <option value="allianceRank">联盟榜单</option><option value="hotSpot">选品热点</option><option value="selectionSquare">选品广场</option>
+                </select></label>
+                <label v-if="rule.sourceKey === 'allianceRank'">榜单<select v-model="rule.rankBoard" :disabled="busy">
+                  <option>爆款榜</option><option>趋势榜</option><option>带货榜</option><option>常销榜</option>
+                </select></label>
+                <label>品类<select :value="rule.categoryPath.join('|')" :disabled="busy" @change="setQuotaCategory(rule, ($event.target as HTMLSelectElement).value)">
+                  <option value="">选择百应品类</option>
+                  <option v-for="category in quotaCategoryOptions" :key="category.path.join('|')" :value="category.path.join('|')">{{ category.label }}（{{ category.id }}）</option>
+                </select></label>
+                <label>目标件数<input v-model.number="rule.target" type="number" min="1" max="2000" step="1" :disabled="busy"></label>
+                <div><button type="button" :disabled="busy || index === 0" @click="moveQuotaRule(index, -1)">上移</button>
+                  <button type="button" :disabled="busy || index === global.candidatePoolQuotas.length - 1" @click="moveQuotaRule(index, 1)">下移</button>
+                  <button type="button" :disabled="busy" @click="global.candidatePoolQuotas.splice(index, 1)">删除</button></div>
+              </div>
+              <button type="button" :disabled="busy" @click="addQuotaRule">添加品类配额</button>
+              <p class="hint">配额合计：{{ quotaPoolTarget }} 件（最多 2000 件）。榜单默认爆款榜，可逐行选其他榜单。原有排除品类继续生效。</p>
+              <div v-if="activeQuotaPool?.mode === 'quota'">
+                <p v-for="progress in activeQuotaPool.quotaProgress" :key="progress.ruleId" class="hint">
+                  {{ quotaProgressLabel(progress.ruleId) }}：{{ progress.collected }}/{{ progress.target }}，缺 {{ progress.deficit }} 件
+                </p>
+              </div>
+            </template>
             <p class="hint">批次先由下列 1–2 个账号顺序只读采集，达到目标数量后，其他账号才从候选池领商品。采集账号也能参加后续选品。</p>
             <label v-for="account in selectionScopeAccounts" :key="account.id">
               <input v-model="global.candidateCollectorAccountIds" type="checkbox" :value="account.id" :disabled="busy || (!global.candidateCollectorAccountIds.includes(account.id) && (account.status !== 'active' || global.candidateCollectorAccountIds.length >= 2))">

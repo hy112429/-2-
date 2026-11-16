@@ -1,3 +1,14 @@
+export type CandidatePoolSource = 'hotSpot' | 'allianceRank' | 'selectionSquare'
+export type CandidatePoolRankBoard = '爆款榜' | '趋势榜' | '带货榜' | '常销榜'
+export interface CandidatePoolQuotaRule {
+  id: string
+  sourceKey: CandidatePoolSource
+  rankBoard: CandidatePoolRankBoard
+  categoryId: string
+  categoryPath: string[]
+  target: number
+}
+
 export interface SelectionFilterSettings {
   candidateLimit: number
   filters: {

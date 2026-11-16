@@ -7686,7 +7686,7 @@ def _read_priority_source_product_ids(
         finally:
             readiness_wait_ms = int((time.monotonic() - readiness_wait_started) * 1000)
 
-        snapshot = source_page.evaluate("""({ selector, listContainerSelectorArg, contentRootSelectorArg, loadingSelectorArg, emptyPattern, sourceKey }) => {
+        snapshot_script = """({ selector, listContainerSelectorArg, contentRootSelectorArg, loadingSelectorArg, emptyPattern, sourceKey }) => {
           const visible = (element) => {
             const rect = element.getBoundingClientRect();
             const style = getComputedStyle(element);
@@ -7999,14 +7999,16 @@ def _read_priority_source_product_ids(
             rootClassSamples: roots.slice(0, 5).map((element) => String(element.className || '').trim().slice(0, 100)),
             classHints
           };
-        }""", {
+        }"""
+        snapshot_args = {
             "selector": candidate_selector,
             "listContainerSelectorArg": list_container_selector,
             "contentRootSelectorArg": BAIYING_PRIORITY_CONTENT_ROOT_SELECTOR,
             "loadingSelectorArg": BAIYING_PRIORITY_ACTIVE_LOADING_SELECTOR,
             "emptyPattern": BAIYING_PRIORITY_EMPTY_PATTERN,
             "sourceKey": source_key,
-        })
+        }
+        snapshot = source_page.evaluate(snapshot_script, snapshot_args)
         if rate_limit_errors:
             raise RuntimeError(rate_limit_errors[-1] + "；已停止当前账号后续平台请求")
         if not isinstance(snapshot, dict):
@@ -8020,6 +8022,57 @@ def _read_priority_source_product_ids(
             dict(row) for row in raw_rows
             if isinstance(row, dict) and str(row.get("product_id") or "").strip()
         ]
+        quota_path_for_scroll = settings.get("_quotaCategoryPath") if isinstance(settings, dict) else None
+        if (ids and isinstance(quota_path_for_scroll, list) and quota_path_for_scroll and
+                isinstance(selected_tab, dict) and selected_tab.get("status") == "mapped" and
+                isinstance(selected_tab.get("categoryIds"), list) and selected_tab["categoryIds"] and
+                _category_id_matches(str(selected_tab["categoryIds"][0]), str(quota_path_for_scroll[0]))):
+            rows_by_id = {str(row["product_id"]): row for row in product_rows}
+            scroll_reads: list[Dict[str, Any]] = []
+            no_new = 0
+            try:
+                scroll_limit = max(1, min(24, int(settings.get("_candidatePoolScrollSteps", 6))))
+            except (TypeError, ValueError):
+                scroll_limit = 6
+            for _ in range(scroll_limit):
+                movement = source_page.evaluate("""({ selector }) => {
+                  const nodes = Array.from(document.querySelectorAll(selector));
+                  const candidates = new Set([document.scrollingElement]);
+                  for (const node of nodes) {
+                    for (let current = node, depth = 0; current && depth < 8; current = current.parentElement, depth++)
+                      candidates.add(current);
+                  }
+                  const scrollables = [...candidates].filter(node => node &&
+                    node.scrollHeight > node.clientHeight + 20 && node.clientHeight > 50);
+                  const target = scrollables.sort((a, b) => a.clientHeight - b.clientHeight)[0];
+                  if (!target) return { moved: false, position: 0 };
+                  const before = target.scrollTop;
+                  target.scrollTop = Math.min(target.scrollHeight, before + Math.max(300, target.clientHeight * 0.8));
+                  return { moved: target.scrollTop > before, position: target.scrollTop };
+                }""", {"selector": list_container_selector})
+                if not isinstance(movement, dict) or not movement.get("moved"):
+                    break
+                source_page.wait_for_timeout(550)
+                current_tabs = _source_category_tabs(source_page, source_key, category_tree)
+                if selected_tab and not any(tab["categoryId"] == selected_tab["categoryId"] and tab["selected"] for tab in current_tabs):
+                    raise RecoverablePrioritySourceReadError(f"{label}滚动后分类选中状态变化，停止计入品类配额")
+                next_snapshot = source_page.evaluate(snapshot_script, snapshot_args)
+                if rate_limit_errors:
+                    raise RuntimeError(rate_limit_errors[-1] + "；已停止当前账号后续平台请求")
+                next_rows = next_snapshot.get("rows") if isinstance(next_snapshot, dict) else []
+                before_count = len(rows_by_id)
+                for row in next_rows if isinstance(next_rows, list) else []:
+                    if isinstance(row, dict) and str(row.get("product_id") or "").isdigit():
+                        rows_by_id.setdefault(str(row["product_id"]), dict(row))
+                new_count = len(rows_by_id) - before_count
+                scroll_reads.append({"position": movement["position"], "newProductIds": new_count})
+                no_new = 0 if new_count else no_new + 1
+                if no_new >= 2:
+                    break
+            product_rows = list(rows_by_id.values())
+            ids.update(rows_by_id)
+            snapshot["quotaScrollReads"] = scroll_reads
+            snapshot["scrollPosition"] = scroll_reads[-1]["position"] if scroll_reads else snapshot.get("scrollPosition")
         if source_key == "hotSpot":
             config = settings.get("sources") if isinstance(settings, dict) and isinstance(settings.get("sources"), dict) else {}
             min_exposure = config.get("hotSpotMinExposure")
@@ -8087,6 +8140,7 @@ def _read_priority_source_product_ids(
                 "sourceCategoryTabs": tabs,
                 "sourceCategoryReadError": tab_read_error,
                 "selectedSourceCategory": selected_tab,
+                "quotaScrollReads": snapshot.get("quotaScrollReads", []),
                 "scrollPosition": snapshot.get("scrollPosition"),
                 "readAt": snapshot.get("readAt"),
                 "pagePath": snapshot.get("pagePath"),
@@ -8260,6 +8314,45 @@ def _collect_priority_source_ids(
         )
         try:
             product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key, category_tree, settings=settings)
+            quota_path = settings.get("_quotaCategoryPath")
+            if isinstance(quota_path, list) and quota_path:
+                tabs = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
+                matching_tabs = [tab for tab in tabs if isinstance(tab, dict) and tab.get("status") == "mapped"
+                                 and isinstance(tab.get("categoryIds"), list) and tab["categoryIds"]
+                                 and len(tab["categoryIds"]) <= len(quota_path)
+                                 and all(_category_id_matches(str(tab["categoryIds"][level]), str(quota_path[level]))
+                                         for level in range(len(tab["categoryIds"]))) ]
+                if matching_tabs:
+                    deepest = max(len(tab["categoryIds"]) for tab in matching_tabs)
+                    matching_tabs = [tab for tab in matching_tabs if len(tab["categoryIds"]) == deepest]
+                if len(matching_tabs) != 1:
+                    raise RecoverablePrioritySourceReadError(
+                        f"{label}无法唯一定位配额品类的稳定来源分类 ID；不计入该品类")
+                quota_tab = matching_tabs[0]
+                selected_category = evidence.get("selectedSourceCategory")
+                if not isinstance(selected_category, dict) or selected_category.get("categoryId") != quota_tab.get("categoryId"):
+                    product_ids, product_rows, evidence = _read_priority_source_product_ids(
+                        page, source_key, category_tree, category_tab=quota_tab, settings=settings)
+                for product_row in product_rows:
+                    source_category = product_row.get("_sourceCategory")
+                    product_row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
+                evidence["categoryTabReads"] = [{"categoryId": quota_tab.get("categoryId"), "productCount": len(product_ids)}]
+                evidence["categoryTabNextOffset"] = 0
+                evidence["categoryTabTotal"] = 1
+                # 配额模式只读取选中的分类，不混入“全部”页或其他分类商品。
+                membership[source_key] = product_ids
+                source_candidates[source_key] = product_rows
+                source_results.append({
+                    "sourceKey": source_key, "label": label, "status": "read" if product_ids else "empty",
+                    "productCount": len(product_ids), "parsedCandidateCount": len(product_rows),
+                    "categoryTabReads": evidence["categoryTabReads"], "categoryTabNextOffset": 0,
+                    "categoryTabTotal": 1, "rankSelection": evidence.get("rankSelection", {}),
+                    "quotaScrollReads": evidence.get("quotaScrollReads", []),
+                    "productIdFingerprint": hashlib.sha256("|".join(sorted(product_ids)).encode("utf-8")).hexdigest(),
+                    "readAt": evidence.get("readAt", ""), "pagePath": evidence.get("pagePath", ""),
+                    "scrollPosition": evidence.get("scrollPosition"),
+                })
+                continue
             by_product = {str(row["product_id"]): row for row in product_rows}
             for row in by_product.values():
                 source_category = row.get("_sourceCategory")
@@ -8636,7 +8729,10 @@ def _collect_selection_square_rows(
     selection_mode = "category" if settings.get("selectionMode") == "category" else "general"
     category_mode = "manual" if settings.get("categoryMode") == "manual" else "auto"
     query_base = copy.deepcopy(settings)
-    if selection_mode != "category" or category_mode != "manual":
+    if isinstance(settings.get("_quotaCategoryPath"), list) and settings["_quotaCategoryPath"]:
+        # 单条配额只查询用户指定的类目路径，不把一级规则展开成全部末级查询。
+        queries = [query_base]
+    elif selection_mode != "category" or category_mode != "manual":
         query_base["categorySelection"] = {"level1": [], "level2": [], "level3": []}
         queries = [query_base]
     else:
@@ -8668,7 +8764,7 @@ def _collect_selection_square_rows(
                     _page_applied_filter_signature(page), query_settings
                 )
             ),
-            replace_category_selection=len(queries) > 1,
+            replace_category_selection=len(queries) > 1 or bool(settings.get("_quotaCategoryPath")),
         )
         payload = _get_cached_material_list(id(page), _selection_filter_signature(query_settings))
         if payload is None:
@@ -8942,7 +9038,8 @@ def _collector_candidate_pool_result(
         candidate["sourceKey"] = sources[0] if sources else ""
     excluded_categories = _excluded_category_selection_ids(settings)
     included_categories = _manual_category_selection_ids(settings) if settings.get("selectionMode") == "category" and settings.get("categoryMode") == "manual" else set()
-    category_required = bool(excluded_categories) or settings.get("selectionMode") == "category"
+    quota_path = settings.get("_quotaCategoryPath") if isinstance(settings.get("_quotaCategoryPath"), list) else []
+    category_required = bool(excluded_categories) or settings.get("selectionMode") == "category" or bool(quota_path)
     excluded_selection = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
     only_root_exclusions = bool(excluded_selection.get("level1")) and not excluded_selection.get("level2") and not excluded_selection.get("level3")
     if category_required:
@@ -8951,19 +9048,36 @@ def _collector_candidate_pool_result(
             category_ids = candidate.get("categoryIds") or []
             raw_source_categories = by_product.get(str(candidate.get("productId") or ""), {}).get("_sourceCategories")
             source_categories = raw_source_categories if isinstance(raw_source_categories, list) else []
+            source_paths = {
+                tuple(str(value) for value in item["categoryIds"])
+                for item in source_categories if isinstance(item, dict)
+                and isinstance(item.get("categoryIds"), list) and item["categoryIds"]
+            }
             source_roots = {
                 str(item["categoryIds"][0]) for item in source_categories if isinstance(item, dict)
                 and isinstance(item.get("categoryIds"), list) and item["categoryIds"]
             }
             if len(category_ids) != 3:
-                if settings.get("selectionMode") == "general" and only_root_exclusions and len(source_roots) == 1:
-                    source_root = next(iter(source_roots))
-                    if any(_category_id_matches(source_root, _category_id_scalar(item)) for item in excluded_selection.get("level1", [])):
-                        candidate["thresholdReasons"] = ["来源分类属于已排除一级类目"]
+                source_path = next(iter(source_paths)) if len(source_paths) == 1 else ()
+                source_matches_quota = bool(quota_path) and len(source_path) >= len(quota_path) and all(
+                    _category_id_matches(source_path[index], str(expected))
+                    for index, expected in enumerate(quota_path)
+                )
+                deeper_exclusions = any(excluded_selection.get(f"level{level}") for level in range(len(source_path) + 1, 4))
+                source_excluded = any(
+                    _category_id_matches(source_path[level - 1], _category_id_scalar(excluded))
+                    for level in range(1, len(source_path) + 1)
+                    for excluded in excluded_selection.get(f"level{level}", [])
+                )
+                if settings.get("selectionMode") == "general" and source_path and not deeper_exclusions and (
+                    source_matches_quota or (only_root_exclusions and len(source_roots) == 1)
+                ):
+                    if source_excluded:
+                        candidate["thresholdReasons"] = ["来源分类属于已排除类目"]
                         rejected.append(candidate)
                     else:
                         candidate["categoryStatus"] = "source_level"
-                        candidate["sourceCategoryIds"] = [source_root]
+                        candidate["sourceCategoryIds"] = list(source_path)
                         ready.append(candidate)
                 else:
                     candidate["thresholdReasons"] = ["采集阶段缺少足以判断排除条件的类目数据；不计入达标池量"]
@@ -8977,6 +9091,22 @@ def _collector_candidate_pool_result(
             else:
                 ready.append(candidate)
         candidates = ready
+    if quota_path:
+        matching: list[Dict[str, Any]] = []
+        for candidate in candidates:
+            ids = candidate.get("categoryIds") if isinstance(candidate.get("categoryIds"), list) else []
+            if len(ids) >= len(quota_path) and all(_category_id_matches(str(ids[index]), str(expected))
+                                                      for index, expected in enumerate(quota_path)):
+                matching.append(candidate)
+            elif (candidate.get("categoryStatus") == "source_level" and
+                  len(candidate.get("sourceCategoryIds", [])) >= len(quota_path) and
+                  all(_category_id_matches(str(candidate["sourceCategoryIds"][index]), str(expected))
+                      for index, expected in enumerate(quota_path))):
+                matching.append(candidate)
+            else:
+                candidate["thresholdReasons"] = ["商品类目未能精确匹配本条品类配额"]
+                rejected.append(candidate)
+        candidates = matching
     for index, candidate in enumerate(candidates):
         product_id = str(candidate.get("productId") or "")
         candidate["categoryStatus"] = "known" if len(candidate.get("categoryIds") or []) == 3 else candidate.get("categoryStatus") or "unknown"
