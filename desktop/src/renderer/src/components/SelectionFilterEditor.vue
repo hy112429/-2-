@@ -12,6 +12,7 @@ const props = withDefaults(defineProps<{
   modelValue: SelectionFilterSettings
   filterGroups: Record<string, FilterField[]>
   featureOptions: string[]
+  rankCategoryOptions?: Array<{ path: string[]; label: string }>
   filterCatalogUpdatedAt?: string
   title?: string
   disabled?: boolean
@@ -22,7 +23,8 @@ const props = withDefaults(defineProps<{
   title: '选品条件',
   disabled: false,
   showSync: false,
-  syncing: false
+  syncing: false,
+  rankCategoryOptions: () => []
 })
 
 const emit = defineEmits<{
@@ -117,6 +119,11 @@ function setSourceOption<K extends keyof SelectionFilterSettings['sources']>(key
   update((settings) => { settings.sources[key] = value })
 }
 
+function setRankCategory(pathKey: string): void {
+  const category = props.rankCategoryOptions.find((item) => item.path.join('|') === pathKey)
+  setSourceOption('rankCategoryPath', category ? [...category.path] : [])
+}
+
 function moveSource(index: number, delta: number): void {
   const nextIndex = index + delta
   if (nextIndex < 0 || nextIndex >= props.modelValue.sources.priority.length) return
@@ -168,7 +175,15 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
         <label>榜单<select :value="modelValue.sources.rankBoard" :disabled="disabled" @change="setSourceOption('rankBoard', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankBoard'])"><option>爆款榜</option><option>趋势榜</option><option>带货榜</option><option>常销榜</option></select></label>
         <label>榜单数据周期<select :value="modelValue.sources.rankPeriod" :disabled="disabled" @change="setSourceOption('rankPeriod', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankPeriod'])"><option>实时</option><option>昨日</option><option>近7日</option><option>近30日</option></select></label>
         <label>榜单载体<select :value="modelValue.sources.rankCarrier" :disabled="disabled" @change="setSourceOption('rankCarrier', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankCarrier'])"><option>不限载体</option><option>短视频</option><option>直播</option><option>橱窗</option><option>图文</option></select></label>
+        <label>榜单分类<select :value="modelValue.sources.rankCategoryPath.join('|')" :disabled="disabled" @change="setRankCategory(($event.target as HTMLSelectElement).value)">
+          <option value="">总榜（全部分类）</option>
+          <option v-for="category in rankCategoryOptions" :key="category.path.join('|')" :value="category.path.join('|')">{{ category.label }}</option>
+        </select></label>
+        <label>榜单售价区间<select :value="modelValue.sources.rankPriceRange" :disabled="disabled" @change="setSourceOption('rankPriceRange', ($event.target as HTMLSelectElement).value as SelectionFilterSettings['sources']['rankPriceRange'])">
+          <option>不限</option><option>1-10</option><option>10-50</option><option>50-100</option><option>100-500</option><option>500-5000</option><option>5000+</option>
+        </select></label>
       </div>
+      <p v-if="modelValue.sources.allianceRankEnabled" class="hint">榜单佣金率、体验分沿用上方统一阈值；售价与分类只作用于榜单。分类按百应稳定 ID 选中并回读，原有排除类目继续生效。</p>
       <div v-if="modelValue.sources.hotSpotEnabled" class="form-grid">
         <label>热点最低曝光热度（万次）<input :value="modelValue.sources.hotSpotMinExposure ?? ''" type="number" min="0" step="0.01" placeholder="不限" :disabled="disabled" @input="setSourceOption('hotSpotMinExposure', ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value))"></label>
         <label>热点最低关联商品数<input :value="modelValue.sources.hotSpotMinRelatedProducts ?? ''" type="number" min="0" placeholder="不限" :disabled="disabled" @input="setSourceOption('hotSpotMinRelatedProducts', ($event.target as HTMLInputElement).value === '' ? null : Number(($event.target as HTMLInputElement).value))"></label>

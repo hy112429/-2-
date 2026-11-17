@@ -39,7 +39,7 @@ public class RegistryController {
 
     public record Candidate(
             @NotBlank @Size(max = 96) String productId,
-            @NotBlank @Size(max = 96) String leafCategoryId,
+            @Size(max = 96) String leafCategoryId,
             @Size(max = 512) String title) {}
     public record ReserveRequest(
             @NotBlank String requestId,
@@ -51,7 +51,8 @@ public class RegistryController {
             @NotBlank @Size(max = 96) String productId,
             @Size(max = 128) String accountKey,
             @Size(max = 96) String leafCategoryId,
-            @Size(max = 512) String title) {}
+            @Size(max = 512) String title,
+            @Size(max = 16) String state) {}
     public record ImportRequest(@NotEmpty @Size(max = 5000) List<@Valid ImportItem> items) {}
 
     @GetMapping("/health")
@@ -116,7 +117,7 @@ public class RegistryController {
 
     private Map<String, Object> reserveOne(UUID requestId, String account, Candidate item) {
         String productId = item.productId().trim();
-        String categoryId = item.leafCategoryId().trim();
+        String categoryId = item.leafCategoryId() == null ? "" : item.leafCategoryId().trim();
         List<Map<String, Object>> retry = jdbc.query(
                 "SELECT reservation_token,state,account_key,leaf_category_id FROM selection_reservation WHERE request_id=? AND product_id=?",
                 (rs, row) -> Map.of("token", rs.getString(1), "state", rs.getString(2), "account", rs.getString(3), "category", rs.getString(4)),
@@ -129,17 +130,19 @@ public class RegistryController {
         }
         List<String> productStates = jdbc.query("SELECT state FROM selection_reservation WHERE product_id=?", (rs, row) -> rs.getString(1), productId);
         if (!productStates.isEmpty() && !"RELEASED".equals(productStates.get(0))) return rejected(productId, "PRODUCT_ALREADY_REGISTERED");
-        List<String> categoryStates = jdbc.query(
+        List<String> categoryStates = categoryId.isEmpty() ? List.of() : jdbc.query(
                 "SELECT state FROM account_category_history WHERE account_key=? AND leaf_category_id=?",
                 (rs, row) -> rs.getString(1), account, categoryId);
         if (!categoryStates.isEmpty() && !"RELEASED".equals(categoryStates.get(0))) return rejected(productId, "ACCOUNT_CATEGORY_ALREADY_USED");
 
         String token = UUID.randomUUID().toString();
-        try {
-            jdbc.update("INSERT INTO account_category_history(account_key,leaf_category_id,product_id,state) VALUES(?,?,?,'RESERVED')",
-                    account, categoryId, productId);
-        } catch (DuplicateKeyException conflict) {
-            return rejected(productId, "ACCOUNT_CATEGORY_ALREADY_USED");
+        if (!categoryId.isEmpty()) {
+            try {
+                jdbc.update("INSERT INTO account_category_history(account_key,leaf_category_id,product_id,state) VALUES(?,?,?,'RESERVED')",
+                        account, categoryId, productId);
+            } catch (DuplicateKeyException conflict) {
+                return rejected(productId, "ACCOUNT_CATEGORY_ALREADY_USED");
+            }
         }
         if (productStates.isEmpty()) {
             try {
@@ -259,14 +262,20 @@ public class RegistryController {
     public Map<String, Object> importHistory(@Valid @RequestBody ImportRequest request) {
         int imported = 0;
         for (ImportItem item : request.items()) {
+            String state = item.state() == null || item.state().isBlank() ? "COMMITTED" : item.state().trim().toUpperCase();
+            if (!"COMMITTED".equals(state) && !"UNCERTAIN".equals(state))
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "import state must be COMMITTED or UNCERTAIN");
+        }
+        for (ImportItem item : request.items()) {
+            String importedState = item.state() == null || item.state().isBlank() ? "COMMITTED" : item.state().trim().toUpperCase();
             transactions.executeWithoutResult(status -> {
-                int count = jdbc.update("INSERT IGNORE INTO selection_reservation(product_id,reservation_token,request_id,account_key,leaf_category_id,title,state) VALUES(?,?,?,?,?,?, 'COMMITTED')",
+                int count = jdbc.update("INSERT IGNORE INTO selection_reservation(product_id,reservation_token,request_id,account_key,leaf_category_id,title,state) VALUES(?,?,?,?,?,?,?)",
                         item.productId().trim(), UUID.randomUUID().toString(), UUID.randomUUID().toString(),
                         item.accountKey() == null || item.accountKey().isBlank() ? "legacy-unmapped" : item.accountKey().trim(),
-                        item.leafCategoryId() == null || item.leafCategoryId().isBlank() ? "legacy-unmapped-" + item.productId().trim() : item.leafCategoryId().trim(), item.title());
+                        item.leafCategoryId() == null ? "" : item.leafCategoryId().trim(), item.title(), importedState);
                 if (count == 1 && item.accountKey() != null && !item.accountKey().isBlank() && item.leafCategoryId() != null && !item.leafCategoryId().isBlank()) {
-                    jdbc.update("INSERT IGNORE INTO account_category_history(account_key,leaf_category_id,product_id,state) VALUES(?,?,?,'COMMITTED')",
-                            item.accountKey().trim(), item.leafCategoryId().trim(), item.productId().trim());
+                    jdbc.update("INSERT IGNORE INTO account_category_history(account_key,leaf_category_id,product_id,state) VALUES(?,?,?,?,?)",
+                            item.accountKey().trim(), item.leafCategoryId().trim(), item.productId().trim(), importedState);
                 }
             });
             imported++;

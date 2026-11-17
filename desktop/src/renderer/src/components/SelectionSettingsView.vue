@@ -379,7 +379,7 @@ const DEFAULTS = {
   filters: { delivery: {} as Record<string, unknown>, product: {} as Record<string, unknown>, features: [] as string[] },
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
-  sources: { hotSpotEnabled: true, allianceRankEnabled: true, selectionSquareEnabled: true, rankBoard: '爆款榜' as SelectionFilterSettings['sources']['rankBoard'], rankPeriod: '昨日' as SelectionFilterSettings['sources']['rankPeriod'], rankCarrier: '不限载体' as SelectionFilterSettings['sources']['rankCarrier'], hotSpotMinExposure: null as number | null, hotSpotMinRelatedProducts: null as number | null, priority: ['hotSpot', 'allianceRank'] as Array<'hotSpot' | 'allianceRank'> },
+  sources: { hotSpotEnabled: true, allianceRankEnabled: true, selectionSquareEnabled: true, rankBoard: '爆款榜' as SelectionFilterSettings['sources']['rankBoard'], rankPeriod: '昨日' as SelectionFilterSettings['sources']['rankPeriod'], rankCarrier: '不限载体' as SelectionFilterSettings['sources']['rankCarrier'], rankPriceRange: '不限' as SelectionFilterSettings['sources']['rankPriceRange'], rankCategoryPath: [] as string[], hotSpotMinExposure: null as number | null, hotSpotMinRelatedProducts: null as number | null, priority: ['hotSpot', 'allianceRank'] as Array<'hotSpot' | 'allianceRank'> },
   thresholds: { salesAmount: null as number | null, salesCount: null as number | null, conversionRate: null as number | null, views: null as number | null, commissionRate: null as number | null, commissionRateMax: null as number | null, experienceScore: null as number | null },
   trendPreference: '上升优先',
   bannedWords: [...DEFAULT_BANNED_WORDS],
@@ -508,7 +508,7 @@ function workflowIndexForStage(stageValue: string, mode: SelectionProgressState[
   if (/发布|投稿|队列|上传视频|创作者中心|封面|关联百应|发布选项/.test(stage)) return 7
   if (/登记加车配额|记录(?:加车|商品|选品车)?配额|配额记录/.test(stage)) return 5
   if (/加车|核验并处理|处理选中商品|商品数据分析|选品车|候选商品处理/.test(stage)) return 4
-  if (/评分|筛选与互斥|类目推荐|推荐类目|互斥分配|候选分配|ID 去重|ID去重|本机登记|核对本机选品记录|保存选品批次|候选计划已就绪|候选统一/.test(stage)) return 3
+  if (/评分|筛选与互斥|类目推荐|推荐类目|互斥分配|候选分配|ID 去重|ID去重|选品登记|保存选品批次|候选计划已就绪|候选统一/.test(stage)) return 3
   if (/统一采集|百应筛选|获取候选|候选预览|查询百应候选|应用选品条件|material_list|来源|热点|联盟|榜单|商品列表/.test(stage)) return 1
   if (/账号配额预检/.test(stage)) return 0
   if (/每日配额|剩余配额|账号配额|quota_check/.test(stage)) return 2
@@ -1950,6 +1950,11 @@ function validateCommissionRange(lower: number | null | undefined, upper: number
 
 function validateCandidateSources(sources: SelectionFilterSettings['sources'], scope: string): void {
   if (!sources.hotSpotEnabled && !sources.allianceRankEnabled && !sources.selectionSquareEnabled) throw new Error(`${scope}至少启用一个候选来源。`)
+  if (!['不限', '1-10', '10-50', '50-100', '100-500', '500-5000', '5000+'].includes(sources.rankPriceRange)) throw new Error(`${scope}榜单售价区间无效。`)
+  if (!Array.isArray(sources.rankCategoryPath) || sources.rankCategoryPath.length > 3 ||
+      (sources.rankCategoryPath.length > 0 && !quotaCategoryOptions.value.some((category) => category.path.join('|') === sources.rankCategoryPath.join('|')))) {
+    throw new Error(`${scope}榜单分类 ID 无效；请同步类目后重新选择。`)
+  }
   for (const value of [sources.hotSpotMinExposure, sources.hotSpotMinRelatedProducts]) {
     if (value != null && (!Number.isFinite(value) || value < 0)) throw new Error(`${scope}热点条件须为非负数。`)
   }
@@ -2188,7 +2193,7 @@ async function filterByLocalRegistry(
   excluded: Array<{ candidate: SelectionCandidate; reason: string }>
   recommendations: Array<{ categoryId: string; highScoreCount: number; averageScore: number }>
 }> {
-  if (!accountKey.trim()) throw new Error('账号本机标识无效，无法读取本机选品历史。')
+  if (!accountKey.trim()) throw new Error('账号标识无效，无法读取选品登记历史。')
   const snapshot = await window.api.browser.getSelectionRegistrySnapshot(accountKey, rows.map((candidate) => ({
     productId: candidate.productId,
     leafCategoryId: candidateLeafCategoryId(candidate)
@@ -2202,7 +2207,7 @@ function filterRowsByLocalRegistry(
     usedProductIds: string[]
     accountUsedCategoryIds: string[]
     categoryUsage: Record<string, number>
-    mode: 'local'
+    mode: 'local' | 'server'
   },
   targetCount: number,
   selectionMode: 'general' | 'category',
@@ -2246,6 +2251,20 @@ function candidateSourceLabels(candidate: SelectionCandidate): string {
   return (candidate.sources ?? []).map((source) => labels[source]).filter(Boolean).join('、')
 }
 
+function registryAccountKey(accountId: number): string {
+  const douyinId = String(accounts.value.find((account) => account.id === accountId)?.douyin_id ?? '').trim()
+  return /^[-\w.]{1,96}$/.test(douyinId) ? `local:${accountId}|douyin:${douyinId}` : `local:${accountId}`
+}
+
+async function occupiedPoolProductIds(rows: SelectionCandidate[], collectorId: number): Promise<Set<string>> {
+  if (!rows.length) return new Set()
+  const snapshot = await window.api.browser.getSelectionRegistrySnapshot(registryAccountKey(collectorId), rows.map((row) => ({
+    productId: row.productId,
+    leafCategoryId: candidateLeafCategoryId(row)
+  })))
+  return new Set(snapshot.usedProductIds.map(String))
+}
+
 async function collectBatchCandidatePoolByQuota(
   batch: SelectionRecoveryBatch,
   contexts: Map<number, AccountRunContext>
@@ -2270,22 +2289,26 @@ async function collectBatchCandidatePoolByQuota(
   if (matches) for (const row of oldPool?.rows ?? []) {
     if (/^\d+$/.test(row.productId) && rules.some((rule) => rule.id === row.quotaRuleId)) rowsById.set(row.productId, row)
   }
+  const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0])
+  for (const productId of occupiedOldIds) rowsById.delete(productId)
   const sourceState: BatchCandidatePool['sourceState'] = matches && oldPool?.sourceState?.collectors
     ? structuredClone(oldPool.sourceState) : { collectors: {} }
   const countFor = (ruleId: string): number => [...rowsById.values()].filter((row) => row.quotaRuleId === ruleId).length
   const ready = (): boolean => rules.every((rule) => countFor(rule.id) >= rule.target)
-  if (!ready() && collectorIds.some((id) => !contexts.has(id))) {
-    throw new Error('采集账号缺少可用的本地资源，已保留品类配额检查点。')
-  }
   const savePool = async (newRows: SelectionCandidate[], collectorId: number): Promise<void> => {
     const capturedAt = new Date().toISOString()
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
       mode: 'quota', quotaRules: rules, target, collectorAccountIds: collectorIds,
       collectorAccountId: collectorId, capturedAt, filterFingerprint,
-      rows: newRows.map((row) => ({ ...row, collectedByAccountId: collectorId, capturedAt })), sourceState
+      rows: newRows.map((row) => ({ ...row, collectedByAccountId: collectorId, capturedAt })),
+      excludedProductIds: [...occupiedOldIds], sourceState
     })
     const result = saved.pool as { count?: number } | undefined
     if (Number(result?.count) !== rowsById.size) throw new Error('品类配额候选池落盘数量不一致，未进入消费阶段。')
+  }
+  if (occupiedOldIds.size) await savePool([], collectorIds[0])
+  if (!ready() && collectorIds.some((id) => !contexts.has(id))) {
+    throw new Error('采集账号缺少可用的本地资源，已保留品类配额检查点。')
   }
   let lastError = ''
   for (const collectorId of collectorIds) {
@@ -2335,9 +2358,11 @@ async function collectBatchCandidatePoolByQuota(
             }))
             if (preview.ok !== true) throw new Error(String(preview.error ?? '品类采集失败'))
             const capturedRows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
+            const occupiedNewIds = await occupiedPoolProductIds(capturedRows, collectorId)
             for (const row of capturedRows) {
               if (countFor(rule.id) >= rule.target) break
-              if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() || rowsById.has(row.productId)) continue
+              if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() ||
+                  rowsById.has(row.productId) || occupiedNewIds.has(row.productId)) continue
               const assigned = { ...row, quotaRuleId: rule.id }
               rowsById.set(row.productId, assigned)
               newRows.push(assigned)
@@ -2349,7 +2374,7 @@ async function collectBatchCandidatePoolByQuota(
             await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
               stage: '候选池采集', code: 'INFO_CANDIDATE_POOL_QUOTA',
               message: `${formatQuotaRule(rule)} ${countFor(rule.id)}/${rule.target}，本轮新增 ${newRows.length} 件。`,
-              detail: '只读采集，未加车；商品 ID 跨规则去重。'
+              detail: `只读采集，未加车；已登记 ID 入池前排除 ${occupiedNewIds.size} 件，商品 ID 跨规则去重。`
             })
             if (!newRows.length) break
           } catch (cause) {
@@ -2415,11 +2440,8 @@ async function collectBatchCandidatePool(
   })
   const oldPool = batch.payload.candidatePool as BatchCandidatePool | undefined
   const poolConfigMatches = oldPool?.target === target && oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') && oldPool.filterFingerprint === filterFingerprint
-  const poolAlreadyReady = Boolean(oldPool && poolConfigMatches &&
-    Array.isArray(oldPool.rows) && oldPool.rows.length >= target)
   if (!Number.isInteger(target) || target < 1 || target > 2000 || ![1, 2].includes(collectorIds.length) ||
-      new Set(collectorIds).size !== collectorIds.length ||
-      (!poolAlreadyReady && collectorIds.some((id) => !contexts.has(id)))) {
+      new Set(collectorIds).size !== collectorIds.length) {
     throw new Error('批次候选池缺少有效的目标数量或 1–2 个已启用采集账号；未开始消费账号选品。')
   }
   const rowsById = new Map<string, SelectionCandidate>()
@@ -2428,6 +2450,8 @@ async function collectBatchCandidatePool(
       if (/^\d+$/.test(String(row.productId ?? ''))) rowsById.set(row.productId, row)
     }
   }
+  const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0])
+  for (const productId of occupiedOldIds) rowsById.delete(productId)
   const sourceState: BatchCandidatePool['sourceState'] = oldPool && poolConfigMatches && oldPool.sourceState?.collectors
     ? structuredClone(oldPool.sourceState) : { collectors: {} }
   const savePool = async (rows: SelectionCandidate[], collectorAccountId: number): Promise<void> => {
@@ -2435,12 +2459,16 @@ async function collectBatchCandidatePool(
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
       target, collectorAccountIds: collectorIds, collectorAccountId, capturedAt, filterFingerprint,
       rows: rows.map((row) => ({ ...row, collectedByAccountId: collectorAccountId, capturedAt })),
-      sourceState
+      excludedProductIds: [...occupiedOldIds], sourceState
     })
     const summary = saved.pool as { count?: number } | undefined
     if (Number(summary?.count ?? rowsById.size) !== rowsById.size) {
       throw new Error('候选池落盘数量与本轮内存商品 ID 数不一致；已停止进入消费阶段。')
     }
+  }
+  if (occupiedOldIds.size) await savePool([], collectorIds[0])
+  if (rowsById.size < target && collectorIds.some((id) => !contexts.has(id))) {
+    throw new Error('剔除已登记商品后候选池未达目标，采集账号资源不可用；已保留检查点。')
   }
   let lastError = ''
   if (rowsById.size < target) {
@@ -2453,6 +2481,8 @@ async function collectBatchCandidatePool(
       for (let round = 0; round < 3 && rowsById.size < target; round += 1) {
         const before = rowsById.size
         const priorOffsets = JSON.stringify(collectorState.tabOffsets)
+        const newRows: SelectionCandidate[] = []
+        let persisted = false
         reportSelectionProgress(collectorId, '只读采集共享候选池', {
           itemIndex: before, itemTotal: target,
           message: `采集账号 ${collectorId}：候选池 ${before}/${target}，第 ${round + 1} 轮读取。`
@@ -2477,9 +2507,10 @@ async function collectBatchCandidatePool(
           }))
           if (preview.ok !== true) throw new Error(String(preview.error ?? '只读采集失败'))
           const capturedRows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
-          const newRows: SelectionCandidate[] = []
+          const occupiedNewIds = await occupiedPoolProductIds(capturedRows, collectorId)
           for (const row of capturedRows) {
-            if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() || rowsById.has(row.productId)) continue
+            if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() ||
+                rowsById.has(row.productId) || occupiedNewIds.has(row.productId)) continue
             rowsById.set(row.productId, row)
             newRows.push(row)
           }
@@ -2509,13 +2540,15 @@ async function collectBatchCandidatePool(
             collectorState.nextRetryAt = new Date(Date.now() + minutes * 60_000).toISOString()
           }
           await savePool(newRows, collectorId)
+          persisted = true
           await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
             stage: '候选池采集', code: 'INFO_CANDIDATE_POOL_COLLECTED',
             message: `采集账号 ${collectorId} 本轮新增 ${newRows.length} 件，池内 ${rowsById.size}/${target}。`,
-            detail: `${sourceSummary}；统一条件淘汰或待核验 ${rejectedCount} 件：${rejectionSummary}。来源分类游标已保存；只读采集，未加车或计入账号配额。`
+            detail: `${sourceSummary}；已登记 ID 入池前排除 ${occupiedNewIds.size} 件；统一条件淘汰或待核验 ${rejectedCount} 件：${rejectionSummary}。来源分类游标已保存；只读采集，未加车或计入账号配额。`
           })
           if (!newRows.length && priorOffsets === JSON.stringify(collectorState.tabOffsets)) break
         } catch (cause) {
+          if (!persisted) for (const row of newRows) rowsById.delete(row.productId)
           const rawError = String(cause instanceof Error ? cause.message : cause)
           lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
           await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
@@ -2777,16 +2810,16 @@ async function prepareBatchCandidatePlans(
 
   if (pendingByAccount.size) {
     for (const account of pendingByAccount.keys()) {
-      reportSelectionProgress(account, '核对本机选品记录', {
+      reportSelectionProgress(account, '核对选品登记记录', {
         accountIndex: orderedTargets.findIndex((item) => item.id === account) + 1,
         accountTotal: orderedTargets.length,
-        message: `正在把 ${pendingByAccount.size} 个账号的候选 ID 合并查询本机登记。`
+        message: `正在查询 ${pendingByAccount.size} 个账号的商品 ID 登记。`
       })
     }
   }
   const registrySnapshots = await window.api.browser.getSelectionRegistryBatchSnapshot(
     [...pendingByAccount.values()].map(({ account, rows }) => ({
-      accountKey: `local:${account.id}`,
+      accountKey: registryAccountKey(account.id),
       candidates: rows.map((candidate) => ({
         productId: candidate.productId,
         leafCategoryId: candidateLeafCategoryId(candidate)
@@ -2798,7 +2831,7 @@ async function prepareBatchCandidatePlans(
     const pending = pendingByAccount.get(account.id)
     if (!pending) continue
     const { settings, preview, quota, rows: rawRows, targetCount } = pending
-    const snapshot = registrySnapshots[`local:${account.id}`]
+    const snapshot = registrySnapshots[registryAccountKey(account.id)]
     if (!snapshot) throw new Error(`账号「${account.name}」缺少本机商品 ID 查重结果；已停止本轮选品。`)
     const registry = filterRowsByLocalRegistry(
       rawRows,
@@ -3227,6 +3260,25 @@ async function executeAccountSelection(
       fetched.length > 0 && selectedIndexes.length > 0,
       completed
     )
+    if (poolConsumerOnly && candidatePlan && !recoveryMode.resumeCart && !recoveryMode.resumeAfterCart) {
+      // 旧恢复路径曾误入三来源预览，把缺类目候选记为“已跳过”。这些商品尚未
+      // 用消费账号按 ID 打开详情，不能让旧来源判断代替本账号的详情核验。
+      const before = completed.length
+      completed = completed.filter((item) => !(
+        item.analysisRejected === true && item.skipped === true &&
+        item.cartAttempted !== true && item.cartAdded !== true &&
+        Array.isArray(item.thresholdReasons) && item.thresholdReasons.some((reason) =>
+          String(reason).startsWith('类目未知：已尝试来源的详情入口或类目字段连续抽样后仍无法核实')
+        )
+      ))
+      if (before !== completed.length) {
+        await recovery?.logEvent({
+          stage: '候选池恢复', code: 'INFO_POOL_SOURCE_REJECTIONS_RECHECKED',
+          message: `旧来源类目判断涉及 ${before - completed.length} 个商品；保留原过程日志，改由当前账号按商品 ID 核验详情。`
+        })
+        await recovery?.persist({ completed })
+      }
+    }
     const accountLabel = accounts.value.find((account) => account.id === targetAccountId)?.name ?? `账号 ${targetAccountId}`
     reportSelectionProgress(targetAccountId, '准备账号选品任务', {
       percent: candidatePlan ? 100 : 0,
@@ -3357,7 +3409,7 @@ async function executeAccountSelection(
           ...previewPlan.registryExcluded.map((item) => `${item.candidate.productId}：${item.reason}`),
           ...previewPlan.mutualExclusionSkipped.map((item) => `${item.productId}：${item.mutualExclusionReason || '商品 ID 已被占用'}`)
         ].slice(0, 4).join('；')
-        warnings.unshift(`本机登记、配额或商品 ID 互斥过滤 ${locallySkipped} 个候选${skippedDetails ? `；示例：${skippedDetails}` : ''}。`)
+        warnings.unshift(`选品登记、配额或商品 ID 互斥过滤 ${locallySkipped} 个候选${skippedDetails ? `；示例：${skippedDetails}` : ''}。`)
       }
       const rejected = previewPlan.rejectedCandidates
       const excludedByCategoryCount = rejected.filter((candidate) =>
@@ -3523,7 +3575,7 @@ async function executeAccountSelection(
           if (refill.ok !== true) continue
           const queriedRows = Array.isArray(refill.candidates) ? refill.candidates as SelectionCandidate[] : []
           const registryRefill = await filterByLocalRegistry(
-            `local:${targetAccountId}`, queriedRows, candidateLimit,
+            registryAccountKey(targetAccountId), queriedRows, candidateLimit,
             settings.selectionMode === 'category' ? 'category' : 'general'
           )
           const newRows = registryRefill.candidates
@@ -3550,7 +3602,7 @@ async function executeAccountSelection(
           await recovery?.logEvent({
             stage: '候选补充', code: 'INFO_CANDIDATE_REFILL_RESULT',
             message: `第 ${attempt + 1} 次补充后候选 ${fetched.length}/${candidateLimit}。`,
-            detail: `本次新读取 ${queriedRows.length} 条，本机登记过滤 ${registryRefill.excluded.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
+            detail: `本次新读取 ${queriedRows.length} 条，选品登记过滤 ${registryRefill.excluded.length} 条，按商品 ID 去重后 ${fetched.length} 条。`
           })
           if (unchanged) {
             await recovery?.logEvent({
@@ -3668,7 +3720,7 @@ async function executeAccountSelection(
         const previousReadFingerprint = lastReadFingerprint
         lastReadFingerprint = candidateReadFingerprint(preview.candidates, preview.rejectedCandidates)
         fetched = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
-        const stableAccountKey = `local:${targetAccountId}`
+        const stableAccountKey = registryAccountKey(targetAccountId)
         const targetCount = Number(settings.candidateLimit ?? 5)
         const registryFiltered = candidatePlan
           ? { candidates: fetched, excluded: [] as Array<{ candidate: SelectionCandidate; reason: string }>, recommendations: candidatePlan.recommendedCategories }
@@ -3694,7 +3746,7 @@ async function executeAccountSelection(
           })
         }
         const dedupeEvents: SelectionRunLogInput[] = allRegistryExcluded.map(({ candidate, reason }) => ({
-            stage: '本机选品登记', code: 'INFO_REGISTRY_CANDIDATE_EXCLUDED',
+            stage: '选品登记', code: 'INFO_REGISTRY_CANDIDATE_EXCLUDED',
             message: `${String(candidate.title ?? candidate.productId)}：${reason}`,
             detail: reason, productId: String(candidate.productId ?? ''), productTitle: String(candidate.title ?? '')
         }))
@@ -3933,8 +3985,8 @@ async function executeAccountSelection(
             ? `已找到 ${selectedIndexesToExecute.length} 个用户勾选候选（含所选备用项）；登记冲突会跳过并尝试其他勾选项，最多加入 ${maxSelectedProducts} 个。`
             : `已找到 ${selectedIndexesToExecute.length} 个主候选；遇到登记冲突会按本批随机排序从候选快照补位，单轮最多检查 ${BATCH_FALLBACK_CANDIDATE_LIMIT} 个候选、加入 ${maxSelectedProducts} 个。`,
           detail: hasExplicitPreviewSelection
-            ? '本次优先使用人工勾选的候选；本机登记拒绝时仍会尝试其他已选候选。'
-            : '先按本机登记、商品锁和配额过滤，再按批次 ID 对合格商品加权随机排序；候选池按全账号商品 ID 互斥分配。正式原子预留遇到并发冲突时会继续检查备用候选；筛选质量、账号归属和最终事务保护不变。'
+            ? '本次优先使用人工勾选的候选；选品登记拒绝时仍会尝试其他已选候选。'
+            : '先按选品登记、商品锁和配额过滤，再按批次 ID 对合格商品加权随机排序；候选池按全账号商品 ID 互斥分配。正式原子预留遇到并发冲突时会继续检查备用候选；筛选质量、账号归属和最终事务保护不变。'
         })
         stage = '加入选品车并取回商品 ID'
         accountStatuses[targetAccountId] = '加入选品车中'
@@ -3951,7 +4003,7 @@ async function executeAccountSelection(
           : candidate)
         const result = await window.api.browser.runBaiyingSelection(toPlainSelectionPayload({
           ...profile, settings, accountId: targetAccountId,
-          accountKey: `local:${targetAccountId}`,
+          accountKey: registryAccountKey(targetAccountId),
           downloadPath: context.downloadPath,
           selectedIndexes: selectedIndexesToExecute,
           candidateSnapshot: executionCandidates,
@@ -3968,15 +4020,15 @@ async function executeAccountSelection(
           ? result.registryRejected as Array<{ productId: string; reason: string }> : []
         for (const rejected of registryRejected) {
           await recovery?.logEvent({
-            stage: '本机选品登记', code: 'WARNING_REGISTRY_CONFLICT',
-            message: `商品 ${rejected.productId} 未获本机预留，已跳过：${rejected.reason}`,
+            stage: '选品登记', code: 'WARNING_REGISTRY_CONFLICT',
+            message: `商品 ${rejected.productId} 未获预留，已跳过：${rejected.reason}`,
             detail: rejected.reason, productId: rejected.productId
           })
         }
         const registryReplacementCount = Math.max(0, Number(result.registryReplacementCount) || 0)
         if (registryReplacementCount) {
           await recovery?.logEvent({
-            stage: '本机选品登记', code: 'INFO_REGISTRY_CANDIDATE_REPLACED',
+            stage: '选品登记', code: 'INFO_REGISTRY_CANDIDATE_REPLACED',
             message: `已自动从后续候选补位 ${registryReplacementCount} 个，继续完成本轮选品。`,
             detail: '前序候选因本机重复登记或类目冲突未能预留；补位商品仍经过同一筛选和加车核验。'
           })
@@ -3985,8 +4037,8 @@ async function executeAccountSelection(
           ? result.registrySettlementWarnings.map(String) : []
         for (const warning of settlementWarnings) {
           await recovery?.logFailure({
-            stage: '本机选品登记', code: 'REGISTRY_SETTLEMENT_PENDING',
-            message: '百应结果已返回，但本机登记结算尚未确认；相关商品保持锁定待核查。',
+            stage: '选品登记', code: 'REGISTRY_SETTLEMENT_PENDING',
+            message: '百应结果已返回，但选品登记结算尚未确认；相关商品保持锁定待核查。',
             detail: warning
           })
         }
@@ -4001,7 +4053,7 @@ async function executeAccountSelection(
           }> : []
         for (const release of registryReleaseEvents) {
           await recovery?.logEvent({
-            stage: '本机选品登记',
+            stage: '选品登记',
             code: 'REGISTRY_RELEASE_CONTROL_FAILURE',
             message: `商品 ${release.productId} 预留已${release.settled ? '自动释放' : '尝试释放'}（${release.outcome}/${release.state}）；释放原因=${release.reason}。`,
             detail: release.diagnosticPath || '控件失败诊断路径未返回。',
@@ -4319,7 +4371,7 @@ async function executeAccountSelection(
             ...profile,
             settings,
             accountId: targetAccountId,
-            accountKey: `local:${targetAccountId}`,
+            accountKey: registryAccountKey(targetAccountId),
             downloadPath: context.downloadPath,
             selectedIndexes: [candidate.cardIndex],
             candidateSnapshot: fetched.map((row) => row.productId === productId
@@ -4467,7 +4519,7 @@ async function executeAccountSelection(
       String(item.title ?? item.productId) + '：' + String(item.status ?? '已完成')
     ).join('；')
     const dedupeSummary = dedupeSkipped.length
-      ? `商品 ID 防重跳过 ${dedupeSkipped.length} 个${dedupeSkipped.length ? `，例如：${dedupeSkipped.slice(0, 3).map((item) => String(item.title || item.productId)).join('、')}${dedupeSkipped.length > 3 ? '等' : ''}` : ''}；完整明细已记入日志`
+      ? `商品 ID 防重跳过 ${dedupeSkipped.length} 个，逐项原因见选品日志`
       : ''
     const categorySummary = categoryWarnings.length
       ? `跳过可恢复的类目 / 来源读取问题 ${categoryWarnings.length} 项（原因已记录）`
@@ -5642,7 +5694,7 @@ async function runSelectionBatch(): Promise<void> {
           (accounts.value.find((item) => item.id === id)?.name ?? id) + '（' + reason + '）'
         ).join('；'))
       }
-      notice.value = '本机选品记录可用；重点类目按百应当前可见商品数据自动推荐。'
+      notice.value = '选品登记记录可用；重点类目按百应当前可见商品数据自动推荐。'
       const batchAccountSummary = enabled.map((account) => `${account.name}（ID ${account.id}）`).join('、')
       const batchPathSummary = enabled.map((account) =>
         `${account.name}：${contexts.get(account.id)?.downloadPath ?? '路径未解析'}`
@@ -5669,6 +5721,13 @@ async function runSelectionBatch(): Promise<void> {
           message: '未创建批次或发起平台请求。', percent: null
         }
         return
+      }
+      // 本次批次使用的通用设置先落盘，重启和自动恢复才能沿用相同采集账号与池目标。
+      const savedSelectionSettings = await runEngine(
+        'selection_settings.py', ['--db', DB_PATH, 'save'], snapshot
+      )
+      if (savedSelectionSettings.ok !== true) {
+        throw new Error('通用选品设置保存失败，未创建批次。')
       }
       reviewedAccountId = null
       reviewedProducts = reviewedAccountId !== null
@@ -5886,7 +5945,13 @@ async function runSelectionBatch(): Promise<void> {
         let browserCloseFailure = ''
         let pauseAfterAccount = false
         try {
-          await persist({ state: 'in_progress', stage: 'account_preflight', error: '' })
+          // 登录预检是恢复前的临时动作，不得覆盖 cart_pending 等商品检查点。
+          // 否则 getSelectionRecoveryMode 会误判为重新读取三来源候选。
+          await persist({
+            state: 'in_progress',
+            ...(task.stage ? {} : { stage: 'account_preflight' }),
+            error: ''
+          })
           const target: LoginPreflightTarget = {
             accountId: account.id,
             accountName: account.name,
@@ -6765,6 +6830,7 @@ onUnmounted(() => {
             title="账号选品条件"
             :filter-groups="filterGroups"
             :feature-options="featureOptions"
+            :rank-category-options="quotaCategoryOptions"
             :filter-catalog-updated-at="filterCatalogUpdatedAt"
             :disabled="busy"
             :show-sync="true"
@@ -7074,6 +7140,7 @@ onUnmounted(() => {
               title="选品条件"
               :filter-groups="filterGroups"
               :feature-options="featureOptions"
+              :rank-category-options="quotaCategoryOptions"
               :filter-catalog-updated-at="filterCatalogUpdatedAt"
               :show-sync="true"
               :syncing="busy"
@@ -7230,6 +7297,7 @@ onUnmounted(() => {
                 title="账号选品条件"
                 :filter-groups="filterGroups"
                 :feature-options="featureOptions"
+                :rank-category-options="quotaCategoryOptions"
                 :filter-catalog-updated-at="filterCatalogUpdatedAt"
                 :disabled="busy"
                 :show-sync="true"
@@ -7252,7 +7320,7 @@ onUnmounted(() => {
 
         <section v-if="candidates.length" id="candidate-pool" class="card candidate-card">
           <h2>三源候选池（{{ candidates.length }}）</h2>
-          <p class="hint">候选来自选品广场、热点趋势和联盟榜单的当前可见列表，统一按数据门槛筛选并按商品 ID 去重；已在本机登记或受配额、发布任务占用的商品会排除。正式批次会复用匹配的预览池，并在执行前再次检查登记状态。</p>
+          <p class="hint">候选来自选品广场、热点趋势和联盟榜单的当前可见列表，统一按数据门槛筛选并按商品 ID 去重；已登记或受配额、发布任务占用的商品会排除。正式批次会复用匹配的预览池，并在执行前再次检查登记状态。</p>
           <div v-if="categoryRecommendations.length" class="category-recommendations">
             <strong>系统重点类目推荐</strong>
             <span v-for="item in categoryRecommendations.slice(0, 3)" :key="item.categoryId" class="category-recommendation">

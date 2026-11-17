@@ -389,11 +389,17 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
     incoming_rows = value.get("rows")
     if not isinstance(incoming_rows, list):
         raise ValueError("候选池商品列表格式无效")
+    excluded_ids = value.get("excludedProductIds", [])
+    if not isinstance(excluded_ids, list) or any(not isinstance(item, str) or not item.isdigit() for item in excluded_ids):
+        raise ValueError("候选池防重剔除 ID 格式无效")
+    excluded = set(excluded_ids)
     by_product: dict[str, dict[str, Any]] = {}
     for candidate in [*existing_rows, *incoming_rows]:
         if not isinstance(candidate, dict):
             continue
         product_id = str(candidate.get("productId") or "").strip()
+        if product_id in excluded:
+            continue
         title = str(candidate.get("title") or "").strip()
         if not product_id.isdigit() or not title:
             continue

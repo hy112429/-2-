@@ -100,7 +100,50 @@ class FakePage:
         return True
 
 
+class FakeFilterLookupPage:
+    def __init__(self, indexes, *, wait_times_out=False):
+        self.indexes = list(indexes)
+        self.wait_times_out = wait_times_out
+        self.wait_calls = []
+
+    def evaluate(self, _expression, arg=None):
+        if arg is None:
+            return ["月销", "浏览量"]
+        return self.indexes.pop(0) if len(self.indexes) > 1 else self.indexes[0]
+
+    def wait_for_function(self, expression, *, arg, timeout, polling):
+        self.wait_calls.append((expression, arg, timeout, polling))
+        if self.wait_times_out:
+            raise browser_cdp.PlaywrightTimeoutError("filter control wait timed out")
+
+    def locator(self, selector):
+        class Locator:
+            def nth(self, index):
+                return selector, index
+
+        return Locator()
+
+
 class SelectionFilterOptionClickTests(TestCase):
+    def test_filter_control_waits_for_exact_label_after_transient_rerender(self):
+        page = FakeFilterLookupPage([-1, 19])
+
+        control = browser_cdp._filter_control(page, "带货达人数")
+
+        self.assertEqual(control, (
+            ".merch-filter-virtual-table .table-row .combine-select-content", 19
+        ))
+        self.assertEqual(page.wait_calls[0][1:], ("带货达人数", 3_000, 150))
+
+    def test_missing_filter_control_has_bounded_wait_and_remains_retryable(self):
+        page = FakeFilterLookupPage([-1], wait_times_out=True)
+
+        with self.assertRaisesRegex(RuntimeError, "带货达人数.*等待 3 秒.*月销") as raised:
+            browser_cdp._filter_control(page, "带货达人数")
+
+        self.assertEqual(len(page.wait_calls), 1)
+        self.assertTrue(browser_cdp._is_retryable_filter_apply_error(raised.exception))
+
     def test_click_timeout_uses_dom_fallback_and_confirms_selected_class(self):
         option = FakeOption()
 

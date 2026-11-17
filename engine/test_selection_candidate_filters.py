@@ -46,6 +46,79 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def rank_page(self, unlimited_labels: set[str]):
+        page = MagicMock()
+        locators = {}
+        for label in {"爆款榜", "昨日", *unlimited_labels}:
+            option = MagicMock()
+            option.is_visible.return_value = True
+            option.evaluate.return_value = True
+            locator = MagicMock()
+            locator.count.return_value = 1
+            locator.nth.return_value = option
+            locator.first = option
+            locators[label] = locator
+        missing = MagicMock()
+        missing.count.return_value = 0
+        page.get_by_text.side_effect = lambda label, exact=True: locators.get(label, missing)
+        return page
+
+    def test_rank_accepts_both_unlimited_carrier_page_labels(self):
+        for page_label in ("不限载体", "不限体裁"):
+            with self.subTest(page_label=page_label):
+                page = self.rank_page({page_label})
+                selected = browser_cdp._select_rank_source_options(page, {
+                    "sources": {"rankBoard": "爆款榜", "rankPeriod": "昨日", "rankCarrier": "不限载体"}
+                })
+                self.assertEqual(selected, {
+                    "rankBoard": "爆款榜", "rankPeriod": "昨日", "rankCarrier": "不限载体"
+                })
+
+    def test_rank_rejects_ambiguous_unlimited_carrier_controls(self):
+        page = self.rank_page({"不限载体", "不限体裁"})
+        with self.assertRaisesRegex(browser_cdp.RecoverablePrioritySourceReadError, "控件未唯一定位"):
+            browser_cdp._select_rank_source_options(page, {
+                "sources": {"rankBoard": "爆款榜", "rankPeriod": "昨日", "rankCarrier": "不限载体"}
+            })
+
+    def test_rank_price_uses_verified_cents_and_rejects_missing_price(self):
+        row = promotion_row("rank-price", ("4", "100", "200"), 15, 4.8)
+        self.assertFalse(browser_cdp._rank_row_matches_price(row, "10-50"))
+        row["base_model"]["marketing_info"] = {"price_desc": {"price": {"origin": 990}}}
+        self.assertEqual(browser_cdp._rank_row_price_yuan(row), 9.9)
+        self.assertFalse(browser_cdp._rank_row_matches_price(row, "10-50"))
+        row["base_model"]["marketing_info"]["price_desc"]["price"]["origin"] = 1050
+        self.assertTrue(browser_cdp._rank_row_matches_price(row, "10-50"))
+        self.assertFalse(browser_cdp._rank_row_matches_price(row, "1-10"))
+        self.assertTrue(browser_cdp._rank_row_matches_price(row, "不限"))
+
+    def test_rank_platform_thresholds_never_narrow_beyond_local_minimum(self):
+        self.assertEqual(browser_cdp._rank_commission_platform_floor(
+            self.settings(thresholds={"commissionRate": 15, "commissionRateMax": 40})
+        ), "≥10%")
+        self.assertEqual(browser_cdp._rank_commission_platform_floor(
+            self.settings(thresholds={"commissionRate": None, "commissionRateMax": 40})
+        ), "不限")
+        self.assertEqual(browser_cdp._rank_experience_platform_floor(
+            self.settings(thresholds={"experienceScore": 4.5})
+        ), "不限")
+        self.assertEqual(browser_cdp._rank_experience_platform_floor(
+            self.settings(thresholds={"experienceScore": 85})
+        ), "≥85")
+
+    def test_rank_tabs_require_unique_official_category_id(self):
+        page = MagicMock()
+        page.evaluate.return_value = [
+            {"index": 0, "name": "全部", "categoryId": "", "selected": True},
+            {"index": 1, "name": "服饰内衣", "categoryId": "", "selected": False},
+        ]
+        tree = [{"id": "4", "children": [{"id": "100", "children": [{"id": "201"}]}]}]
+        mapped = browser_cdp._source_category_tabs(page, "allianceRank", tree, {"服饰内衣": {"4"}})
+        self.assertEqual(mapped[1]["categoryIds"], ["4"])
+        self.assertEqual(mapped[1]["status"], "mapped")
+        ambiguous = browser_cdp._source_category_tabs(page, "allianceRank", tree, {"服饰内衣": {"4", "5"}})
+        self.assertEqual(ambiguous[1]["status"], "unresolved")
+
     def test_commission_confirm_click_waits_for_stable_button(self):
         page = MagicMock()
         confirm = MagicMock()
@@ -64,7 +137,97 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         confirm.bounding_box.return_value = {"x": 10, "y": 20, "width": 60, "height": 24}
         confirm.click.side_effect = TimeoutError("element is not stable after click")
         browser_cdp._click_filter_confirm_stably(page, confirm, confirmation_check=lambda: True)
-        self.assertGreaterEqual(confirm.click.call_count, 1)
+        confirm.click.assert_called_once_with(timeout=2500, no_wait_after=True)
+
+    def test_commission_confirm_does_not_reclick_when_popup_state_is_unknown(self):
+        page = MagicMock()
+        confirm = MagicMock()
+        confirm.click.side_effect = TimeoutError("element is not stable after click")
+        with patch.object(browser_cdp, "_wait_filter_confirm_stable"), \
+             patch.object(browser_cdp, "_wait_filter_dropdown_closed", side_effect=browser_cdp.PlaywrightTimeoutError("popup remains open")):
+            with self.assertRaises(browser_cdp.CommissionFilterUnconfirmed):
+                browser_cdp._click_filter_confirm_stably(page, confirm)
+        confirm.click.assert_called_once_with(timeout=2500, no_wait_after=True)
+
+    def test_filter_chip_readback_uses_keyword_arg_and_only_swallows_timeout(self):
+        for readback in (browser_cdp._wait_filter_applied_chip, browser_cdp._wait_filter_summary_text):
+            with self.subTest(readback=readback.__name__):
+                class KeywordOnlyPage:
+                    def __init__(self, error=None):
+                        self.error = error
+                        self.arg = None
+
+                    def wait_for_function(self, expression, *, arg=None, timeout=None, polling=None):
+                        self.arg = arg
+                        if self.error is not None:
+                            raise self.error
+
+                page = KeywordOnlyPage()
+                self.assertTrue(readback(page, "佣金区间", "10%-50%", timeout_ms=350))
+                self.assertEqual(page.arg, {"label": "佣金区间", "value": "10%-50%"})
+                self.assertFalse(readback(
+                    KeywordOnlyPage(browser_cdp.PlaywrightTimeoutError("result chip missing")),
+                    "佣金区间", "10%-50%", timeout_ms=350,
+                ))
+                with self.assertRaises(TypeError):
+                    readback(KeywordOnlyPage(TypeError("invalid Playwright call")), "佣金区间", "10%-50%")
+
+    def test_commission_range_reuses_verified_result_chip_without_reopening_menu(self):
+        page = MagicMock()
+        with patch.object(browser_cdp, "_wait_filter_dropdown_closed"), \
+             patch.object(browser_cdp, "_wait_filter_summary_text", return_value=True) as summary, \
+             patch.object(browser_cdp, "_open_filter_dropdown") as open_menu:
+            browser_cdp._apply_square_commission_range(
+                page, self.settings(thresholds={"commissionRate": 10, "commissionRateMax": 50})
+            )
+        summary.assert_called_once_with(page, "佣金区间", "10%-50%", timeout_ms=350)
+        open_menu.assert_not_called()
+
+    def test_commission_range_rejects_confirm_without_result_chip(self):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        menu = MagicMock()
+        menu.locator.return_value.count.return_value = 1
+        menu.get_by_text.return_value.count.return_value = 1
+        with patch.object(browser_cdp, "_wait_filter_dropdown_closed"), \
+             patch.object(browser_cdp, "_wait_filter_summary_text", return_value=False), \
+             patch.object(browser_cdp, "_open_filter_dropdown", return_value=(MagicMock(), menu)), \
+             patch.object(browser_cdp, "_click_filter_confirm_stably") as click_confirm, \
+             patch.object(browser_cdp, "_close_filter_dropdown"):
+            with self.assertRaises(browser_cdp.CommissionFilterUnconfirmed):
+                browser_cdp._apply_square_commission_range(
+                    page, self.settings(thresholds={"commissionRate": 10, "commissionRateMax": 50})
+                )
+        click_confirm.assert_called_once()
+
+    def test_commission_range_accepts_result_chip_after_click_timeout(self):
+        page = MagicMock()
+        page.is_closed.return_value = False
+        menu = MagicMock()
+        menu.locator.return_value.count.return_value = 1
+        menu.get_by_text.return_value.count.return_value = 1
+        with patch.object(browser_cdp, "_wait_filter_dropdown_closed"), \
+             patch.object(browser_cdp, "_wait_filter_summary_text", side_effect=[False, True]), \
+             patch.object(browser_cdp, "_open_filter_dropdown", return_value=(MagicMock(), menu)), \
+             patch.object(browser_cdp, "_click_filter_confirm_stably", side_effect=browser_cdp.CommissionFilterUnconfirmed("click timeout")) as click_confirm, \
+             patch.object(browser_cdp, "_close_filter_dropdown"):
+            browser_cdp._apply_square_commission_range(
+                page, self.settings(thresholds={"commissionRate": 10, "commissionRateMax": 50})
+            )
+        click_confirm.assert_called_once()
+
+    def test_unconfirmed_square_source_is_skipped_without_marking_collection_failed(self):
+        settings = self.settings(
+            _visibleSourcesOnly=True, _candidatePoolCollectOnly=True,
+            sources={"hotSpotEnabled": False, "allianceRankEnabled": False, "selectionSquareEnabled": True, "priority": []},
+        )
+        with patch.object(browser_cdp, "_collect_priority_source_ids", return_value=({}, [], [], {})), \
+             patch.object(browser_cdp, "_collect_selection_square_rows", side_effect=browser_cdp.CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED")):
+            result = browser_cdp.apply_settings_and_collect_candidates(MagicMock(), settings)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["candidateCount"], 0)
+        self.assertEqual(result["prioritySourceResults"][-1]["status"], "skipped")
+        self.assertIn("COMMISSION_FILTER_UNCONFIRMED", result["prioritySourceResults"][-1]["detail"])
 
     def test_three_sources_share_exclusion_and_thresholds(self):
         rows = {
@@ -108,7 +271,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
             )
         self.assertEqual(result["candidates"], [])
         reasons = result["rejectedCandidates"][0]["thresholdReasons"]
-        self.assertIn("缺少有效佣金率实测数据，无法核验设定区间", reasons)
+        self.assertIn("缺少佣金率实测数据，无法核验设定区间", reasons)
         self.assertIn("缺少体验分实测数据，无法核验阈值 4.5", reasons)
 
     def test_detail_metrics_are_written_back_to_common_candidate_shape(self):
@@ -158,7 +321,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual(tabs[0]["level"], 1)
 
     def test_source_level_exclusion_blocks_even_when_row_has_exact_category(self):
-        row = promotion_row("excluded", ("1", "201", "301"), 8, 4.8)
+        row = promotion_row("excluded", ("1", "201", "301"), 12, 4.8)
         row["_sourceCategory"] = {"name": "分类", "id": "1", "categoryIds": ["1"], "level": 1}
         settings = self.settings(excludedCategorySelection={"level1": ["1"], "level2": [], "level3": []})
         result = browser_cdp._visible_source_candidate_result(
@@ -247,7 +410,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         ]
         seen: list[int] = []
 
-        def read_source(page, source_key, tree, category_tab=None):
+        def read_source(page, source_key, tree, category_tab=None, settings=None):
             if category_tab is None:
                 return set(), [], {"sourceCategoryTabs": tabs, "productCount": 0}
             seen.append(category_tab["index"])

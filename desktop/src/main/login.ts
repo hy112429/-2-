@@ -759,7 +759,10 @@ export function registerLoginIpc(): void {
       return runManagedSelection(params)
     }
 
-    const accountKey = `local:${params.accountId}`
+    const accountKey = params.accountKey ?? `local:${params.accountId}`
+    if (!accountKey.startsWith(`local:${params.accountId}|`) && accountKey !== `local:${params.accountId}`) {
+      throw new Error('选品登记账号身份与当前浏览器账号不一致；本次未执行加车。')
+    }
     const snapshot = Array.isArray(params.candidateSnapshot) ? params.candidateSnapshot as Array<Record<string, unknown>> : []
     const selected = Array.isArray(params.selectedIndexes) ? params.selectedIndexes : []
     if (!snapshot.length || !selected.length) throw new Error('本次加车缺少候选快照；本机登记前已停止平台操作。')
@@ -839,7 +842,7 @@ export function registerLoginIpc(): void {
     const reservedRows = candidatesToReserve
       .map(({ candidate }) => candidate)
       .filter((candidate) => tokenByProduct.has(String(candidate.productId ?? '').trim()))
-    const reservationResult = { ...registryResult, rejected, mode: 'local' as const }
+    const reservationResult = { ...registryResult, rejected }
     const skippedRegistryRows = (completed: Array<Record<string, unknown>> = []): Array<Record<string, unknown>> => {
       const completedIds = new Set(completed.map((item) => String(item.productId ?? '').trim()).filter(Boolean))
       return reservationResult.rejected.flatMap((item) => {
@@ -853,7 +856,7 @@ export function registerLoginIpc(): void {
           cartAttempted: false,
           skipped: true,
           registryExcluded: true,
-          status: `本机登记未通过，已跳过并继续后续候选：${item.reason}`
+          status: `选品登记未通过，已跳过并继续后续候选：${item.reason}`
         }]
       })
     }
@@ -940,7 +943,7 @@ export function registerLoginIpc(): void {
             confirmedDownloads.push({ productId, commodityId: String(item.commodityId ?? candidate.commodityId ?? '') })
           }
         } catch (error) {
-          settlementWarnings.push(`${productId}本机登记结算暂未确认：${error instanceof Error ? error.message : String(error)}`)
+          settlementWarnings.push(`${productId}选品登记结算暂未确认：${error instanceof Error ? error.message : String(error)}`)
         }
       }
       for (const item of confirmedDownloads) {

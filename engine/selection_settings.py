@@ -68,6 +68,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "rankBoard": "爆款榜",
         "rankPeriod": "昨日",
         "rankCarrier": "不限载体",
+        "rankPriceRange": "不限",
+        "rankCategoryPath": [],
         "hotSpotMinExposure": None,
         "hotSpotMinRelatedProducts": None,
         "priority": ["hotSpot", "allianceRank"],
@@ -286,6 +288,15 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
             raise ValueError("榜单周期无效")
         if sources.get("rankCarrier", "不限载体") not in {"不限载体", "短视频", "直播", "橱窗", "图文"}:
             raise ValueError("榜单载体无效")
+        if sources.get("rankPriceRange", "不限") not in {"不限", "1-10", "10-50", "50-100", "100-500", "500-5000", "5000+"}:
+            raise ValueError("榜单售价区间无效")
+        rank_path = sources.get("rankCategoryPath", [])
+        if not isinstance(rank_path, list) or len(rank_path) > 3 or any(
+            not isinstance(item, str) or not all(
+                part.isdecimal() and int(part) > 0 for part in item.split("__RC_CASCADER_SPLIT__")
+            ) for item in rank_path
+        ):
+            raise ValueError("榜单分类路径必须是最多三级的有效类目 ID")
         for key in ("hotSpotMinExposure", "hotSpotMinRelatedProducts"):
             threshold = sources.get(key)
             if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold < 0):

@@ -62,7 +62,7 @@ def export_items(database: Path) -> list[dict[str, Any]]:
                     continue
                 owner_id = row["owner_id"]
                 account_key = account_keys.get(int(owner_id), "") if owner_id is not None else ""
-                item = products.setdefault(product_id, {"productId": product_id})
+                item = products.setdefault(product_id, {"productId": product_id, "state": "COMMITTED"})
                 if account_key:
                     item["accountKey"] = account_key
                 if row["title"] and not item.get("title"):
@@ -70,6 +70,27 @@ def export_items(database: Path) -> list[dict[str, Any]]:
 
         add_rows("products", ("account_row_id", "account_id"))
         add_rows("selection_quota_events", ("account_id", "account_row_id"))
+        registry_columns = _columns(connection, "selection_local_registry")
+        if {"product_id", "account_key", "leaf_category_id", "state"}.issubset(registry_columns):
+            for row in connection.execute(
+                "SELECT product_id,account_key,leaf_category_id,state FROM selection_local_registry "
+                "WHERE state IN ('COMMITTED','UNCERTAIN','ATTEMPTING','RESERVED')"
+            ):
+                product_id = str(row["product_id"] or "").strip()
+                if not product_id:
+                    continue
+                state = "COMMITTED" if row["state"] == "COMMITTED" else "UNCERTAIN"
+                item = products.setdefault(product_id, {"productId": product_id, "state": state})
+                if state == "COMMITTED":
+                    item["state"] = "COMMITTED"
+                local_key = str(row["account_key"] or "")
+                if local_key.startswith("local:") and local_key[6:].isdigit():
+                    account_key = account_keys.get(int(local_key[6:]), "")
+                    if account_key:
+                        item["accountKey"] = account_key
+                leaf = str(row["leaf_category_id"] or "").strip()
+                if leaf:
+                    item["leafCategoryId"] = leaf
         return [products[key] for key in sorted(products)]
     finally:
         connection.close()

@@ -365,7 +365,7 @@ declare global {
           usedProductIds: string[]
           accountUsedCategoryIds: string[]
           categoryUsage: Record<string, number>
-          mode: 'local'
+          mode: 'local' | 'server'
         }>
         getSelectionRegistryBatchSnapshot(entries: Array<{
           accountKey: string
@@ -374,7 +374,7 @@ declare global {
           usedProductIds: string[]
           accountUsedCategoryIds: string[]
           categoryUsage: Record<string, number>
-          mode: 'local'
+          mode: 'local' | 'server'
         }>>
         onSelectionProgress(cb: (progress: SelectionProgressPayload) => void): () => void
         prepareDouyinPublish(params: {

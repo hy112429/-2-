@@ -25,6 +25,8 @@ export interface SelectionFilterSettings {
     rankBoard: '爆款榜' | '趋势榜' | '带货榜' | '常销榜'
     rankPeriod: '实时' | '昨日' | '近7日' | '近30日'
     rankCarrier: '不限载体' | '短视频' | '直播' | '橱窗' | '图文'
+    rankPriceRange: '不限' | '1-10' | '10-50' | '50-100' | '100-500' | '500-5000' | '5000+'
+    rankCategoryPath: string[]
     hotSpotMinExposure: number | null
     hotSpotMinRelatedProducts: number | null
     priority: Array<'hotSpot' | 'allianceRank'>
@@ -46,7 +48,7 @@ export const DEFAULT_SELECTION_FILTER_SETTINGS: SelectionFilterSettings = {
   filters: { delivery: {}, product: {}, features: [] },
   poolPriority: ['流量扶持', '小二严选', '低价好货', '福袋奖品'],
   poolFallback: true,
-  sources: { hotSpotEnabled: true, allianceRankEnabled: true, selectionSquareEnabled: true, rankBoard: '爆款榜', rankPeriod: '昨日', rankCarrier: '不限载体', hotSpotMinExposure: null, hotSpotMinRelatedProducts: null, priority: ['hotSpot', 'allianceRank'] },
+  sources: { hotSpotEnabled: true, allianceRankEnabled: true, selectionSquareEnabled: true, rankBoard: '爆款榜', rankPeriod: '昨日', rankCarrier: '不限载体', rankPriceRange: '不限', rankCategoryPath: [], hotSpotMinExposure: null, hotSpotMinRelatedProducts: null, priority: ['hotSpot', 'allianceRank'] },
   thresholds: { salesAmount: null, salesCount: null, conversionRate: null, views: null, commissionRate: null, commissionRateMax: null, experienceScore: null },
   trendPreference: '上升优先'
 }
@@ -118,6 +120,8 @@ export function createSelectionFilterSettings(
       rankBoard: ['爆款榜', '趋势榜', '带货榜', '常销榜'].includes(String(sourceSources.rankBoard)) ? sourceSources.rankBoard as SelectionFilterSettings['sources']['rankBoard'] : fallbackSources.rankBoard,
       rankPeriod: ['实时', '昨日', '近7日', '近30日'].includes(String(sourceSources.rankPeriod)) ? sourceSources.rankPeriod as SelectionFilterSettings['sources']['rankPeriod'] : fallbackSources.rankPeriod,
       rankCarrier: ['不限载体', '短视频', '直播', '橱窗', '图文'].includes(String(sourceSources.rankCarrier)) ? sourceSources.rankCarrier as SelectionFilterSettings['sources']['rankCarrier'] : fallbackSources.rankCarrier,
+      rankPriceRange: ['不限', '1-10', '10-50', '50-100', '100-500', '500-5000', '5000+'].includes(String(sourceSources.rankPriceRange)) ? sourceSources.rankPriceRange as SelectionFilterSettings['sources']['rankPriceRange'] : fallbackSources.rankPriceRange,
+      rankCategoryPath: Array.isArray(sourceSources.rankCategoryPath) ? sourceSources.rankCategoryPath.map(String) : [...fallbackSources.rankCategoryPath],
       hotSpotMinExposure: normalizeThreshold(sourceSources.hotSpotMinExposure, fallbackSources.hotSpotMinExposure),
       hotSpotMinRelatedProducts: normalizeThreshold(sourceSources.hotSpotMinRelatedProducts, fallbackSources.hotSpotMinRelatedProducts),
       priority: normalizedSourcePriority

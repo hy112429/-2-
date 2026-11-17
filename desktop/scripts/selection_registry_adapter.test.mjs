@@ -13,6 +13,7 @@ let response = { ok: true }
 const mocks = {
   electron: { ipcMain: { handle: (name, handler) => handlers.set(name, handler) } },
   './app-dirs': { getClientPaths: () => ({ databasePath: 'D:\\software\\codex\\registry-isolated.sqlite' }) },
+  './center_client_bootstrap': { getOrCreateCenterMachineId: () => 'isolated-machine' },
   './engine': {
     runEngineCommand: async (script, args) => {
       calls.push({ script, args })

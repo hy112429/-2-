@@ -5354,11 +5354,32 @@ def find_selection_page(
 
 
 def _filter_control(page: Page, label: str) -> Any:
-    index = page.evaluate("""(targetLabel) => Array.from(document.querySelectorAll('.merch-filter-virtual-table .table-row .combine-select-content'))
+    lookup = """(targetLabel) => Array.from(document.querySelectorAll('.merch-filter-virtual-table .table-row .combine-select-content'))
       .findIndex(node => !node.closest('.merch-filter-cate-cascader-item') &&
-        (node.innerText || '').replace(/\\s+/g, ' ').trim() === targetLabel)""", label)
+        (node.innerText || '').replace(/\\s+/g, ' ').trim() === targetLabel)"""
+    index = page.evaluate(lookup, arg=label)
     if not isinstance(index, int) or index < 0:
-        raise RuntimeError(f"百应页面没有找到筛选项「{label}」")
+        # 类目或上一项筛选提交后，百应会短暂卸载整行筛选控件。
+        # 只等待同一精确标签重新出现，不通过相邻索引猜控件。
+        try:
+            page.wait_for_function(
+                f"(targetLabel) => ({lookup})(targetLabel) >= 0",
+                arg=label,
+                timeout=3_000,
+                polling=150,
+            )
+        except PlaywrightTimeoutError:
+            pass
+        index = page.evaluate(lookup, arg=label)
+    if not isinstance(index, int) or index < 0:
+        visible_labels = page.evaluate("""() => Array.from(document.querySelectorAll(
+          '.merch-filter-virtual-table .table-row .combine-select-content'))
+          .filter(node => !node.closest('.merch-filter-cate-cascader-item'))
+          .filter(node => node.getBoundingClientRect().width > 0)
+          .map(node => (node.innerText || '').replace(/\\s+/g, ' ').trim())
+          .filter(Boolean).slice(0, 20)""")
+        summary = "、".join(visible_labels) if isinstance(visible_labels, list) else "无法读取"
+        raise RuntimeError(f"百应页面没有找到筛选项「{label}」（等待 3 秒；当前可见筛选项：{summary or '无'}）")
     # 查询索引与 locator 必须使用同一筛选器容器；全局列表还包含 17 个一级类目，
     # 在该列表中直接按筛选器索引取元素会错点类目控件。
     return page.locator(".merch-filter-virtual-table .table-row .combine-select-content").nth(index)
@@ -5517,6 +5538,24 @@ def _click_filter_option(
     ) from click_error
 
 
+class CommissionFilterUnconfirmed(RuntimeError):
+    """平台佣金筛选结果未核实；仅跳过选品广场，不放宽商品佣金门槛。"""
+
+
+def _commission_error_requires_pause(error: BaseException) -> bool:
+    """只把账号、浏览器、限流及未结束请求升级为全局停点。"""
+    message = str(error).lower()
+    return any(marker in message for marker in (
+        "11001", "限流", "频控", "冷却", "滑块", "验证码", "安全验证", "风控", "登录",
+        "captcha", "verification required", "risk control", "login required", "unauthorized",
+        "rate limit", "target page", "target closed", "browser has been closed",
+        "context has been closed", "page has been closed", "browser disconnected",
+        "connection closed", "disconnected", "websocket", "cdp", "远程调试",
+        "浏览器已关闭", "页面已关闭", "连接中断", "net::err_", "request failed",
+        "material_list_request_pending", "material_list 返回", "环境危险", "环境异常",
+    ))
+
+
 def _wait_filter_applied_chip(page: Page, label: str, value: str, timeout_ms: int = 1_000) -> bool:
     """在可见的“已筛选”摘要区回读单选条件，避免依赖关闭菜单后已卸载的 option 节点。"""
     try:
@@ -5526,7 +5565,8 @@ def _wait_filter_applied_chip(page: Page, label: str, value: str, timeout_ms: in
             const style = getComputedStyle(node);
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           };
-          const clean = (text) => String(text || '').replace(/\\s+/g, '').replace(/[：:]/g, ':');
+          const clean = (text) => String(text || '').replace(/\\s+/g, '')
+            .replace(/[：:]/g, ':').replace(/[‐‑‒–—−]/g, '-');
           const cleanLabel = (text) => clean(text).replace(/(数量|人数)/g, '');
           const leaves = Array.from(document.querySelectorAll('body *')).filter((node) =>
             node.children.length === 0 && visible(node));
@@ -5546,28 +5586,44 @@ def _wait_filter_applied_chip(page: Page, label: str, value: str, timeout_ms: in
             }
           }
           return false;
-        }""", {"label": label, "value": value}, timeout=timeout_ms, polling=100)
+        }""", arg={"label": label, "value": value}, timeout=timeout_ms, polling=100)
         return True
-    except Exception:
+    except PlaywrightTimeoutError:
         return False
 
 
 def _wait_filter_summary_text(page: Page, label: str, value: str, timeout_ms: int = 1_000) -> bool:
-    """回读页面可见文本，兼容百应更换“已筛选”摘要 DOM 层级的情况。"""
+    """仅回读“已筛选”结果区；弹窗中的输入与选项不能充当已应用证据。"""
     try:
         page.wait_for_function("""({label, value}) => {
-          const clean = (text) => String(text || '').replace(/\\s+/g, '').replace(/[：:]/g, ':');
+          const clean = (text) => String(text || '').replace(/\\s+/g, '')
+            .replace(/[：:]/g, ':').replace(/[‐‑‒–—−]/g, '-');
           const wanted = `${clean(label)}:${clean(value)}`;
           const visible = (node) => {
             const rect = node.getBoundingClientRect();
             const style = getComputedStyle(node);
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           };
-          return Array.from(document.querySelectorAll('body *')).some((node) =>
-            visible(node) && clean(node.innerText || node.textContent).includes(wanted));
-        }""", {"label": label, "value": value}, timeout=timeout_ms, polling=100)
+          const leaves = Array.from(document.querySelectorAll('body *')).filter((node) =>
+            node.children.length === 0 && visible(node));
+          const heading = leaves.find((node) => clean(node.innerText || node.textContent) === '已筛选');
+          if (!heading) return false;
+          const startY = heading.getBoundingClientRect().top - 8;
+          const end = leaves.find((node) => clean(node.innerText || node.textContent) === '为你推荐以下商品');
+          const endY = end ? end.getBoundingClientRect().top : startY + 140;
+          return leaves.some((leaf) => {
+            if (leaf.closest('.aurora-select-dropdown')) return false;
+            const y = leaf.getBoundingClientRect().top;
+            if (y < startY || y >= endY) return false;
+            for (let node = leaf, depth = 0; node && depth < 8; node = node.parentElement, depth++) {
+              const text = clean(node.innerText || node.textContent);
+              if (text.length <= 160 && text.includes(wanted)) return true;
+            }
+            return false;
+          });
+        }""", arg={"label": label, "value": value}, timeout=timeout_ms, polling=100)
         return True
-    except Exception:
+    except PlaywrightTimeoutError:
         return False
 
 
@@ -5575,6 +5631,8 @@ def _is_retryable_filter_apply_error(error: BaseException) -> bool:
     message = str(error).lower()
     if any(marker in message for marker in ("11001", "验证码", "安全验证", "登录失效", "连接断开", "没有选项")):
         return False
+    if "百应页面没有找到筛选项" in message:
+        return True
     return any(marker in message for marker in (
         "option-selected", "未确认筛选生效", "locator.click", "下拉菜单仍打开", "筛选应用确认",
         "下拉菜单未稳定加载出选项", "无法定位稳定选项",
@@ -5710,6 +5768,7 @@ def _wait_filter_confirm_stable(page: Page, confirm: Any, timeout_ms: int = 2_50
     deadline = time.monotonic() + timeout_ms / 1000
     previous_box: Optional[tuple[float, float, float, float]] = None
     stable_since: Optional[float] = None
+    last_error: Optional[BaseException] = None
     while time.monotonic() < deadline:
         try:
             if not confirm.is_visible(timeout=300) or not confirm.is_enabled(timeout=300):
@@ -5727,11 +5786,14 @@ def _wait_filter_confirm_stable(page: Page, confirm: Any, timeout_ms: int = 2_50
                     else:
                         stable_since = None
                     previous_box = current_box
-        except Exception:
+        except Exception as error:
+            if _commission_error_requires_pause(error):
+                raise
+            last_error = error
             stable_since = None
             previous_box = None
         page.wait_for_timeout(60)
-    raise RuntimeError("选品广场佣金区间确认按钮连续 2.5 秒未稳定；未执行重复点击")
+    raise RuntimeError("选品广场佣金区间确认按钮连续 2.5 秒未稳定；未执行重复点击") from last_error
 
 
 def _click_filter_confirm_stably(
@@ -5739,41 +5801,32 @@ def _click_filter_confirm_stably(
     confirm: Any,
     confirmation_check: Optional[Callable[[], bool]] = None,
 ) -> None:
-    """确认按钮稳定后点击并核对菜单关闭；短暂动画抖动只在控件层重试。"""
-    last_error: Optional[BaseException] = None
-    for attempt in range(3):
-        try:
-            _wait_filter_confirm_stable(page, confirm, timeout_ms=2_500)
-            try:
-                confirm.scroll_into_view_if_needed(timeout=1_000)
-            except Exception:
-                pass
-            confirm.click(timeout=2_500, no_wait_after=True)
-            try:
-                _wait_filter_dropdown_closed(page, timeout_ms=2_000)
-            except PlaywrightTimeoutError:
-                # 点击可能已提交但弹层正在离场；只有按钮仍可见时才继续重试。
-                try:
-                    if not confirm.is_visible(timeout=300):
-                        return
-                except Exception:
-                    return
-                raise RuntimeError("选品广场佣金区间确认后下拉菜单仍在动画中")
+    """确认按钮最多点击一次；不确定时先等弹窗关闭再读应用状态。"""
+    try:
+        _wait_filter_confirm_stable(page, confirm, timeout_ms=2_500)
+    except RuntimeError as error:
+        if _commission_error_requires_pause(error):
+            raise
+        raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：确认按钮未稳定，未点击") from error
+    try:
+        confirm.scroll_into_view_if_needed(timeout=1_000)
+    except Exception:
+        pass
+    click_error: Optional[BaseException] = None
+    try:
+        confirm.click(timeout=2_500, no_wait_after=True)
+    except (PlaywrightTimeoutError, TimeoutError) as error:
+        if _commission_error_requires_pause(error):
+            raise
+        click_error = error
+    try:
+        _wait_filter_dropdown_closed(page, timeout_ms=2_000)
+    except PlaywrightTimeoutError as error:
+        raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：确认后弹窗未关闭，提交结果不明") from (click_error or error)
+    if click_error is not None:
+        if confirmation_check is not None and confirmation_check():
             return
-        except Exception as error:
-            last_error = error
-            # Playwright 可能在点击事件已经提交、页面开始重绘后，
-            # 卡在 click 的收尾稳定性检查；优先回读页面已应用摘要，避免把成功误报成失败。
-            if confirmation_check is not None:
-                try:
-                    if confirmation_check():
-                        return
-                except Exception:
-                    pass
-            if attempt >= 2:
-                break
-            page.wait_for_timeout(180 * (attempt + 1))
-    raise RuntimeError(f"选品广场佣金区间确认按钮点击未稳定：{last_error}") from last_error
+        raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：点击收尾超时，已停止重复提交") from click_error
 
 
 def _stabilize_background_filter_dropdown(page: Page) -> None:
@@ -6909,47 +6962,57 @@ def _commission_rate_bounds(settings: Dict[str, Any]) -> tuple[Optional[float], 
 
 
 def _apply_square_commission_range(page: Page, settings: Dict[str, Any]) -> None:
-    """选品广场自定义佣金区间；提交后回读两个输入框，最终仍按商品实测值核验。"""
+    """选品广场自定义佣金区间；以结果区标签确认应用，绝不重复提交未知点击。"""
     lower, upper = _commission_rate_bounds(settings)
     if lower is None and upper is None:
         return
-    control, menu = _open_filter_dropdown(page, "佣金区间")
+    expected_min, expected_max = f"{lower if lower is not None else 0:g}", f"{upper if upper is not None else 100:g}"
+    expected_value = f"{expected_min}%-{expected_max}%"
+    def applied() -> bool:
+        return _wait_filter_summary_text(page, "佣金区间", expected_value, timeout_ms=350)
+
+    # 截图显示旧标签在弹窗打开时仍可见。只有弹窗已关闭时，才允许把旧标签当作已应用状态。
     try:
+        _wait_filter_dropdown_closed(page, timeout_ms=350)
+        if applied():
+            return
+    except PlaywrightTimeoutError:
+        pass
+
+    control = None
+    apply_error: Optional[BaseException] = None
+    try:
+        control, menu = _open_filter_dropdown(page, "佣金区间")
         minimum = menu.locator('input[placeholder*="最低"]')
         maximum = menu.locator('input[placeholder*="最高"]')
         if minimum.count() != 1 or maximum.count() != 1:
-            raise RuntimeError("选品广场自定义佣金输入框未唯一定位")
-        expected_min, expected_max = f"{lower if lower is not None else 0:g}", f"{upper if upper is not None else 100:g}"
+            raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：自定义佣金输入框未唯一定位")
         minimum.fill(expected_min)
         maximum.fill(expected_max)
         confirm = menu.get_by_text("确定", exact=True)
         if not confirm.count():
             confirm = menu.get_by_text("确 定", exact=True)
         if confirm.count() != 1:
-            raise RuntimeError("选品广场佣金区间确认控件未唯一定位")
-        expected_chip_values = (
-            f"{expected_min}%-{expected_max}%",
-            f"{expected_min}%–{expected_max}%",
-        )
-        _click_filter_confirm_stably(
-            page,
-            confirm,
-            confirmation_check=lambda: any(
-                _wait_filter_applied_chip(page, "佣金区间", value, timeout_ms=800) or
-                _wait_filter_summary_text(page, "佣金区间", value, timeout_ms=800)
-                for value in expected_chip_values
-            ),
-        )
+            raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：佣金确认控件未唯一定位")
+        _click_filter_confirm_stably(page, confirm)
+    except Exception as error:
+        apply_error = error
     finally:
-        _close_filter_dropdown(page, control)
-    control, menu = _open_filter_dropdown(page, "佣金区间")
+        if control is not None:
+            _close_filter_dropdown(page, control)
+    if apply_error is not None and _commission_error_requires_pause(apply_error):
+        raise apply_error
+    if getattr(page, "is_closed", lambda: False)() is True:
+        raise RuntimeError("百应页面已关闭，停止当前账号采集")
     try:
-        minimum = menu.locator('input[placeholder*="最低"]')
-        maximum = menu.locator('input[placeholder*="最高"]')
-        if minimum.count() != 1 or maximum.count() != 1 or minimum.input_value() != expected_min or maximum.input_value() != expected_max:
-            raise RuntimeError("选品广场佣金自定义区间提交后回读不一致")
-    finally:
-        _close_filter_dropdown(page, control)
+        _wait_filter_dropdown_closed(page, timeout_ms=1_000)
+    except PlaywrightTimeoutError as error:
+        raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：佣金弹窗关闭状态无法核实") from error
+    if applied():
+        return
+    if apply_error is not None:
+        raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：确认后结果区未出现目标佣金范围") from apply_error
+    raise CommissionFilterUnconfirmed("COMMISSION_FILTER_UNCONFIRMED：确认按钮返回后结果区仍无目标佣金范围")
 
 
 def _effective_selection_filters(settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -7445,7 +7508,10 @@ def _save_priority_source_dom_evidence(
         }
 
 
-def _source_category_tabs(page: Page, source_key: str, category_tree: Sequence[Any]) -> list[Dict[str, Any]]:
+def _source_category_tabs(
+    page: Page, source_key: str, category_tree: Sequence[Any],
+    rank_root_catalog: Optional[Dict[str, set[str]]] = None,
+) -> list[Dict[str, Any]]:
     """读取来源分类控件的稳定 ID；名称仅用于诊断，不参与类目匹配。"""
     selector = (
         'div[class*="subCategoryGroup"] > div[class*="box"]'
@@ -7494,6 +7560,7 @@ def _source_category_tabs(page: Page, source_key: str, category_tree: Sequence[A
         const className = String(node.className || '');
         return { index, name, categoryId: id || '', selected:
           node.getAttribute('aria-selected') === 'true' || node.getAttribute('aria-checked') === 'true' ||
+          node.getAttribute('data-active') === 'true' ||
           /(?:active|selected|checked|current)/i.test(className),
           ambiguousId: ownIds.length > 1 && new Set(ownIds).size !== 1 };
       }).filter(item => item.name);
@@ -7503,6 +7570,10 @@ def _source_category_tabs(page: Page, source_key: str, category_tree: Sequence[A
         if not isinstance(item, dict):
             continue
         category_id = _category_id_scalar(item.get("categoryId"))
+        if source_key == "allianceRank" and not category_id and isinstance(rank_root_catalog, dict):
+            verified_ids = rank_root_catalog.get(str(item.get("name") or ""), set())
+            if len(verified_ids) == 1:
+                category_id = next(iter(verified_ids))
         path, level = _resolve_single_category_id(category_id, category_tree)
         tabs.append({
             "index": int(item.get("index", 0)), "name": str(item.get("name") or "")[:50],
@@ -7523,22 +7594,170 @@ def _rank_option_selected(option: Any) -> bool:
     }"""))
 
 
+_RANK_PRICE_BOUNDS: Dict[str, tuple[Optional[float], Optional[float]]] = {
+    "不限": (None, None), "1-10": (1, 10), "10-50": (10, 50),
+    "50-100": (50, 100), "100-500": (100, 500),
+    "500-5000": (500, 5000), "5000+": (5000, None),
+}
+
+
+def _rank_category_ids(path: Any) -> list[str]:
+    if not isinstance(path, list) or len(path) > 3:
+        raise RecoverablePrioritySourceReadError("带货商品榜分类路径格式无效")
+    result = [_category_id_scalar(value).rsplit(CATEGORY_PATH_SEPARATOR, 1)[-1] for value in path]
+    if any(not value for value in result):
+        raise RecoverablePrioritySourceReadError("带货商品榜分类路径缺少稳定 ID")
+    return result
+
+
+def _select_rank_category(page: Page, path: list[str], requests: list[Dict[str, Any]]) -> Dict[str, Any]:
+    ids = _rank_category_ids(path)
+    control = page.locator('[class*="categoryCascader"] .aurora-select').first
+    if not control.is_visible():
+        raise RecoverablePrioritySourceReadError("带货商品榜分类控件不可见")
+    page.wait_for_timeout(350)
+    previous_request_count = len(requests)
+    control.click(timeout=8_000, no_wait_after=True)
+    expected_names: list[str] = []
+    keys = [CATEGORY_PATH_SEPARATOR.join(ids[:index]) for index in range(1, len(ids) + 1)] or ["-1"]
+    for key in keys:
+        options = page.locator('.aurora-cascader-menu-item[data-path-key="' + key + '"]')
+        visible = [options.nth(index) for index in range(min(options.count(), 5)) if options.nth(index).is_visible()]
+        if len(visible) != 1:
+            raise RecoverablePrioritySourceReadError(f"带货商品榜分类 ID {key} 未唯一定位")
+        expected_names.append(visible[0].inner_text().strip())
+        if ids or visible[0].get_attribute("aria-checked") != "true":
+            # 后台页的 CSS 过渡可能长期保持“不稳定”；DOM click 仍交给百应 React 处理，之后回读请求。
+            visible[0].evaluate("node => node.click()")
+        page.wait_for_timeout(200)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(250)
+    display = page.locator('[class*="categoryCascader"] .aurora-select-content-value').first.inner_text().strip()
+    if not display or (ids and not all(name in display for name in expected_names)) or (not ids and display != "总榜"):
+        raise RecoverablePrioritySourceReadError("带货商品榜分类点击后未回读到预期路径")
+    new_requests = requests[previous_request_count:]
+    if new_requests:
+        last = new_requests[-1]
+        expected_id = ids[-1] if ids else "-1"
+        if str(last.get("cate_id")) != expected_id or str(last.get("cate_level")) != str(len(ids) - 1):
+            raise RecoverablePrioritySourceReadError("带货商品榜分类请求 ID 与所选路径不一致")
+    return {"categoryIds": ids, "categoryLabel": display, "categoryId": ids[-1] if ids else "-1"}
+
+
+def _select_rank_dropdown(
+    page: Page, label: str, value: str, request_key: str,
+    request_value: str, requests: list[Dict[str, Any]],
+) -> str:
+    trigger = page.locator('[data-variant="combineSelect"]').filter(has_text=label)
+    if trigger.count() != 1 or not trigger.first.is_visible():
+        raise RecoverablePrioritySourceReadError(f"带货商品榜{label}控件未唯一定位")
+    marker = {"售价区间": "1-10", "佣金率": "≥10%", "体验分": "≥75"}.get(label)
+    if not marker:
+        raise RecoverablePrioritySourceReadError("带货商品榜未知筛选控件")
+    option_script = """({ value, marker, click }) => {
+      const menus = [...document.querySelectorAll('.aurora-select-dropdown')]
+        .filter(node => !node.classList.contains('aurora-select-dropdown-hidden') &&
+          !node.classList.contains('aurora-slide-up-leave') &&
+          [...node.querySelectorAll('.aurora-select-item-option')]
+            .some(option => option.getAttribute('title') === marker));
+      const matches = menus.flatMap(menu => [...menu.querySelectorAll('.aurora-select-item-option')])
+        .filter(node => node.getAttribute('title') === value);
+      if (matches.length !== 1) return { count: matches.length, selected: false };
+      const selected = matches[0].classList.contains('aurora-select-item-option-selected');
+      if (click) matches[0].click();
+      return { count: 1, selected };
+    }"""
+    previous_request_count = len(requests)
+    trigger.evaluate("node => node.click()")
+    state = page.evaluate(option_script, {"value": value, "marker": marker, "click": False})
+    if not isinstance(state, dict) or state.get("count") != 1:
+        # 后台页上一弹窗的退出动画可能悬停；再打开当前控件并按唯一档位回读。
+        trigger.evaluate("node => node.click()")
+        state = page.evaluate(option_script, {"value": value, "marker": marker, "click": False})
+    if not isinstance(state, dict) or state.get("count") != 1:
+        raise RecoverablePrioritySourceReadError(f"带货商品榜{label}档位 {value} 未唯一定位")
+    if not state.get("selected") or value == "不限":
+        page.evaluate(option_script, {"value": value, "marker": marker, "click": True})
+        page.wait_for_timeout(250)
+    if value == "不限":
+        if trigger.get_attribute("data-active") != "false":
+            raise RecoverablePrioritySourceReadError(f"带货商品榜{label}未回读到不限状态")
+    else:
+        trigger.evaluate("node => node.click()")
+        state = page.evaluate(option_script, {"value": value, "marker": marker, "click": False})
+        if not isinstance(state, dict) or state.get("count") != 1 or not state.get("selected"):
+            raise RecoverablePrioritySourceReadError(f"带货商品榜{label}点击后未回读到选中状态")
+    page.keyboard.press("Escape")
+    new_requests = requests[previous_request_count:]
+    if new_requests and str(new_requests[-1].get(request_key) or "") != request_value:
+        raise RecoverablePrioritySourceReadError(f"带货商品榜{label}请求与选中档位不一致")
+    return value
+
+
+def _select_rank_price_range(page: Page, value: str, requests: list[Dict[str, Any]]) -> str:
+    if value not in _RANK_PRICE_BOUNDS:
+        raise RecoverablePrioritySourceReadError("带货商品榜售价区间无效")
+    return _select_rank_dropdown(page, "售价区间", value, "sale_range", "" if value == "不限" else value, requests)
+
+
+def _rank_commission_platform_floor(settings: Dict[str, Any]) -> str:
+    lower, _ = _commission_rate_bounds(settings)
+    available = (10, 20, 30, 50)
+    floor = next((level for level in reversed(available) if lower is not None and lower >= level), None)
+    return f"≥{floor}%" if floor is not None else "不限"
+
+
+def _rank_experience_platform_floor(settings: Dict[str, Any]) -> str:
+    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    score = _number(thresholds.get("experienceScore"))
+    # 4.x 店铺体验分与榜单的 75–90 档位单位不同，不能擅自换算。
+    floor = next((level for level in (90, 85, 80, 75) if score is not None and score >= level), None)
+    return f"≥{floor}" if floor is not None else "不限"
+
+
+def _rank_row_price_yuan(row: Dict[str, Any]) -> Optional[float]:
+    base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
+    marketing = base.get("marketing_info") if isinstance(base.get("marketing_info"), dict) else {}
+    description = marketing.get("price_desc") if isinstance(marketing.get("price_desc"), dict) else {}
+    price = description.get("price") if isinstance(description.get("price"), dict) else {}
+    cents = _number(price.get("origin"))
+    return cents / 100 if cents is not None and math.isfinite(cents) and cents >= 0 else None
+
+
+def _rank_row_matches_price(row: Dict[str, Any], value: str) -> bool:
+    lower, upper = _RANK_PRICE_BOUNDS[value]
+    if lower is None and upper is None:
+        return True
+    price = _rank_row_price_yuan(row)
+    return price is not None and (lower is None or price >= lower) and (upper is None or price <= upper)
+
+
 def _select_rank_source_options(page: Page, settings: Dict[str, Any]) -> Dict[str, str]:
     config = settings.get("sources") if isinstance(settings.get("sources"), dict) else {}
     try:
         page.get_by_text("爆款榜", exact=True).first.wait_for(state="visible", timeout=8_000)
     except PlaywrightTimeoutError as error:
         raise RecoverablePrioritySourceReadError("带货商品榜选项未加载，不能确认榜单类型") from error
+    def visible_options(names: Sequence[str]) -> list[Any]:
+        options: list[Any] = []
+        for name in names:
+            choices = page.get_by_text(name, exact=True)
+            options.extend(choices.nth(i) for i in range(min(choices.count(), 12)) if choices.nth(i).is_visible())
+        return options
+
     selected: Dict[str, str] = {}
     groups = (
         ("rankBoard", "爆款榜", ("爆款榜", "趋势榜", "带货榜", "常销榜")),
         ("rankPeriod", "昨日", ("实时", "昨日", "近7日", "近30日")),
-        ("rankCarrier", "不限载体", ("不限载体", "短视频", "直播", "橱窗", "图文")),
+        ("rankCarrier", "不限载体", ("不限载体", "不限体裁", "短视频", "直播", "橱窗", "图文")),
     )
     for key, expected, labels in groups:
         label = str(config.get(key) or expected)
-        choices = page.get_by_text(label, exact=True)
-        visible = [choices.nth(i) for i in range(min(choices.count(), 12)) if choices.nth(i).is_visible()]
+        # 百应当前页面把旧设置名“不限载体”显示为“不限体裁”；保留旧设置值，避免改写批次快照。
+        if key == "rankCarrier" and label == "不限体裁":
+            label = "不限载体"
+        aliases = ("不限载体", "不限体裁") if key == "rankCarrier" and label == "不限载体" else (label,)
+        visible = visible_options(aliases)
         if len(visible) != 1:
             raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」控件未唯一定位，不能确认榜单筛选")
         option = visible[0]
@@ -7548,8 +7767,7 @@ def _select_rank_source_options(page: Page, settings: Dict[str, Any]) -> Dict[st
             except PlaywrightTimeoutError as error:
                 raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」控件未能选中") from error
             page.wait_for_timeout(700)
-            choices = page.get_by_text(label, exact=True)
-            visible = [choices.nth(i) for i in range(min(choices.count(), 12)) if choices.nth(i).is_visible()]
+            visible = visible_options(aliases)
             if len(visible) != 1 or not _rank_option_selected(visible[0]):
                 raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」点击后未回读到选中状态")
         selected_labels = []
@@ -7557,7 +7775,7 @@ def _select_rank_source_options(page: Page, settings: Dict[str, Any]) -> Dict[st
             matches = page.get_by_text(item_label, exact=True)
             matches_visible = [matches.nth(i) for i in range(min(matches.count(), 12)) if matches.nth(i).is_visible()]
             if len(matches_visible) == 1 and _rank_option_selected(matches_visible[0]):
-                selected_labels.append(item_label)
+                selected_labels.append("不限载体" if key == "rankCarrier" and item_label == "不限体裁" else item_label)
         if selected_labels != [label]:
             raise RecoverablePrioritySourceReadError(f"带货商品榜「{label}」选中状态不唯一，未采集当前页")
         selected[key] = label
@@ -7584,6 +7802,37 @@ def _read_priority_source_product_ids(
     )
     source_page: Optional[Page] = None
     rate_limit_errors: list[str] = []
+    rank_requests: list[Dict[str, Any]] = []
+    rank_root_catalog: Dict[str, set[str]] = {}
+
+    def observe_rank_request(request: Any) -> None:
+        if source_key != "allianceRank" or "/pc/leaderboard_26/board_pmt" not in str(request.url):
+            return
+        try:
+            payload = request.post_data_json
+            if isinstance(payload, dict):
+                rank_requests.append({key: payload.get(key) for key in ("cate_id", "cate_level", "sale_range", "cos_ratio", "exp_score")})
+        except Exception:
+            return
+
+    def observe_rank_catalog(response: Any) -> None:
+        if source_key != "allianceRank" or "/pc/leaderboard_26/get_board_default_info" not in str(response.url):
+            return
+        try:
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else {}
+            industry = data.get("industry_list") if isinstance(data, dict) else []
+            for top in industry if isinstance(industry, list) else []:
+                children = top.get("child_cate_list") if isinstance(top, dict) else []
+                for child in children if isinstance(children, list) else []:
+                    if not isinstance(child, dict) or str(child.get("father_cate_id")) != "0":
+                        continue
+                    category_id = _category_id_scalar(child.get("cate_id"))
+                    name = str(child.get("cate_name") or "").strip()
+                    if category_id and name:
+                        rank_root_catalog.setdefault(name, set()).add(category_id)
+        except Exception:
+            return
 
     def observe_rate_limit(response: Any) -> None:
         request = getattr(response, "request", None)
@@ -7608,6 +7857,9 @@ def _read_priority_source_product_ids(
     try:
         source_page = _create_selection_work_page(page.context)
         source_page.on("response", observe_rate_limit)
+        if source_key == "allianceRank":
+            source_page.on("response", observe_rank_catalog)
+            source_page.on("request", observe_rank_request)
         # SPA 页面可能迟迟不触发 DOMContentLoaded；先等首个响应提交，再按真实列表/空状态判断就绪。
         response = source_page.goto(url, wait_until="commit", timeout=45_000)
         if rate_limit_errors:
@@ -7629,11 +7881,36 @@ def _read_priority_source_product_ids(
         if prompt_kind:
             raise RuntimeError(f"百应来源页面存在待处理提示，商品身份无法唯一确认：{prompt_text[:160]}")
 
-        rank_selection = _select_rank_source_options(source_page, settings or {}) if source_key == "allianceRank" else {}
+        rank_selection: Dict[str, Any] = {}
+        if source_key == "allianceRank":
+            rank_selection = _select_rank_source_options(source_page, settings or {})
+            config = settings.get("sources") if isinstance(settings, dict) and isinstance(settings.get("sources"), dict) else {}
+            quota_path = settings.get("_quotaCategoryPath") if isinstance(settings, dict) else None
+            requested_path = quota_path if isinstance(quota_path, list) and quota_path else config.get("rankCategoryPath", [])
+            requested_path = _rank_category_ids(requested_path)
+            if requested_path:
+                resolved, _ = _resolve_single_category_id(requested_path[-1], category_tree)
+                if len(resolved) != len(requested_path) or any(
+                    not _category_id_matches(actual, expected) for actual, expected in zip(resolved, requested_path)
+                ):
+                    raise RecoverablePrioritySourceReadError("带货商品榜分类 ID 无法在当前百应类目树中唯一核实")
+            rank_selection.update(_select_rank_category(source_page, requested_path, rank_requests))
+            price_range = str(config.get("rankPriceRange") or "不限")
+            rank_selection["rankPriceRange"] = _select_rank_price_range(source_page, price_range, rank_requests)
+            commission_floor = _rank_commission_platform_floor(settings or {})
+            rank_selection["rankCommissionFloor"] = _select_rank_dropdown(
+                source_page, "佣金率", commission_floor, "cos_ratio",
+                "" if commission_floor == "不限" else commission_floor[1:-1], rank_requests,
+            )
+            experience_floor = _rank_experience_platform_floor(settings or {})
+            rank_selection["rankExperienceFloor"] = _select_rank_dropdown(
+                source_page, "体验分", experience_floor, "exp_score",
+                "" if experience_floor == "不限" else experience_floor[1:], rank_requests,
+            )
 
         tab_read_error = ""
         try:
-            tabs = _source_category_tabs(source_page, source_key, category_tree)
+            tabs = _source_category_tabs(source_page, source_key, category_tree, rank_root_catalog)
         except Exception as error:
             if category_tab is not None:
                 raise RecoverablePrioritySourceReadError(f"{label}分类控件无法安全回读") from error
@@ -7647,15 +7924,35 @@ def _read_priority_source_product_ids(
                 raise RecoverablePrioritySourceReadError(f"{label}来源分类控件已变化，无法按稳定 ID 选中分类")
             tab_selector = ('div[class*="subCategoryGroup"] > div[class*="box"]'
                             if source_key == "allianceRank" else 'div[class*="cateFilterMain"] > div[class*="box"]')
-            source_page.locator(tab_selector).nth(expected_index).click(timeout=8_000)
+            if source_key == "allianceRank":
+                source_page.locator(tab_selector).nth(expected_index).evaluate("node => node.click()")
+            else:
+                source_page.locator(tab_selector).nth(expected_index).click(timeout=8_000)
             source_page.wait_for_timeout(1_000)
-            tabs = _source_category_tabs(source_page, source_key, category_tree)
-            selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
-            if selected_tab is None or selected_tab["categoryId"] != expected_id or not selected_tab["selected"]:
-                raise RecoverablePrioritySourceReadError(f"{label}来源分类选中状态无法回读；未将商品归入该分类")
+            tabs = _source_category_tabs(source_page, source_key, category_tree, rank_root_catalog)
+            if source_key == "allianceRank":
+                display = source_page.locator('[class*="categoryCascader"] .aurora-select-content-value').first.inner_text().strip()
+                if (str(category_tab.get("name") or "") not in display or not rank_requests or
+                        str(rank_requests[-1].get("cate_id")) != expected_id):
+                    raise RecoverablePrioritySourceReadError("带货商品榜分类标签与实际榜单请求 ID 不一致")
+                # 百应点击一级分类后将它移入级联标题，下方标签随即变成二级，原 index 不再存在。
+                selected_tab = {**category_tab, "selected": True, "index": -1}
+            else:
+                selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
+                if selected_tab is None or selected_tab["categoryId"] != expected_id or not selected_tab["selected"]:
+                    raise RecoverablePrioritySourceReadError(f"{label}来源分类选中状态无法回读；未将商品归入该分类")
         else:
-            selected_tabs = [item for item in tabs if item["selected"]]
-            selected_tab = selected_tabs[0] if len(selected_tabs) == 1 else None
+            if source_key == "allianceRank" and rank_selection.get("categoryIds"):
+                selected_tab = {
+                    "name": str(rank_selection.get("categoryLabel") or "")[:50],
+                    "categoryId": rank_selection["categoryIds"][-1],
+                    "categoryIds": rank_selection["categoryIds"],
+                    "level": len(rank_selection["categoryIds"]),
+                    "status": "mapped", "selected": True, "index": -1,
+                }
+            else:
+                selected_tabs = [item for item in tabs if item["selected"]]
+                selected_tab = selected_tabs[0] if len(selected_tabs) == 1 else None
 
         readiness_reached = False
         readiness_wait_started = time.monotonic()
@@ -8124,7 +8421,7 @@ def _read_priority_source_product_ids(
             dict(row) for row in raw_rows
             if isinstance(row, dict) and str(row.get("product_id") or "").strip()
         ]
-        quota_path_for_scroll = settings.get("_quotaCategoryPath") if isinstance(settings, dict) else None
+        quota_path_for_scroll = (settings.get("_quotaCategoryPath") or rank_selection.get("categoryIds")) if isinstance(settings, dict) else None
         if (ids and isinstance(quota_path_for_scroll, list) and quota_path_for_scroll and
                 isinstance(selected_tab, dict) and selected_tab.get("status") == "mapped" and
                 isinstance(selected_tab.get("categoryIds"), list) and selected_tab["categoryIds"] and
@@ -8155,8 +8452,8 @@ def _read_priority_source_product_ids(
                 if not isinstance(movement, dict) or not movement.get("moved"):
                     break
                 source_page.wait_for_timeout(550)
-                current_tabs = _source_category_tabs(source_page, source_key, category_tree)
-                if selected_tab and not any(tab["categoryId"] == selected_tab["categoryId"] and tab["selected"] for tab in current_tabs):
+                current_tabs = _source_category_tabs(source_page, source_key, category_tree, rank_root_catalog)
+                if selected_tab and selected_tab.get("index") != -1 and not any(tab["categoryId"] == selected_tab["categoryId"] and tab["selected"] for tab in current_tabs):
                     raise RecoverablePrioritySourceReadError(f"{label}滚动后分类选中状态变化，停止计入品类配额")
                 next_snapshot = source_page.evaluate(snapshot_script, snapshot_args)
                 if rate_limit_errors:
@@ -8193,6 +8490,11 @@ def _read_priority_source_product_ids(
                 snapshot["sourceFilterRejected"] = len(product_rows) - len(filtered_rows)
                 product_rows = filtered_rows
                 ids = {str(row["product_id"]) for row in product_rows}
+        if source_key == "allianceRank" and rank_selection.get("rankPriceRange") != "不限":
+            before_count = len(product_rows)
+            product_rows = [row for row in product_rows if _rank_row_matches_price(row, rank_selection["rankPriceRange"])]
+            snapshot["sourceFilterRejected"] = before_count - len(product_rows)
+            ids = {str(row["product_id"]) for row in product_rows}
         if selected_tab and selected_tab.get("status") == "mapped":
             for row in product_rows:
                 row["_sourceCategory"] = {
@@ -8417,24 +8719,33 @@ def _collect_priority_source_ids(
         try:
             product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key, category_tree, settings=settings)
             quota_path = settings.get("_quotaCategoryPath")
+            if source_key == "allianceRank" and not quota_path:
+                quota_path = config.get("rankCategoryPath")
             if isinstance(quota_path, list) and quota_path:
-                tabs = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
-                matching_tabs = [tab for tab in tabs if isinstance(tab, dict) and tab.get("status") == "mapped"
-                                 and isinstance(tab.get("categoryIds"), list) and tab["categoryIds"]
-                                 and len(tab["categoryIds"]) <= len(quota_path)
-                                 and all(_category_id_matches(str(tab["categoryIds"][level]), str(quota_path[level]))
-                                         for level in range(len(tab["categoryIds"]))) ]
-                if matching_tabs:
-                    deepest = max(len(tab["categoryIds"]) for tab in matching_tabs)
-                    matching_tabs = [tab for tab in matching_tabs if len(tab["categoryIds"]) == deepest]
-                if len(matching_tabs) != 1:
-                    raise RecoverablePrioritySourceReadError(
-                        f"{label}无法唯一定位配额品类的稳定来源分类 ID；不计入该品类")
-                quota_tab = matching_tabs[0]
                 selected_category = evidence.get("selectedSourceCategory")
-                if not isinstance(selected_category, dict) or selected_category.get("categoryId") != quota_tab.get("categoryId"):
-                    product_ids, product_rows, evidence = _read_priority_source_product_ids(
-                        page, source_key, category_tree, category_tab=quota_tab, settings=settings)
+                if source_key == "allianceRank":
+                    requested_ids = _rank_category_ids(quota_path)
+                    selected_ids = selected_category.get("categoryIds") if isinstance(selected_category, dict) else []
+                    if selected_ids != requested_ids:
+                        raise RecoverablePrioritySourceReadError("带货商品榜分类 ID 未回读到设定路径；不计入该分类")
+                    quota_tab = selected_category
+                else:
+                    tabs = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
+                    matching_tabs = [tab for tab in tabs if isinstance(tab, dict) and tab.get("status") == "mapped"
+                                     and isinstance(tab.get("categoryIds"), list) and tab["categoryIds"]
+                                     and len(tab["categoryIds"]) <= len(quota_path)
+                                     and all(_category_id_matches(str(tab["categoryIds"][level]), str(quota_path[level]))
+                                             for level in range(len(tab["categoryIds"]))) ]
+                    if matching_tabs:
+                        deepest = max(len(tab["categoryIds"]) for tab in matching_tabs)
+                        matching_tabs = [tab for tab in matching_tabs if len(tab["categoryIds"]) == deepest]
+                    if len(matching_tabs) != 1:
+                        raise RecoverablePrioritySourceReadError(
+                            f"{label}无法唯一定位配额品类的稳定来源分类 ID；不计入该品类")
+                    quota_tab = matching_tabs[0]
+                    if not isinstance(selected_category, dict) or selected_category.get("categoryId") != quota_tab.get("categoryId"):
+                        product_ids, product_rows, evidence = _read_priority_source_product_ids(
+                            page, source_key, category_tree, category_tab=quota_tab, settings=settings)
                 for product_row in product_rows:
                     source_category = product_row.get("_sourceCategory")
                     product_row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
@@ -10250,6 +10561,8 @@ def _classify_selection_failure(
     error: BaseException,
 ) -> str:
     """结合当前页面和 DOM 判断失败阶段，避免登录探测 unknown 覆盖真实筛选错误。"""
+    if isinstance(error, CommissionFilterUnconfirmed):
+        return "COMMISSION_FILTER_UNCONFIRMED"
     if any(str(event.get("businessCode")) == "11001" for event in request_events):
         return "BAIYING_RATE_LIMIT"
     if "SEARCHBOX_ZERO_EXHAUSTED" in str(error):
@@ -11103,6 +11416,8 @@ def apply_filter_settings(
     try:
         _apply_square_commission_range(page, settings)
     except Exception as error:
+        if isinstance(error, CommissionFilterUnconfirmed):
+            raise
         if _selection_error_requires_pause(error):
             raise
         warnings.append(f"选品广场佣金区间未确认应用；将按商品实际佣金率在客户端核验：{_safe_diagnostic_text(error, 180)}")
@@ -11252,6 +11567,10 @@ def _apply_one_category_and_collect_candidates(
             f"诊断文件 {diagnostic.get('jsonPath', '未能保存')}；"
             f"截图 {diagnostic.get('screenshotPath', '未能保存')}。"
         )
+        if isinstance(error, CommissionFilterUnconfirmed):
+            raise CommissionFilterUnconfirmed(
+                f"COMMISSION_FILTER_UNCONFIRMED：选品广场佣金筛选状态不明；{request_status}{artifact_status}"
+            ) from error
         raise RuntimeError(f"{error}；{request_status}{artifact_status}") from error
     finally:
         _remove_material_list_listeners(page, collector)
@@ -11495,6 +11814,8 @@ def _candidate_rank(candidate: Dict[str, Any], settings: Dict[str, Any]) -> tupl
 
 def _selection_error_requires_pause(error: BaseException) -> bool:
     """账号/浏览器/限流状态不确定时暂停；普通类目查询错误允许跳过该类目。"""
+    if isinstance(error, CommissionFilterUnconfirmed):
+        return False
     if isinstance(error, CandidateCartSkip):
         return False
     message = str(error).lower()
@@ -15156,11 +15477,17 @@ def _execute_pool_consumer_candidates(
         if actual.hostname != expected.hostname or actual.path.rstrip("/") != expected.path.rstrip("/"):
             raise RuntimeError("当前账号百应选品广场未正常打开；请检查登录和选品权限")
         search_settings = copy.deepcopy(settings)
-        thresholds = search_settings.get("thresholds") if isinstance(search_settings.get("thresholds"), dict) else {}
-        search_settings["thresholds"] = {**thresholds, "commissionRate": None, "commissionRateMax": None}
+        # 池内商品已由采集账号读取；消费账号只需在未收窄的页面上按精确 ID
+        # 找到可见商品，再用自身详情和实际指标逐项核验。沿用采集时的页面筛选
+        # 会隐藏池内商品，并可能在搜索前被无关控件阻断。
+        search_settings["filters"] = {}
+        search_settings["filterCatalog"] = {}
+        search_settings["thresholds"] = {}
+        search_settings["categorySelection"] = {"level1": [], "level2": [], "level3": []}
+        search_settings["searchKeyword"] = ""
         filter_warnings = apply_filter_settings(page, search_settings)
         if filter_warnings:
-            raise RuntimeError("当前账号百应筛选条件未全部确认应用；保留检查点：" + "；".join(filter_warnings[:3]))
+            raise RuntimeError("当前账号百应搜索页未能清理旧筛选；保留检查点：" + "；".join(filter_warnings[:3]))
         for position, candidate in enumerate(selected, start=1):
             if sum(row.get("cartAdded") is True for row in completed) >= target:
                 break

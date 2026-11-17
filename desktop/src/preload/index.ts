@@ -91,15 +91,15 @@ const browser = {
   }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('browser:runBaiyingSelection', toPlainIpcPayload(params)),
 
-  /** 本机选品登记快照；记录仅写入当前客户端 SQLite。 */
+  /** 选品登记快照；配置共享服务后以服务器为准。 */
   getSelectionRegistrySnapshot: (accountKey: string, candidates: Array<{ productId: string; leafCategoryId: string }>): Promise<{
     usedProductIds: string[]
     accountUsedCategoryIds: string[]
     categoryUsage: Record<string, number>
-    mode: 'local'
+    mode: 'local' | 'server'
   }> => ipcRenderer.invoke('selection-registry:snapshot', accountKey, toPlainIpcPayload(candidates)),
 
-  /** 一次检查整批多账号候选的本机选品登记。 */
+  /** 一次检查整批多账号候选的选品登记。 */
   getSelectionRegistryBatchSnapshot: (entries: Array<{
     accountKey: string
     candidates: Array<{ productId: string; leafCategoryId: string }>
@@ -107,7 +107,7 @@ const browser = {
     usedProductIds: string[]
     accountUsedCategoryIds: string[]
     categoryUsage: Record<string, number>
-    mode: 'local'
+    mode: 'local' | 'server'
   }>> => ipcRenderer.invoke('selection-registry:snapshot-batch', toPlainIpcPayload(entries)),
 
   /** 订阅百应选品的实时阶段、类目和商品处理进度。 */

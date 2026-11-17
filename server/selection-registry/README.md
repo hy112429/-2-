@@ -4,12 +4,13 @@
 
 ## 当前执行口径
 
-客户端目前走本机登记：`desktop/src/main/selection_registry.ts` → `engine/selection_registry_local.py`，`mode: local`，数据保存在当前客户端的本机 SQLite 中。**本服务保留未部署、未对接状态**；共享登记适配曾具备，当前未启用。本文中的服务端操作用于本机隔离冒烟，不代表客户端已经切换到共享服务。
+客户端未配置 `TOUGUANG_REGISTRY_URL` 与 `TOUGUANG_REGISTRY_TOKEN` 时仍走本机 SQLite（`mode: local`）。两项同时配置后，主进程通过 HTTPS 访问本服务（`mode: server`）；服务不可达或响应不完整时停止本轮并保留检查点，不回退到本机结果。凭据仅由主进程环境提供，不写入仓库或选品日志。**当前服务尚未生产部署，历史记录尚未导入，甲方客户端尚未切换。**
 
 ## 数据规则
 
 - 服务端商品 ID 在全部账号和电脑间全局唯一。状态为 `RESERVED`、`ATTEMPTING`、`COMMITTED`、`UNCERTAIN` 的记录都占用商品 ID。
 - 同一抖音账号的末级类目只能登记一次。账号身份使用稳定的 `douyin_id`；客户端账号表本地自增 ID 不跨电脑复用。
+- 客户端账号缺少可用 `douyin_id` 时，以机器 ID 加本地账号 ID 作为账号键；商品 ID 仍全局互斥，但该账号的末级类目历史不能跨电脑合并，启用前应补齐账号身份。
 - 跨账号类目不设唯一约束。快照返回类目使用次数，调用方可把它作为错开偏好。
 - API 流程为加车前预留；确认加入后提交；确定未加入时释放；执行结果不明时进入 `UNCERTAIN` 并继续锁定。
 - `UNCERTAIN` 记录不会自动过期或释放。人工核对后才可通过 `/resolve` 结算。
@@ -24,11 +25,11 @@
    python engine/selection_registry_export.py --db "D:\path\to\ad_client.db" --output "D:\selection-registry-import.json"
    ```
 
-   旧 SQLite 仅保存商品 ID 与账号 ID，没有历史末级类目 ID，因此初始导入只能恢复商品全局去重；旧账号类目历史无法从当前表结构还原。
+   导出会合并已确认商品、加车配额和本机登记；`COMMITTED` 与 `UNCERTAIN` 分别导入，执行中或预留未结算的记录按 `UNCERTAIN` 保守锁定，`RELEASED` 不导入。已有末级类目 ID 时一并导入；缺少时只能恢复商品全局去重。各电脑都须导入，且须先核对同一 ID 的冲突状态。导出文件包含商品和账号标识，存放在受控目录，不提交 Git。
 
-2. 通过凭证闸门确认 HTTPS、服务域名与访问密钥的签发和保管方式。不要把密钥写入版本库；在另行授权客户端切换前，不要要求客户端填写服务地址或密钥。
+2. 确认 HTTPS、服务域名与访问密钥的签发和保管方式。只在部署和历史导入完成后，为客户端运行环境一次性配置 `TOUGUANG_REGISTRY_URL`（服务根地址）和 `TOUGUANG_REGISTRY_TOKEN`；普通选品无需每次设置。仅本机隔离可使用 `http://127.0.0.1`。
 3. 在私有网络中部署服务，配置 HTTPS 反向代理、数据库备份与恢复演练。MySQL 不应直接发布到局域网或公网。
-4. 完成独立的启用决策与客户端变更卡，再安排共享对接。**本卡完成后仍不自动恢复客户端对接。**
+4. 先核对服务端已导入历史、客户端稳定账号身份和待核查记录，再启用客户端共享模式。启用后新候选入池前查询服务器；恢复旧池也剔除已占用 ID，未达目标保留缺额并继续补池。加车前仍由服务端原子预留，避免快照后其他电脑抢先选中。
 
 ## 本机隔离冒烟
 
@@ -60,10 +61,10 @@ docker compose -p selection-registry-local-harden-20261104 --env-file "$runtime\
 | `POST /api/v1/registry/reservations/{token}/finish` | `ADDED` / `NOT_ADDED` / `UNKNOWN` 结算 |
 | `GET /api/v1/registry/pending` | 查看预留、执行中及结果不明记录 |
 | `POST /api/v1/registry/reservations/{token}/resolve` | 管理员人工核对后，以 `manuallyConfirmed: true` 结算 `ADDED` 或 `NOT_ADDED` |
-| `POST /api/v1/registry/import` | 启用共享前导入既有商品 ID / 可用账号类目历史 |
+| `POST /api/v1/registry/import` | 启用共享前导入既有商品 ID / 可用账号类目历史；每项可标注 `COMMITTED` 或 `UNCERTAIN` |
 
 `UNCERTAIN` 记录不会自动过期或释放。管理员应先按账号和商品 ID 在百应选品车核对，再调用 `/resolve`；不能确认结果时保持锁定。
 
 ## 当前部署状态
 
-服务端源码、Compose 和 Flyway 迁移具备；本机隔离冒烟的执行记录、通过项与环境阻断见 `D:\software\投广客户端\小g工作区\selection-registry-local-harden-20261104\evidence\`。**未**生产部署，**未**改客户端登记路径。共享适配曾具备，当前未启用。
+服务端源码、Compose 和 Flyway 迁移具备；本机隔离冒烟的历史执行记录见 `D:\software\投广客户端\小g工作区\selection-registry-local-harden-20261104\evidence\`。客户端共享适配已写入源码，但本轮未运行服务端或客户端验证；**未**生产部署、导入历史或切换甲方运行环境。
