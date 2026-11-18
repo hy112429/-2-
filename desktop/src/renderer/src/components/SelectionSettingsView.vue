@@ -35,6 +35,27 @@ import {
   selectCandidateIdsForAccount
 } from '../utils/selection_batch'
 
+function safeCandidateCollectorErrorDetail(input: unknown): string {
+  const raw = String(input instanceof Error ? input.message : input ?? '').trim()
+  if (!raw) return ''
+  return raw
+    .replace(/https?:\/\/[^\s)]+/gi, (value) => {
+      try {
+        const url = new URL(value)
+        for (const key of [...url.searchParams.keys()]) {
+          if (/(cookie|token|secret|auth|session|password|signature|sign)/i.test(key)) {
+            url.searchParams.set(key, '[redacted]')
+          }
+        }
+        return url.toString()
+      } catch {
+        return '[redacted-url]'
+      }
+    })
+    .replace(/(cookie|token|secret|auth|session|password|signature|sign)\s*[=:]\s*[^\s,;]+/gi, '$1=[redacted]')
+    .slice(0, 1_200)
+}
+
 const props = withDefaults(defineProps<{
   initialAccountId?: number | null
   dialogOnly?: boolean
@@ -1948,6 +1969,22 @@ function validateCommissionRange(lower: number | null | undefined, upper: number
   if (lower != null && upper != null && lower > upper) throw new Error(`${scope}最低佣金率不能超过最高佣金率。`)
 }
 
+function commissionBounds(settings: Record<string, unknown>): [number | null, number | null] {
+  const thresholds = (settings.thresholds ?? {}) as Record<string, unknown>
+  const normalize = (value: unknown): number | null => {
+    if (value === null || value === undefined || value === '') return null
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return [normalize(thresholds.commissionRate), normalize(thresholds.commissionRateMax)]
+}
+
+function commissionBoundsEqual(left: Record<string, unknown>, right: Record<string, unknown>): boolean {
+  const [leftMin, leftMax] = commissionBounds(left)
+  const [rightMin, rightMax] = commissionBounds(right)
+  return leftMin === rightMin && leftMax === rightMax
+}
+
 function validateCandidateSources(sources: SelectionFilterSettings['sources'], scope: string): void {
   if (!sources.hotSpotEnabled && !sources.allianceRankEnabled && !sources.selectionSquareEnabled) throw new Error(`${scope}至少启用一个候选来源。`)
   if (!['不限', '1-10', '10-50', '50-100', '100-500', '500-5000', '5000+'].includes(sources.rankPriceRange)) throw new Error(`${scope}榜单售价区间无效。`)
@@ -2383,7 +2420,8 @@ async function collectBatchCandidatePoolByQuota(
             lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
             await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
               stage: '候选池采集', code: 'WARNING_CANDIDATE_POOL_QUOTA_READ',
-              message: `${formatQuotaRule(rule)} 本轮未能读取。`, detail: lastError
+              message: `${formatQuotaRule(rule)} 本轮未能读取。`,
+              detail: `${lastError}；${safeCandidateCollectorErrorDetail(rawError)}`
             })
             if (/11001|RATE_LIMIT|限流|验证码|安全验证|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) throw cause
             break
@@ -2425,7 +2463,8 @@ async function collectBatchCandidatePoolByQuota(
 
 async function collectBatchCandidatePool(
   batch: SelectionRecoveryBatch,
-  contexts: Map<number, AccountRunContext>
+  contexts: Map<number, AccountRunContext>,
+  consumerTarget = 1
 ): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean }> {
   const snapshot = batch.payload.settingsSnapshot as Record<string, unknown> | undefined
   if (snapshot?.candidatePoolMode === 'quota') return collectBatchCandidatePoolByQuota(batch, contexts)
@@ -2471,14 +2510,14 @@ async function collectBatchCandidatePool(
     throw new Error('剔除已登记商品后候选池未达目标，采集账号资源不可用；已保留检查点。')
   }
   let lastError = ''
-  if (rowsById.size < target) {
+  if (rowsById.size < target && rowsById.size < consumerTarget) {
     for (const collectorId of collectorIds) {
       const context = contexts.get(collectorId)!
       const collectorState: BatchCandidatePool['sourceState']['collectors'][string] =
         sourceState.collectors[String(collectorId)] ?? { tabOffsets: {}, samePoolCount: 0 }
       sourceState.collectors[String(collectorId)] = collectorState
       if (collectorState.nextRetryAt && new Date(collectorState.nextRetryAt).getTime() > Date.now()) continue
-      for (let round = 0; round < 3 && rowsById.size < target; round += 1) {
+      for (let round = 0; round < 3 && rowsById.size < target && rowsById.size < consumerTarget; round += 1) {
         const before = rowsById.size
         const priorOffsets = JSON.stringify(collectorState.tabOffsets)
         const newRows: SelectionCandidate[] = []
@@ -2553,7 +2592,8 @@ async function collectBatchCandidatePool(
           lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
           await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
             stage: '候选池采集', code: 'WARNING_CANDIDATE_COLLECTOR_SKIPPED',
-            message: `采集账号 ${collectorId} 本轮未完成读取。`, detail: lastError
+            message: `采集账号 ${collectorId} 本轮未完成读取。`,
+            detail: `${lastError}；${safeCandidateCollectorErrorDetail(rawError)}`
           })
           if (/11001|RATE_LIMIT|限流|验证码|安全验证|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) break
           break
@@ -2568,6 +2608,7 @@ async function collectBatchCandidatePool(
           }
         }
       }
+      if (rowsById.size >= consumerTarget) break
     }
   }
   if (!oldPool && rowsById.size === 0) await savePool([], collectorIds[0])
@@ -2575,11 +2616,11 @@ async function collectBatchCandidatePool(
   const currentBatch = refreshed.batch as SelectionRecoveryBatch | null
   if (!currentBatch || currentBatch.batchId !== batch.batchId) throw new Error('候选池采集后批次检查点发生变化；已停止消费阶段。')
   const pool = currentBatch.payload.candidatePool as BatchCandidatePool
-  if (!pool || pool.rows.length < target) {
+  if (!pool || pool.rows.length < consumerTarget) {
     await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
       stage: '候选池采集', code: 'WARNING_CANDIDATE_POOL_TARGET_UNMET',
-      message: `共享候选池 ${pool?.rows.length ?? 0}/${target}，未达到目标，消费账号尚未开始。`,
-      detail: lastError || '已保留采集游标和商品 ID，等待来源产生新商品后续读。'
+      message: `共享候选池 ${pool?.rows.length ?? 0}/${target}，当前账号需要 ${consumerTarget} 件，尚未开始消费。`,
+      detail: lastError || '已保留采集游标和商品 ID；达到当前账号目标后可先消费，候选池总目标继续保留检查点补充。'
     })
     const updated = await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
     return { batch: updated.batch as SelectionRecoveryBatch, pool, ready: false }
@@ -2664,11 +2705,19 @@ async function prepareBatchCandidatePlans(
     const sameFilterDifferentVisibility = [...sharedPools.values()].some((pool) =>
       pool.filterFingerprint === filterFingerprint && pool.visibilityFingerprint !== visibilityFingerprint
     )
+    const accountTarget = Number.isFinite(configuredTarget) ? Math.max(1, Math.min(10, configuredTarget)) : 5
+    const cumulativeConsumerTarget = orderedTargets
+      .slice(0, targetIndex + 1)
+      .reduce((sum, targetAccount) => {
+        const targetContext = contexts.get(targetAccount.id)
+        const raw = Number(targetContext?.settings.candidateLimit ?? 5)
+        return sum + (Number.isFinite(raw) ? Math.max(1, Math.min(10, raw)) : 5)
+      }, 0)
     const seededPlan = seededPreviewPlans?.get(account.id)
     const seededRows = seededPlan?.candidatePool
     const seededSharedRows = seededPlan?.sharedCandidatePool
     const seededMeta = seededPlan?.candidatePoolMeta
-    const reusableSharedPool = collectorPool?.status === 'ready' && collectorPool.rows.length >= collectorPool.target
+    const reusableSharedPool = collectorPool && collectorPool.rows.length >= cumulativeConsumerTarget
       ? {
           rows: collectorPool.rows,
           createdByAccountId: collectorPool.collectorAccountIds[0],
@@ -2694,7 +2743,7 @@ async function prepareBatchCandidatePlans(
         }
       : sharedPools.get(sharedPoolKey)
     const reuseAllowed = Boolean(reusableSharedPool && reusableSharedPool.rows.length && (
-      collectorPool?.status === 'ready' || (
+      Boolean(collectorPool && collectorPool.rows.length >= cumulativeConsumerTarget) || (
         reusableSharedPool.filterFingerprint === filterFingerprint &&
         reusableSharedPool.visibilityFingerprint === visibilityFingerprint &&
         Boolean(visibilityFingerprint)
@@ -5645,6 +5694,22 @@ async function runSelectionBatch(): Promise<void> {
       if (savedThresholds.commissionRate != null && snapshot.commissionRateRule !== 'minimum') {
         throw new Error('旧批次佣金率按上限保存，不能按新最低值规则自动恢复；检查点已保留。')
       }
+      const currentPersistedResult = await runEngine('selection_settings.py', ['--db', DB_PATH, 'get'])
+      const currentPersistedSettings = (currentPersistedResult.settings ?? {}) as Record<string, unknown>
+      validateCommissionRange(
+        commissionBounds(currentPersistedSettings)[0],
+        commissionBounds(currentPersistedSettings)[1],
+        '当前已保存设置'
+      )
+      if (!commissionBoundsEqual(snapshot, currentPersistedSettings)) {
+        const [oldMin, oldMax] = commissionBounds(snapshot)
+        const [currentMin, currentMax] = commissionBounds(currentPersistedSettings)
+        throw new Error(
+          `旧批次佣金快照为 ${oldMin ?? '不限'}%–${oldMax ?? '不限'}%，` +
+          `当前已保存设置为 ${currentMin ?? '不限'}%–${currentMax ?? '不限'}%；` +
+          '为避免新旧佣金规则混用，未恢复旧批次，请新建批次。'
+        )
+      }
       reviewedAccountId = typeof batch.payload.reviewedAccountId === 'number' ? batch.payload.reviewedAccountId : null
       const reviewedIds = batch.payload.reviewedProductIds
       reviewedProducts = Array.isArray(reviewedIds) ? new Set(reviewedIds.map(String)) : undefined
@@ -5666,6 +5731,23 @@ async function runSelectionBatch(): Promise<void> {
         account.status === 'active' && isSelectionAccountInScope(account.id)
       )
       if (!enabled.length) throw new Error('没有启用的账号可执行自动选品。')
+      const persistedBeforeCreate = await runEngine('selection_settings.py', ['--db', DB_PATH, 'get'])
+      const persistedBeforeCreateSettings = (persistedBeforeCreate.settings ?? {}) as Record<string, unknown>
+      validateCommissionRange(
+        commissionBounds(persistedBeforeCreateSettings)[0],
+        commissionBounds(persistedBeforeCreateSettings)[1],
+        '当前已保存设置'
+      )
+      const uiSettings = JSON.parse(JSON.stringify(global)) as Record<string, unknown>
+      if (!commissionBoundsEqual(uiSettings, persistedBeforeCreateSettings)) {
+        const [uiMin, uiMax] = commissionBounds(uiSettings)
+        const [savedMin, savedMax] = commissionBounds(persistedBeforeCreateSettings)
+        throw new Error(
+          `当前页面佣金设置为 ${uiMin ?? '不限'}%–${uiMax ?? '不限'}%，` +
+          `但已保存设置为 ${savedMin ?? '不限'}%–${savedMax ?? '不限'}%；` +
+          '请先保存通用选品设置，未创建新批次。'
+        )
+      }
       snapshot = JSON.parse(JSON.stringify(global)) as Record<string, unknown>
       if (commissionRuleMigrationRequired.value) throw new Error('旧佣金设置按上限保存；请核对最低佣金率并保存通用设置后再新建批次。')
       const collectorIds = Array.isArray(snapshot.candidateCollectorAccountIds)
@@ -5714,7 +5796,7 @@ async function runSelectionBatch(): Promise<void> {
       if (!confirmSelectionScope(newBatchScopeFingerprint,
         `本批次将依次运行以下全部启用账号：\n\n${batchAccountSummary}\n\n` +
         `素材保存根目录（每账号独立，后续按日期和商品名称分层）：\n${batchPathSummary}\n\n` +
-        `先由采集账号 ${collectorIds.join('、')} 顺序只读采集，${snapshot.candidatePoolMode === 'quota' ? '每条品类配额分别达标' : `候选池达到 ${snapshot.candidatePoolTarget} 件`}后才开始消费账号。每次只启动当前账号的浏览器；消费账号按池内商品 ID 用自身百应登录态核验详情和加车，完成选品发布并关闭浏览器后才会启动下一个账号。`
+        `先由采集账号 ${collectorIds.join('、')} 顺序只读采集并保存共享候选池；${snapshot.candidatePoolMode === 'quota' ? '每条品类配额全部达标' : '当前账号可用候选达到自身目标数量'}后即可开始消费，池总目标 ${snapshot.candidatePoolTarget} 件继续按检查点补充。每次只启动当前账号的浏览器；消费账号按池内商品 ID 用自身百应登录态核验详情和加车，完成选品发布并关闭浏览器后才会启动下一个账号。`
       )) {
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '已取消启动',
@@ -5728,6 +5810,10 @@ async function runSelectionBatch(): Promise<void> {
       )
       if (savedSelectionSettings.ok !== true) {
         throw new Error('通用选品设置保存失败，未创建批次。')
+      }
+      const savedSnapshotSettings = (savedSelectionSettings.settings ?? {}) as Record<string, unknown>
+      if (!commissionBoundsEqual(snapshot, savedSnapshotSettings) || savedSnapshotSettings.commissionRateRule !== 'minimum') {
+        throw new Error('佣金范围快照保存后校验不一致，未创建批次。')
       }
       reviewedAccountId = null
       reviewedProducts = reviewedAccountId !== null
@@ -5796,7 +5882,13 @@ async function runSelectionBatch(): Promise<void> {
       ((batchPayload.settingsSnapshot as Record<string, unknown>).candidateCollectorAccountIds as unknown[]).length > 0
     let collectorPool: BatchCandidatePool | undefined
     if (poolMode) {
-      const collected = await collectBatchCandidatePool(batch, contexts)
+      const firstConsumer = activeTaskAccounts.find((account) => contexts.has(account.id))
+      const configuredConsumerTarget = Number(
+        firstConsumer ? contexts.get(firstConsumer.id)?.settings.candidateLimit ?? 5 : 5
+      )
+      const firstConsumerTarget = Number.isFinite(configuredConsumerTarget)
+        ? Math.max(1, Math.min(10, configuredConsumerTarget)) : 5
+      const collected = await collectBatchCandidatePool(batch, contexts, firstConsumerTarget)
       batch = collected.batch
       recoveryBatch.value = batch
       batchPayload = batch.payload
@@ -5807,7 +5899,7 @@ async function runSelectionBatch(): Promise<void> {
             .map((item) => `${quotaProgressLabel(item.ruleId)} 缺 ${item.deficit} 件`).join('；') : ''
         notice.value = quotaDeficits
           ? `候选池品类配额尚未达标：${quotaDeficits}。已保存检查点，消费账号未启动。`
-          : `候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}，尚未达到设定目标；已保存检查点，消费账号未启动。`
+          : `候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}，当前账号还需要 ${firstConsumerTarget} 件合格候选；已保存检查点，消费账号未启动。`
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '候选池待补充',
           message: notice.value, percent: null

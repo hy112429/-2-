@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""热点、榜单、选品广场统一筛选与详情补核验的隔离用例。"""
+"""热点、榜单、选品广场分来源筛选与详情补核验的隔离用例。"""
 
 from __future__ import annotations
 
@@ -229,9 +229,9 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual(result["prioritySourceResults"][-1]["status"], "skipped")
         self.assertIn("COMMISSION_FILTER_UNCONFIRMED", result["prioritySourceResults"][-1]["detail"])
 
-    def test_three_sources_share_exclusion_and_thresholds(self):
+    def test_source_policies_allow_hotspot_without_extra_thresholds(self):
         rows = {
-            "hotSpot": [promotion_row("hot-good", ("1", "201", "301"), 10, 4.8)],
+            "hotSpot": [promotion_row("hot-good", ("1", "201", "301"), 3, 3.1)],
             "allianceRank": [promotion_row("rank-bad", ("1", "201", "302"), 5, 4.8)],
             "selectionSquare": [promotion_row("square-blocked", ("1", "202", "309"), 10, 4.9)],
         }
@@ -252,10 +252,12 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertIn("佣金率 5 低于设定下限 10", rejected["rank-bad"]["thresholdReasons"])
         self.assertIn("square-blocked", rejected)
         self.assertIn("命中当前设置中排除的类目", rejected["square-blocked"]["thresholdReasons"])
+        self.assertEqual(result["candidates"][0]["sourceKey"], "hotSpot")
+        self.assertEqual(result["candidates"][0]["sourcePolicy"], "hotspot_category_and_banned_words")
 
     def test_missing_threshold_is_not_silently_allowed_after_detail_failure(self):
-        rows = {"hotSpot": [promotion_row("missing", ("1", "201", "301"), None, None)]}
-        membership = {"hotSpot": {"missing"}}
+        rows = {"allianceRank": [promotion_row("missing", ("1", "201", "301"), None, None)]}
+        membership = {"allianceRank": {"missing"}}
         with patch.object(browser_cdp, "_read_candidate_category_from_detail", return_value={
             "productId": "missing", "categoryIds": [], "reason": "DETAIL_UNAVAILABLE"
         }), patch.object(browser_cdp, "_cached_detail_payload", return_value=None):
@@ -263,7 +265,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
                 type("FakePage", (), {"context": object()})(),
                 rows,
                 membership,
-                [{"sourceKey": "hotSpot", "label": "热点", "status": "read", "productCount": 1}],
+                [{"sourceKey": "allianceRank", "label": "榜单", "status": "read", "productCount": 1}],
                 [],
                 {},
                 [],
@@ -273,6 +275,25 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         reasons = result["rejectedCandidates"][0]["thresholdReasons"]
         self.assertIn("缺少佣金率实测数据，无法核验设定区间", reasons)
         self.assertIn("缺少体验分实测数据，无法核验阈值 4.5", reasons)
+
+    def test_hotspot_does_not_apply_commission_or_experience_thresholds(self):
+        row = promotion_row("hot-low", ("1", "201", "301"), 1, 2.0)
+        candidates, _messages, rejected = browser_cdp._candidate_rows_by_source_policy(
+            {"hotSpot": [row]}, {"hotSpot": {"hot-low"}}, self.settings(), 20,
+        )
+        self.assertEqual([item["productId"] for item in candidates], ["hot-low"])
+        self.assertEqual(rejected, [])
+
+    def test_rank_keeps_configured_thresholds_while_square_rechecks_them_locally(self):
+        rank = promotion_row("rank-low", ("1", "201", "301"), 5, 4.8)
+        square = promotion_row("square-low", ("1", "201", "302"), 5, 4.8)
+        candidates, _messages, rejected = browser_cdp._candidate_rows_by_source_policy(
+            {"allianceRank": [rank], "selectionSquare": [square]},
+            {"allianceRank": {"rank-low"}, "selectionSquare": {"square-low"}},
+            self.settings(), 20,
+        )
+        self.assertEqual(candidates, [])
+        self.assertEqual({item["productId"] for item in rejected}, {"rank-low", "square-low"})
 
     def test_detail_metrics_are_written_back_to_common_candidate_shape(self):
         row = promotion_row("detail", ("1", "201", "301"), None, None)
@@ -320,6 +341,139 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         self.assertEqual(tabs[0]["categoryIds"], ["1"])
         self.assertEqual(tabs[0]["level"], 1)
 
+    def test_general_square_category_paths_skip_excluded_levels_before_query(self):
+        settings = self.settings(
+            excludedCategorySelection={"level1": ["2"], "level2": [], "level3": ["101__RC_CASCADER_SPLIT__302"]},
+            categoryTree=[
+                {"id": "1", "children": [{"id": "101", "children": [{"id": "301"}, {"id": "302"}]}]},
+                {"id": "2", "children": [{"id": "201", "children": [{"id": "401"}]}]},
+            ],
+        )
+        self.assertEqual(
+            browser_cdp._selection_square_allowed_category_paths(settings),
+            [("1", "101", "101__RC_CASCADER_SPLIT__301")],
+        )
+
+    def test_filter_conditions_are_applied_before_category_selection(self):
+        page = MagicMock()
+        page.get_by_text.return_value.count.return_value = 0
+        events: list[str] = []
+        settings = self.settings(
+            filters={"delivery": {}, "product": {"商家体验分": ["80分以上"]}, "features": []},
+            filterCatalog={"filters": {"商家体验分": []}, "features": []},
+            categorySelection={"level1": ["1"], "level2": ["101"], "level3": ["101__RC_CASCADER_SPLIT__301"]},
+            thresholds={"commissionRate": 10},
+        )
+        with patch.object(browser_cdp, "_page_applied_filter_signature", return_value=""), \
+             patch.object(browser_cdp, "_apply_configured_filter_field", side_effect=lambda *args: events.append("field")), \
+             patch.object(browser_cdp, "_apply_square_commission_range", side_effect=lambda *args: events.append("commission")), \
+             patch.object(browser_cdp, "apply_category_settings", side_effect=lambda *args, **kwargs: events.append("category") or []):
+            browser_cdp.apply_filter_settings(page, settings)
+        self.assertEqual(events, ["field", "commission", "category"])
+
+    def test_general_square_collects_allowed_categories_one_by_one(self):
+        page = MagicMock()
+        page.url = browser_cdp.BAIYING_SELECTION_SQUARE_SOURCE[1]
+        settings = self.settings(
+            _candidatePoolScrollSteps=1,
+            categoryTree=[
+                {"id": "1", "children": [{"id": "101", "children": [{"id": "301"}, {"id": "302"}]}]},
+                {"id": "2", "children": [{"id": "201", "children": [{"id": "401"}]}]},
+            ],
+            excludedCategorySelection={"level1": ["2"], "level2": [], "level3": ["101__RC_CASCADER_SPLIT__302"]},
+        )
+        seen: list[dict[str, list[str]]] = []
+
+        def collect(_page, query_settings, **_kwargs):
+            selection = query_settings["categorySelection"]
+            seen.append(selection)
+            return {"candidates": [{"productId": str(len(seen)), "title": "商品"}]}
+
+        with patch.object(browser_cdp, "_visible_baiying_prompt", return_value=("", "")), \
+             patch.object(browser_cdp, "_apply_one_category_and_collect_candidates", side_effect=collect), \
+             patch.object(browser_cdp, "_page_applied_filter_signature", return_value=""), \
+             patch.object(browser_cdp, "_can_reuse_applied_non_category_filters", return_value=True), \
+             patch.object(browser_cdp, "_get_cached_material_list", return_value=None), \
+             patch.object(browser_cdp, "_rendered_material_payload", return_value={}), \
+             patch.object(browser_cdp, "_promotion_items", return_value=[]), \
+             patch.object(browser_cdp, "_scroll_selection_square_rows", return_value=([], [])), \
+             patch.object(browser_cdp, "_row_category_evidence", return_value={"status": "known", "categoryIds": ["1", "101", "101__RC_CASCADER_SPLIT__301"]}):
+            rows, _result = browser_cdp._collect_selection_square_rows(page, settings)
+
+        self.assertEqual(seen, [{
+            "level1": ["1"], "level2": ["101"], "level3": ["101__RC_CASCADER_SPLIT__301"]
+        }])
+        self.assertEqual([row["product_id"] for row in rows], ["1"])
+        self.assertEqual(rows[0]["_categoryEvidence"]["categoryIds"], ["1", "101", "101__RC_CASCADER_SPLIT__301"])
+        self.assertEqual(rows[0]["_sourceCategory"]["selectionConfirmed"], True)
+
+    def test_material_list_login_business_error_is_recorded_separately(self):
+        collector = browser_cdp._MaterialListCollector(self.settings())
+        request = MagicMock()
+        request.url = "https://buyin.jinritemai.com/pc/selection/common/material_list"
+        response = MagicMock()
+        response.url = request.url
+        response.request = request
+        response.status = 200
+        response.json.return_value = {"code": -2, "msg": "用户未登录"}
+        collector.on_request(request)
+        collector.on_response(response)
+        self.assertIsNotNone(collector.login_error_since(0))
+        self.assertEqual(collector.login_error_since(0)[1], -2)
+        self.assertEqual(collector.successes, [])
+
+    def test_rank_source_scans_allowed_category_paths_without_total_board(self):
+        settings = self.settings(
+            candidateLimit=1,
+            categoryTree=[{"id": "1", "children": [{"id": "101", "children": [{"id": "301"}]}]}],
+            excludedCategorySelection={"level1": [], "level2": [], "level3": []},
+            sources={"hotSpotEnabled": False, "allianceRankEnabled": True, "priority": ["allianceRank"]},
+        )
+        seen: list[list[str]] = []
+
+        def read_source(_page, source_key, _tree, category_tab=None, settings=None):
+            self.assertEqual(source_key, "allianceRank")
+            self.assertIsNone(category_tab)
+            path = list(settings.get("_sourceCategoryPath") or [])
+            seen.append(path)
+            row = promotion_row("123456789", None, 12, 4.8)
+            row["_sourceCategory"] = {"categoryIds": path, "id": path[-1], "level": 3, "selected": True}
+            return {"123456789"}, [row], {"readAt": "2026-11-17T00:00:00", "pagePath": "/rank"}
+
+        with patch.object(browser_cdp, "_read_priority_source_product_ids", side_effect=read_source):
+            membership, _warnings, results, candidates = browser_cdp._collect_priority_source_ids(object(), settings)
+        self.assertEqual(seen, [["1", "101", "101__RC_CASCADER_SPLIT__301"]])
+        self.assertEqual(membership["allianceRank"], {"123456789"})
+        self.assertEqual(candidates["allianceRank"][0]["_sourceCategories"][0]["categoryIds"], seen[0])
+        self.assertEqual(results[0]["categoryTabTotal"], 1)
+
+    def test_hotspot_deep_exclusion_uses_leaf_category_context(self):
+        settings = self.settings(
+            candidateLimit=1,
+            categoryTree=[{"id": "1", "children": [{"id": "101", "children": [{"id": "301"}]}]}],
+            excludedCategorySelection={"level1": [], "level2": [], "level3": ["999"]},
+            sources={"hotSpotEnabled": True, "allianceRankEnabled": False, "priority": ["hotSpot"]},
+        )
+        calls: list[dict] = []
+
+        def read_source(_page, source_key, _tree, category_tab=None, settings=None):
+            calls.append({"source": source_key, "tab": category_tab, "path": settings.get("_sourceCategoryPath") if settings else None})
+            if category_tab is None:
+                return set(), [], {"sourceCategoryTabs": [{
+                    "index": 0, "name": "类目1", "categoryId": "1", "categoryIds": ["1"],
+                    "level": 1, "status": "mapped", "selected": False,
+                }]}
+            row = promotion_row("123456789", None, 12, 4.8)
+            row["_sourceCategory"] = {"categoryIds": category_tab["categoryIds"], "id": category_tab["categoryIds"][-1], "level": 3, "selected": True}
+            return {"123456789"}, [row], {"readAt": "2026-11-17T00:00:00", "pagePath": "/hot"}
+
+        with patch.object(browser_cdp, "_read_priority_source_product_ids", side_effect=read_source):
+            membership, _warnings, results, candidates = browser_cdp._collect_priority_source_ids(object(), settings)
+        self.assertEqual(calls[1]["path"], ["1", "101", "101__RC_CASCADER_SPLIT__301"])
+        self.assertEqual(membership["hotSpot"], {"123456789"})
+        self.assertEqual(candidates["hotSpot"][0]["_sourceCategories"][0]["categoryIds"], calls[1]["path"])
+        self.assertEqual(results[0]["categoryTabTotal"], 1)
+
     def test_source_level_exclusion_blocks_even_when_row_has_exact_category(self):
         row = promotion_row("excluded", ("1", "201", "301"), 12, 4.8)
         row["_sourceCategory"] = {"name": "分类", "id": "1", "categoryIds": ["1"], "level": 1}
@@ -331,6 +485,25 @@ class SelectionCandidateFilterTests(unittest.TestCase):
         )
         self.assertEqual(result["candidates"], [])
         self.assertIn("命中已核验的来源一级排除类目", result["rejectedCandidates"][0]["thresholdReasons"])
+
+    def test_general_mode_accepts_source_category_for_root_only_exclusions(self):
+        row = promotion_row("source-level", None, 3, 3.1)
+        row["_sourceCategory"] = {"name": "允许类目", "id": "1", "categoryIds": ["1"], "level": 1}
+        page = type("FakePage", (), {"context": object()})()
+        settings = self.settings(
+            thresholds={},
+            excludedCategorySelection={"level1": ["2"], "level2": [], "level3": []},
+        )
+        with patch.object(browser_cdp, "_probe_source_card_category", return_value={
+            "status": "entry_unavailable", "categoryIds": [], "reason": "来源卡片未定位"
+        }), patch.object(browser_cdp, "_read_candidate_category_from_detail", side_effect=AssertionError("不应因来源一级路径重复打开详情")):
+            result = browser_cdp._visible_source_candidate_result(
+                page, {"hotSpot": [row]}, {"hotSpot": {"source-level"}},
+                [{"sourceKey": "hotSpot", "label": "热点", "status": "read", "productCount": 1}],
+                [], {}, [], settings,
+            )
+        self.assertEqual([item["productId"] for item in result["candidates"]], ["source-level"])
+        self.assertEqual(result["candidates"][0]["categoryStatus"], "source_level")
 
     def test_three_missing_detail_samples_stop_repeating_same_source(self):
         rows = [promotion_row(str(index), None, 8, 4.8) for index in range(1, 5)]
@@ -421,6 +594,7 @@ class SelectionCandidateFilterTests(unittest.TestCase):
             _, _, results, _ = browser_cdp._collect_priority_source_ids(
                 object(), self.settings(candidateLimit=1,
                     sources={"hotSpotEnabled": True, "allianceRankEnabled": False, "priority": ["hotSpot"]},
+                    excludedCategorySelection={"level1": [], "level2": [], "level3": []},
                     _sourceCategoryTabOffsets={"hotSpot": 2}),
             )
         self.assertEqual(seen, [2, 3, 4])

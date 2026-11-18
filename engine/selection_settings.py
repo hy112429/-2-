@@ -119,6 +119,54 @@ def scope_key(account_id: Optional[int]) -> str:
     return "global" if account_id is None else f"account:{account_id}"
 
 
+def _newer_orphan_global_settings(
+    connection: sqlite3.Connection,
+    global_updated_at: str,
+) -> Optional[Dict[str, Any]]:
+    """兼容旧版本把完整通用设置写入错误 scope_key 的情况。
+
+    这类记录不能作为账号设置读取，但如果它比 global 更新且包含完整的
+    通用设置结构（尤其是最低/最高佣金率），应在内存中恢复，保证新批次
+    不再丢失用户已经保存的佣金上限。不会删除或覆盖原始记录。
+    """
+    try:
+        rows = connection.execute(
+            "SELECT scope_key, settings_json, updated_at FROM selection_settings "
+            "WHERE scope_key <> 'global' AND scope_key NOT LIKE 'account:%'"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    candidates: list[tuple[str, Dict[str, Any]]] = []
+    required_keys = {"candidateLimit", "candidatePoolTarget", "filters", "sources", "thresholds", "bannedWords"}
+    for row in rows:
+        updated_at = str(row["updated_at"] or "")
+        if not updated_at or updated_at <= str(global_updated_at or ""):
+            continue
+        try:
+            value = json.loads(row["settings_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict) or not required_keys.issubset(value):
+            continue
+        thresholds = value.get("thresholds")
+        if not isinstance(thresholds, dict):
+            continue
+        lower = thresholds.get("commissionRate")
+        upper = thresholds.get("commissionRateMax")
+        if value.get("commissionRateRule") != "minimum" or lower is None or upper is None:
+            continue
+        try:
+            if not (0 <= float(lower) <= 100 and 0 <= float(upper) <= 100 and float(lower) <= float(upper)):
+                continue
+        except (TypeError, ValueError):
+            continue
+        candidates.append((updated_at, value))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
 def migrate_banned_words_seed(connection: sqlite3.Connection) -> None:
     """向已有通用设置增量补齐系统屏蔽词，不覆盖用户保存的其他屏蔽词。"""
     try:
@@ -183,13 +231,19 @@ def migrate_prototype_banned_words(connection: sqlite3.Connection) -> None:
 def load_settings(connection: sqlite3.Connection, account_id: Optional[int]) -> Dict[str, Any]:
     migrate_banned_words_seed(connection)
     global_row = connection.execute(
-        "SELECT settings_json FROM selection_settings WHERE scope_key = 'global'"
+        "SELECT settings_json, updated_at FROM selection_settings WHERE scope_key = 'global'"
     ).fetchone()
     if global_row:
         stored_global = json.loads(global_row["settings_json"])
         global_settings = {**DEFAULT_SETTINGS, **stored_global}
-        stored_thresholds = stored_global.get("thresholds") if isinstance(stored_global.get("thresholds"), dict) else {}
-        if stored_thresholds.get("commissionRate") is not None and stored_global.get("commissionRateRule") != "minimum":
+        orphan_global = _newer_orphan_global_settings(
+            connection,
+            str(global_row["updated_at"] or ""),
+        )
+        if orphan_global is not None:
+            global_settings = {**global_settings, **orphan_global}
+        effective_thresholds = global_settings.get("thresholds") if isinstance(global_settings.get("thresholds"), dict) else {}
+        if effective_thresholds.get("commissionRate") is not None and global_settings.get("commissionRateRule") != "minimum":
             global_settings["commissionRateRule"] = "legacy_upper"
     else:
         global_settings = DEFAULT_SETTINGS

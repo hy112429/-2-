@@ -5542,6 +5542,10 @@ class CommissionFilterUnconfirmed(RuntimeError):
     """平台佣金筛选结果未核实；仅跳过选品广场，不放宽商品佣金门槛。"""
 
 
+class BaiyingLoginRequired(RuntimeError):
+    """百应列表接口明确返回未登录；不能把账号状态误报成筛选条件失败。"""
+
+
 def _commission_error_requires_pause(error: BaseException) -> bool:
     """只把账号、浏览器、限流及未结束请求升级为全局停点。"""
     message = str(error).lower()
@@ -6851,6 +6855,113 @@ def _candidate_rows(
     return candidates, list(dict.fromkeys(messages)), rejected
 
 
+def _source_candidate_filter_settings(settings: Dict[str, Any], source_key: str) -> Dict[str, Any]:
+    """返回单一来源的本地候选筛选设置。
+
+    百应三个入口的筛选语义不同：热点页只有类目入口，候选入池阶段只做
+    屏蔽词和商品 ID 去重；选品广场的佣金、体验分等条件已经在平台页应用，
+    仍需在本地复核；联盟榜单继续使用当前保存的榜单条件和本地阈值。
+    """
+    scoped = copy.deepcopy(settings)
+    if source_key == "hotSpot":
+        # 热点没有选品广场的额外筛选控件。不要把消费账号的佣金/体验分
+        # 阈值错误地套到热点来源，详情核验和加车阶段仍由消费账号单独执行。
+        scoped["thresholds"] = {}
+        scoped["filters"] = {}
+        scoped["_sourceFilterPolicy"] = "hotspot_category_and_banned_words"
+    elif source_key == "selectionSquare":
+        scoped["_sourceFilterPolicy"] = "selection_square_platform_filters_then_local_recheck"
+    else:
+        scoped["_sourceFilterPolicy"] = "alliance_rank_configured_filters"
+    return scoped
+
+
+def _candidate_rows_by_source_policy(
+    rows_by_source: Dict[str, list[Dict[str, Any]]],
+    source_membership: Dict[str, set[str]],
+    settings: Dict[str, Any],
+    limit: int,
+    preserve_product_ids: Optional[Sequence[str]] = None,
+) -> tuple[list[Dict[str, Any]], list[str], list[Dict[str, Any]]]:
+    """按来源分别筛选，再按商品 ID 合并，避免来源规则互相污染。"""
+    source_order = [*_enabled_priority_source_order(settings), "selectionSquare"]
+    accepted_by_id: Dict[str, Dict[str, Any]] = {}
+    rejected_by_id: Dict[str, Dict[str, Any]] = {}
+    messages: list[str] = []
+
+    for source_key in source_order:
+        rows = rows_by_source.get(source_key, [])
+        if not rows:
+            continue
+        scoped_settings = _source_candidate_filter_settings(settings, source_key)
+        candidates, source_messages, rejected = _candidate_rows(
+            {"data": {"summary_promotions": rows}},
+            {**scoped_settings, "_sourceMembership": source_membership},
+            max(1, min(2000, limit)),
+            preserve_product_ids,
+        )
+        messages.extend(source_messages)
+        source_ids = source_membership.get(source_key, set())
+
+        def annotate(item: Dict[str, Any]) -> Dict[str, Any]:
+            value = copy.deepcopy(item)
+            product_id = str(value.get("productId") or "")
+            value["sourceKey"] = source_key
+            value["sourcePolicy"] = scoped_settings.get("_sourceFilterPolicy", "")
+            value["sources"] = [key for key in source_order if product_id in source_membership.get(key, set())]
+            if source_key not in value["sources"] and product_id in source_ids:
+                value["sources"].append(source_key)
+            return value
+
+        for item in candidates:
+            product_id = str(item.get("productId") or "")
+            if not product_id:
+                continue
+            value = annotate(item)
+            if product_id in accepted_by_id:
+                merged = _merge_candidate_source_rows(accepted_by_id[product_id], value)
+                merged["sources"] = list(dict.fromkeys([
+                    *(accepted_by_id[product_id].get("sources") or []),
+                    *(value.get("sources") or []),
+                ]))
+                merged["sourcePolicies"] = list(dict.fromkeys([
+                    *(accepted_by_id[product_id].get("sourcePolicies") or []),
+                    str(value.get("sourcePolicy") or ""),
+                ]))
+                accepted_by_id[product_id] = merged
+            else:
+                value["sourcePolicies"] = [str(value.get("sourcePolicy") or "")]
+                accepted_by_id[product_id] = value
+            # 同一商品只要有一个来源通过，就不能被另一个来源的阈值拒绝。
+            rejected_by_id.pop(product_id, None)
+
+        for item in rejected:
+            product_id = str(item.get("productId") or "")
+            if not product_id or product_id in accepted_by_id:
+                continue
+            value = annotate(item)
+            if product_id in rejected_by_id:
+                merged = _merge_candidate_source_rows(rejected_by_id[product_id], value)
+                merged["sources"] = list(dict.fromkeys([
+                    *(rejected_by_id[product_id].get("sources") or []),
+                    *(value.get("sources") or []),
+                ]))
+                merged["sourcePolicies"] = list(dict.fromkeys([
+                    *(rejected_by_id[product_id].get("sourcePolicies") or []),
+                    str(value.get("sourcePolicy") or ""),
+                ]))
+                rejected_by_id[product_id] = merged
+            else:
+                value["sourcePolicies"] = [str(value.get("sourcePolicy") or "")]
+                rejected_by_id[product_id] = value
+
+    return (
+        list(accepted_by_id.values()),
+        list(dict.fromkeys(messages)),
+        list(rejected_by_id.values()),
+    )
+
+
 def _enabled_threshold_names(settings: Dict[str, Any]) -> list[str]:
     thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
     return list(dict.fromkeys(
@@ -7886,7 +7997,12 @@ def _read_priority_source_product_ids(
             rank_selection = _select_rank_source_options(source_page, settings or {})
             config = settings.get("sources") if isinstance(settings, dict) and isinstance(settings.get("sources"), dict) else {}
             quota_path = settings.get("_quotaCategoryPath") if isinstance(settings, dict) else None
-            requested_path = quota_path if isinstance(quota_path, list) and quota_path else config.get("rankCategoryPath", [])
+            source_path = settings.get("_sourceCategoryPath") if isinstance(settings, dict) else None
+            requested_path = (
+                quota_path if isinstance(quota_path, list) and quota_path else
+                source_path if isinstance(source_path, list) and source_path else
+                config.get("rankCategoryPath", [])
+            )
             requested_path = _rank_category_ids(requested_path)
             if requested_path:
                 resolved, _ = _resolve_single_category_id(requested_path[-1], category_tree)
@@ -7919,6 +8035,7 @@ def _read_priority_source_product_ids(
         if category_tab is not None:
             expected_id = str(category_tab.get("categoryId") or "")
             expected_index = int(category_tab.get("index", -1))
+            requested_path = category_tab.get("categoryIds") if isinstance(category_tab.get("categoryIds"), list) else []
             selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
             if not expected_id or selected_tab is None or selected_tab["categoryId"] != expected_id:
                 raise RecoverablePrioritySourceReadError(f"{label}来源分类控件已变化，无法按稳定 ID 选中分类")
@@ -7938,8 +8055,40 @@ def _read_priority_source_product_ids(
                 # 百应点击一级分类后将它移入级联标题，下方标签随即变成二级，原 index 不再存在。
                 selected_tab = {**category_tab, "selected": True, "index": -1}
             else:
-                selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
-                if selected_tab is None or selected_tab["categoryId"] != expected_id or not selected_tab["selected"]:
+                if len(requested_path) > 1:
+                    deep_matches = [
+                        item for item in tabs
+                        if item.get("status") == "mapped"
+                        and isinstance(item.get("categoryIds"), list)
+                        and len(item["categoryIds"]) >= len(requested_path)
+                        and all(_category_id_matches(str(item["categoryIds"][level]), str(requested_path[level]))
+                                for level in range(len(requested_path)))
+                    ]
+                    if len(deep_matches) != 1:
+                        raise RecoverablePrioritySourceReadError(
+                            f"{label}未能在当前页面唯一打开三级类目路径；未读取全部页"
+                        )
+                    deep_tab = deep_matches[0]
+                    if int(deep_tab.get("index", -1)) < 0:
+                        raise RecoverablePrioritySourceReadError(f"{label}深层类目控件缺少稳定索引；未读取全部页")
+                    source_page.locator(tab_selector).nth(int(deep_tab["index"])).click(timeout=8_000)
+                    source_page.wait_for_timeout(1_000)
+                    tabs = _source_category_tabs(source_page, source_key, category_tree, rank_root_catalog)
+                    selected_tab = next(
+                        (item for item in tabs if item.get("index") == deep_tab.get("index")
+                         and item.get("categoryId") == deep_tab.get("categoryId") and item.get("selected") is True),
+                        None,
+                    )
+                else:
+                    selected_tab = next((item for item in tabs if item["index"] == expected_index), None)
+                path_matches = (
+                    len(requested_path) <= 1
+                    or (isinstance(selected_tab, dict) and isinstance(selected_tab.get("categoryIds"), list)
+                        and len(selected_tab["categoryIds"]) >= len(requested_path)
+                        and all(_category_id_matches(str(selected_tab["categoryIds"][level]), str(requested_path[level]))
+                                for level in range(len(requested_path))))
+                )
+                if selected_tab is None or (len(requested_path) <= 1 and selected_tab.get("categoryId") != expected_id) or not path_matches or not selected_tab.get("selected"):
                     raise RecoverablePrioritySourceReadError(f"{label}来源分类选中状态无法回读；未将商品归入该分类")
         else:
             if source_key == "allianceRank" and rank_selection.get("categoryIds"):
@@ -8705,7 +8854,6 @@ def _collect_priority_source_ids(
     except (TypeError, ValueError):
         target_count = 5
     tab_read_budget = min(8, max(3, target_count * 2))
-    excluded_roots = settings.get("excludedCategorySelection", {}).get("level1", []) if isinstance(settings.get("excludedCategorySelection"), dict) else []
     for index, source_key in enumerate(selected_sources, start=1):
         label = BAIYING_PRIORITY_SOURCES[source_key][0]
         _report_operation_progress(
@@ -8717,7 +8865,165 @@ def _collect_priority_source_ids(
             message=f"正在读取{label}当前页；不会触发搜索、加车或发布",
         )
         try:
+            # 联盟榜单支持级联类目。没有单独指定榜单类目时，按保存的类目树
+            # 逐个查询允许的三级路径，不先读取“总榜”再依赖商品行补类目。
+            rank_category_path = config.get("rankCategoryPath") if isinstance(config.get("rankCategoryPath"), list) else []
+            quota_path_for_source = settings.get("_quotaCategoryPath")
+            if source_key == "allianceRank" and not rank_category_path and not quota_path_for_source:
+                rank_paths = _selection_square_allowed_category_paths(settings)
+                excluded_selection = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+                has_exclusions = any(
+                    isinstance(excluded_selection.get(level), list) and excluded_selection.get(level)
+                    for level in ("level1", "level2", "level3")
+                )
+                if not rank_paths and has_exclusions:
+                    raise RecoverablePrioritySourceReadError(
+                        f"{label}类目目录未能读取，无法安全跳过排除类目；未查询总榜"
+                    )
+                try:
+                    rank_offset = max(0, min(len(rank_paths), int(tab_offsets.get(source_key, 0))))
+                except (TypeError, ValueError):
+                    rank_offset = 0
+                rank_batch = rank_paths[rank_offset:rank_offset + tab_read_budget]
+                if rank_batch:
+                    rank_ids: set[str] = set()
+                    rank_rows_by_product: Dict[str, Dict[str, Any]] = {}
+                    rank_reads: list[Dict[str, Any]] = []
+                    rank_read_warnings: list[str] = []
+                    for category_path in rank_batch:
+                        rank_settings = copy.deepcopy(settings)
+                        rank_settings["_sourceCategoryPath"] = list(category_path)
+                        try:
+                            path_ids, path_rows, path_evidence = _read_priority_source_product_ids(
+                                page, source_key, category_tree, settings=rank_settings
+                            )
+                            rank_ids.update(path_ids)
+                            rank_reads.append({
+                                "categoryIds": list(category_path),
+                                "productCount": len(path_ids),
+                                "readAt": path_evidence.get("readAt"),
+                                "pagePath": path_evidence.get("pagePath"),
+                            })
+                            for row in path_rows:
+                                product_id = str(row.get("product_id") or "").strip()
+                                if not product_id:
+                                    continue
+                                source_category = row.get("_sourceCategory")
+                                row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
+                                if product_id in rank_rows_by_product:
+                                    rank_rows_by_product[product_id] = _merge_candidate_source_rows(
+                                        rank_rows_by_product[product_id], row
+                                    )
+                                else:
+                                    rank_rows_by_product[product_id] = row
+                        except Exception as error:
+                            if _selection_error_requires_pause(error):
+                                raise
+                            rank_read_warnings.append(
+                                f"{label}类目 {'/'.join(category_path)} 读取失败；已跳过该类目："
+                                f"{_safe_diagnostic_text(error, 180)}"
+                            )
+                    product_ids = rank_ids
+                    product_rows = list(rank_rows_by_product.values())
+                    source_candidates[source_key] = product_rows
+                    membership[source_key] = product_ids
+                    warnings.extend(rank_read_warnings)
+                    source_results.append({
+                        "sourceKey": source_key, "label": label,
+                        "status": "read" if product_ids else "empty",
+                        "productCount": len(product_ids), "parsedCandidateCount": len(product_rows),
+                        "categoryTabReads": rank_reads,
+                        "categoryTabNextOffset": rank_offset + len(rank_batch),
+                        "categoryTabTotal": len(rank_paths),
+                        "categoryTabReadLimitReached": rank_offset + len(rank_batch) < len(rank_paths),
+                        "sourceCategoryPaths": [list(path) for path in rank_batch],
+                        "productIdFingerprint": hashlib.sha256("|".join(sorted(product_ids)).encode("utf-8")).hexdigest(),
+                        "readAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                    })
+                    continue
             product_ids, product_rows, evidence = _read_priority_source_product_ids(page, source_key, category_tree, settings=settings)
+            excluded_selection = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+            deep_exclusion_enabled = any(
+                isinstance(excluded_selection.get(level), list) and excluded_selection.get(level)
+                for level in ("level2", "level3")
+            )
+            if source_key == "hotSpot" and deep_exclusion_enabled:
+                hot_paths = _selection_square_allowed_category_paths(settings)
+                tabs_for_paths = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
+                root_tabs = {
+                    str(tab.get("categoryIds", [""])[0]): tab
+                    for tab in tabs_for_paths
+                    if isinstance(tab, dict) and tab.get("status") == "mapped"
+                    and isinstance(tab.get("categoryIds"), list) and tab.get("categoryIds")
+                    and tab.get("selected") is not True
+                }
+                if not hot_paths:
+                    raise RecoverablePrioritySourceReadError(
+                        f"{label}类目目录未能读取，无法安全跳过二级/三级排除类目；未读取全部页"
+                    )
+                try:
+                    hot_offset = max(0, min(len(hot_paths), int(tab_offsets.get(source_key, 0))))
+                except (TypeError, ValueError):
+                    hot_offset = 0
+                hot_batch = [path for path in hot_paths[hot_offset:hot_offset + tab_read_budget] if path[0] in root_tabs]
+                if not hot_batch:
+                    raise RecoverablePrioritySourceReadError(
+                        f"{label}当前分类控件未能提供允许类目的稳定路径；未读取全部页"
+                    )
+                hot_ids: set[str] = set()
+                hot_rows_by_product: Dict[str, Dict[str, Any]] = {}
+                hot_reads: list[Dict[str, Any]] = []
+                for category_path in hot_batch:
+                    category_tab = {
+                        **root_tabs[category_path[0]],
+                        "name": "/".join(category_path),
+                        "categoryIds": list(category_path), "level": 3,
+                    }
+                    path_settings = copy.deepcopy(settings)
+                    path_settings["_sourceCategoryPath"] = list(category_path)
+                    try:
+                        path_ids, path_rows, path_evidence = _read_priority_source_product_ids(
+                            page, source_key, category_tree, category_tab=category_tab, settings=path_settings
+                        )
+                        hot_ids.update(path_ids)
+                        hot_reads.append({
+                            "categoryIds": list(category_path), "productCount": len(path_ids),
+                            "readAt": path_evidence.get("readAt"), "pagePath": path_evidence.get("pagePath"),
+                        })
+                        for row in path_rows:
+                            product_id = str(row.get("product_id") or "").strip()
+                            if not product_id:
+                                continue
+                            source_category = row.get("_sourceCategory")
+                            row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
+                            hot_rows_by_product[product_id] = (
+                                _merge_candidate_source_rows(hot_rows_by_product[product_id], row)
+                                if product_id in hot_rows_by_product else row
+                            )
+                    except Exception as error:
+                        if _selection_error_requires_pause(error):
+                            raise
+                        warnings.append(
+                            f"{label}类目 {'/'.join(category_path)} 读取失败；已跳过该类目："
+                            f"{_safe_diagnostic_text(error, 180)}"
+                        )
+                product_ids = hot_ids
+                product_rows = list(hot_rows_by_product.values())
+                source_candidates[source_key] = product_rows
+                membership[source_key] = product_ids
+                source_results.append({
+                    "sourceKey": source_key, "label": label,
+                    "status": "read" if product_ids else "empty",
+                    "productCount": len(product_ids), "parsedCandidateCount": len(product_rows),
+                    "categoryTabReads": hot_reads,
+                    "categoryTabNextOffset": hot_offset + len(hot_batch),
+                    "categoryTabTotal": len(hot_paths),
+                    "categoryTabReadLimitReached": hot_offset + len(hot_batch) < len(hot_paths),
+                    "sourceCategoryPaths": [list(path) for path in hot_batch],
+                    "productIdFingerprint": hashlib.sha256("|".join(sorted(product_ids)).encode("utf-8")).hexdigest(),
+                    "readAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                })
+                continue
             quota_path = settings.get("_quotaCategoryPath")
             if source_key == "allianceRank" and not quota_path:
                 quota_path = config.get("rankCategoryPath")
@@ -8766,20 +9072,48 @@ def _collect_priority_source_ids(
                     "scrollPosition": evidence.get("scrollPosition"),
                 })
                 continue
-            by_product = {str(row["product_id"]): row for row in product_rows}
-            for row in by_product.values():
-                source_category = row.get("_sourceCategory")
-                row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
             tabs = evidence.get("sourceCategoryTabs") if isinstance(evidence.get("sourceCategoryTabs"), list) else []
+            excluded_selection = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
             def excluded_tab(tab: Dict[str, Any]) -> bool:
                 path = tab.get("categoryIds")
                 if not isinstance(path, list) or not path:
                     return False
-                return any(_category_id_matches(str(path[0]), _category_id_scalar(excluded))
-                           for excluded in excluded_roots if _category_id_scalar(excluded))
+                for level, key in enumerate(("level1", "level2", "level3"), start=1):
+                    excluded_ids = [
+                        _category_id_scalar(value)
+                        for value in (excluded_selection.get(key) or [])
+                        if _category_id_scalar(value)
+                    ]
+                    if not excluded_ids:
+                        continue
+                    if len(path) < level:
+                        return True
+                    if any(_category_id_matches(str(path[level - 1]), value) for value in excluded_ids):
+                        return True
+                return False
 
             mapped_tabs = [tab for tab in tabs if isinstance(tab, dict) and tab.get("status") == "mapped"
                            and tab.get("selected") is not True and not excluded_tab(tab)]
+            category_tabs_available = any(
+                isinstance(tab, dict) and tab.get("status") == "mapped" and tab.get("selected") is not True
+                for tab in tabs
+            )
+            if category_tabs_available and not mapped_tabs:
+                warnings.append(
+                    f"{label}当前分类控件无法提供满足排除类目深度的可选路径；"
+                    "未读取全部页商品，等待更深层类目控件或后续补池。"
+                )
+            # 只要来源页面能回读稳定的分类 ID，就丢弃“全部”页的原始行，
+            # 后续候选只来自逐个点击的允许分类；否则热点/榜单会先把排除类目
+            # 混入池中，再依赖详情阶段补救，和选品广场的顺序不一致。
+            if category_tabs_available:
+                product_ids = set()
+                by_product: Dict[str, Dict[str, Any]] = {}
+            else:
+                by_product = {str(row["product_id"]): row for row in product_rows}
+            for row in by_product.values():
+                source_category = row.get("_sourceCategory")
+                row["_sourceCategories"] = [source_category] if isinstance(source_category, dict) else []
             try:
                 tab_offset = max(0, min(len(mapped_tabs), int(tab_offsets.get(source_key, 0))))
             except (TypeError, ValueError):
@@ -8943,6 +9277,36 @@ def _candidate_matches_manual_categories(candidate: Dict[str, Any], selected_ids
     }
     return bool(selected_ids.intersection(str(value).strip() for value in candidate_ids if str(value).strip()) or
                 selected_aliases.intersection(candidate_aliases))
+
+
+def _candidate_source_category_satisfies_general_exclusions(
+    candidate: Dict[str, Any], settings: Dict[str, Any]
+) -> bool:
+    """判断候选携带的来源类目路径是否足以完成通用模式排除判断。"""
+    if settings.get("selectionMode") == "category" or candidate.get("categoryStatus") == "ambiguous":
+        return False
+    raw_paths: list[Any] = []
+    source_path = candidate.get("sourceCategoryIds")
+    if isinstance(source_path, list) and source_path:
+        raw_paths.append(source_path)
+    if not raw_paths:
+        return False
+    excluded = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+    for raw_path in raw_paths:
+        path = [str(value) for value in raw_path if str(value)]
+        for level, key in enumerate(("level1", "level2", "level3"), start=1):
+            blocked = [
+                _category_id_scalar(value)
+                for value in (excluded.get(key) or [])
+                if _category_id_scalar(value)
+            ]
+            if not blocked:
+                continue
+            if len(path) < level:
+                return False
+            if any(_category_id_matches(path[level - 1], value) for value in blocked):
+                return False
+    return True
 
 
 def _excluded_category_selection_ids(settings: Dict[str, Any]) -> set[str]:
@@ -9121,6 +9485,29 @@ def _scroll_selection_square_rows(
     return rows, reads
 
 
+def _selection_square_allowed_category_paths(settings: Dict[str, Any]) -> list[tuple[str, str, str]]:
+    """返回选品广场本轮允许逐项查询的三级类目路径。
+
+    通用模式不再先查询“全部”页：用已同步的百应类目树展开为稳定路径，
+    在发起平台请求前排除保存的一级/二级/三级排除类目。没有类目树时返回空，
+    由调用方保留旧的全量查询并交给后续类目核验 fail closed。
+    """
+    tree = settings.get("categoryTree") if isinstance(settings.get("categoryTree"), list) else []
+    excluded = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+    excluded_by_level = {
+        level: [str(value) for value in (excluded.get(level) or []) if str(value)]
+        for level in ("level1", "level2", "level3")
+    }
+
+    def is_excluded(path: tuple[str, str, str]) -> bool:
+        return any(
+            any(_category_id_matches(path[index], value) for value in excluded_by_level[level])
+            for index, level in enumerate(("level1", "level2", "level3"))
+        )
+
+    return [path for path in _category_tree_paths(tree) if not is_excluded(path)]
+
+
 def _collect_selection_square_rows(
     page: Page,
     settings: Dict[str, Any],
@@ -9147,7 +9534,42 @@ def _collect_selection_square_rows(
         queries = [query_base]
     elif selection_mode != "category" or category_mode != "manual":
         query_base["categorySelection"] = {"level1": [], "level2": [], "level3": []}
-        queries = [query_base]
+        # 通用模式也按百应页面的类目逐项读取。先由首个查询应用佣金、体验分、
+        # 带货情况等非类目条件，后续查询只替换当前类目，避免“全部”页把被排除
+        # 类目混入候选后再依赖商品详情补救。
+        if not isinstance(query_base.get("categoryTree"), list) or not query_base.get("categoryTree"):
+            # 旧批次设置可能没有随快照保存类目树；只从当前页面读取类目目录，
+            # 不勾选、不搜索、不消费商品，避免无树时退回“全部”页绕过排除类目。
+            try:
+                live_catalog = collect_filter_catalog(page, include_category_tree=True)
+                live_tree = live_catalog.get("categoryRoots") if isinstance(live_catalog, dict) else None
+                if isinstance(live_tree, list) and live_tree:
+                    query_base["categoryTree"] = live_tree
+                    if not isinstance(query_base.get("filterCatalog"), dict):
+                        query_base["filterCatalog"] = {
+                            "filters": live_catalog.get("filters", {}),
+                            "features": live_catalog.get("features", []),
+                        }
+            except Exception as error:
+                warnings.append(f"百应类目目录读取失败，未执行通用模式全量查询：{_safe_diagnostic_text(error, 240)}")
+        paths = _selection_square_allowed_category_paths(query_base)
+        excluded_config = query_base.get("excludedCategorySelection")
+        has_exclusions = isinstance(excluded_config, dict) and any(
+            isinstance(excluded_config.get(level), list) and excluded_config.get(level)
+            for level in ("level1", "level2", "level3")
+        )
+        if not paths and has_exclusions:
+            raise RuntimeError("百应类目目录未能读取，无法安全跳过排除类目；未查询全部商品")
+        if paths:
+            queries = []
+            for first, second, third in paths:
+                query = copy.deepcopy(query_base)
+                query["categorySelection"] = {
+                    "level1": [first], "level2": [second], "level3": [third],
+                }
+                queries.append(query)
+        else:
+            queries = [query_base]
     else:
         queries = _category_query_settings(query_base)
     rows_by_id: Dict[str, Dict[str, Any]] = {}
@@ -9155,7 +9577,15 @@ def _collect_selection_square_rows(
     warnings: list[str] = []
     observed_rows = 0
     page_reads: list[Dict[str, Any]] = []
+    try:
+        raw_target = max(5, min(2_000, int(settings.get("_candidatePoolLimit") or settings.get("candidateLimit") or 5) * 8))
+    except (TypeError, ValueError):
+        raw_target = 40
+    query_limit_reached = False
     for index, query in enumerate(queries, start=1):
+        if len(rows_by_id) >= raw_target:
+            query_limit_reached = True
+            break
         query_settings = copy.deepcopy(query)
         # 来源原始行先保留，平台自定义佣金区间单独应用；商品数据随后统一核验。
         query_settings["_platformCommissionRateBounds"] = list(_commission_rate_bounds(settings))
@@ -9168,17 +9598,29 @@ def _collect_selection_square_rows(
             percent=int((index - 1) * 100 / max(1, len(queries))),
             message=f"采集选品广场当前可见商品（类目查询 {index}/{len(queries)}）",
         )
-        result = _apply_one_category_and_collect_candidates(
-            page,
-            query_settings,
-            force_refresh=index == 1,
-            preserve_other_filters=(
-                index > 1 and _can_reuse_applied_non_category_filters(
-                    _page_applied_filter_signature(page), query_settings
-                )
-            ),
-            replace_category_selection=len(queries) > 1 or bool(settings.get("_quotaCategoryPath")),
-        )
+        try:
+            result = _apply_one_category_and_collect_candidates(
+                page,
+                query_settings,
+                force_refresh=index == 1,
+                preserve_other_filters=(
+                    index > 1 and _can_reuse_applied_non_category_filters(
+                        _page_applied_filter_signature(page), query_settings
+                    )
+                ),
+                replace_category_selection=len(queries) > 1 or bool(settings.get("_quotaCategoryPath")),
+            )
+        except CommissionFilterUnconfirmed:
+            # 佣金条件未回读确认时不能继续使用任何类目结果。
+            raise
+        except Exception as error:
+            if _selection_error_requires_pause(error) or index == 1:
+                raise
+            warnings.append(
+                f"跳过选品广场类目查询 {index}/{len(queries)}；"
+                f"未执行加车：{_safe_diagnostic_text(error, 240)}"
+            )
+            continue
         payload = _get_cached_material_list(id(page), _selection_filter_signature(query_settings))
         if payload is None:
             payload = _rendered_material_payload(page)
@@ -9203,6 +9645,25 @@ def _collect_selection_square_rows(
         page_reads.extend({"query": index, **entry} for entry in scroll_reads)
         observed_rows += len(raw_rows)
         selection = query_settings.get("categorySelection")
+        query_category_path: list[str] = []
+        if isinstance(selection, dict):
+            raw_path = [
+                str(selection.get(level, [""])[0])
+                for level in ("level1", "level2", "level3")
+                if isinstance(selection.get(level), list) and selection.get(level)
+            ]
+            if len(raw_path) == 3 and all(raw_path):
+                category_tree = query_settings.get("categoryTree") if isinstance(query_settings.get("categoryTree"), list) else []
+                query_category_path = _normalize_exact_category_path(raw_path, category_tree) or raw_path
+        query_source_category = (
+            {
+                "name": "/".join(query_category_path), "id": query_category_path[-1],
+                "categoryIds": query_category_path, "level": len(query_category_path),
+                "source": "selectionSquare", "selected": True,
+                "selectionConfirmed": True,
+            }
+            if len(query_category_path) == 3 else None
+        )
         for row in raw_rows:
             product_id = str(row.get("product_id") or "").strip()
             if not product_id:
@@ -9211,6 +9672,17 @@ def _collect_selection_square_rows(
                 row, product_id, settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else [],
                 str(row.get("_categorySourceHint") or "material_list"),
             )
+            if query_source_category is not None:
+                row["_sourceCategory"] = copy.deepcopy(query_source_category)
+                row["_sourceCategories"] = [copy.deepcopy(query_source_category)]
+                if evidence.get("status") != "known":
+                    # material_list 行不带完整类目时，以已确认的查询路径作为来源类目；
+                    # 详情核验阶段仍会检查真实类目是否冲突。
+                    evidence = {
+                        "status": "known", "categoryIds": list(query_category_path),
+                        "categorySource": "selected_query_category",
+                        "reason": "平台已确认当前查询类目，商品行未返回完整三级类目",
+                    }
             row["_categoryEvidence"] = evidence
             if evidence.get("status") == "known":
                 base = row.get("base_model") if isinstance(row.get("base_model"), dict) else {}
@@ -9230,7 +9702,8 @@ def _collect_selection_square_rows(
     ids = set(rows_by_id)
     detail = (
         f"{label}读取 material_list {observed_rows} 行，去重后 {len(ids)} 个商品 ID；"
-        f"类目模式 {selection_mode}，手动类目查询 {len(queries)} 组；"
+        f"类目模式 {selection_mode}，逐类目查询 {index - 1 if query_limit_reached else len(queries)} 组；"
+        f"{'达到本轮原始候选上限后停止' if query_limit_reached else '未触发原始候选上限'}；"
         f"实际滚动 {len(page_reads)} 次，新增响应商品 {sum(item.get('newProductIds', 0) for item in page_reads)} 个。"
     )
     return list(rows_by_id.values()), {
@@ -9247,6 +9720,7 @@ def _collect_selection_square_rows(
         "detail": detail,
         "warnings": warnings,
         "pageReads": page_reads,
+        "categoryQueryLimitReached": query_limit_reached,
         "productIdFingerprint": hashlib.sha256("|".join(sorted(ids)).encode("utf-8")).hexdigest(),
         "readAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "pagePath": _detail_diagnostic_path(page.url),
@@ -9438,17 +9912,33 @@ def _collector_candidate_pool_result(
                 by_product[product_id] = _merge_candidate_source_rows(by_product[product_id], row)
             else:
                 by_product[product_id] = copy.deepcopy(row)
-    broad_settings = {**settings, "_sourceMembership": source_membership}
-    candidates, parse_messages, rejected = _candidate_rows(
-        {"data": {"summary_promotions": list(by_product.values())}},
-        broad_settings, min(2000, len(by_product)),
-    )
     source_order = [*_enabled_priority_source_order(settings), "selectionSquare"]
+    rows_by_source = {
+        source_key: list(source_candidates.get(source_key, []))
+        for source_key in source_order
+    }
+    candidates, parse_messages, rejected = _candidate_rows_by_source_policy(
+        rows_by_source,
+        source_membership,
+        settings,
+        min(2000, len(by_product)),
+    )
     for candidate in [*candidates, *rejected]:
         product_id = str(candidate.get("productId") or "")
         sources = [key for key in source_order if product_id in source_membership.get(key, set())]
         candidate["sources"] = sources
-        candidate["sourceKey"] = sources[0] if sources else ""
+        if str(candidate.get("sourceKey") or "") not in sources:
+            candidate["sourceKey"] = sources[0] if sources else ""
+    accepted_ids = {str(item.get("productId") or "") for item in candidates}
+    rejected_ids = {str(item.get("productId") or "") for item in rejected}
+    for source_result in source_results:
+        source_key = str(source_result.get("sourceKey") or "")
+        source_ids = source_membership.get(source_key, set())
+        source_result["sourceFilterPolicy"] = _source_candidate_filter_settings(settings, source_key).get(
+            "_sourceFilterPolicy", ""
+        )
+        source_result["localPassedCount"] = len(source_ids.intersection(accepted_ids))
+        source_result["localRejectedCount"] = len(source_ids.intersection(rejected_ids))
     excluded_categories = _excluded_category_selection_ids(settings)
     included_categories = _manual_category_selection_ids(settings) if settings.get("selectionMode") == "category" and settings.get("categoryMode") == "manual" else set()
     quota_path = settings.get("_quotaCategoryPath") if isinstance(settings.get("_quotaCategoryPath"), list) else []
@@ -9553,14 +10043,16 @@ def _visible_source_candidate_result(
     preserve_product_ids: Optional[Sequence[str]] = None,
     progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    """三源候选统一去重、补指标并应用相同的数据与类目门槛。"""
+    """三源候选统一去重、补指标，并按各来源的筛选语义处理。"""
     source_order = _enabled_priority_source_order(settings)
     source_labels = {key: value[0] for key, value in BAIYING_PRIORITY_SOURCES.items()}
     source_labels["selectionSquare"] = BAIYING_SELECTION_SQUARE_SOURCE[0]
     source_urls = {key: value[1] for key, value in BAIYING_PRIORITY_SOURCES.items()}
     source_urls["selectionSquare"] = BAIYING_SELECTION_SQUARE_SOURCE[1]
     excluded_category_ids = _excluded_category_selection_ids(settings)
-    # 商品类目未知或互相冲突时，任何模式都不能把它当作可加车候选。
+    # 商品类目未知或互相冲突时不能进入候选；已由来源路径确认排除范围的
+    # source_level 候选可以继续进入通用模式候选池，后续仍按商品 ID 和账号
+    # 状态执行独立核验。
     category_gate_enabled = True
     threshold_names = _enabled_threshold_names(settings)
     category_tree = settings.get("categoryTree", []) if isinstance(settings.get("categoryTree"), list) else []
@@ -9649,6 +10141,36 @@ def _visible_source_candidate_result(
         base["product_info"] = info
         row["base_model"] = base
 
+    excluded_selection = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+
+    def source_category_satisfies_general_exclusions(product_id: str) -> bool:
+        """判断来源逐类目读取是否足以完成通用模式的排除类目判断。"""
+        if settings.get("selectionMode") == "category":
+            return False
+        source_categories = source_categories_by_id.get(product_id, [])
+        paths = [
+            [str(value) for value in item.get("categoryIds", []) if str(value)]
+            for item in source_categories
+            if isinstance(item, dict) and isinstance(item.get("categoryIds"), list) and item.get("categoryIds")
+        ]
+        if not paths:
+            return False
+        for path in paths:
+            for level, key in enumerate(("level1", "level2", "level3"), start=1):
+                blocked = [
+                    _category_id_scalar(value)
+                    for value in (excluded_selection.get(key) or [])
+                    if _category_id_scalar(value)
+                ]
+                if not blocked:
+                    continue
+                # 来源只回读到上级类目时，无法安全判断更深层排除类目。
+                if len(path) < level:
+                    return False
+                if any(_category_id_matches(path[level - 1], value) for value in blocked):
+                    return False
+        return True
+
     raw_rows = list(merged_raw.values())
     raw_ids = set(merged_raw)
     if preserve_product_ids:
@@ -9658,6 +10180,7 @@ def _visible_source_candidate_result(
     category_enrichment: Dict[str, Any] = {
         "candidateCount": len(raw_rows),
         "successCount": 0,
+        "sourceLevelCount": 0,
         "failureCount": 0,
         "successes": [],
         "failureDetails": [],
@@ -9823,7 +10346,11 @@ def _visible_source_candidate_result(
     ))
 
     def ready_after_detail(row: Dict[str, Any]) -> bool:
-        if row.get("_sourceLevelExcluded") or row.get("_categoryAmbiguous") or len(_promotion_row_category_ids(row)) < 3:
+        product_id = str(row.get("product_id") or "").strip()
+        source_level_ready = source_category_satisfies_general_exclusions(product_id) and not row.get("_sourceLevelExcluded") and not row.get("_categoryAmbiguous")
+        if row.get("_sourceLevelExcluded") or row.get("_categoryAmbiguous") or (
+            len(_promotion_row_category_ids(row)) < 3 and not source_level_ready
+        ):
             return False
         ready, _, _ = _candidate_rows(
             {"data": {"summary_promotions": [row]}},
@@ -9860,7 +10387,8 @@ def _visible_source_candidate_result(
             metric for metric in threshold_names
             if existing_metrics.get(metric) is None
         ]
-        needs_category_detail = category_gate_enabled and len(listed_category_ids) < 3
+        source_category_sufficient = source_category_satisfies_general_exclusions(product_id) and not source_level_excluded and not category_ambiguous
+        needs_category_detail = category_gate_enabled and len(listed_category_ids) < 3 and not source_category_sufficient
         if needs_category_detail and product_id in detail_skip_ids:
             continue
         product_sources = sources_by_id.get(product_id, [])
@@ -9922,6 +10450,20 @@ def _visible_source_candidate_result(
             elif source_level_excluded:
                 enrichment = {"productId": product_id, "categoryIds": [], "status": "excluded_source_level",
                               "reason": "命中已核验的来源一级排除类目"}
+            elif source_category_sufficient:
+                source_paths = [
+                    [str(value) for value in item.get("categoryIds", []) if str(value)]
+                    for item in source_categories_by_id.get(product_id, [])
+                    if isinstance(item, dict) and isinstance(item.get("categoryIds"), list) and item.get("categoryIds")
+                ]
+                source_path = max(source_paths, key=len, default=[])
+                enrichment = {
+                    "productId": product_id,
+                    "categoryIds": source_path if len(source_path) == 3 else [],
+                    "status": "source_level",
+                    "reason": "来源页面已按允许类目路径读取；通用模式排除范围可由来源类目确认",
+                    "categorySource": "source_category_path",
+                }
             elif enrichment is None:
                 if len(listed_category_ids) >= 3:
                     enrichment = {
@@ -9953,6 +10495,8 @@ def _visible_source_candidate_result(
             }
             category_enrichment["successCount"] += 1
             category_enrichment["successes"].append({"productId": product_id, "categoryIds": category_ids[:3]})
+        elif enrichment.get("status") == "source_level":
+            category_enrichment["sourceLevelCount"] += 1
         else:
             reason = str(enrichment.get("reason") or "详情页未返回完整三级类目 ID")
             category_enrichment["failureCount"] += 1
@@ -9995,9 +10539,23 @@ def _visible_source_candidate_result(
     except (TypeError, ValueError):
         requested = 5
     limit = max(1, min(200, requested))
-    candidates, parse_messages, rejected = _candidate_rows(
-        {"data": {"summary_promotions": raw_rows}},
-        {**settings, "_sourceMembership": source_membership},
+    policy_rows_by_source: Dict[str, list[Dict[str, Any]]] = {
+        source_key: [] for source_key in [*source_order, "selectionSquare"]
+    }
+    for row in raw_rows:
+        product_id = str(row.get("product_id") or "").strip()
+        if not product_id:
+            continue
+        row_sources = [
+            source_key for source_key in [*source_order, "selectionSquare"]
+            if source_key in sources_by_id.get(product_id, [])
+        ]
+        for source_key in row_sources:
+            policy_rows_by_source[source_key].append(copy.deepcopy(row))
+    candidates, parse_messages, rejected = _candidate_rows_by_source_policy(
+        policy_rows_by_source,
+        source_membership,
+        settings,
         max(200, limit),
         preserve_product_ids,
     )
@@ -10008,7 +10566,9 @@ def _visible_source_candidate_result(
             candidate_sources.append("selectionSquare")
         candidate["sources"] = candidate_sources
         if candidate_sources:
-            source_key = next((key for key in candidate_sources if key in source_order), "selectionSquare")
+            source_key = str(candidate.get("sourceKey") or "")
+            if source_key not in candidate_sources:
+                source_key = next((key for key in candidate_sources if key in source_order), "selectionSquare")
             candidate["sourceKey"] = source_key
             candidate["sourceUrl"] = source_urls[source_key]
         candidate["selectionMode"] = "category" if category_logic_enabled else "general"
@@ -10024,9 +10584,14 @@ def _visible_source_candidate_result(
         candidate["sourceCategoryId"] = str(source_category.get("id") or "")
         candidate["sourceCategoryLevel"] = int(source_category.get("level") or 0)
         candidate["sourceCategoryIds"] = source_category.get("categoryIds", [])
+        source_level_sufficient = source_category_satisfies_general_exclusions(product_id) and not merged_row.get("_sourceLevelExcluded") and not merged_row.get("_categoryAmbiguous")
+        source_category_ids = [str(value) for value in candidate.get("sourceCategoryIds", []) if str(value)]
+        if source_level_sufficient and len(source_category_ids) == 3 and not candidate.get("leafCategoryId"):
+            candidate["leafCategoryId"] = source_category_ids[-1]
         candidate["categoryStatus"] = (
             "ambiguous" if merged_row.get("_categoryAmbiguous") else
-            "known" if candidate["leafCategoryId"] else "unknown"
+            "known" if candidate["leafCategoryId"] else
+            "source_level" if source_level_sufficient else "unknown"
         )
         candidate["categorySource"] = str(category_result.get("categorySource") or (
             merged_row.get("_categoryEvidence", {}).get("categorySource", "")
@@ -10041,11 +10606,14 @@ def _visible_source_candidate_result(
             candidate["categoryStatus"] = "unknown"
             candidate["categoryConfidence"] = "source_level"
         if not candidate["leafCategoryId"]:
-            candidate["categoryError"] = str(category_result.get("reason") or "详情页未返回完整三级类目 ID")
+            candidate["categoryError"] = str(category_result.get("reason") or (
+                "来源类目路径已确认，但详情未返回三级类目 ID" if source_level_sufficient else
+                "详情页未返回完整三级类目 ID"
+            ))
 
     category_filtered_ids: set[str] = set()
     if category_gate_enabled:
-        invalid_category = [candidate for candidate in candidates if not candidate.get("leafCategoryId")]
+        invalid_category = [candidate for candidate in candidates if not candidate.get("leafCategoryId") and candidate.get("categoryStatus") != "source_level"]
         for candidate in invalid_category:
             candidate["analysisRejected"] = True
             reason = str(candidate.get("categoryError") or "来源数据未提供三级类目 ID")
@@ -10059,7 +10627,9 @@ def _visible_source_candidate_result(
             candidate["skipped"] = True
             rejected.append(candidate)
             category_filtered_ids.add(str(candidate.get("productId") or ""))
-        candidates = [candidate for candidate in candidates if candidate.get("leafCategoryId")]
+        candidates = [candidate for candidate in candidates if (
+            candidate.get("leafCategoryId") or candidate.get("categoryStatus") == "source_level"
+        )]
     if category_logic_enabled and settings.get("categoryMode") == "manual":
         selected_category_ids = _manual_category_selection_ids(settings)
         outside_manual_scope = [
@@ -10153,7 +10723,8 @@ def _visible_source_candidate_result(
         enrichment_summary = (
             f"类目详情补充统计：读取 {category_enrichment['candidateCount']} 个商品，"
             f"本轮核验 {category_enrichment['processedCount']} 个，待续核验 {category_enrichment['deferredCount']} 个；"
-            f"成功补到类目 {category_enrichment['successCount']}，类目未知 {category_enrichment['failureCount']}。"
+            f"详情补到完整类目 {category_enrichment['successCount']}，"
+            f"来源路径确认 {category_enrichment['sourceLevelCount']}，详情仍未知 {category_enrichment['failureCount']}。"
             + (
                 "类目数据不可用来源："
                 + "、".join(source_labels[key] for key in sorted(source_category_unavailable))
@@ -10167,8 +10738,9 @@ def _visible_source_candidate_result(
         enrichment_summary = (
             f"通用数据模式类目识别统计：读取 {category_enrichment['candidateCount']} 个商品，"
             f"本轮核验 {category_enrichment['processedCount']} 个，待续核验 {category_enrichment['deferredCount']} 个；"
-            f"列表含完整三级类目 {category_enrichment['successCount']} 个，类目未知 {category_enrichment['failureCount']} 个；"
-            "类目未知商品在启用类目范围或排除类目时直接淘汰。"
+            f"列表/详情含完整三级类目 {category_enrichment['successCount']} 个，"
+            f"来源路径已确认 {category_enrichment['sourceLevelCount']} 个，类目仍未知 {category_enrichment['failureCount']} 个；"
+            "来源路径不足以判断排除类目的商品仍会淘汰。"
             + (f"通用设置排除类目过滤 {len(excluded_by_category)} 个商品。" if excluded_by_category else "")
             + f"推荐依据：{recommendation_summary}。"
         )
@@ -10286,6 +10858,7 @@ class _MaterialListCollector:
         self.pending: set[int] = set()
         self.successes: list[tuple[int, Any]] = []
         self.errors: list[tuple[int, Any, str]] = []
+        self.login_errors: list[tuple[int, Any, str]] = []
         self.failures: list[tuple[int, str]] = []
         self.category_mismatch_count = 0
         self.last_activity_at = time.time()
@@ -10387,9 +10960,16 @@ class _MaterialListCollector:
 
         if isinstance(result, dict) and result.get("code") not in (None, 0, "0"):
             code = result.get("code")
-            # 11001 即使响应体缺少或错带类目，也必须阻止消费并行成功结果。
-            if str(code) == "11001" or is_matching_category:
-                diagnostics = _material_list_response_diagnostics(response, result)
+            diagnostics = _material_list_response_diagnostics(response, result)
+            message = str(result.get("msg") or result.get("message") or "")
+            is_login_error = (
+                str(code) in {"-2", "10001", "401", "403"}
+                or re.search(r"未登录|未登陆|登录失效|登陆失效|login required|unauthorized", message, re.I)
+            )
+            if is_login_error:
+                self.login_errors.append((sequence, code, diagnostics))
+            # 11001、登录失效，或当前类目响应的其他业务错误都必须阻止消费。
+            if str(code) == "11001" or is_matching_category or is_login_error:
                 self.errors.append((sequence, code, diagnostics))
                 if event is not None:
                     event["diagnostic"] = diagnostics
@@ -10457,6 +11037,10 @@ class _MaterialListCollector:
 
     def rate_limit_error_since(self, mark: int) -> Optional[tuple[int, Any, str]]:
         entries = [entry for entry in self.errors if entry[0] > mark and str(entry[1]) == "11001"]
+        return max(entries, key=lambda entry: entry[0]) if entries else None
+
+    def login_error_since(self, mark: int) -> Optional[tuple[int, Any, str]]:
+        entries = [entry for entry in self.login_errors if entry[0] > mark]
         return max(entries, key=lambda entry: entry[0]) if entries else None
 
     def latest_success_since(self, mark: int) -> Optional[tuple[int, Any]]:
@@ -11388,13 +11972,6 @@ def apply_filter_settings(
         reset.click(force=True, timeout=3_000, no_wait_after=True)
         # 百应重置会异步清空类目与商品列表；100ms 内再次点击类目可能被重置请求覆盖。
         page.wait_for_timeout(1_000)
-    if replace_category_selection:
-        warnings.extend(apply_category_settings(page, settings, replace_existing=True))
-    else:
-        warnings.extend(apply_category_settings(page, settings))
-    # 类目级联会异步提交筛选状态。等待其稳定后再触发搜索，避免连续提交导致 11001。
-    page.wait_for_timeout(1_200)
-
     # 空值代表“不增加该筛选”；只操作用户实际配置的字段，避免逐项打开无效筛选器。
     for label, configured in configured_fields.items():
         selected = configured if isinstance(configured, list) else [configured] if configured else []
@@ -11455,6 +12032,16 @@ def apply_filter_settings(
             if should_select and not bool(state.get("active")):
                 page.mouse.click(float(state["x"]), float(state["y"]))
                 page.wait_for_timeout(100)
+
+    # 先完成佣金、体验分、带货情况等平台筛选，再逐个应用类目。
+    # 百应类目级联会触发一次新的 material_list 请求；把类目放在最后，
+    # 可以避免每次切换类目时把前面已经确认的筛选条件重置或覆盖。
+    if replace_category_selection:
+        warnings.extend(apply_category_settings(page, settings, replace_existing=True))
+    else:
+        warnings.extend(apply_category_settings(page, settings))
+    # 类目级联会异步提交筛选状态。等待其稳定后再触发搜索，避免连续提交导致 11001。
+    page.wait_for_timeout(1_200)
     try:
         page.evaluate("(signature) => { window.__touguangAppliedFilterSettings = signature }", signature)
     except Exception:
@@ -11546,11 +12133,22 @@ def _apply_one_category_and_collect_candidates(
         request_count = collector.request_count_since(apply_mark)
         pending_count = collector.pending_count_since(apply_mark)
         rate_limit_error = collector.rate_limit_error_since(apply_mark)
+        login_error = collector.login_error_since(apply_mark)
+        if login_error:
+            error = BaiyingLoginRequired(
+                "百应列表接口返回用户未登录；当前账号的网页登录态或浏览器 profile 无法确认，"
+                "未继续执行佣金确认、类目采集或候选搜索。"
+            )
         if rate_limit_error:
             _mark_page_rate_limited(page_key)
             request_status = (
                 f"百应应用筛选时 material_list 返回 11001，账号已进入 "
                 f"{BAIYING_RATE_LIMIT_COOLDOWN_SECONDS} 秒冷却；观察到 {request_count} 个请求，"
+                f"其中 {pending_count} 个尚未结束；未继续执行候选搜索。"
+            )
+        elif login_error:
+            request_status = (
+                f"百应应用筛选时 material_list 返回未登录业务错误；观察到 {request_count} 个请求，"
                 f"其中 {pending_count} 个尚未结束；未继续执行候选搜索。"
             )
         elif request_count:
@@ -11586,6 +12184,17 @@ def _apply_one_category_and_collect_candidates(
             f"百应应用筛选阶段的 material_list 接口返回业务错误 11001；"
             f"当前账号进入 {BAIYING_RATE_LIMIT_COOLDOWN_SECONDS} 秒查询冷却，"
             f"本次不再补发搜索请求。百应响应诊断：{rate_limit_error[2][:320]}"
+        )
+    login_error = collector.login_error_since(apply_mark)
+    if login_error:
+        diagnostic = _write_selection_failure_diagnostic(
+            page, settings, collector, apply_mark,
+            BaiyingLoginRequired("百应列表接口返回用户未登录；未继续执行候选搜索。"),
+        )
+        raise BaiyingLoginRequired(
+            "百应列表接口返回用户未登录；未继续执行候选搜索。"
+            f"诊断编号 {diagnostic.get('diagnosticId', '未知')}；"
+            f"诊断文件 {diagnostic.get('jsonPath', '未能保存')}。"
         )
     outcome, value = collector.latest_outcome_since(apply_mark)
     if collection_status == "settled" and outcome == "success":
@@ -13731,13 +14340,21 @@ def execute_selected_candidates(
                 category_ids = candidate.get("categoryIds") if isinstance(candidate.get("categoryIds"), list) else []
                 needs_category = bool(_excluded_category_selection_ids(settings)) or settings.get("selectionMode") == "category"
                 if needs_category and (len(category_ids) != 3 or not all(_category_id_scalar(value) for value in category_ids)):
-                    reasons.append("类目未知：当前账号列表及详情均未返回可核实的三级类目")
+                    if not _candidate_source_category_satisfies_general_exclusions(candidate, settings):
+                        reasons.append("类目未知：当前账号列表及详情均未返回可核实的三级类目")
+                    else:
+                        # 通用模式下来源页已经逐类目读取，且来源路径足以排除
+                        # 当前设置的类目；详情仍继续核对商品 ID 和指标，不再
+                        # 因详情接口缺少三级类目重复淘汰。
+                        category_ids = [str(value) for value in (candidate.get("sourceCategoryIds") or []) if str(value)]
                 elif len(category_ids) == 3:
                     excluded = _excluded_category_selection_ids(settings)
                     if _candidate_matches_manual_categories(candidate, excluded):
                         reasons.append("商品属于当前账号设置的排除类目")
                     if settings.get("selectionMode") == "category" and settings.get("categoryMode") == "manual" and not _candidate_matches_manual_categories(candidate, _manual_category_selection_ids(settings)):
                         reasons.append("商品不属于当前账号手动选择的类目范围")
+                elif _candidate_source_category_satisfies_general_exclusions(candidate, settings):
+                    category_ids = [str(value) for value in (candidate.get("sourceCategoryIds") or []) if str(value)]
                 candidate["thresholdReasons"] = reasons
                 candidate["eligible"] = not reasons
             if reasons:
