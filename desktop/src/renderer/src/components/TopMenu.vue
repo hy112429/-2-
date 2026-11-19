@@ -49,11 +49,11 @@ onMounted(() => {
 .top {
   display: flex;
   align-items: center;
-  gap: 28px;
-  padding: 0 18px;
-  background: linear-gradient(105deg, #18243c 0%, #213659 100%);
-  border-bottom: 1px solid var(--border-dark);
-  box-shadow: 0 2px 12px rgba(16, 30, 55, .16);
+  gap: 24px;
+  padding: 0 16px;
+  background: rgba(255, 255, 255, .96);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 1px 0 rgba(0, 0, 0, .025);
   z-index: 2;
 }
 
@@ -69,18 +69,17 @@ onMounted(() => {
   height: 30px;
   display: grid;
   place-items: center;
-  background: linear-gradient(135deg, #6297ff, #2d68e4);
+  background: var(--text);
   color: #ffffff;
   border-radius: 9px;
-  box-shadow: 0 3px 10px rgba(45, 104, 228, .28);
   font-size: 14px;
   font-weight: 700;
 }
 
 .brand-name {
-  color: var(--text-on-dark-strong);
-  font-weight: 600;
-  letter-spacing: 0.3px;
+  color: var(--text);
+  font-weight: 650;
+  letter-spacing: -0.02em;
   white-space: nowrap;
 }
 
@@ -89,37 +88,38 @@ onMounted(() => {
   align-items: center;
   gap: 4px;
   padding: 4px;
-  border: 1px solid rgba(255, 255, 255, .08);
-  border-radius: 10px;
-  background: rgba(8, 20, 39, .22);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-app);
 }
 
 .menu-item {
   min-height: 32px;
-  padding: 0 15px;
-  color: var(--text-on-dark);
-  border-radius: 7px;
+  padding: 0 13px;
+  color: var(--text-muted);
+  border-radius: 999px;
   transition: color 0.15s, background 0.15s;
   white-space: nowrap;
 }
 
 .menu-item:hover {
-  color: var(--text-on-dark-strong);
-  background: rgba(255, 255, 255, 0.09);
+  color: var(--text);
+  background: #eaeaec;
 }
 
 .menu-item.active {
-  color: var(--text-on-dark-strong);
-  background: rgba(104, 154, 255, .27);
-  box-shadow: inset 0 0 0 1px rgba(169, 199, 255, .16);
+  color: var(--text);
+  background: #ffffff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .09);
+  font-weight: 600;
 }
 
 .version {
   margin-left: auto;
   padding: 3px 8px;
-  border: 1px solid rgba(182, 203, 238, .18);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  color: #b8c7df;
+  color: var(--text-muted);
   font-size: 11px;
 }
 </style>

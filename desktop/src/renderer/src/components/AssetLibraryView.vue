@@ -545,7 +545,7 @@ onBeforeUnmount(() => {
 }
 
 .btn.primary:hover:not(:disabled) {
-  background: #2f6fd8;
+  background: var(--brand);
 }
 
 .btn.danger {
@@ -589,8 +589,8 @@ onBeforeUnmount(() => {
 
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(152px, 1fr));
+  gap: 8px;
 }
 
 .view-toolbar {
@@ -693,7 +693,7 @@ onBeforeUnmount(() => {
 }
 
 .meta {
-  padding: 9px 10px;
+  padding: 8px 9px;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -701,9 +701,12 @@ onBeforeUnmount(() => {
 }
 
 .name {
+  display: -webkit-box;
   font-weight: 600;
   color: var(--text);
-  white-space: nowrap;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -749,12 +752,18 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 10px;
+  padding: 5px 9px;
   border-top: 1px solid var(--border);
-  background: #fbfcff;
+  background: var(--bg-app);
 }
 
 .mono {
   font-family: Consolas, 'Courier New', monospace;
 }
+.lib { gap: 12px; padding: 14px; }
+.toolbar { gap: 9px; padding-bottom: 12px; }
+.btn { min-height: 32px; border-radius: var(--radius-control); }
+.btn.primary { border-color: var(--brand); background: var(--brand); color: #fff; }
+.card { border-radius: var(--radius); box-shadow: var(--shadow-card); }
+.card:hover { border-color: var(--border-dark); box-shadow: var(--shadow-card); }
 </style>

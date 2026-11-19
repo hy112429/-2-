@@ -19,7 +19,8 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{ (event: 'navigate', value: string): void }>()
-const selectionSettingsOpened = ref(false)
+// 候选池退避计时器属于选品设置组件；启动后保持挂载，才能在其他页面自动续采。
+const selectionSettingsOpened = ref(true)
 const focusedSection = ref(false)
 const scheduledStart = ref<SelectionScheduleDue | null>(null)
 const receivedScheduleDates = new Set<string>()
@@ -208,8 +209,8 @@ watch(
   width: 100%;
   min-width: 0;
   min-height: 0;
-  background: radial-gradient(circle at 94% -10%, #e8efff 0, transparent 34%), var(--bg-app);
-  padding: 13px 18px 18px;
+  background: var(--bg-app);
+  padding: 16px 19px 19px;
   /* 这里**不能**是 auto：一旦这个容器能滚动，用户滚动时
      覆盖层（浏览器视图）不会跟着动，位置就会错位。
      所以让内容自适应、不产生滚动。 */
@@ -220,16 +221,16 @@ watch(
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: rgba(15, 23, 42, .48);
+  background: rgba(29, 29, 31, .42);
 }
 
 .work--focused {
   position: fixed;
   inset: clamp(18px, 5vh, 48px) clamp(18px, 6vw, 96px);
   z-index: 90;
-  padding: 15px 18px 18px;
+  padding: 16px 19px 19px;
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 20px;
   background: var(--bg-app);
   box-shadow: var(--shadow-float);
 }
@@ -239,19 +240,19 @@ watch(
   display: flex;
   align-items: center;
   gap: 7px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 600;
 }
 .crumb > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.crumb::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--brand); box-shadow: 0 0 0 3px var(--brand-soft); }
-.focus-button { flex: 0 0 auto; min-height: 26px; margin-left: auto; padding: 0 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-panel); color: var(--text-muted); font-size: 11px; }
+.crumb::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--brand); }
+.focus-button { flex: 0 0 auto; min-height: 30px; margin-left: auto; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg-panel); color: var(--text-muted); font-size: 11px; }
 .focus-button:hover { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
 
 .content {
   display: flex;
-  gap: 12px;
+  gap: 10px;
   flex: 1;
   min-width: 0;
   min-height: 0;

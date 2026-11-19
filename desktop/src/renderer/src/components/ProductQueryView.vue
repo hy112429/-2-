@@ -1095,6 +1095,8 @@ async function downloadCached(): Promise<void> {
   const tasks = rows.flatMap((p) => videoUrlsOf(p).map((url, index) => ({
     id: `${p.product_id}-${index + 1}`,
     product_id: p.product_id,
+    account_id: p.account_id ?? undefined,
+    visual_dedupe: true,
     url,
     dest: `${downloadDir.value}\\${baiyingAccountFolder(p)}\\${date}\\${p.product_id}\\${p.product_id}_${videoIdFromUrl(url, index)}_${String(index + 1).padStart(3, '0')}_${timestamp}.mp4`
   })))
@@ -1132,6 +1134,7 @@ async function downloadFound(): Promise<boolean> {
     product_id: p.product_id,
     account_id: queryAccountId.value,
     verify_video: true,
+    visual_dedupe: true,
     url: video.url,
     dest: `${accountRoot}\\${date}\\${p.product_id}\\${p.product_id}_${video.videoId}_${String(index + 1).padStart(3, '0')}_${video.publishTime ? fileTimestampFromSeconds(video.publishTime) : fileTimestamp()}.mp4`
   }))
@@ -1915,7 +1918,7 @@ onBeforeUnmount(() => {
 }
 
 .btn.primary:hover:not(:disabled) {
-  background: #2f6fd8;
+  background: var(--brand);
 }
 
 /* 行内小按钮（下载任务行「打开文件夹」） */
@@ -2678,4 +2681,14 @@ onBeforeUnmount(() => {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+.query { gap: 12px; padding: 16px; }
+.query-head { align-items: baseline; padding-bottom: 10px; }
+.query-head h1 { font-size: 23px; letter-spacing: -.03em; }
+.query-head span { font-size: 12px; }
+.advanced-panel > summary { padding: 10px 12px; font-size: 13px; }
+.btn { border-radius: var(--radius-control); }
+.product-card, .queue-panel, .edit-panel { border-radius: var(--radius); }
+.wm-modal { border-radius: 20px; box-shadow: var(--shadow-float); }
+.wm-mask { background: rgb(29 29 31 / 40%); }
+.table-wrap { border-radius: var(--radius-control); }
 </style>

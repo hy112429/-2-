@@ -292,7 +292,7 @@ onBeforeUnmount(() => {
 }
 
 .btn.primary:hover:not(:disabled) {
-  background: #2f6fd8;
+  background: var(--brand);
 }
 
 .btn.danger:hover:not(:disabled) {
@@ -440,4 +440,9 @@ onBeforeUnmount(() => {
   font-size: 12px;
   opacity: 0.8;
 }
+.pane { gap: 10px; padding: 14px; }
+.session-note, .external-note { padding: 10px 12px; line-height: 1.55; }
+.toolbar { gap: 7px; }
+.btn, .select { min-height: 32px; border-radius: var(--radius-control); }
+.host { border-radius: var(--radius); }
 </style>

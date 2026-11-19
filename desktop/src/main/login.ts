@@ -809,6 +809,10 @@ export function registerLoginIpc(): void {
         rejected.push({ productId: '', reason: '候选缺少商品 ID，已跳过并尝试其他候选' })
         continue
       }
+      if (candidate.cartAttempted === true && candidate.cartAdded !== true) {
+        rejected.push({ productId, reason: '该商品曾尝试加车但结果不明，须先回读选品车；本次不重复加车' })
+        continue
+      }
       if (seenProductIds.has(productId)) {
         rejected.push({ productId, reason: '本轮候选池中商品 ID 重复，已跳过重复项' })
         continue
@@ -902,6 +906,13 @@ export function registerLoginIpc(): void {
       const result = await runManagedSelection(runParams)
       const completed = Array.isArray(result.completed) ? result.completed as Array<Record<string, unknown>> : []
       const completedById = new Map(completed.map((item) => [String(item.productId ?? ''), item]))
+      const preCartUntouchedProductIds = new Set(
+        Array.isArray(result.preCartUntouchedProductIds)
+          ? result.preCartUntouchedProductIds.map(String) : []
+      )
+      if (result.poolConsumerRateLimit && !completed.some((item) => item.retryableRateLimit === true)) {
+        throw new Error('百应搜索限流缺少逐商品检查点；预占结果保持待核查。')
+      }
       const settlementWarnings: string[] = []
       const confirmedDownloads: Array<{ productId: string; commodityId: string }> = []
       const registryReleaseEvents: Array<{
@@ -922,9 +933,18 @@ export function registerLoginIpc(): void {
         const controlFailure = item?.cartFailureClass === 'CONTROL_FAILURE' &&
           item.cartAttempted !== true && item.skipped === true &&
           /加车前控件定位失败|未点击加车/.test(String(item.status ?? ''))
+        // 池消费执行器显式列出未搜索/未点击的商品。若某行既无结果也无
+        // “加车前未触碰”证明，不能仅凭缺席就释放预占。
+        const confirmedNotAttempted = item
+          ? params.settings._poolConsumerOnly === true
+            ? item.cartAttempted === false && item.skipped === true
+            : item.cartAttempted !== true
+          : params.settings._poolConsumerOnly === true
+            ? preCartUntouchedProductIds.has(productId)
+            : true
         const outcome = item?.cartAdded === true
           ? 'ADDED'
-          : controlFailure || item?.confirmedCartRejection === true || item?.cartAttempted !== true
+          : controlFailure || item?.confirmedCartRejection === true || confirmedNotAttempted
             ? 'NOT_ADDED'
             : 'UNKNOWN'
         const releaseEvent = controlFailure ? {

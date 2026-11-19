@@ -4,7 +4,8 @@ stdin: {"anchors": [{"id": "job:1", "path": "..."}],
         "candidates": [{"id": 2, "path": "..."}], "limit": 10}
 stdout: {"ok": true, "acceptedIds": [2], "duplicates": [...], "unreadableIds": [...]}
 
-仅当较短视频至少 60% 的抽样画面按时间顺序与另一视频高度一致时判重。
+默认仅当较短视频至少 60% 的抽样画面按时间顺序与另一视频高度一致时判重；
+商品下载入口单独传入 80% 阈值与较少抽帧，不改变千川素材筛选的默认口径。
 无法解码的文件不靠猜测拦截，仍交给后续素材质量检查。
 """
 
@@ -26,6 +27,8 @@ MAX_SAMPLES = 90
 PIXEL_DIFFERENCE_LIMIT = 12.0
 HASH_DISTANCE_LIMIT = 8
 OVERLAP_LIMIT = 0.60
+DOWNLOAD_OVERLAP_LIMIT = 0.80
+DOWNLOAD_MAX_SAMPLES = 18
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,7 @@ def _frame_signature(frame: np.ndarray) -> FrameSignature:
     return FrameSignature(visual_hash, pixels)
 
 
-def video_signature(path: Path) -> list[FrameSignature]:
+def video_signature(path: Path, max_samples: int = MAX_SAMPLES) -> list[FrameSignature]:
     if not path.is_file():
         return []
     capture = cv2.VideoCapture(str(path))
@@ -54,7 +57,7 @@ def video_signature(path: Path) -> list[FrameSignature]:
         if not capture.isOpened() or not math.isfinite(fps) or fps <= 0 or count < 1:
             return []
         duration = count / fps
-        sample_count = min(MAX_SAMPLES, max(1, int(duration)))
+        sample_count = min(max_samples, max(1, int(duration)))
         times = np.linspace(min(0.5, duration / 2), max(0.5, duration - 0.5), sample_count)
         frames: list[FrameSignature] = []
         for seconds in times:
@@ -96,9 +99,12 @@ def visual_overlap(left: list[FrameSignature], right: list[FrameSignature]) -> f
 
 
 def select_unique(anchors: list[dict[str, Any]], candidates: list[dict[str, Any]],
-                  limit: int) -> dict[str, Any]:
+                  limit: int, overlap_limit: float = OVERLAP_LIMIT,
+                  max_samples: int = MAX_SAMPLES) -> dict[str, Any]:
     if len(anchors) + len(candidates) > MAX_ITEMS or not 1 <= limit <= MAX_ITEMS:
         raise ValueError("画面去重候选数量超出限制")
+    if not 0.60 <= overlap_limit <= 1 or not 8 <= max_samples <= MAX_SAMPLES:
+        raise ValueError("画面去重阈值或抽帧数无效")
     accepted: list[int] = []
     duplicates: list[dict[str, Any]] = []
     unreadable: list[int] = []
@@ -107,7 +113,7 @@ def select_unique(anchors: list[dict[str, Any]], candidates: list[dict[str, Any]
 
     def signature(path: str) -> list[FrameSignature]:
         if path not in cache:
-            cache[path] = video_signature(Path(path))
+            cache[path] = video_signature(Path(path), max_samples)
         return cache[path]
 
     for item in anchors:
@@ -120,7 +126,7 @@ def select_unique(anchors: list[dict[str, Any]], candidates: list[dict[str, Any]
         if not frames:
             unreadable.append(asset_id)
         duplicate = next(((other_id, overlap) for other_id, other in known
-                          if (overlap := visual_overlap(frames, other)) >= OVERLAP_LIMIT), None)
+                          if (overlap := visual_overlap(frames, other)) >= overlap_limit), None)
         if duplicate:
             duplicates.append({"assetId": asset_id, "matches": duplicate[0],
                                "overlap": round(duplicate[1], 3)})
@@ -137,7 +143,9 @@ def select_unique(anchors: list[dict[str, Any]], candidates: list[dict[str, Any]
 def main() -> None:
     request = json.loads(sys.stdin.readline())
     result = select_unique(request.get("anchors", []), request.get("candidates", []),
-                           int(request.get("limit", MAX_ITEMS)))
+                           int(request.get("limit", MAX_ITEMS)),
+                           float(request.get("overlapLimit", OVERLAP_LIMIT)),
+                           int(request.get("maxSamples", MAX_SAMPLES)))
     print(json.dumps(result, ensure_ascii=False))
 
 

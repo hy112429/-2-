@@ -103,9 +103,16 @@ onBeforeUnmount(() => { stopProgress?.(); stopProgress = null })
 </template>
 
 <style scoped>
-.violations{padding:14px;border:1px solid #e1e6ee;border-radius:7px;background:#fff;color:#263249;min-width:0;overflow:auto}.violations header,.actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}.violations h2{margin:0;font-size:16px}.violations p{font-size:12px;color:#6c788b;overflow-wrap:anywhere}.violations button,.violations select{min-height:30px;padding:4px 9px;border:1px solid #d8dee8;border-radius:5px;background:#fff;color:#263249;cursor:pointer}.violations button:disabled{opacity:.5;cursor:not-allowed}.violations .danger{background:#bd3939;color:#fff;border-color:#bd3939}.notice{padding:9px;background:#edf4ff}.table-scroll{max-height:400px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}th,td{text-align:left;padding:8px;border-bottom:1px solid #edf0f4;vertical-align:top;overflow-wrap:anywhere}th:first-child{width:56px}th:nth-child(2){width:27%}th:nth-child(3){width:14%}th:last-child{width:130px}td small{display:block;color:#7a8797}.actions{margin-top:10px;font-size:12px}.manifest{margin-top:14px;border-top:1px solid #edf0f4}.manifest h3{font-size:14px}.manifest ul{max-height:200px;overflow:auto;font-size:12px}
+.violations{padding:14px;border:1px solid var(--border);border-radius:7px;background:#fff;color:var(--text);min-width:0;overflow:auto}.violations header,.actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}.violations h2{margin:0;font-size:16px}.violations p{font-size:12px;color:var(--text-muted);overflow-wrap:anywhere}.violations button,.violations select{min-height:30px;padding:4px 9px;border:1px solid var(--border);border-radius:5px;background:#fff;color:var(--text);cursor:pointer}.violations button:disabled{opacity:.5;cursor:not-allowed}.violations .danger{background:#bd3939;color:#fff;border-color:#bd3939}.notice{padding:9px;background:var(--brand-soft)}.table-scroll{max-height:400px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}th,td{text-align:left;padding:8px;border-bottom:1px solid #edf0f4;vertical-align:top;overflow-wrap:anywhere}th:first-child{width:56px}th:nth-child(2){width:27%}th:nth-child(3){width:14%}th:last-child{width:130px}td small{display:block;color:var(--text-muted)}.actions{margin-top:10px;font-size:12px}.manifest{margin-top:14px;border-top:1px solid #edf0f4}.manifest h3{font-size:14px}.manifest ul{max-height:200px;overflow:auto;font-size:12px}
 .violations { border-radius: var(--radius); box-shadow: var(--shadow-card); }
 .violations header { padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .violations button:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
 .violations .danger:hover:not(:disabled) { border-color: #a92c2c; color: #fff; background: #a92c2c; }
+.violations { padding: 16px; }
+.violations h2 { font-size: 17px; letter-spacing: -.02em; }
+.violations header { padding-bottom: 12px; }
+.violations button, .violations select { min-height: 32px; border-radius: var(--radius-control); }
+th, td { padding: 7px; }
+.notice { border-radius: var(--radius-control); }
+th { background: var(--surface-muted); }
 </style>

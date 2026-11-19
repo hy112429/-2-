@@ -15,11 +15,18 @@ export interface RegistryReservation {
   state: string
 }
 
+interface RegistryReserveResponse {
+  reserved?: RegistryReservation[]
+  rejected?: Array<{ productId: string; reason: string }>
+}
+
 export interface RegistrySnapshot {
   usedProductIds: string[]
   accountUsedCategoryIds: string[]
   categoryUsage: Record<string, number>
   mode: 'local' | 'server'
+  syncConflicts?: Array<{ productId: string; reason: string }>
+  warning?: string
 }
 
 interface RegistryPayload {
@@ -27,6 +34,9 @@ interface RegistryPayload {
   error?: string
   [key: string]: unknown
 }
+
+class RegistryUnavailableError extends Error {}
+class RegistryAmbiguousResponseError extends Error {}
 
 function normalizeLocalAccountKey(value: string): string {
   const key = String(value ?? '').trim()
@@ -72,13 +82,14 @@ async function runServerRegistry<T>(path: string, body?: unknown): Promise<T> {
       })
       break
     } catch {
-      if (attempt === 1) throw new Error('共享选品登记服务不可达；已保留检查点，未按未查重结果继续。')
+      if (attempt === 1) throw new RegistryUnavailableError('共享选品登记服务暂时不可达；已切换本机选品登记，联网恢复后同步。')
     }
   }
   if (!response) throw new Error('共享选品登记未返回结果；已保留检查点。')
+  if (response.status >= 500) throw new RegistryUnavailableError(`共享选品登记服务暂时不可用（HTTP ${response.status}）；本次未继续提交。`)
   if (!response.ok) throw new Error(`共享选品登记返回 HTTP ${response.status}；已保留检查点。`)
   try { return await response.json() as T }
-  catch { throw new Error('共享选品登记响应无效；已保留检查点。') }
+  catch { throw new RegistryAmbiguousResponseError('共享选品登记响应无法解析；需要回读服务器状态后恢复。') }
 }
 
 async function getServerSnapshot(accountKey: string, candidates: RegistryCandidate[]): Promise<RegistrySnapshot> {
@@ -121,8 +132,39 @@ async function runLocalRegistry<T extends RegistryPayload>(args: string[], stdin
   return result
 }
 
-export async function getRegistrySnapshot(accountKey: string, candidates: RegistryCandidate[]): Promise<RegistrySnapshot> {
-  if (serverConfig()) return getServerSnapshot(accountKey, candidates)
+async function syncLocalRegistryToServer(accountKey: string): Promise<Array<{ productId: string; reason: string }>> {
+  const localAccountKey = normalizeLocalAccountKey(accountKey)
+  const exported = await runLocalRegistry<RegistryPayload & { items?: Array<Record<string, string>> }>([
+    'sync-export', '--limit', '5000', '--account-key', localAccountKey
+  ])
+  const items = Array.isArray(exported.items) ? exported.items : []
+  const conflicts: Array<{ productId: string; reason: string }> = []
+  for (let offset = 0; offset < items.length; offset += 50) {
+    const chunk = items.slice(offset, offset + 50)
+    const response = await runServerRegistry<{ outcomes?: Array<{ localToken: string; productId: string; status: string; reason?: string }> }>(
+      '/offline-sync', {
+        items: chunk.map((item) => ({
+          productId: String(item.productId ?? ''),
+          localToken: String(item.localToken ?? ''),
+          accountKey: remoteAccountKey(accountKey),
+          leafCategoryId: String(item.leafCategoryId ?? ''),
+          title: String(item.title ?? ''),
+          state: String(item.state ?? '')
+        }))
+      }
+    )
+    if (!Array.isArray(response.outcomes) || response.outcomes.length !== chunk.length) throw new Error('共享选品离线同步回执数量不完整；本机记录保持待同步。')
+    const outcomes = response.outcomes.map((outcome) => {
+      if (outcome.status === 'conflict') conflicts.push({ productId: String(outcome.productId), reason: String(outcome.reason ?? 'SERVER_CONFLICT') })
+      return { localToken: String(outcome.localToken ?? ''), status: String(outcome.status ?? ''), reason: String(outcome.reason ?? '') }
+    })
+    const applied = await runLocalRegistry<RegistryPayload & { updated?: number }>(['sync-apply'], { outcomes })
+    if (Number(applied.updated) !== outcomes.length) throw new Error('本机离线同步回执未全部落账；未继续消费候选。')
+  }
+  return conflicts
+}
+
+async function getLocalSnapshot(accountKey: string, candidates: RegistryCandidate[]): Promise<RegistrySnapshot> {
   const localAccountKey = normalizeLocalAccountKey(accountKey)
   const result = await runLocalRegistry<RegistryPayload & RegistrySnapshot>([
     'snapshot', '--account-key', localAccountKey
@@ -132,23 +174,39 @@ export async function getRegistrySnapshot(accountKey: string, candidates: Regist
     throw new Error('本机选品查重结果不完整；本次已停止，未执行加车。')
   }
   return {
-    usedProductIds: Array.isArray(result.usedProductIds) ? result.usedProductIds.map(String) : [],
-    accountUsedCategoryIds: Array.isArray(result.accountUsedCategoryIds) ? result.accountUsedCategoryIds.map(String) : [],
-    categoryUsage: result.categoryUsage && typeof result.categoryUsage === 'object'
-      ? result.categoryUsage as Record<string, number>
-      : {},
+    usedProductIds: result.usedProductIds.map(String),
+    accountUsedCategoryIds: result.accountUsedCategoryIds.map(String),
+    categoryUsage: result.categoryUsage as Record<string, number>,
     mode: 'local'
   }
 }
 
-export async function getRegistryBatchSnapshots(
+export async function getRegistrySnapshot(accountKey: string, candidates: RegistryCandidate[]): Promise<RegistrySnapshot> {
+  if (!serverConfig()) return getLocalSnapshot(accountKey, candidates)
+  try {
+    const syncConflicts = await syncLocalRegistryToServer(accountKey)
+    const [server, local] = await Promise.all([
+      getServerSnapshot(accountKey, candidates),
+      getLocalSnapshot(accountKey, candidates)
+    ])
+    return {
+      usedProductIds: [...new Set([...server.usedProductIds, ...local.usedProductIds])],
+      accountUsedCategoryIds: [...new Set([...server.accountUsedCategoryIds, ...local.accountUsedCategoryIds])],
+      categoryUsage: Object.fromEntries([...new Set([...Object.keys(server.categoryUsage), ...Object.keys(local.categoryUsage)])]
+        .map((categoryId) => [categoryId, Math.max(server.categoryUsage[categoryId] ?? 0, local.categoryUsage[categoryId] ?? 0)] as const)),
+      mode: 'server',
+      ...(syncConflicts.length ? { syncConflicts } : {})
+    }
+  } catch (cause) {
+    if (!(cause instanceof RegistryUnavailableError)) throw cause
+    const local = await getLocalSnapshot(accountKey, candidates)
+    return { ...local, warning: cause.message }
+  }
+}
+
+async function getLocalBatchSnapshots(
   entries: Array<{ accountKey: string; candidates: RegistryCandidate[] }>
 ): Promise<Record<string, RegistrySnapshot>> {
-  if (serverConfig()) {
-    const snapshots: Record<string, RegistrySnapshot> = {}
-    for (const entry of entries) snapshots[entry.accountKey] = await getServerSnapshot(entry.accountKey, entry.candidates)
-    return snapshots
-  }
   const normalized = entries.map((entry) => ({
     originalKey: entry.accountKey,
     accountKey: normalizeLocalAccountKey(entry.accountKey),
@@ -182,6 +240,41 @@ export async function getRegistryBatchSnapshots(
   }))
 }
 
+export async function getRegistryBatchSnapshots(
+  entries: Array<{ accountKey: string; candidates: RegistryCandidate[] }>
+): Promise<Record<string, RegistrySnapshot>> {
+  const local = await getLocalBatchSnapshots(entries)
+  if (!serverConfig()) return local
+  try {
+    const conflictsByAccount: Record<string, Array<{ productId: string; reason: string }>> = {}
+    const snapshots: Record<string, RegistrySnapshot> = {}
+    for (const entry of entries) {
+      conflictsByAccount[entry.accountKey] = await syncLocalRegistryToServer(entry.accountKey)
+      snapshots[entry.accountKey] = await getServerSnapshot(entry.accountKey, entry.candidates)
+    }
+    return Object.fromEntries(entries.map((entry) => {
+      const server = snapshots[entry.accountKey]
+      const offline = local[entry.accountKey]
+      if (!server || !offline) throw new Error(`账号 ${entry.accountKey} 的共享登记快照不完整。`)
+      return [entry.accountKey, {
+        usedProductIds: [...new Set([
+          ...server.usedProductIds,
+          ...offline.usedProductIds,
+          ...(conflictsByAccount[entry.accountKey] ?? []).map((item) => String(item.productId))
+        ])],
+        accountUsedCategoryIds: [...new Set([...server.accountUsedCategoryIds, ...offline.accountUsedCategoryIds])],
+        categoryUsage: Object.fromEntries([...new Set([...Object.keys(server.categoryUsage), ...Object.keys(offline.categoryUsage)])]
+          .map((categoryId) => [categoryId, Math.max(server.categoryUsage[categoryId] ?? 0, offline.categoryUsage[categoryId] ?? 0)] as const)),
+        mode: 'server' as const,
+        ...(conflictsByAccount[entry.accountKey]?.length ? { syncConflicts: conflictsByAccount[entry.accountKey] } : {})
+      }]
+    }))
+  } catch (cause) {
+    if (!(cause instanceof RegistryUnavailableError)) throw cause
+    return Object.fromEntries(Object.entries(local).map(([key, snapshot]) => [key, { ...snapshot, warning: cause.message }]))
+  }
+}
+
 export async function reserveRegistryCandidates(
   accountKey: string,
   requestId: string,
@@ -189,21 +282,75 @@ export async function reserveRegistryCandidates(
   maxReserved?: number
 ): Promise<{ reserved: RegistryReservation[]; rejected: Array<{ productId: string; reason: string }>; mode: 'local' | 'server' }> {
   if (serverConfig()) {
-    const reserved: RegistryReservation[] = []
-    const rejected: Array<{ productId: string; reason: string }> = []
-    const limit = Number.isInteger(maxReserved) ? Math.max(0, Number(maxReserved)) : items.length
-    for (let offset = 0; offset < items.length && reserved.length < limit;) {
-      const take = Math.min(50, limit - reserved.length)
-      const chunk = items.slice(offset, offset + take)
-      offset += chunk.length
-      const response = await runServerRegistry<{ reserved?: RegistryReservation[]; rejected?: Array<{ productId: string; reason: string }> }>(
-        '/reservations', { requestId, accountKey: remoteAccountKey(accountKey), items: chunk }
-      )
-      if (!Array.isArray(response.reserved) || !Array.isArray(response.rejected)) throw new Error('共享选品预留响应不完整；请核查服务端待处理记录。')
-      reserved.push(...response.reserved)
-      rejected.push(...response.rejected)
+    let reservationSubmitted = false
+    try {
+      await syncLocalRegistryToServer(accountKey)
+      const reserved: RegistryReservation[] = []
+      const rejected: Array<{ productId: string; reason: string }> = []
+      const limit = Number.isInteger(maxReserved) ? Math.max(0, Number(maxReserved)) : items.length
+      for (let offset = 0; offset < items.length && reserved.length < limit;) {
+        const take = Math.min(50, limit - reserved.length)
+        const chunk = items.slice(offset, offset + take)
+        offset += chunk.length
+        const remoteKey = remoteAccountKey(accountKey)
+        const body = { requestId, accountKey: remoteKey, items: chunk }
+        reservationSubmitted = true
+        let response: RegistryReserveResponse
+        try {
+          response = await runServerRegistry<RegistryReserveResponse>('/reservations', body)
+          if (!Array.isArray(response.reserved) || !Array.isArray(response.rejected)) {
+            throw new RegistryAmbiguousResponseError('共享选品预留回执不完整；需要回读服务器状态后恢复。')
+          }
+        } catch (cause) {
+          if (!(cause instanceof RegistryUnavailableError) && !(cause instanceof RegistryAmbiguousResponseError)) throw cause
+          const readbackBody = { requestId, accountKey: remoteKey, productIds: chunk.map((item) => item.productId) }
+          const readback = await runServerRegistry<{ reserved?: RegistryReservation[] }>(
+            '/reservations/readback', readbackBody
+          )
+          if (!Array.isArray(readback.reserved)) throw new Error('共享选品预留回读不完整；保留检查点，未在本机重复预留。')
+          const readbackIds = new Set(readback.reserved.map((item) => String(item.productId)))
+          const missing = chunk.filter((item) => !readbackIds.has(item.productId))
+          if (!missing.length) {
+            response = { reserved: readback.reserved, rejected: [] }
+          } else {
+            try {
+              response = await runServerRegistry<RegistryReserveResponse>('/reservations', { ...body, items: missing })
+              if (!Array.isArray(response.reserved) || !Array.isArray(response.rejected)) {
+                throw new RegistryAmbiguousResponseError('共享选品预留重试回执不完整；需要再次回读服务器状态。')
+              }
+            } catch (retryCause) {
+              if (!(retryCause instanceof RegistryUnavailableError) && !(retryCause instanceof RegistryAmbiguousResponseError)) throw retryCause
+              const afterRetry = await runServerRegistry<{ reserved?: RegistryReservation[] }>(
+                '/reservations/readback', readbackBody
+              )
+              if (!Array.isArray(afterRetry.reserved)) throw new Error('共享选品预留重试后的回读不完整；保留检查点，未在本机重复预留。')
+              const confirmedIds = new Set(afterRetry.reserved.map((item) => String(item.productId)))
+              response = {
+                reserved: afterRetry.reserved,
+                rejected: missing.filter((item) => !confirmedIds.has(item.productId)).map((item) => ({
+                  productId: item.productId, reason: '服务器预留回读未确认；未执行加车，需恢复后核对'
+                }))
+              }
+            }
+            if (Array.isArray(response.reserved)) {
+              response.reserved = [...new Map([
+                ...readback.reserved.map((item) => [String(item.productId), item] as const),
+                ...response.reserved.map((item) => [String(item.productId), item] as const)
+              ]).values()]
+            }
+          }
+        }
+        if (!Array.isArray(response.reserved) || !Array.isArray(response.rejected)) throw new Error('共享选品预留响应不完整；请核查服务端待处理记录。')
+        reserved.push(...response.reserved)
+        rejected.push(...response.rejected)
+      }
+      return { reserved, rejected, mode: 'server' }
+    } catch (cause) {
+      if (!(cause instanceof RegistryUnavailableError)) throw cause
+      if (reservationSubmitted) {
+        throw new Error(`${cause.message} 预留请求已经发出，结果未确认；本次停止本机回退和加车，请联网后读取服务器预留状态再恢复。`)
+      }
     }
-    return { reserved, rejected, mode: 'server' }
   }
   const localAccountKey = normalizeLocalAccountKey(accountKey)
   if (!requestId.trim()) throw new Error('本机登记请求标识为空；本次未执行加车。')
@@ -221,24 +368,40 @@ export async function reserveRegistryCandidates(
     rejected?: Array<{ productId: string; reason: string }>
   }>(args)
   return {
-    reserved: Array.isArray(result.reserved) ? result.reserved : [],
+    reserved: Array.isArray(result.reserved) ? result.reserved.map((item) => ({ ...item, token: `local:${item.token}` })) : [],
     rejected: Array.isArray(result.rejected) ? result.rejected : [],
     mode: 'local'
   }
 }
 
 export async function beginRegistryReservation(token: string): Promise<void> {
-  if (serverConfig()) {
-    await runServerRegistry(`/reservations/${encodeURIComponent(token)}/begin`, {})
+  if (token.startsWith('local:')) {
+    await runLocalRegistry(['begin', '--token', token.slice('local:'.length)])
     return
+  }
+  if (serverConfig()) {
+    try {
+      await runServerRegistry(`/reservations/${encodeURIComponent(token)}/begin`, {})
+      return
+    } catch (cause) {
+      if (!(cause instanceof RegistryUnavailableError) && !String(cause).includes('HTTP 404')) throw cause
+    }
   }
   await runLocalRegistry(['begin', '--token', token])
 }
 
 export async function finishRegistryReservation(token: string, outcome: 'ADDED' | 'NOT_ADDED' | 'UNKNOWN'): Promise<void> {
-  if (serverConfig()) {
-    await runServerRegistry(`/reservations/${encodeURIComponent(token)}/finish`, { outcome })
+  if (token.startsWith('local:')) {
+    await runLocalRegistry(['finish', '--token', token.slice('local:'.length), '--outcome', outcome])
     return
+  }
+  if (serverConfig()) {
+    try {
+      await runServerRegistry(`/reservations/${encodeURIComponent(token)}/finish`, { outcome })
+      return
+    } catch (cause) {
+      if (!(cause instanceof RegistryUnavailableError) && !String(cause).includes('HTTP 404')) throw cause
+    }
   }
   await runLocalRegistry(['finish', '--token', token, '--outcome', outcome])
 }

@@ -1391,11 +1391,11 @@ onUnmounted(() => {
 .page-head h1 { margin: 0; font-size: 21px; }
 .page-head p, .card-title span, .summary-note, .form-actions > span { color: var(--text-muted); font-size: 12px; }
 .page-head p { margin: 5px 0 0; }
-.notice { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px; border: 1px solid #bfdbfe; border-radius: var(--radius); background: #eff6ff; color: #1d4ed8; font-size: 12px; line-height: 1.5; }
+.notice { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px; border: 1px solid #bfdbfe; border-radius: var(--radius); background: var(--brand-soft); color: var(--brand); font-size: 12px; line-height: 1.5; }
 .workflow-note { display: grid; grid-template-columns: 96px minmax(0, 1fr); align-items: start; gap: 5px 10px; }
 .notice.error { border-color: #fecaca; background: #fef2f2; color: #b91c1c; }
 .notice.result { margin-top: 9px; }
-.publish-progress-card { margin: 9px 0; padding: 11px 13px; border: 1px solid #93c5fd; border-radius: var(--radius); background: #eff6ff; color: #1e3a8a; }
+.publish-progress-card { margin: 9px 0; padding: 11px 13px; border: 1px solid #93c5fd; border-radius: var(--radius); background: var(--brand-soft); color: #1e3a8a; }
 .publish-progress-card.succeeded { border-color: #86efac; background: #f0fdf4; color: #166534; }
 .publish-progress-card.failed { border-color: #fecaca; background: #fef2f2; color: #991b1b; }
 .publish-progress-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; font-size: 12px; }
@@ -1410,7 +1410,7 @@ onUnmounted(() => {
 .row-publish-progress small { color: var(--text-muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
 @keyframes publish-progress-slide { from { left: -38%; } to { left: 105%; } }
 .account-workspace { min-width: 0; }
-.account-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 12px; padding: 13px 15px; border: 1px solid var(--border); border-radius: var(--radius); background: linear-gradient(110deg, #f6f9ff, #ffffff); box-shadow: var(--shadow-card); }
+.account-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 12px; padding: 13px 15px; border: 1px solid var(--border); border-radius: var(--radius); background: linear-gradient(110deg, var(--bg-app), #ffffff); box-shadow: var(--shadow-card); }
 .account-head h2 { margin: 0; font-size: 16px; }
 .account-head p { margin: 5px 0 0; color: var(--text-muted); font-size: 12px; }
 .account-actions { display: flex; flex-wrap: wrap; gap: 7px; }
@@ -1457,9 +1457,9 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
 .badge.uploading, .badge.needs_review { background: #fff7ed; color: #c2410c; }
 .badge.submitting, .badge.submission_uncertain { background: #fff7ed; color: #c2410c; }
 .badge.isolated { background: #fff7ed; color: #9a6700; }
-.badge.uploaded_waiting_publish, .badge.submitted_review { background: #eff6ff; color: #1d4ed8; }
+.badge.uploaded_waiting_publish, .badge.submitted_review { background: var(--brand-soft); color: var(--brand); }
 .badge.published { background: #ecfdf5; color: #047857; }
-.publish-action { color: #1d4ed8; font-weight: 700; }
+.publish-action { color: var(--brand); font-weight: 700; }
 .immediate-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 5px; }
 .actions { min-width: 150px; white-space: normal; }
 .row-more-actions { margin-top: 5px; font-size: 11px; }
@@ -1473,4 +1473,16 @@ th { color: var(--text-muted); font-weight: 500; white-space: nowrap; }
 tr.cancelled { color: var(--text-muted); }
 @media (max-width: 900px) { .page-head { align-items: flex-start; flex-direction: column; } .account-head { align-items: flex-start; flex-direction: column; } }
 @media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } label.wide { grid-column: auto; } .form-actions { align-items: flex-start; flex-direction: column; } .scheduler-settings-body { grid-template-columns: 1fr; } }
+.publish-page { padding: 4px 4px 17px; }
+.page-head { margin-bottom: 12px; padding: 8px 4px 12px; }
+.page-head h1 { font-size: 24px; letter-spacing: -.03em; }
+.head-actions { gap: 7px; }
+.button { min-height: 32px; border-radius: var(--radius-control); }
+.header-more > summary { border-radius: var(--radius-control); }
+.header-more-actions { border-radius: var(--radius); box-shadow: var(--shadow-float); }
+.receipt-events { border-radius: 20px; box-shadow: var(--shadow-float); }
+.receipt-events-mask { background: rgb(29 29 31 / 40%); }
+.card { margin-top: 12px; padding: 16px; }
+.account-head { padding: 14px 16px; }
+.notice { padding: 10px 12px; }
 </style>

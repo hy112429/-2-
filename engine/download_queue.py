@@ -24,12 +24,15 @@ CLI：
 """
 
 import argparse
+import hashlib
 import json
 import random
 import sqlite3
 import subprocess
 import sys
 import time
+import uuid
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -53,6 +56,50 @@ cancel_flag = {"value": False}
 
 class NoRetryError(RuntimeError):
     """不可重试错误：重试同一 URL 无意义（如签名已过期的直链），直接失败。"""
+
+
+@contextmanager
+def visual_product_lock(db_path: Path, task: Dict[str, Any], dest: Path):
+    """同一商品的画面检查、成品落盘和登记跨下载进程串行。"""
+    product_id = str(task.get("product_id") or "")
+    if not product_id.isdigit() or dest.parent.name != product_id:
+        raise ValueError("画面去重任务缺少匹配的商品 ID 下载目录")
+    account_scope = str(task.get("account_id") or dest.parents[2])
+    key = hashlib.sha256(f"{account_scope}:{product_id}".encode("utf-8")).hexdigest()[:24]
+    lock_dir = db_path.parent / "download-dedupe-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / f"{key}.lock", "a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            deadline = time.monotonic() + 600
+            while True:
+                if cancel_flag["value"]:
+                    raise RuntimeError("任务已取消，停止等待同商品画面检查")
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("同商品画面检查等待超过 10 分钟")
+                    time.sleep(0.25)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def emit(event: dict) -> None:
@@ -188,7 +235,55 @@ def ensure_h264(dest: Path) -> str:
         return f"转码失败：{exc}（已保留原文件）"
 
 
-def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float) -> Dict[str, Any]:
+def visual_anchor_paths(con: sqlite3.Connection, task: Dict[str, Any], dest: Path) -> list[Path]:
+    """只比较同账号同商品的已登记视频，以及当前商品目录内的成品。"""
+    paths: list[Path] = []
+    account_id = task.get("account_id")
+    if account_id is not None:
+        with _db_lock:
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='assets'").fetchone():
+                rows = con.execute(
+                    "SELECT file_path FROM assets WHERE account_id=? AND product_id=? "
+                    "AND source_type='web_download' AND status='ready' ORDER BY id DESC",
+                    (int(account_id), str(task["product_id"])),
+                ).fetchall()
+                paths.extend(Path(str(row[0])) for row in rows)
+    if dest.parent.is_dir():
+        paths.extend(dest.parent.glob("*.mp4"))
+    unique: dict[str, Path] = {}
+    for path in paths:
+        if path != dest and path.is_file() and path.stat().st_size > 0:
+            unique[str(path.resolve())] = path
+    return list(unique.values())
+
+
+def visual_duplicate(con: sqlite3.Connection, task: Dict[str, Any], staged: Path,
+                     dest: Path) -> tuple[Optional[str], float, str]:
+    """证据不足时保留候选，并在任务结果中说明未完成画面检查。"""
+    try:
+        try:
+            from .video_visual_dedupe import (DOWNLOAD_MAX_SAMPLES, DOWNLOAD_OVERLAP_LIMIT,
+                                               video_signature, visual_overlap)
+        except ImportError:
+            from video_visual_dedupe import (DOWNLOAD_MAX_SAMPLES, DOWNLOAD_OVERLAP_LIMIT,
+                                             video_signature, visual_overlap)
+        frames = video_signature(staged, DOWNLOAD_MAX_SAMPLES)
+        if not frames:
+            return None, 0.0, "画面无法解码，未据此判重"
+        for anchor in visual_anchor_paths(con, task, dest):
+            other = video_signature(anchor, DOWNLOAD_MAX_SAMPLES)
+            if not other:
+                continue
+            overlap = visual_overlap(frames, other)
+            if overlap >= DOWNLOAD_OVERLAP_LIMIT:
+                return anchor.name, overlap, ""
+        return None, 0.0, ""
+    except Exception as error:  # OpenCV 解码错误也不能作为“相似”证据
+        return None, 0.0, f"画面识别未完成，已保留视频供复核：{error}"
+
+
+def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float,
+                 db_con: Optional[sqlite3.Connection] = None) -> Dict[str, Any]:
     """执行一次下载。成功返回统计，失败抛异常。"""
     url = task["url"]
 
@@ -214,10 +309,11 @@ def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float)
 
         total = int(response.headers.get("Content-Length") or 0)
         written = 0
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        # 写到临时文件，下载完成后原子改名 —— 中断不会留下半截「成品」
-        tmp = dest.with_suffix(dest.suffix + ".part")
+        visual_check = task.get("visual_dedupe") is True
+        # 画面检查先放在账号目录的临时区，候选不提前进入商品成品目录。
+        tmp = (dest.parents[2] / ".download-staging" / f"{uuid.uuid4().hex}.mp4"
+               if visual_check else dest.with_suffix(dest.suffix + ".part"))
+        tmp.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(tmp, "wb") as handle:
                 # 注：分块保持 8KB + 每块上报（与最初基线一致），真实提速靠请求头（DOWNLOAD_HEADERS），
@@ -242,20 +338,34 @@ def download_one(session: Any, task: Dict[str, Any], dest: Path, timeout: float)
             # 千川开放平台地址须确实返回可识别的视频，不能把 200 HTML 错误页当 MP4 登记。
             if task.get("verify_video") and not probe_codec(tmp, "v:0"):
                 raise NoRetryError("接口地址未返回可识别的视频文件（可能是过期直链或 HTML 错误页）")
+            if total > 0 and written != total:
+                raise RuntimeError(f"下载不完整：期望 {total} 字节，实际 {written} 字节")
+            visual_note = ""
+            if visual_check:
+                if db_con is None:
+                    raise ValueError("画面去重任务缺少素材库连接")
+                matched_name, overlap, visual_note = visual_duplicate(db_con, task, tmp, dest)
+                if matched_name:
+                    return {"status": "skipped", "bytes": written,
+                            "message": f"画面高度相似（重合 {overlap:.0%}，对应 {matched_name}），未保存到正式目录"}
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() and dest.stat().st_size > 0:
+                return {"status": "skipped", "bytes": dest.stat().st_size,
+                        "message": "文件已存在，跳过下载", "file_path": str(dest)}
             tmp.replace(dest)
         finally:
             tmp.unlink(missing_ok=True)
 
-        if total > 0 and written != total:
-            raise RuntimeError(f"下载不完整：期望 {total} 字节，实际 {written} 字节")
-
     # 规格转码：非 H.264/AAC 时转码（小红书 HEVC 等），抖音 h264 源不重编码
     transcode_note = ensure_h264(dest)
 
-    return {"status": "success", "bytes": written, "message": "下载完成" + (f"，{transcode_note}" if transcode_note else ""), "file_path": str(dest)}
+    notes = [note for note in (transcode_note, visual_note if task.get("visual_dedupe") else "") if note]
+    return {"status": "success", "bytes": written,
+            "message": "下载完成" + (f"，{'；'.join(notes)}" if notes else ""), "file_path": str(dest)}
 
 
-def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: float, db_con: sqlite3.Connection) -> Dict[str, Any]:
+def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: float,
+             db_con: sqlite3.Connection, db_path: Optional[Path] = None) -> Dict[str, Any]:
     """带重试的单个任务执行。"""
     task["attempts"] = 0
     last_error = ""
@@ -279,24 +389,29 @@ def run_task(session: Any, task: Dict[str, Any], max_retries: int, timeout: floa
         })
         upsert_task(db_con, task["id"], task["url"], "running", attempt, 0, "下载中")
         try:
-            result = download_one(session, task, dest, timeout)
-            # 只有本次真实下载成功，才足以证明 web_download 来源；已有文件跳过不作来源推断。
-            if result["status"] == "success":
-                try:
-                    with _db_lock:
-                        ensure_asset_schema(db_con)
-                        explicit_account = task.get("account_id")
-                        register_asset(
-                            db_con, str(dest), "web_download",
-                            int(explicit_account) if explicit_account is not None else None,
-                            str(task["product_id"]) if task.get("product_id") else None,
-                        )
-                except (OSError, sqlite3.Error, ValueError) as error:
-                    result["message"] = result.get("message", "下载完成") + f"；素材库登记待核查：{error}"
-                    emit({
-                        "type": "asset_registration_warning", "tid": task["id"],
-                        "message": f"文件下载成功，但素材来源登记失败：{error}",
-                    })
+            visual_check = task.get("visual_dedupe") is True
+            lock = (visual_product_lock(db_path or Path(DEFAULT_DB_PATH), task, dest) if visual_check
+                    else nullcontext())
+            with lock:
+                result = (download_one(session, task, dest, timeout, db_con) if visual_check
+                          else download_one(session, task, dest, timeout))
+                # 只有本次真实下载成功，才足以证明 web_download 来源；已有文件跳过不作来源推断。
+                if result["status"] == "success":
+                    try:
+                        with _db_lock:
+                            ensure_asset_schema(db_con)
+                            explicit_account = task.get("account_id")
+                            register_asset(
+                                db_con, str(dest), "web_download",
+                                int(explicit_account) if explicit_account is not None else None,
+                                str(task["product_id"]) if task.get("product_id") else None,
+                            )
+                    except (OSError, sqlite3.Error, ValueError) as error:
+                        result["message"] = result.get("message", "下载完成") + f"；素材库登记待核查：{error}"
+                        emit({
+                            "type": "asset_registration_warning", "tid": task["id"],
+                            "message": f"文件下载成功，但素材来源登记失败：{error}",
+                        })
             upsert_task(db_con, task["id"], task["url"], result["status"], attempt, 100, result.get("message", ""))
             emit({
                 "type": "task",
@@ -404,7 +519,7 @@ def main() -> int:
         # 任务间随机间隔（限速）：先睡一段再取任务，打散固定节拍
         if not cancel_flag["value"]:
             time.sleep(random.uniform(args.min_delay, args.max_delay))
-        result = run_task(session, task, args.max_retries, args.timeout, db_con)
+        result = run_task(session, task, args.max_retries, args.timeout, db_con, Path(args.db))
         with done_lock:
             stats["done"] += 1
             if result.get("status") == "success":

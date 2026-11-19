@@ -397,7 +397,7 @@ onBeforeUnmount(() => { stopAuthPoll(); offEngine?.() })
     </details>
     <p class="hint">下载目录：{{ downloadDir }}</p>
     <div v-for="(video, index) in videos" :key="`${video.videoId}-${index}`" class="qc-result">
-      <span class="qc-title">{{ video.title || video.videoId || `视频 ${index + 1}` }}<small class="qc-origin">{{ video.advertiserName }}</small></span>
+      <span class="qc-title"><strong :title="video.title || video.videoId || `视频 ${index + 1}`">{{ video.title || video.videoId || `视频 ${index + 1}` }}</strong><small class="qc-origin">{{ video.advertiserName }}</small></span>
       <span>{{ video.url ? '有视频地址' : '无视频地址' }}</span>
       <button :disabled="!video.url || !!activeDownload" @click="download(video)">下载验证</button>
     </div>
@@ -416,7 +416,7 @@ onBeforeUnmount(() => { stopAuthPoll(); offEngine?.() })
 .qc-input.wide { flex-basis: 360px; }
 .qc-query-row { padding: 10px; border-radius: 8px; background: var(--bg-subtle, var(--bg-panel)); }
 .qc-product { min-width: 220px; flex: 2 1 300px; }
-.qc-primary { background: var(--primary, #3678f6); border-color: var(--primary, #3678f6); color: #fff; font-weight: 700; }
+.qc-primary { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 700; }
 .qc-warning { border-left: 3px solid #dc2626; padding: 8px 10px; color: #a12b2b; background: rgba(220, 38, 38, .06); }
 .qc-advanced, .qc-setup { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
 .qc-advanced summary, .qc-setup summary { cursor: pointer; color: var(--text-muted); font-size: 13px; }
@@ -424,8 +424,16 @@ button { border: 1px solid var(--border); border-radius: 6px; background: var(--
 button:disabled { opacity: .5; cursor: default; }
 .hint { color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
 .qc-message { color: var(--text); overflow-wrap: anywhere; }
-.qc-result { display: flex; gap: 10px; align-items: center; border-top: 1px solid var(--border); padding: 7px 0; }
+.qc-result { display: flex; gap: 9px; align-items: center; border-top: 1px solid var(--border); padding: 6px 0; }
 .qc-result-actions { display: flex; justify-content: flex-end; padding-top: 8px; }
-.qc-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.qc-title { flex: 1; min-width: 0; overflow-wrap: anywhere; line-height: 1.4; }
+.qc-title strong { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .qc-origin { display: block; color: var(--text-muted); font-size: 11px; }
+.qc-panel { border-radius: var(--radius); padding: 14px; background: var(--bg-panel); box-shadow: var(--shadow-card); }
+.qc-panel summary { font-size: 15px; }
+.qc-row { gap: 9px; margin: 10px 0; }
+.qc-input { min-height: 32px; border-radius: var(--radius-control); }
+.qc-query-row { border-radius: var(--radius-control); background: var(--surface-muted); }
+.qc-primary { background: var(--brand); border-color: var(--brand); }
+button { min-height: 32px; border-radius: var(--radius-control); }
 </style>

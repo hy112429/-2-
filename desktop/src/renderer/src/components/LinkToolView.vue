@@ -339,7 +339,7 @@ onBeforeUnmount(() => {
   padding: 12px;
   gap: 8px;
   overflow-y: auto;
-  background: linear-gradient(180deg, #ffffff, #fbfcff);
+  background: linear-gradient(180deg, #ffffff, var(--bg-app));
 }
 
 .head {
@@ -371,7 +371,7 @@ onBeforeUnmount(() => {
   color: var(--brand);
   background: var(--brand-soft);
 }
-.btn.primary:hover:not(:disabled) { background: #265dc7; color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--brand); color: #fff; }
 
 .btn:disabled {
   opacity: 0.5;
@@ -597,4 +597,8 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   word-break: break-all;
 }
+.link-tool { gap: 12px; padding: 14px; background: transparent; }
+.head h3 { font-size: 18px; letter-spacing: -.02em; }
+.btn { min-height: 32px; border-radius: var(--radius-control); }
+.result-card { border-radius: var(--radius); box-shadow: var(--shadow-card); }
 </style>

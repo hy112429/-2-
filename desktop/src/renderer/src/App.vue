@@ -198,12 +198,12 @@ onBeforeUnmount(() => {
   display: grid;
   place-items: center;
   min-width: 0;
-  color: #667085;
-  background: #f4f6fa;
+  color: var(--text-muted);
+  background: var(--bg-app);
   padding: 24px;
 }
 
 .startup-state.error {
-  color: #c0392b;
+  color: var(--danger);
 }
 </style>

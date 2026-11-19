@@ -1358,7 +1358,7 @@ function toggleSelectBind(id: number): void {
   padding: 12px 14px;
   box-shadow: var(--shadow-card);
 }
-.stat-card:first-child { background: linear-gradient(135deg, #ffffff, #edf4ff); border-color: #d4e3fb; }
+.stat-card:first-child { background: linear-gradient(135deg, #ffffff, var(--brand-soft)); border-color: #d4e3fb; }
 
 .stat-card .num {
   font-size: 24px;
@@ -1509,7 +1509,7 @@ function toggleSelectBind(id: number): void {
 .grid th {
   position: sticky;
   top: 0;
-  background: #f7f8fa;
+  background: var(--bg-app);
   color: var(--text-muted);
   font-weight: 500;
   z-index: 1;
@@ -1612,7 +1612,7 @@ function toggleSelectBind(id: number): void {
   border-color: var(--brand);
   color: #fff;
 }
-.btn.primary:hover:not(:disabled) { background: #265dc7; color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--brand); color: #fff; }
 
 .btn.mini {
   padding: 2px 7px;
@@ -1638,7 +1638,7 @@ function toggleSelectBind(id: number): void {
 .compact-card:hover { border-color: #bacced; }
 .compact-head, .compact-identity, .compact-summary, .compact-actions { display: flex; align-items: center; gap: 8px; }
 .compact-head { justify-content: space-between; }
-.compact-head strong { font-size: 14px; color: #203351; }
+.compact-head strong { font-size: 14px; color: var(--text); }
 .compact-identity { min-width: 0; cursor: pointer; }
 .compact-identity span { display: flex; flex-direction: column; min-width: 0; }
 .compact-identity strong, .compact-identity small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1705,7 +1705,7 @@ function toggleSelectBind(id: number): void {
   align-items: center;
   justify-content: space-between;
   padding: 5px 10px;
-  background: #f7f8fa;
+  background: var(--bg-app);
   border-bottom: 1px solid var(--border);
 }
 
@@ -1762,7 +1762,7 @@ function toggleSelectBind(id: number): void {
 }
 
 .member-row:hover {
-  background: #f7f8fa;
+  background: var(--bg-app);
 }
 
 /* 弹层 */
@@ -1837,4 +1837,14 @@ function toggleSelectBind(id: number): void {
   gap: 6px;
   font-size: 13px;
 }
+.acct-view { gap: 12px; padding: 14px; }
+.stats { gap: 10px; }
+.stat-card { padding: 14px; }
+.stat-card:first-child { background: var(--bg-panel); border-color: var(--border); }
+.btn { min-height: 32px; border-radius: var(--radius-control); }
+.btn.primary { border-color: var(--brand); background: var(--brand); color: #fff; }
+.modal { border-radius: 20px; box-shadow: var(--shadow-float); }
+.modal-mask { background: rgb(29 29 31 / 40%); }
+.table-wrap { border-radius: var(--radius-control); }
+.compact-card { padding: 14px; }
 </style>

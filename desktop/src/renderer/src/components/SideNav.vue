@@ -62,10 +62,11 @@ watch(() => props.active, (active) => {
 
 <style scoped>
 .nav {
-  background: linear-gradient(180deg, #16243e 0%, #121c32 100%);
-  padding: 15px 0 18px;
+  background: var(--bg-nav);
+  border-right: 1px solid var(--border);
+  padding: 16px 0 18px;
   overflow-y: auto;
-  /* 极窄的滚动条，避免深色背景下出现一条突兀的白条 */
+  /* 侧栏滚动条保持轻量。 */
   scrollbar-width: thin;
 }
 
@@ -77,16 +78,16 @@ watch(() => props.active, (active) => {
   justify-content: space-between;
   align-items: center;
   padding: 8px 15px 6px 17px;
-  color: #899bb7;
+  color: var(--text-muted);
   text-align: left;
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: .05em;
+  letter-spacing: .02em;
 }
 
-.group-title:hover { color: #e6eeff; }
+.group-title:hover { color: var(--text); }
 .more-group > .group-title { border: 0; background: none; cursor: pointer; font-family: inherit; }
-.group-chevron { color: #7c8799; font-size: 14px; transition: transform .15s; }
+.group-chevron { color: var(--text-muted); font-size: 14px; transition: transform .15s; }
 .group-chevron.collapsed { transform: rotate(-90deg); }
 .group-items { display: flex; flex-direction: column; gap: 3px; }
 
@@ -96,23 +97,22 @@ watch(() => props.active, (active) => {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-height: 37px;
+  min-height: 36px;
   padding: 7px 10px;
-  border-radius: 8px;
-  color: var(--text-on-dark);
+  border-radius: var(--radius-control);
+  color: #424245;
   text-align: left;
   transition: background 0.15s, color 0.15s;
 }
 
 .nav-item:hover {
-  background: rgba(137, 171, 233, .12);
-  color: var(--text-on-dark-strong);
+  background: var(--bg-nav-hover);
+  color: var(--text);
 }
 
 .nav-item.active {
-  background: linear-gradient(90deg, rgba(78, 130, 245, .32), rgba(78, 130, 245, .13));
-  color: var(--text-on-dark-strong);
-  box-shadow: inset 3px 0 #6fa1ff;
+  background: #e7f2ff;
+  color: #005bbd;
   font-weight: 600;
 }
 
@@ -123,16 +123,16 @@ watch(() => props.active, (active) => {
   justify-content: center;
   align-items: center;
   border-radius: 6px;
-  background: rgba(255, 255, 255, .055);
-  color: #9fb2d0;
+  background: #ededf0;
+  color: #6e6e73;
   font-size: 13px;
   line-height: 1;
   flex-shrink: 0;
 }
 
 .nav-item.active .nav-icon {
-  background: rgba(126, 171, 255, .18);
-  color: #b9d2ff;
+  background: #d4e8ff;
+  color: #005bbd;
 }
 
 .label {

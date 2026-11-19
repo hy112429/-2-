@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import BrowserPane from './BrowserPane.vue'
 import SelectionFilterEditor from './SelectionFilterEditor.vue'
 import { createSelectionFilterSettings } from '../utils/selection_filters'
@@ -34,6 +34,40 @@ import {
   runSequentialSelectionBatch,
   selectCandidateIdsForAccount
 } from '../utils/selection_batch'
+
+function isBaiyingCooldownClassification(value: string | undefined): boolean {
+  return value === 'BAIYING_RATE_LIMIT' || value === 'BAIYING_NETWORK_ERROR' ||
+    value === 'BAIYING_11001_UNCONFIRMED'
+}
+
+function consumer11001RetryPlan(reason: string, logs: unknown, accountId: number): {
+  code: 'BAIYING_RATE_LIMIT' | 'BAIYING_NETWORK_ERROR' | 'BAIYING_11001_UNCONFIRMED'
+  label: string
+  cooldownSeconds: number
+} {
+  const classification = toUserSelectionError(reason).classification
+  const code = classification === 'BAIYING_NETWORK_ERROR' || classification === 'BAIYING_11001_UNCONFIRMED'
+    ? classification : 'BAIYING_RATE_LIMIT'
+  const label = code === 'BAIYING_NETWORK_ERROR'
+    ? '百应商品搜索返回 11001，平台提示网络错误'
+    : code === 'BAIYING_11001_UNCONFIRMED'
+      ? '百应商品搜索返回 11001，原因未确认'
+      : '百应商品搜索返回 11001，平台提示频控'
+  const accountLogs = Array.isArray(logs) ? logs.filter((entry) => {
+    const log = entry && typeof entry === 'object' ? entry as Record<string, unknown> : {}
+    return Number(log.accountId) === accountId
+  }) as Record<string, unknown>[] : []
+  const lastConfirmedCartId = accountLogs.reduce((latest, log) =>
+    String(log.code ?? '') === 'SUCCESS_PRODUCT_CART_ADDED' ? Math.max(latest, Number(log.id) || 0) : latest, 0)
+  const previousCount = accountLogs.filter((log) => {
+    const previousCode = String(log.code ?? '')
+    return (previousCode === code ||
+      (code === 'BAIYING_11001_UNCONFIRMED' && previousCode === 'BAIYING_RATE_LIMIT')) &&
+      (Number(log.id) || 0) > lastConfirmedCartId
+  }).length
+  const baseSeconds = code === 'BAIYING_NETWORK_ERROR' ? 30 : 60
+  return { code, label, cooldownSeconds: Math.min(15 * 60, baseSeconds * (2 ** Math.min(previousCount, 5))) }
+}
 
 function safeCandidateCollectorErrorDetail(input: unknown): string {
   const raw = String(input instanceof Error ? input.message : input ?? '').trim()
@@ -197,6 +231,9 @@ interface PrioritySourceReadResult {
   pageReads?: Array<{ query?: number; step: number; scrollTop?: number; newProductIds?: number }>
   categoryTabNextOffset?: number
   categoryTabTotal?: number
+  categoryTabReadLimitReached?: boolean
+  sourceReadLimitReached?: boolean
+  scrollPositions?: Record<string, number>
   sourceFilterRejected?: number
   rankSelection?: Record<string, string>
   sourceCategoryTabs?: Array<{ name?: string; categoryId?: string; status?: string; level?: number; selected?: boolean }>
@@ -272,13 +309,31 @@ interface BatchCandidatePool {
   target: number
   mode?: 'total' | 'quota'
   quotaRules?: CandidatePoolQuotaRule[]
-  quotaProgress?: Array<{ ruleId: string; collected: number; target: number; deficit: number }>
+  quotaProgress?: Array<{ ruleId: string; collected: number; target: number; effectiveTarget?: number; transferredIn?: number; transferredOut?: number; deficit: number }>
+  quotaTransfers?: Array<{ fromRuleId: string; toRuleId: string; count: number; transferredAt: string }>
+  excludedProductIds?: string[]
   collectorAccountIds: number[]
   filterFingerprint: string
   rows: SelectionCandidate[]
-  sourceState: { collectors: Record<string, { tabOffsets: Record<string, number>; samePoolCount: number; nextRetryAt?: string; ruleStates?: Record<string, { samePoolCount: number; nextRetryAt?: string }> }> }
+  sourceState: { autoResumeAllowed?: boolean; collectors: Record<string, { tabOffsets: Record<string, number>; samePoolCount: number; rateLimitCount?: number; nextRetryAt?: string; scrollSteps?: number; rawLimit?: number; scrollPositions?: Record<string, number>; detailAttemptedIds?: string[]; ruleStates?: Record<string, { samePoolCount: number; nextRetryAt?: string; exhausted?: boolean; scrollSteps?: number; rawLimit?: number; scrollPosition?: number; categoryTabOffset?: number; detailAttemptedIds?: string[] }> }> }
   status: 'collecting' | 'ready'
   capturedAt: string
+}
+
+interface SavedLocalCandidatePool {
+  batchId: string
+  count: number
+  recentCount: number
+  target: number
+  mode: 'total' | 'quota'
+  capturedAt: string
+  updatedAt: string
+  collectorAccountIds: number[]
+  sourceCounts: Record<string, number>
+  minimumCommissionRate: number | null
+  maximumCommissionRate: number | null
+  excludedCategoryCount: number
+  preview: Array<{ productId: string; title: string; sourceKey: string }>
 }
 
 interface FilterField {
@@ -288,6 +343,8 @@ interface FilterField {
 }
 
 interface SelectionCandidate {
+  collectedByAccountId?: number
+  capturedAt?: string
   cardIndex: number
   productId: string
   cartAdded?: boolean
@@ -309,6 +366,10 @@ interface SelectionCandidate {
   commissionRate: number | null
   shopScore: number | null
   trendRising: boolean
+  trendKnown?: boolean
+  trendStatus?: string
+  trendSlope?: number | null
+  trendPoints?: number
   poolRank: number
   sources?: CandidateSource[]
   dataMetrics?: Record<string, number | null>
@@ -334,6 +395,9 @@ interface SelectionCandidate {
   status?: string
   selected: boolean
   sourceCategorySelection?: { level1: string[]; level2: string[]; level3: string[] }
+  sourceCategoryId?: string
+  sourceCategoryName?: string
+  sourceRecords?: Array<{ sourceKey: string; categoryPath?: string[]; rankBoard?: string; sourceCategoryId?: string; sourceCategoryName?: string }>
   categoryIds?: string[]
   leafCategoryId?: string
   sourceKey?: string
@@ -342,9 +406,17 @@ interface SelectionCandidate {
   selectionMode?: 'general' | 'category'
   categoryMode?: 'auto' | 'manual'
   categoryStatus?: string
+  categorySource?: string
   categoryError?: string
   mutualExclusionReason?: string
   mutualExclusionWinnerAccountId?: number
+}
+
+interface CandidateDetail extends Partial<SelectionCandidate> {
+  productId: string
+  title: string
+  sourceCategoryIds?: string[]
+  reusedFromBatchId?: string
 }
 
 type CategoryLevel = 'level1' | 'level2' | 'level3'
@@ -414,6 +486,8 @@ const commissionRuleMigrationRequired = ref(false)
 const error = ref('')
 const notice = ref('')
 const selectionInitialized = ref(false)
+const selectionUiDataReady = ref(false)
+let selectionUiDataPromise: Promise<void> | null = null
 const dailySelectionSchedule = reactive({
   enabled: false,
   time: '09:00',
@@ -446,6 +520,8 @@ let selectionViewUnmounted = false
 let stopSelectionCooldownExpired: (() => void) | undefined
 let automaticResumeBatchId: string | null = null
 let automaticResumeAccountId: number | null = null
+let candidatePoolResumeTimer: number | null = null
+let automaticPoolResumeBatchId: string | null = null
 const autoResumeAccountId = ref<number | null>(null)
 interface CooldownAutoResumeIntent {
   batchId: string
@@ -479,6 +555,23 @@ interface SelectionProgressState {
   resultSummary?: string
 }
 const selectionProgress = ref<SelectionProgressState | null>(null)
+interface CandidatePoolProgressState {
+  batchId: string
+  count: number | null
+  target: number
+  status: 'collecting' | 'ready'
+  mode: 'total' | 'quota'
+  sourceCounts: Record<string, number>
+  quotaRules: CandidatePoolQuotaRule[]
+  quotaProgress: NonNullable<BatchCandidatePool['quotaProgress']>
+  quotaTransfers: NonNullable<BatchCandidatePool['quotaTransfers']>
+}
+const candidatePoolProgress = ref<CandidatePoolProgressState | null>(null)
+const batchProgressPhase = ref<'pool' | 'account'>('pool')
+const manualPauseRequested = ref(false)
+const manualPauseSaving = ref(false)
+const activeSelectionRunBatchId = ref<string | null>(null)
+let manualPauseWritePromise: Promise<void> | null = null
 let stopSelectionProgress: (() => void) | undefined
 let stopAutoPublishProgress: (() => void) | undefined
 let activeAutoPublishQueueId: number | null = null
@@ -489,7 +582,7 @@ interface SelectionWorkflowStep {
   weight: number
 }
 
-const BATCH_SELECTION_WORKFLOW: SelectionWorkflowStep[] = [
+const LEGACY_BATCH_SELECTION_WORKFLOW: SelectionWorkflowStep[] = [
   { key: 'preflight', label: '检查账号、浏览器与登录状态', weight: 8 },
   { key: 'collect', label: '采集百应当前可见商品', weight: 20 },
   { key: 'quota_check', label: '检查账号剩余商品配额', weight: 5 },
@@ -498,6 +591,15 @@ const BATCH_SELECTION_WORKFLOW: SelectionWorkflowStep[] = [
   { key: 'quota_record', label: '登记商品配额', weight: 3 },
   { key: 'video', label: '处理详情图并生成视频', weight: 20 },
   { key: 'queue', label: '写入发布队列（全自动时继续发布）', weight: 12 }
+]
+
+const SHARED_POOL_ACCOUNT_WORKFLOW: SelectionWorkflowStep[] = [
+  { key: 'account_check', label: '检查当前账号与商品配额', weight: 10 },
+  { key: 'allocate', label: '从共享候选池分配商品 ID', weight: 10 },
+  { key: 'cart', label: '按精确商品 ID 核验并加车', weight: 40 },
+  { key: 'quota_record', label: '登记商品配额', weight: 5 },
+  { key: 'video', label: '处理详情图并生成视频', weight: 20 },
+  { key: 'queue', label: '写入队列或自动发布并读取回执', weight: 15 }
 ]
 
 const BATCH_FALLBACK_CANDIDATE_LIMIT = 50
@@ -509,21 +611,123 @@ const PREVIEW_SELECTION_WORKFLOW: SelectionWorkflowStep[] = [
   { key: 'result', label: '整理并显示候选预览', weight: 5 }
 ]
 
-function workflowIndexForStage(stageValue: string, mode: SelectionProgressState['mode']): number {
+function poolSourceCounts(rows: SelectionCandidate[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const row of rows) {
+    const source = row.sourceKey || 'unknown'
+    counts[source] = (counts[source] ?? 0) + 1
+  }
+  return counts
+}
+
+function showSavedPoolCheckpoint(batch: SelectionRecoveryBatch): void {
+  const settings = batch.payload.settingsSnapshot as Record<string, unknown> | undefined
+  const collectors = settings?.candidateCollectorAccountIds
+  if (!Array.isArray(collectors) || !collectors.length) {
+    candidatePoolProgress.value = null
+    return
+  }
+  const target = Number(settings?.candidatePoolTarget)
+  const pool = batch.payload.candidatePool as BatchCandidatePool | undefined
+  const validPool = pool && Array.isArray(pool.rows) && pool.target === target &&
+    pool.filterFingerprint === batchCandidatePoolFingerprint(settings ?? {}) &&
+    pool.collectorAccountIds?.join(',') === collectors.map(Number).join(',') ? pool : undefined
+  candidatePoolProgress.value = {
+    batchId: batch.batchId,
+    count: validPool ? validPool.rows.length : null,
+    target: Number.isInteger(target) && target > 0 ? target : 0,
+    status: validPool?.status ?? 'collecting',
+    mode: settings?.candidatePoolMode === 'quota' ? 'quota' : 'total',
+    sourceCounts: validPool ? poolSourceCounts(validPool.rows) : {},
+    quotaRules: validPool?.quotaRules ?? [],
+    quotaProgress: validPool?.quotaProgress ?? [],
+    quotaTransfers: validPool?.quotaTransfers ?? []
+  }
+}
+
+function showConfirmedPoolSave(batchId: string, target: number, mode: 'total' | 'quota',
+                               status: 'collecting' | 'ready', rows: SelectionCandidate[],
+                               rules: CandidatePoolQuotaRule[] = [],
+                               transfers: NonNullable<BatchCandidatePool['quotaTransfers']> = []): void {
+  const effectiveTargets = new Map(rules.map((rule) => [rule.id, rule.target]))
+  for (const transfer of transfers) {
+    effectiveTargets.set(transfer.fromRuleId, (effectiveTargets.get(transfer.fromRuleId) ?? 0) - transfer.count)
+    effectiveTargets.set(transfer.toRuleId, (effectiveTargets.get(transfer.toRuleId) ?? 0) + transfer.count)
+  }
+  const counts = new Map(rules.map((rule) => [rule.id, 0]))
+  for (const row of rows) if (row.quotaRuleId && counts.has(row.quotaRuleId)) {
+    counts.set(row.quotaRuleId, (counts.get(row.quotaRuleId) ?? 0) + 1)
+  }
+  candidatePoolProgress.value = {
+    batchId, count: rows.length, target, status, mode,
+    sourceCounts: poolSourceCounts(rows), quotaRules: rules,
+    quotaProgress: rules.map((rule) => {
+      const effectiveTarget = effectiveTargets.get(rule.id) ?? rule.target
+      const collected = counts.get(rule.id) ?? 0
+      return {
+        ruleId: rule.id, collected, target: rule.target, effectiveTarget,
+        transferredIn: transfers.filter((item) => item.toRuleId === rule.id).reduce((sum, item) => sum + item.count, 0),
+        transferredOut: transfers.filter((item) => item.fromRuleId === rule.id).reduce((sum, item) => sum + item.count, 0),
+        deficit: Math.max(0, effectiveTarget - collected)
+      }
+    }),
+    quotaTransfers: transfers
+  }
+}
+
+const showCandidatePoolProgress = computed(() => {
+  const progress = selectionProgress.value
+  if (progress?.mode === 'preview') return false
+  if (progress?.mode === 'batch') return batchProgressPhase.value === 'pool' || candidatePoolProgress.value !== null
+  return candidatePoolProgress.value !== null && ['in_progress', 'needs_retry'].includes(recoveryBatch.value?.state ?? '')
+})
+const candidatePoolProgressPercent = computed(() => {
+  const pool = candidatePoolProgress.value
+  return pool?.count !== null && pool?.count !== undefined && pool.target > 0
+    ? Math.max(0, Math.min(100, Math.floor(pool.count * 100 / pool.target))) : null
+})
+const candidatePoolSourceProgress = computed(() => {
+  const pool = candidatePoolProgress.value
+  if (!pool) return []
+  const sources = ['hotSpot', 'allianceRank', 'selectionSquare']
+  return sources.map((key) => ({
+    key, label: localPoolSourceLabels[key] ?? key,
+    collected: pool.sourceCounts[key] ?? 0,
+    target: pool.mode === 'quota'
+      ? pool.quotaProgress.filter((item) => pool.quotaRules.find((rule) => rule.id === item.ruleId)?.sourceKey === key)
+        .reduce((sum, item) => sum + (item.effectiveTarget ?? item.target), 0) : null
+  })).filter((item) => item.collected > 0 || (item.target ?? 0) > 0)
+})
+function candidatePoolProgressRuleLabel(ruleId: string): string {
+  const rule = candidatePoolProgress.value?.quotaRules.find((item) => item.id === ruleId)
+  return rule ? formatQuotaRule(rule) : ruleId
+}
+
+function workflowIndexForStage(stageValue: string, mode: SelectionProgressState['mode'], sharedPool: boolean): number {
   const stage = stageValue.replace(/^(失败于：|账号处理失败：)/, '').trim()
-  const steps = mode === 'preview' ? PREVIEW_SELECTION_WORKFLOW : BATCH_SELECTION_WORKFLOW
-  if (/video_pending/.test(stage)) return 6
-  if (/cart_pending/.test(stage)) return 4
-  if (/quota_cart/.test(stage)) return 5
-  if (/quota_check/.test(stage)) return 2
-  if (/candidate_fetch/.test(stage)) return 1
   if (mode === 'preview') {
+    if (/candidate_fetch/.test(stage)) return 1
     if (/候选预览完成|预览结果/.test(stage)) return 3
     if (/评分|去重|筛选与互斥|类目推荐|推荐类目|统一分配/.test(stage)) return 2
     if (/准备候选预览|准备账号选品任务|检查账号设置|读取账号设置/.test(stage)) return 0
     if (/采集|候选|百应筛选|热点|联盟|榜单|来源|列表/.test(stage)) return 1
     return 0
   }
+  if (sharedPool) {
+    if (/video_pending|详情图|图转视频|生成视频|视频生成|恢复详情图/.test(stage)) return 4
+    if (/发布|投稿|队列|上传视频|创作者中心|封面|关联百应|发布选项/.test(stage)) return 5
+    if (/quota_cart|登记加车配额|记录(?:加车|商品|选品车)?配额|配额记录/.test(stage)) return 3
+    if (/cart_pending|加车|核验并处理|处理选中商品|选中商品处理结果|商品数据分析|选品车|候选商品处理/.test(stage)) return 2
+    if (/quota_check|账号配额预检|每日配额|剩余配额|账号配额|登录|账号资源校验/.test(stage)) return 0
+    if (/candidate_fetch|candidate_refilling|评分|筛选|类目推荐|互斥|候选|准备账号选品任务|账号选品执行中|开始顺序处理账号|等待账号执行/.test(stage)) return 1
+    if (/完成|处理结束/.test(stage)) return SHARED_POOL_ACCOUNT_WORKFLOW.length - 1
+    return 0
+  }
+  if (/video_pending/.test(stage)) return 6
+  if (/cart_pending/.test(stage)) return 4
+  if (/quota_cart/.test(stage)) return 5
+  if (/quota_check/.test(stage)) return 2
+  if (/candidate_fetch/.test(stage)) return 1
   if (/准备选品批次|读取启用账号|检查百应与创作者中心登录态|复核登录状态|账号资源校验|登录状态预检/.test(stage)) return 0
   if (/详情图|图转视频|生成视频|视频生成|恢复详情图/.test(stage)) return 6
   if (/发布|投稿|队列|上传视频|创作者中心|封面|关联百应|发布选项/.test(stage)) return 7
@@ -535,19 +739,20 @@ function workflowIndexForStage(stageValue: string, mode: SelectionProgressState[
   if (/每日配额|剩余配额|账号配额|quota_check/.test(stage)) return 2
   // 批次候选计划已在账号执行前统一采集；账号执行入口的准备/配额检查属于候选整理阶段。
   if (/准备账号选品任务|账号选品执行中|开始顺序处理账号|等待账号执行/.test(stage)) return 3
-  if (/完成|处理结束/.test(stage)) return steps.length - 1
+  if (/完成|处理结束/.test(stage)) return LEGACY_BATCH_SELECTION_WORKFLOW.length - 1
   return 0
 }
 
 const selectionWorkflowSteps = computed(() => {
   const progress = selectionProgress.value
-  return progress?.mode === 'preview' ? PREVIEW_SELECTION_WORKFLOW : BATCH_SELECTION_WORKFLOW
+  return progress?.mode === 'preview' ? PREVIEW_SELECTION_WORKFLOW
+    : candidatePoolProgress.value ? SHARED_POOL_ACCOUNT_WORKFLOW : LEGACY_BATCH_SELECTION_WORKFLOW
 })
 
 const selectionWorkflowStageIndex = computed(() => {
   const progress = selectionProgress.value
   if (!progress) return 0
-  return workflowIndexForStage(progress.stage, progress.mode)
+  return workflowIndexForStage(progress.stage, progress.mode, candidatePoolProgress.value !== null)
 })
 
 const selectionWorkflowStagePercent = computed(() => {
@@ -570,20 +775,22 @@ const selectionWorkflowPercent = computed(() => {
   const progress = selectionProgress.value
   if (!progress) return 0
   if (progress.state === 'finished' && progress.percent === 100) return 100
+  if (progress.mode === 'batch' && candidatePoolProgress.value && progress.accountId === null) return null
   const steps = selectionWorkflowSteps.value
   const stageIndex = Math.max(0, Math.min(steps.length - 1, selectionWorkflowStageIndex.value))
   const priorWeight = steps.slice(0, stageIndex).reduce((sum, step) => sum + step.weight, 0)
   const stageWeight = steps[stageIndex]?.weight ?? 0
   const stagePercent = selectionWorkflowStagePercent.value ?? 0
 
-  if (progress.mode === 'batch' && stageIndex >= 6) {
+  const videoIndex = candidatePoolProgress.value ? 4 : 6
+  if (progress.mode === 'batch' && stageIndex >= videoIndex) {
     // 视频与队列按商品串行处理；商品序号参与计算，避免每处理下一个商品时总进度倒退。
     const itemTotal = Math.max(1, progress.itemTotal ?? 1)
     const itemIndex = Math.max(1, Math.min(itemTotal, progress.itemIndex ?? 1))
-    const itemPhase = stageIndex === 6
+    const itemPhase = stageIndex === videoIndex
       ? 0.7 * stagePercent / 100
       : 0.7 + 0.3 * stagePercent / 100
-    const completedBeforeProducts = steps.slice(0, 6).reduce((sum, step) => sum + step.weight, 0)
+    const completedBeforeProducts = steps.slice(0, videoIndex).reduce((sum, step) => sum + step.weight, 0)
     const productPhaseWeight = 100 - completedBeforeProducts
     return Math.max(0, Math.min(100, Math.round(
       completedBeforeProducts + productPhaseWeight * ((itemIndex - 1 + itemPhase) / itemTotal)
@@ -692,7 +899,7 @@ function acknowledgeSelectionCooldownEvent(
 }
 
 function onSelectionCooldownExpired(event: { batchId: string; deadline: number; sendCount: number }): void {
-  if (props.dialogOnly) {
+  if (props.dialogOnly || manualPausePending()) {
     acknowledgeSelectionCooldownEvent(event)
     return
   }
@@ -742,7 +949,7 @@ function onSelectionCooldownExpired(event: { batchId: string; deadline: number; 
     state.pendingAccountIds.includes(state.rateLimitedAccountId)) {
     const limitedAccount = recoveryBatch.value?.accounts.find((account) =>
       account.accountId === state.rateLimitedAccountId && account.state === 'needs_retry' &&
-      toUserSelectionError(account.error).classification === 'BAIYING_RATE_LIMIT'
+      isBaiyingCooldownClassification(toUserSelectionError(account.error).classification)
     )
     if (limitedAccount) {
       intent = {
@@ -830,9 +1037,13 @@ function onSelectionCooldownExpired(event: { batchId: string; deadline: number; 
 }
 
 function restoreSelectionCooldown(batch: SelectionRecoveryBatch | null): boolean {
+  if (manualPauseRequested.value || batchIsManuallyPaused(batch)) {
+    stopManualPauseAutoResume()
+    return false
+  }
   const limitedAccount = batch?.accounts.find((account) =>
     account.state === 'needs_retry' &&
-    toUserSelectionError(account.error).classification === 'BAIYING_RATE_LIMIT'
+    isBaiyingCooldownClassification(toUserSelectionError(account.error).classification)
   )
   if (!limitedAccount) {
     const intent = cooldownAutoResumeIntent.value
@@ -851,22 +1062,35 @@ function restoreSelectionCooldown(batch: SelectionRecoveryBatch | null): boolean
   const updatedAt = limitedAccount.updatedAt ? Date.parse(limitedAccount.updatedAt) : Number.NaN
   const deadline = Number.isFinite(updatedAt) ? updatedAt + duration * 1000 : Date.now() + duration * 1000
   const currentIntent = cooldownAutoResumeIntent.value
-  if (!currentIntent || currentIntent.batchId !== batch?.batchId || currentIntent.accountId !== limitedAccount.accountId ||
-    (currentIntent.phase === 'starting' && deadline > currentIntent.deadline)) {
+  const sameIntent = Boolean(currentIntent && batch && currentIntent.batchId === batch.batchId &&
+    currentIntent.accountId === limitedAccount.accountId)
+  const deadlineExtended = sameIntent && deadline > (currentIntent?.deadline ?? 0)
+  if (!sameIntent || deadlineExtended) {
+    clearAutoResumeTimer()
     cooldownAutoResumeIntent.value = {
       batchId: batch?.batchId ?? '', accountId: limitedAccount.accountId,
       deadline, attempts: 0, phase: 'pending'
     }
     completedCooldownAutoResume = null
+    if (deadlineExtended && batch) traceSelectionCooldown('renderer_cooldown_deadline_extended', batch.batchId, {
+      accountId: limitedAccount.accountId, previousDeadline: currentIntent?.deadline ?? null, deadline
+    })
   }
-  armSelectionCooldown(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)), deadline)
+  if (sameIntent && currentIntent?.phase === 'starting' && !deadlineExtended) return true
+  const activeDeadline = sameIntent && !deadlineExtended
+    ? Math.max(deadline, currentIntent?.deadline ?? deadline, currentIntent?.retryAt ?? 0) : deadline
+  if (!selectionCooldownArmed.value || selectionCooldownDeadline !== activeDeadline) {
+    armSelectionCooldown(Math.max(0, Math.ceil((activeDeadline - Date.now()) / 1000)), activeDeadline)
+  } else {
+    refreshCooldownFromDeadline()
+  }
   return true
 }
 
 watch(notice, (message) => {
   if (!message) return
   const presentation = toUserSelectionError(message)
-  if (presentation.classification === 'BAIYING_RATE_LIMIT') {
+  if (isBaiyingCooldownClassification(presentation.classification) && !manualPausePending()) {
     if (!restoreSelectionCooldown(recoveryBatch.value)) armSelectionCooldown(presentation.cooldownSeconds ?? 60)
   }
   if (selectionProgress.value?.state !== 'running') notifyGlobal(presentation.userMessage)
@@ -874,17 +1098,417 @@ watch(notice, (message) => {
 watch(error, (message) => {
   if (!message) return
   const presentation = toUserSelectionError(message)
-  if (presentation.classification === 'BAIYING_RATE_LIMIT') {
+  if (isBaiyingCooldownClassification(presentation.classification) && !manualPausePending()) {
     if (!restoreSelectionCooldown(recoveryBatch.value)) armSelectionCooldown(presentation.cooldownSeconds ?? 60)
   }
   notifyGlobal(presentation.userMessage, 'error')
 })
 
 const recoveryBatch = ref<SelectionRecoveryBatch | null>(null)
+function batchIsManuallyPaused(batch: SelectionRecoveryBatch | null): boolean {
+  const value = batch?.payload.manualPause
+  return Boolean(batch && ['in_progress', 'needs_retry'].includes(batch.state) &&
+    value && typeof value === 'object' && (value as Record<string, unknown>).active === true)
+}
+function manualPausePending(): boolean {
+  return manualPauseRequested.value || batchIsManuallyPaused(recoveryBatch.value)
+}
+async function persistManualPause(batchId: string): Promise<void> {
+  const previousWrite = manualPauseWritePromise
+  manualPauseSaving.value = true
+  const write = (async () => {
+    if (previousWrite) await previousWrite.catch(() => undefined)
+    const result = await runRecovery(['batch', 'manual-pause', '--batch-id', batchId, '--state', 'request'])
+    const saved = result.batch as SelectionRecoveryBatch | undefined
+    if (!saved || saved.batchId !== batchId || !batchIsManuallyPaused(saved)) {
+      throw new Error('手动暂停标记未能从批次检查点回读')
+    }
+    recoveryBatch.value = saved
+  })()
+  manualPauseWritePromise = write
+  try {
+    await write
+  } finally {
+    if (manualPauseWritePromise === write) {
+      manualPauseWritePromise = null
+      manualPauseSaving.value = false
+    }
+  }
+}
+function stopManualPauseAutoResume(): void {
+  clearCandidatePoolResumeTimer()
+  clearAutoResumeTimer()
+  cooldownAutoResumeIntent.value = null
+  autoResumeAccountId.value = null
+  automaticResumeBatchId = null
+  automaticResumeAccountId = null
+  automaticPoolResumeBatchId = null
+  void window.api.selectionCooldown.cancel().catch(() => undefined)
+}
+async function requestManualSelectionPause(): Promise<void> {
+  if (manualPausePending() || manualPauseSaving.value) return
+  if (busy.value && (selectionProgress.value?.mode !== 'batch' || selectionProgress.value?.state !== 'running')) return
+  if (!busy.value && recoveryBatch.value?.state !== 'needs_retry') return
+  manualPauseRequested.value = true
+  stopManualPauseAutoResume()
+  notice.value = busy.value
+    ? '已请求安全暂停；当前平台操作完成并保存检查点后停止后续步骤。'
+    : '已请求暂停自动续选；正在保存本批次暂停标记。'
+  const batchId = activeSelectionRunBatchId.value ?? (!busy.value ? recoveryBatch.value?.batchId : null)
+  if (!batchId) return
+  try {
+    await persistManualPause(batchId)
+    if (!busy.value) notice.value = '本批次已手动暂停；重启和冷却到期不会自动续做，请点击“继续选品”恢复。'
+  } catch (cause) {
+    error.value = '当前会话已停止后续选品，但暂停标记未能落盘；重启前请核对批次状态：' + conciseFailureMessage(cause)
+  }
+}
+async function clearManualSelectionPause(): Promise<boolean> {
+  const batch = recoveryBatch.value
+  if (!batch || !batchIsManuallyPaused(batch)) {
+    manualPauseRequested.value = false
+    return true
+  }
+  manualPauseSaving.value = true
+  try {
+    const result = await runRecovery(['batch', 'manual-pause', '--batch-id', batch.batchId, '--state', 'clear'])
+    const saved = result.batch as SelectionRecoveryBatch | undefined
+    if (!saved || saved.batchId !== batch.batchId || batchIsManuallyPaused(saved)) {
+      throw new Error('手动暂停解除结果未能回读')
+    }
+    recoveryBatch.value = saved
+    manualPauseRequested.value = false
+    restoreSelectionCooldown(saved)
+    return true
+  } catch (cause) {
+    error.value = '解除手动暂停失败，未开始新平台操作：' + conciseFailureMessage(cause)
+    return false
+  } finally {
+    manualPauseSaving.value = false
+  }
+}
+async function pauseBatchAtSafeBoundary(batchId: string, stage: string): Promise<boolean> {
+  if (!manualPausePending()) return false
+  stopManualPauseAutoResume()
+  let persisted = false
+  try {
+    await persistManualPause(batchId)
+    persisted = true
+  } catch (cause) {
+    error.value = '当前轮次已停止，但手动暂停标记未能落盘，重启前须核对批次：' + conciseFailureMessage(cause)
+  }
+  const updated = await runRecovery(['batch', 'update', '--batch-id', batchId, '--state', 'needs_retry'])
+  const savedBatch = updated.batch as SelectionRecoveryBatch
+  recoveryBatch.value = savedBatch
+  showSavedPoolCheckpoint(savedBatch)
+  const message = persisted
+    ? '已在安全边界手动暂停；检查点保留，重启和冷却到期不会自动续做。点击“继续选品”恢复。'
+    : '本轮已在安全边界停止；暂停标记落盘失败，请先核对批次，避免重启后自动续做。'
+  notice.value = message
+  if (selectionProgress.value) selectionProgress.value = {
+    ...selectionProgress.value, state: 'finished', stage, message, percent: null
+  }
+  try {
+    await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', '0'], {
+      stage: '手动暂停', code: persisted ? 'INFO_MANUAL_PAUSE' : 'WARNING_MANUAL_PAUSE_NOT_SAVED', message
+    })
+  } catch { /* 暂停结果已在批次检查点和页面提示中保留。 */ }
+  return true
+}
 const activeQuotaPool = computed(() => recoveryBatch.value?.payload.candidatePool as BatchCandidatePool | undefined)
+const activePoolSearch = ref('')
+const activePoolPage = ref(1)
+const activePoolPageSize = 20
+const activePoolFilteredItems = computed(() => {
+  const keyword = activePoolSearch.value.trim().toLocaleLowerCase('zh-CN')
+  const rows = activeQuotaPool.value?.rows ?? []
+  return keyword ? rows.filter((item) => item.productId.includes(keyword) || item.title.toLocaleLowerCase('zh-CN').includes(keyword)) : rows
+})
+const activePoolPageCount = computed(() => Math.max(1, Math.ceil(activePoolFilteredItems.value.length / activePoolPageSize)))
+const activePoolVisibleItems = computed(() => activePoolFilteredItems.value.slice(
+  (activePoolPage.value - 1) * activePoolPageSize, activePoolPage.value * activePoolPageSize))
+watch(activePoolSearch, () => { activePoolPage.value = 1 })
+watch(activeQuotaPool, () => { activePoolPage.value = 1 })
+const savedLocalPools = ref<SavedLocalCandidatePool[]>([])
+const savedLocalPoolLoading = ref(false)
+const savedPoolBrowserBatchId = ref<string | null>(null)
+const savedPoolSearch = ref('')
+const savedPoolAppliedSearch = ref('')
+const savedPoolItems = ref<CandidateDetail[]>([])
+const savedPoolItemsLoading = ref(false)
+const savedPoolItemsError = ref('')
+const savedPoolPage = ref(1)
+const savedPoolTotal = ref(0)
+const savedPoolPageSize = 20
+let savedPoolItemsRequest = 0
+const candidateDetails = ref<CandidateDetail | null>(null)
+const candidateDetailsCloseButton = ref<HTMLButtonElement | null>(null)
+let candidateDetailsReturnFocus: HTMLElement | null = null
+const selectedLocalPoolBatchId = ref<string | null>(null)
+const selectedLocalPoolCategoryTree = ref<CategoryNode[] | null>(null)
+const localPoolSourceLabels: Record<string, string> = {
+  hotSpot: '热点趋势', allianceRank: '联盟榜单', selectionSquare: '选品广场'
+}
+const candidateMetricLabels: Record<string, string> = {
+  salesAmount: '销售额', salesCount: '销量', conversionRate: '转化率',
+  views: '浏览量', commissionRate: '佣金率', experienceScore: '体验分'
+}
+const candidateCategoryLevelLabels: Record<CategoryLevel, string> = {
+  level1: '一级', level2: '二级', level3: '三级'
+}
+const savedPoolPageCount = computed(() => Math.max(1, Math.ceil(savedPoolTotal.value / savedPoolPageSize)))
+
+function candidateDetailValue(value: unknown, suffix = ''): string {
+  if (value === null || value === undefined || value === '') return '未采集'
+  if (typeof value === 'number') return Number.isFinite(value) ? `${value.toLocaleString('zh-CN')}${suffix}` : '未采集'
+  if (typeof value === 'boolean') return value ? '是' : '否'
+  if (Array.isArray(value)) return value.length ? value.map(String).join('、') : '未采集'
+  return `${String(value)}${suffix}`
+}
+
+function candidateDetailDate(value: string | undefined): string {
+  if (!value) return '未采集'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '未采集' : date.toLocaleString('zh-CN')
+}
+
+const candidateDetailGroups = computed(() => {
+  const item = candidateDetails.value
+  if (!item) return []
+  const sourceKeys = new Set<string>([item.sourceKey ?? '', ...(item.sources ?? []),
+    ...(item.sourceRecords ?? []).map((record) => record.sourceKey)].filter(Boolean))
+  const sources = [...sourceKeys].map((source) => localPoolSourceLabels[source] ?? source).join('、')
+  const sourceRecords = (item.sourceRecords ?? []).map((record) => {
+    const source = localPoolSourceLabels[record.sourceKey] ?? record.sourceKey
+    const parts = [source, record.rankBoard, record.sourceCategoryName,
+      record.categoryPath?.length ? record.categoryPath.join(' / ') : ''].filter(Boolean)
+    return parts.join(' · ')
+  }).join('；')
+  const experienceScore = item.dataMetrics?.experienceScore ?? item.shopScore
+  const trend = item.trendRising === undefined ? '未采集' : item.trendRising ? '走势上升' : '未确认上升'
+  const selectedCategories = item.sourceCategorySelection
+    ? ['level1', 'level2', 'level3'].flatMap((level) => {
+      const ids = item.sourceCategorySelection?.[level as CategoryLevel] ?? []
+      const label = candidateCategoryLevelLabels[level as CategoryLevel]
+      return ids.length ? [`${label}: ${ids.join('、')}`] : []
+    }).join('；') : ''
+  const groups = [
+    { title: '基本信息', fields: [
+      { label: '商品名称', value: candidateDetailValue(item.title) },
+      { label: '商品 ID', value: candidateDetailValue(item.productId) },
+      { label: '推广 ID', value: candidateDetailValue(item.commodityId) },
+      { label: '候选状态', value: candidateDetailValue(item.status) }
+    ] },
+    { title: '经营指标', fields: [
+      { label: '价格', value: candidateDetailValue(item.price, ' 元') },
+      { label: '月销量', value: candidateDetailValue(item.monthSales) },
+      { label: '销售额', value: candidateDetailValue(item.saleAmount, ' 元') },
+      { label: '预估销售额', value: candidateDetailValue(item.estimatedSalesAmount, ' 元') },
+      { label: '佣金率', value: candidateDetailValue(item.commissionRate, '%') },
+      { label: '转化率', value: candidateDetailValue(item.conversionRate) },
+      { label: '浏览量', value: candidateDetailValue(item.views) },
+      { label: '体验分', value: candidateDetailValue(experienceScore) },
+      { label: '走势', value: trend },
+      { label: '走势数据已确认', value: candidateDetailValue(item.trendKnown) },
+      { label: '走势状态', value: candidateDetailValue(item.trendStatus) },
+      { label: '走势斜率', value: candidateDetailValue(item.trendSlope) },
+      { label: '走势数据点', value: candidateDetailValue(item.trendPoints) }
+    ] },
+    { title: '来源与类目', fields: [
+      { label: '来源', value: candidateDetailValue(sources) },
+      { label: '来源记录', value: candidateDetailValue(sourceRecords) },
+      { label: '页面类目', value: candidateDetailValue(item.sourceCategoryName ?? item.sourceCategoryId) },
+      { label: '页面类目 ID 路径', value: candidateDetailValue(item.sourceCategoryIds) },
+      { label: '商品类目 ID 路径', value: candidateDetailValue(item.categoryIds) },
+      { label: '末级类目 ID', value: candidateDetailValue(item.leafCategoryId) },
+      { label: '类目状态', value: candidateDetailValue(item.categoryStatus) },
+      { label: '类目依据', value: candidateDetailValue(item.categorySource) },
+      { label: '页面选定类目', value: candidateDetailValue(selectedCategories) },
+      { label: '配额规则 ID', value: candidateDetailValue(item.quotaRuleId) }
+    ] },
+    { title: '采集与分析', fields: [
+      { label: '采集时间', value: candidateDetailDate(item.capturedAt) },
+      { label: '采集账号 ID', value: candidateDetailValue(item.collectedByAccountId) },
+      { label: '详情读取时间', value: candidateDetailDate(item.detailCapturedAt) },
+      { label: '池内顺序', value: candidateDetailValue(item.poolRank) },
+      { label: '统一分', value: candidateDetailValue(item.unifiedScore ?? item.analysisScore) },
+      { label: '分析状态', value: candidateDetailValue(item.analysisStatus) },
+      { label: '数据覆盖', value: item.analysisCoverage === undefined ? '未采集' : `${item.analysisCoverage}/${item.analysisMetricCount ?? '?'}` },
+      { label: '分析依据', value: candidateDetailValue(item.analysisReasons) },
+      { label: '原候选池批次', value: candidateDetailValue(item.reusedFromBatchId) }
+    ] }
+  ]
+  if (item.dataMetrics && Object.keys(item.dataMetrics).length) {
+    groups[3].fields.push(...Object.entries(item.dataMetrics).map(([label, value]) => ({
+      label: `已存指标 · ${candidateMetricLabels[label] ?? label}`, value: candidateDetailValue(value)
+    })))
+  }
+  if (item.metricSources && Object.keys(item.metricSources).length) {
+    groups[3].fields.push(...Object.entries(item.metricSources).map(([label, source]) => ({
+      label: `指标来源 · ${candidateMetricLabels[label] ?? label}`, value: candidateDetailValue(source)
+    })))
+  }
+  return groups
+})
+
+function openCandidateDetails(item: CandidateDetail, event: MouseEvent): void {
+  candidateDetailsReturnFocus = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
+  candidateDetails.value = item
+  void nextTick(() => candidateDetailsCloseButton.value?.focus())
+}
+
+function closeCandidateDetails(): void {
+  candidateDetails.value = null
+  const returnFocus = candidateDetailsReturnFocus
+  candidateDetailsReturnFocus = null
+  void nextTick(() => returnFocus?.focus())
+}
+
+async function loadSavedPoolItems(page = 1): Promise<void> {
+  const batchId = savedPoolBrowserBatchId.value
+  if (!batchId) return
+  const request = ++savedPoolItemsRequest
+  const nextPage = Math.max(1, page)
+  if (nextPage === 1) savedPoolAppliedSearch.value = savedPoolSearch.value.trim()
+  savedPoolItemsLoading.value = true
+  savedPoolItemsError.value = ''
+  try {
+    const result = await runRecovery(['batch', 'pool-items', '--batch-id', batchId,
+      '--query', savedPoolAppliedSearch.value, '--limit', String(savedPoolPageSize),
+      '--offset', String((nextPage - 1) * savedPoolPageSize)])
+    if (request !== savedPoolItemsRequest || savedPoolBrowserBatchId.value !== batchId) return
+    savedPoolItems.value = (Array.isArray(result.rows) ? result.rows : []).filter((item): item is CandidateDetail =>
+      Boolean(item && typeof item === 'object' && typeof item.productId === 'string' && typeof item.title === 'string'))
+    savedPoolTotal.value = Math.max(0, Number(result.total) || 0)
+    savedPoolPage.value = nextPage
+  } catch (cause) {
+    if (request !== savedPoolItemsRequest || savedPoolBrowserBatchId.value !== batchId) return
+    savedPoolItems.value = []
+    savedPoolTotal.value = 0
+    savedPoolItemsError.value = `读取候选池商品失败：${String(cause instanceof Error ? cause.message : cause)}`
+  } finally {
+    if (request === savedPoolItemsRequest) savedPoolItemsLoading.value = false
+  }
+}
+
+function toggleSavedPoolBrowser(pool: SavedLocalCandidatePool): void {
+  if (savedPoolBrowserBatchId.value === pool.batchId) {
+    savedPoolBrowserBatchId.value = null
+    savedPoolItemsRequest += 1
+    return
+  }
+  savedPoolBrowserBatchId.value = pool.batchId
+  savedPoolSearch.value = ''
+  savedPoolAppliedSearch.value = ''
+  savedPoolItems.value = []
+  savedPoolTotal.value = 0
+  savedPoolPage.value = 1
+  void loadSavedPoolItems(1)
+}
+
+async function loadSavedLocalPools(): Promise<void> {
+  if (savedLocalPoolLoading.value) return
+  savedLocalPoolLoading.value = true
+  try {
+    const result = await runRecovery(['batch', 'pool-list', '--limit', '10'])
+    savedLocalPools.value = Array.isArray(result.pools) ? result.pools as SavedLocalCandidatePool[] : []
+    if (savedLocalPools.value.some((pool) => pool.recentCount > 0) &&
+        error.value.includes('请先设置候选池目标数量')) {
+      error.value = ''
+      notice.value = '本机已有可复用候选池，可在下方查看商品并选择“使用此池开始选品”。'
+    }
+  } catch (cause) {
+    savedLocalPools.value = []
+    runLogWarning.value = `读取本机历史候选池失败：${String(cause instanceof Error ? cause.message : cause)}`
+  } finally {
+    savedLocalPoolLoading.value = false
+  }
+}
+async function ensureSelectionUiData(): Promise<void> {
+  if (selectionUiDataReady.value) return
+  if (!selectionUiDataPromise) {
+    selectionUiDataPromise = (async () => {
+      const failures: string[] = []
+      try {
+        await loadAccountSettings()
+      } catch (cause) {
+        failures.push(String(cause instanceof Error ? cause.message : cause))
+      }
+      try {
+        const results = await Promise.allSettled([reloadCatalog(), loadCachedFilterCatalog()])
+        for (const result of results) {
+          if (result.status === 'rejected') {
+            failures.push(String(result.reason instanceof Error ? result.reason.message : result.reason))
+          }
+        }
+        if (!props.dialogOnly) await loadSavedLocalPools()
+      } finally {
+        if (failures.length) error.value = failures.join('；')
+        selectionUiDataReady.value = true
+        selectionUiDataPromise = null
+      }
+    })()
+  }
+  await selectionUiDataPromise
+}
+function localPoolSourcePercent(pool: SavedLocalCandidatePool, count: number): number {
+  return pool.count > 0 ? Math.max(0, Math.min(100, Math.round(count / pool.count * 100))) : 0
+}
+async function useSavedLocalPool(pool: SavedLocalCandidatePool): Promise<void> {
+  if (busy.value || savedLocalPoolLoading.value) return
+  if (recoveryBatch.value && ['in_progress', 'needs_retry'].includes(recoveryBatch.value.state)) {
+    error.value = '当前仍有待恢复批次，请先处理该批次；本机历史池不会删除。'
+    return
+  }
+  savedLocalPoolLoading.value = true
+  error.value = ''
+  try {
+    await loadAccounts()
+    const enabled = accounts.value.filter((account) => account.status === 'active' && isSelectionAccountInScope(account.id))
+    if (!enabled.length) throw new Error('当前没有启用的消费账号，不能从候选池开始选品。')
+    const result = await runRecovery(['batch', 'pool-settings', '--batch-id', pool.batchId])
+    const currentPool = result.pool as SavedLocalCandidatePool | undefined
+    const savedSettings = result.settingsSnapshot as Record<string, unknown> | undefined
+    if (!currentPool || currentPool.recentCount < 1 || !savedSettings || !Array.isArray(savedSettings.categoryTree)) {
+      throw new Error('所选候选池没有 24 小时内可复用的商品，请重新采集。')
+    }
+    const poolSettingKeys = [
+      'candidatePoolTarget', 'candidatePoolMode', 'candidatePoolQuotas', 'commissionRateRule',
+      'selectionMode', 'categoryMode', 'categorySelection', 'excludedCategorySelection',
+      'filters', 'poolPriority', 'poolFallback', 'sources', 'thresholds', 'trendPreference',
+      'bannedWords', 'bannedWordsSeedVersion'
+    ]
+    const editable = global as unknown as Record<string, unknown>
+    for (const key of poolSettingKeys) {
+      if (key in savedSettings) editable[key] = JSON.parse(JSON.stringify(savedSettings[key]))
+    }
+    global.candidateCollectorAccountIds = [enabled[0].id]
+    bannedWordsText.value = global.bannedWords.join('\n')
+    commissionRuleMigrationRequired.value = false
+    await saveGlobal()
+    if (error.value) return
+    if (batchCandidatePoolFingerprint(global as unknown as Record<string, unknown>) !== result.filterFingerprint) {
+      throw new Error('保存后的筛选条件与历史候选池不一致，已停止启动；请检查设置后重新选择候选池。')
+    }
+    selectedLocalPoolBatchId.value = pool.batchId
+    selectedLocalPoolCategoryTree.value = savedSettings.categoryTree as CategoryNode[]
+    selectionSettingsDialogOpen.value = false
+    notice.value = `已选择本机候选池 ${currentPool.recentCount}/${currentPool.target}；将先按商品 ID 给当前启用账号核验，缺额再补采。`
+    void startSelectionFromButton().catch((cause) => {
+      error.value = String(cause instanceof Error ? cause.message : cause)
+    })
+  } catch (cause) {
+    error.value = String(cause instanceof Error ? cause.message : cause)
+  } finally {
+    savedLocalPoolLoading.value = false
+  }
+}
 function formatQuotaRule(rule: CandidatePoolQuotaRule): string {
+  const source = rule.sourceKey === 'allianceRank' ? `联盟榜单·${rule.rankBoard}` :
+    rule.sourceKey === 'hotSpot' ? '选品热点' : '选品广场'
+  if (!rule.categoryPath.length) return `${source} · 全部允许类目`
   const category = quotaCategoryOptions.value.find((item) => item.path.join('|') === rule.categoryPath.join('|'))
-  return `${rule.sourceKey === 'allianceRank' ? `联盟榜单·${rule.rankBoard}` : rule.sourceKey === 'hotSpot' ? '选品热点' : '选品广场'} · ${category?.label ?? rule.categoryId}`
+  return `${source} · ${category?.label ?? rule.categoryId}`
 }
 function quotaProgressLabel(ruleId: string): string {
   const rule = activeQuotaPool.value?.quotaRules?.find((item) => item.id === ruleId)
@@ -1003,6 +1627,118 @@ function clearAutoResumeTimer(): void {
   selectionAutoResumeTimer = null
 }
 
+function clearCandidatePoolResumeTimer(): void {
+  if (candidatePoolResumeTimer !== null) window.clearTimeout(candidatePoolResumeTimer)
+  candidatePoolResumeTimer = null
+}
+
+function hasStaleReadyPoolAccount(batch: SelectionRecoveryBatch, pool: BatchCandidatePool): boolean {
+  if (batch.state !== 'needs_retry' || pool.status !== 'ready') return false
+  const availableIds = new Set(pool.rows.map((row) => row.productId))
+  return batch.accounts.some((account) => {
+    if (account.state !== 'needs_retry' || !account.candidates?.length) return false
+    const completed = account.completed ?? []
+    return completed.every((item) => item.skipped === true &&
+      item.cartAttempted !== true && item.cartAdded !== true) &&
+      account.candidates.every((item) => !availableIds.has(item.productId))
+  })
+}
+
+function candidatePoolRateLimitRetryAt(count: number): string {
+  const minutes = Math.min(15, 2 ** Math.min(Math.max(0, count - 1), 4))
+  return new Date(Date.now() + minutes * 60_000).toISOString()
+}
+
+function pauseCandidatePoolAfterRateLimit(
+  sourceState: BatchCandidatePool['sourceState'], collectorIds: number[]
+): string {
+  const count = Math.min(5, Math.max(0, ...collectorIds.map((id) =>
+    sourceState.collectors[String(id)]?.rateLimitCount ?? 0
+  )) + 1)
+  const retryAt = candidatePoolRateLimitRetryAt(count)
+  for (const id of collectorIds) {
+    const collector: BatchCandidatePool['sourceState']['collectors'][string] =
+      sourceState.collectors[String(id)] ?? { tabOffsets: {}, samePoolCount: 0 }
+    collector.rateLimitCount = count
+    collector.nextRetryAt = retryAt
+    sourceState.collectors[String(id)] = collector
+  }
+  return retryAt
+}
+
+async function canResumePendingCandidatePool(batch: SelectionRecoveryBatch, pool: BatchCandidatePool): Promise<boolean> {
+  if (pool.sourceState.autoResumeAllowed !== undefined) return pool.sourceState.autoResumeAllowed
+  // 旧检查点没有此标记；只在最近一次采集失败属于可自动恢复的情况时接管。
+  try {
+    const result = await runRecovery(['batch', 'logs', '--batch-id', batch.batchId])
+    const logs = Array.isArray(result.runLogs) ? result.runLogs as SelectionRunLog[] : []
+    if (logs.at(-1)?.code !== 'WARNING_CANDIDATE_POOL_TARGET_UNMET') return false
+    const failure = [...logs].reverse().find((entry) =>
+      ['WARNING_CANDIDATE_COLLECTOR_SKIPPED', 'WARNING_CANDIDATE_POOL_QUOTA_READ'].includes(entry.code)
+    )
+    if (!failure) return true
+    return !/验证码|安全验证|需要登录|未登录|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(
+      `${failure.message} ${failure.detail}`
+    )
+  } catch {
+    return false
+  }
+}
+
+function scheduleCandidatePoolResume(batch: SelectionRecoveryBatch, pool: BatchCandidatePool): void {
+  clearCandidatePoolResumeTimer()
+  const readyAccountRecovery = hasStaleReadyPoolAccount(batch, pool)
+  if (props.dialogOnly || manualPauseRequested.value || batchIsManuallyPaused(batch) || batch.state !== 'needs_retry' ||
+      (pool.status !== 'collecting' && !readyAccountRecovery) ||
+      (pool.status === 'collecting' && pool.sourceState.autoResumeAllowed === false)) return
+  const retryTimes = Object.values(pool.sourceState?.collectors ?? {}).flatMap((collector) => {
+    const collectorRetry = collector.nextRetryAt ? Date.parse(collector.nextRetryAt) : NaN
+    return Number.isFinite(collectorRetry) && collectorRetry > Date.now()
+      ? [collector.nextRetryAt]
+      : Object.values(collector.ruleStates ?? {}).map((rule) => rule.nextRetryAt)
+  }).map((value) => value ? Date.parse(value) : NaN)
+    .filter((value) => Number.isFinite(value) && value > Date.now())
+  const retryAt = readyAccountRecovery ? Date.now() + 5_000 :
+    retryTimes.length ? Math.min(...retryTimes) : Date.now() + 2 * 60_000
+  const delayMs = Math.max(5_000, Math.min(30 * 60_000, retryAt - Date.now()))
+  candidatePoolResumeTimer = window.setTimeout(() => {
+    candidatePoolResumeTimer = null
+    if (selectionViewUnmounted || recoveryBatch.value?.batchId !== batch.batchId) return
+    if (loginPreflight.value) return
+    if (busy.value || selectionCooldownRemaining.value > 0) {
+      scheduleCandidatePoolResume(batch, pool)
+      return
+    }
+    void (async () => {
+      const latest = (await runRecovery(['batch', 'latest'])).batch as SelectionRecoveryBatch | null
+      const latestPool = latest?.payload.candidatePool as BatchCandidatePool | undefined
+      if (!latest || latest.batchId !== batch.batchId || latest.state !== 'needs_retry' ||
+          batchIsManuallyPaused(latest) || manualPauseRequested.value ||
+          !latestPool || (latestPool.status !== 'collecting' && !hasStaleReadyPoolAccount(latest, latestPool))) return
+      if (latestPool.status === 'collecting' && !await canResumePendingCandidatePool(latest, latestPool)) return
+      const pendingIds = latest.accounts.filter((item) => item.state !== 'completed').map((item) => item.accountId)
+      if (!pendingIds.length) return
+      recoveryBatch.value = latest
+      showSavedPoolCheckpoint(latest)
+      recoverySelectionBatchId.value = latest.batchId
+      recoverySelectedAccountIds.value = pendingIds
+      automaticPoolResumeBatchId = latest.batchId
+      void startSelection().then((started) => {
+        if (started) return
+        automaticPoolResumeBatchId = null
+        if (!loginPreflight.value) scheduleCandidatePoolResume(latest, latestPool)
+      }).catch((cause) => {
+        automaticPoolResumeBatchId = null
+        error.value = `候选池自动续采启动失败：${safeCandidateCollectorErrorDetail(cause)}`
+        if (!loginPreflight.value) scheduleCandidatePoolResume(latest, latestPool)
+      })
+    })().catch((cause) => {
+      error.value = `候选池自动续采准备失败：${safeCandidateCollectorErrorDetail(cause)}`
+      scheduleCandidatePoolResume(batch, pool)
+    })
+  }, delayMs)
+}
+
 function cooldownAutoResumeDecision(intent: CooldownAutoResumeIntent) {
   const state = currentAutoResumeState()
   return evaluateSelectionCooldownResume({
@@ -1014,6 +1750,10 @@ function cooldownAutoResumeDecision(intent: CooldownAutoResumeIntent) {
 }
 
 function scheduleCooldownAutoResume(): boolean {
+  if (manualPausePending()) {
+    clearAutoResumeTimer()
+    return false
+  }
   const state = currentAutoResumeState()
   let intent = cooldownAutoResumeIntent.value
   if (!intent && canAutoResumeSelection(state)) {
@@ -1053,6 +1793,7 @@ function scheduleCooldownAutoResume(): boolean {
       return
     }
     const latestIntent = cooldownAutoResumeIntent.value
+    if (manualPausePending()) return
     const latestDecision = latestIntent ? cooldownAutoResumeDecision(latestIntent) : 'stale_account'
     if (!latestIntent || latestDecision !== 'start') {
       if (batchId) traceSelectionCooldown('renderer_auto_resume_skipped', batchId, {
@@ -1455,11 +2196,44 @@ function normalizeCategorySelection(
   return { level1, level2, level3 }
 }
 
+function normalizeExcludedCategorySelection(
+  selection: { level1: string[]; level2: string[]; level3: string[] }, tree: CategoryNode[]
+): { level1: string[]; level2: string[]; level3: string[] } {
+  const levels = [tree, tree.flatMap((root) => root.children), tree.flatMap((root) => root.children.flatMap((second) => second.children))]
+  const resolve = (id: string, options: CategoryNode[]): string => {
+    const exact = options.find((item) => item.id === id)
+    if (exact) return exact.id
+    const matches = options.filter((item) => sameCategoryId(item.id, id))
+    return matches.length === 1 ? matches[0].id : id
+  }
+  return {
+    level1: [...new Set(selection.level1.map((id) => resolve(id, levels[0])))],
+    level2: [...new Set(selection.level2.map((id) => resolve(id, levels[1])))],
+    level3: [...new Set(selection.level3.map((id) => resolve(id, levels[2])))]
+  }
+}
+
 function normalizeCurrentCategorySelections(): void {
   global.categorySelection = normalizeCategorySelection(global.categorySelection, categories.value)
-  global.excludedCategorySelection = normalizeCategorySelection(global.excludedCategorySelection, categories.value)
+  global.excludedCategorySelection = normalizeExcludedCategorySelection(global.excludedCategorySelection, categories.value)
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
-  accountDraft.excludedCategorySelection = normalizeCategorySelection(accountDraft.excludedCategorySelection, categories.value)
+  accountDraft.excludedCategorySelection = normalizeExcludedCategorySelection(accountDraft.excludedCategorySelection, categories.value)
+}
+
+function pruneExcludedCategorySelectionToCatalog(
+  selection: { level1: string[]; level2: string[]; level3: string[] }, tree: CategoryNode[]
+): { selection: { level1: string[]; level2: string[]; level3: string[] }; removed: number } {
+  const normalized = normalizeExcludedCategorySelection(selection, tree)
+  const levels = [tree, tree.flatMap((root) => root.children), tree.flatMap((root) => root.children.flatMap((second) => second.children))]
+  const valid = (id: string, options: CategoryNode[]): boolean => options.some((item) => item.id === id)
+  const next = {
+    level1: normalized.level1.filter((id) => valid(id, levels[0])),
+    level2: normalized.level2.filter((id) => valid(id, levels[1])),
+    level3: normalized.level3.filter((id) => valid(id, levels[2]))
+  }
+  const before = selection.level1.length + selection.level2.length + selection.level3.length
+  const after = next.level1.length + next.level2.length + next.level3.length
+  return { selection: next, removed: Math.max(0, before - after) }
 }
 
 function pruneCategorySelectionToCatalog(
@@ -1484,9 +2258,9 @@ function pruneCategorySelectionToCatalog(
 
 function pruneCurrentCategorySelections(): number {
   const globalResult = pruneCategorySelectionToCatalog(global.categorySelection, categories.value)
-  const globalExcludedResult = pruneCategorySelectionToCatalog(global.excludedCategorySelection, categories.value)
+  const globalExcludedResult = pruneExcludedCategorySelectionToCatalog(global.excludedCategorySelection, categories.value)
   const accountResult = pruneCategorySelectionToCatalog(accountDraft.categorySelection, categories.value)
-  const accountExcludedResult = pruneCategorySelectionToCatalog(accountDraft.excludedCategorySelection, categories.value)
+  const accountExcludedResult = pruneExcludedCategorySelectionToCatalog(accountDraft.excludedCategorySelection, categories.value)
   global.categorySelection = globalResult.selection
   global.excludedCategorySelection = globalExcludedResult.selection
   accountDraft.categorySelection = accountResult.selection
@@ -1571,6 +2345,24 @@ async function loadAccounts(): Promise<void> {
   }
 }
 
+async function refreshSelectionAccounts(announce = true): Promise<void> {
+  if (busy.value) return
+  busy.value = true
+  if (announce) error.value = ''
+  try {
+    await loadAccounts()
+    if (announce) {
+      notice.value = `账号列表已刷新：${accounts.value.length} 个。未保存的通用设置保持不变；新账号可继承通用设置，也可单独覆盖。`
+    }
+  } catch (cause) {
+    const message = `刷新账号列表失败：${String(cause instanceof Error ? cause.message : cause)}`
+    if (announce || !error.value) error.value = message
+    else notice.value = message
+  } finally {
+    busy.value = false
+  }
+}
+
 async function loadAccountSettings(): Promise<void> {
   if (accountId.value === null) return
   const id = accountId.value
@@ -1591,7 +2383,7 @@ async function loadAccountSettings(): Promise<void> {
     level1: [...(excluded.level1 ?? [])], level2: [...(excluded.level2 ?? [])], level3: [...(excluded.level3 ?? [])]
   }
   accountDraft.categorySelection = normalizeCategorySelection(accountDraft.categorySelection, categories.value)
-  accountDraft.excludedCategorySelection = normalizeCategorySelection(accountDraft.excludedCategorySelection, categories.value)
+  accountDraft.excludedCategorySelection = normalizeExcludedCategorySelection(accountDraft.excludedCategorySelection, categories.value)
   accountDraft.browserProfilePath = String(value.browserProfilePath ?? '')
   accountDraft.downloadPath = String(value.downloadPath ?? '')
   const savedDailyQuota = (value.dailyQuotaOverride ?? {}) as Record<string, unknown>
@@ -1610,7 +2402,9 @@ async function loadAccountSettings(): Promise<void> {
   )
   savedAccountPaths.browserProfilePath = accountDraft.browserProfilePath
   savedAccountPaths.downloadPath = accountDraft.downloadPath
-  if (settings?.inherited) notice.value = `账号「${accounts.value.find((a) => a.id === id)?.name ?? id}」尚未单独配置，将继承通用筛选设置。`
+  if (settings?.inherited && !['in_progress', 'needs_retry'].includes(recoveryBatch.value?.state ?? '')) {
+    notice.value = `账号「${accounts.value.find((a) => a.id === id)?.name ?? id}」尚未单独配置，将继承通用筛选设置。`
+  }
 }
 
 async function reloadCatalog(): Promise<void> {
@@ -1769,12 +2563,58 @@ const quotaCategoryOptions = computed(() => {
   return options
 })
 const quotaPoolTarget = computed(() => global.candidatePoolQuotas.reduce((sum, rule) => sum + Number(rule.target || 0), 0))
+function quotaCategoryOptionsForSource(sourceKey: CandidatePoolQuotaRule['sourceKey']) {
+  return sourceKey === 'hotSpot'
+    ? quotaCategoryOptions.value.filter((category) => category.path.length === 1)
+    : quotaCategoryOptions.value
+}
+function sourceQuotaTarget(sourceKey: CandidatePoolQuotaRule['sourceKey']): number {
+  return global.candidatePoolQuotas
+    .filter((rule) => rule.sourceKey === sourceKey)
+    .reduce((sum, rule) => sum + Number(rule.target || 0), 0)
+}
+function setSourceQuotaTarget(sourceKey: CandidatePoolQuotaRule['sourceKey'], raw: string): void {
+  const target = Number(raw)
+  const rule = global.candidatePoolQuotas.find((item) => item.sourceKey === sourceKey && !item.categoryPath.length)
+  if (!Number.isInteger(target) || target < 0 || target > 2000) {
+    error.value = '来源目标须为 0–2000 的整数。'
+    return
+  }
+  const categoryTarget = global.candidatePoolQuotas
+    .filter((item) => item.sourceKey === sourceKey && item.categoryPath.length > 0)
+    .reduce((sum, item) => sum + Number(item.target || 0), 0)
+  if (target < categoryTarget) {
+    error.value = `该来源已设置 ${categoryTarget} 件指定品类配额，来源合计不能低于此数。`
+    return
+  }
+  error.value = ''
+  const remaining = target - categoryTarget
+  if (remaining === 0) {
+    if (rule) global.candidatePoolQuotas.splice(global.candidatePoolQuotas.indexOf(rule), 1)
+    return
+  }
+  if (rule) {
+    rule.target = remaining
+    return
+  }
+  global.candidatePoolQuotas.push({
+    id: crypto.randomUUID(), sourceKey, rankBoard: global.sources.rankBoard,
+    categoryId: '', categoryPath: [], target: remaining
+  })
+}
 function addQuotaRule(): void {
   const category = quotaCategoryOptions.value[0]
-  global.candidatePoolQuotas.push({
+  if (!category) {
+    error.value = '请先同步百应类目目录，再添加指定品类配额。'
+    return
+  }
+  const rule: CandidatePoolQuotaRule = {
     id: crypto.randomUUID(), sourceKey: 'allianceRank', rankBoard: '爆款榜',
-    categoryId: category?.id ?? '', categoryPath: category?.path ?? [], target: 10
-  })
+    categoryId: category.id, categoryPath: category.path, target: 10
+  }
+  const sourceWideIndex = global.candidatePoolQuotas.findIndex((item) =>
+    item.sourceKey === rule.sourceKey && !item.categoryPath.length)
+  global.candidatePoolQuotas.splice(sourceWideIndex < 0 ? global.candidatePoolQuotas.length : sourceWideIndex, 0, rule)
 }
 function moveQuotaRule(index: number, step: number): void {
   const next = index + step
@@ -1795,7 +2635,13 @@ function validateQuotaRules(
   sourceSettings: SelectionFilterSettings['sources'], excluded: typeof DEFAULTS.excludedCategorySelection
 ): number {
   if (mode === 'total') return global.candidatePoolTarget
-  if (!Array.isArray(rules) || !rules.length) throw new Error('按品类配额模式至少需要一条规则。')
+  if (!Array.isArray(rules) || !rules.length) throw new Error('按来源和品类配额模式至少需要一条规则。')
+  const excludedSecondPaths = [...excluded.level2.map((id) => ({ id, level: 2 })),
+    ...excluded.level3.map((id) => ({ id, level: 3 }))].map(({ id, level }) => {
+    const matches = quotaCategoryOptions.value.filter((item) => item.path.length === level && categoryIdMatches(item.id, id))
+    if (matches.length !== 1) throw new Error(`排除的${level}级类目 ${id} 无法唯一定位，请刷新百应类目目录。`)
+    return matches[0].path.slice(0, 2)
+  })
   const seen = new Set<string>()
   let total = 0
   for (const [index, rule] of rules.entries()) {
@@ -1806,14 +2652,27 @@ function validateQuotaRules(
       throw new Error(`${name}的榜单类型无效。`)
     }
     if (!Number.isInteger(rule.target) || rule.target < 1 || rule.target > 2000) throw new Error(`${name}的目标数须为 1–2000。`)
-    const category = quotaCategoryOptions.value.find((item) => item.id === rule.categoryId &&
+    const sourceWide = Array.isArray(rule.categoryPath) && rule.categoryPath.length === 0 && rule.categoryId === ''
+    if (rule.sourceKey === 'hotSpot' && rule.categoryPath.length > 1) {
+      throw new Error(`${name}指定了热点二级或三级类目；热点页面仅能筛选一级类目。`)
+    }
+    const category = sourceWide ? undefined : quotaCategoryOptions.value.find((item) => item.id === rule.categoryId &&
       item.path.join('|') === rule.categoryPath?.join('|'))
-    if (!category || !category.path.length) throw new Error(`${name}缺少可核实的百应类目 ID；请刷新类目并重新选择。`)
-    if (category.path.some((id, level) => excluded[`level${level + 1}` as keyof typeof excluded]
+    if (!sourceWide && (!category || !category.path.length)) throw new Error(`${name}缺少可核实的百应类目 ID；请刷新类目并重新选择。`)
+    if (category?.path.some((id, level) => excluded[`level${level + 1}` as keyof typeof excluded]
       .some((excludedId) => categoryIdMatches(id, excludedId)))) {
       throw new Error(`${name}选择的品类已经被排除，不能计入配额。`)
     }
-    const key = `${rule.sourceKey}|${rule.sourceKey === 'allianceRank' ? rule.rankBoard : ''}|${category.path.join('|')}`
+    if (rule.sourceKey === 'hotSpot' && category && excludedSecondPaths.some((path) =>
+      categoryIdMatches(category.path[0], path[0]))) {
+      throw new Error(`${name}的热点一级类目下有二级或三级排除项；热点会跳过整个一级，不能设置该配额。`)
+    }
+    if (category && category.path.length >= 2 && excludedSecondPaths.some((path) =>
+      categoryIdMatches(category.path[0], path[0]) && categoryIdMatches(category.path[1], path[1]))) {
+      throw new Error(`${name}落在已排除的二级分支，不能计入配额。`)
+    }
+    const key = sourceWide ? `${rule.sourceKey}|全部允许类目` :
+      `${rule.sourceKey}|${rule.sourceKey === 'allianceRank' ? rule.rankBoard : ''}|${category?.path.join('|') ?? ''}`
     if (seen.has(key)) throw new Error(`${name}与前面的来源、榜单及品类重复。`)
     seen.add(key)
     total += rule.target
@@ -1823,12 +2682,22 @@ function validateQuotaRules(
 }
 const level2Options = computed(() => categories.value.filter((item) => global.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const level3Options = computed(() => level2Options.value.filter((item) => global.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
-const excludedLevel2Options = computed(() => categories.value.filter((item) => global.excludedCategorySelection.level1.includes(item.id)).flatMap((item) => item.children))
-const excludedLevel3Options = computed(() => excludedLevel2Options.value.filter((item) => global.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
+const excludedBrowseRoot = reactive({ global: '', account: '' })
+const excludedBrowseSecond = reactive({ global: '', account: '' })
+const excludedLevel2Options = computed(() => categories.value.find((item) => item.id === excludedBrowseRoot.global)?.children ?? [])
+const excludedLevel3Options = computed(() => excludedLevel2Options.value.find((item) => item.id === excludedBrowseSecond.global)?.children ?? [])
 const accountLevel2Options = computed(() => categories.value.filter((item) => accountDraft.categorySelection.level1.includes(item.id)).flatMap((item) => item.children))
 const accountLevel3Options = computed(() => accountLevel2Options.value.filter((item) => accountDraft.categorySelection.level2.includes(item.id)).flatMap((item) => item.children))
-const accountExcludedLevel2Options = computed(() => categories.value.filter((item) => accountDraft.excludedCategorySelection.level1.includes(item.id)).flatMap((item) => item.children))
-const accountExcludedLevel3Options = computed(() => accountExcludedLevel2Options.value.filter((item) => accountDraft.excludedCategorySelection.level2.includes(item.id)).flatMap((item) => item.children))
+const accountExcludedLevel2Options = computed(() => categories.value.find((item) => item.id === excludedBrowseRoot.account)?.children ?? [])
+const accountExcludedLevel3Options = computed(() => accountExcludedLevel2Options.value.find((item) => item.id === excludedBrowseSecond.account)?.children ?? [])
+function showExcludedCategoryChildren(id: string, level: CategoryLevel, scope: 'global' | 'account'): void {
+  if (level === 'level1') {
+    excludedBrowseRoot[scope] = id
+    excludedBrowseSecond[scope] = ''
+  } else if (level === 'level2') {
+    excludedBrowseSecond[scope] = id
+  }
+}
 function selectedCategoryCount(selection: { level1: string[]; level2: string[]; level3: string[] }): number {
   return selection.level1.length + selection.level2.length + selection.level3.length
 }
@@ -1870,27 +2739,12 @@ function categoryAction(level: CategoryLevel, scope: 'global' | 'account', actio
   updateCategory(level, scope)
 }
 
-function updateExcludedCategory(level: CategoryLevel, scope: 'global' | 'account'): void {
-  const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
-  const lv2 = scope === 'global' ? excludedLevel2Options.value : accountExcludedLevel2Options.value
-  const lv3 = scope === 'global' ? excludedLevel3Options.value : accountExcludedLevel3Options.value
-  if (level === 'level1') {
-    const allowed = new Set(lv2.map((item) => item.id))
-    selected.level2 = selected.level2.filter((id) => allowed.has(id))
-  }
-  if (level !== 'level3') {
-    const allowed = new Set(lv3.map((item) => item.id))
-    selected.level3 = selected.level3.filter((id) => allowed.has(id))
-  }
-}
-
 function toggleExcludedCategory(id: string, level: CategoryLevel, scope: 'global' | 'account', checked: boolean): void {
   const selected = scope === 'global' ? global.excludedCategorySelection : accountDraft.excludedCategorySelection
   const current = selected[level]
   selected[level] = checked
     ? current.includes(id) ? current : [...current, id]
     : current.filter((item) => item !== id)
-  updateExcludedCategory(level, scope)
 }
 
 function excludedCategoryAction(level: CategoryLevel, scope: 'global' | 'account', action: 'all' | 'invert' | 'clear'): void {
@@ -1906,7 +2760,28 @@ function excludedCategoryAction(level: CategoryLevel, scope: 'global' | 'account
     : action === 'all'
       ? options.map((item) => item.id)
       : options.map((item) => item.id).filter((id) => !current.includes(id))
-  updateExcludedCategory(level, scope)
+}
+
+async function activeConsumerDemand(settings: Record<string, unknown>): Promise<{ total: number; detail: string }> {
+  const enabled = accounts.value.filter((account) =>
+    account.status === 'active' && isSelectionAccountInScope(account.id)
+  )
+  let total = 0
+  const detail: string[] = []
+  for (const account of enabled) {
+    const result = await runEngine('selection_settings.py', [
+      '--db', DB_PATH, 'get', '--account-id', String(account.id)
+    ])
+    const saved = (result.settings ?? {}) as { account?: Record<string, unknown> }
+    const accountSettings = saved.account ?? {}
+    const overrides = accountSettings.filterOverrides && typeof accountSettings.filterOverrides === 'object'
+      ? accountSettings.filterOverrides as Record<string, unknown> : {}
+    const raw = overrides.candidateLimit ?? settings.candidateLimit ?? 5
+    const target = Number.isInteger(Number(raw)) ? Math.max(1, Math.min(10, Number(raw))) : 5
+    total += target
+    detail.push(`${account.name} ${target}`)
+  }
+  return { total, detail: detail.join('、') }
 }
 
 async function saveGlobal(): Promise<void> {
@@ -1915,6 +2790,10 @@ async function saveGlobal(): Promise<void> {
     global.candidatePoolTarget = validateQuotaRules(global.candidatePoolMode, global.candidatePoolQuotas, global.sources, global.excludedCategorySelection)
     if (!Number.isInteger(global.candidatePoolTarget) || global.candidatePoolTarget < 1 || global.candidatePoolTarget > 2000) {
       throw new Error('共享候选池目标数须为 1–2000 的整数。')
+    }
+    const demand = await activeConsumerDemand(global)
+    if (global.candidatePoolTarget < demand.total) {
+      throw new Error(`候选池目标 ${global.candidatePoolTarget} 件小于已启用消费账号目标合计 ${demand.total} 件（${demand.detail || '无账号'}）。请增加池目标后保存。`)
     }
     if (global.candidateCollectorAccountIds.length > 2 || new Set(global.candidateCollectorAccountIds).size !== global.candidateCollectorAccountIds.length) {
       throw new Error('候选采集账号最多选择两个不同账号。')
@@ -1940,7 +2819,11 @@ async function saveGlobal(): Promise<void> {
     ]))
     global.bannedWordsSeedVersion = 2
     bannedWordsText.value = global.bannedWords.join('\n')
-    await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify(global)))
+    await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify({
+      ...global, categoryTree: categories.value
+    })))
+    selectedLocalPoolBatchId.value = null
+    selectedLocalPoolCategoryTree.value = null
     commissionRuleMigrationRequired.value = false
     notice.value = '通用选品设置已保存；账号未单独配置的条件会继承此设置。'
   } catch (cause) {
@@ -2203,6 +3086,8 @@ function closeDialog(): void {
 
 function openSelectionSettingsDialog(): void {
   selectionSettingsDialogOpen.value = true
+  void refreshSelectionAccounts(false)
+  void loadSavedLocalPools()
 }
 
 function closeSelectionSettingsDialog(): void {
@@ -2293,19 +3178,85 @@ function registryAccountKey(accountId: number): string {
   return /^[-\w.]{1,96}$/.test(douyinId) ? `local:${accountId}|douyin:${douyinId}` : `local:${accountId}`
 }
 
-async function occupiedPoolProductIds(rows: SelectionCandidate[], collectorId: number): Promise<Set<string>> {
+async function occupiedPoolProductIds(rows: SelectionCandidate[], collectorId: number, batchId?: string): Promise<Set<string>> {
   if (!rows.length) return new Set()
   const snapshot = await window.api.browser.getSelectionRegistrySnapshot(registryAccountKey(collectorId), rows.map((row) => ({
     productId: row.productId,
     leafCategoryId: candidateLeafCategoryId(row)
   })))
+  if (batchId) {
+    const status = snapshot as typeof snapshot & {
+      warning?: unknown
+      syncConflicts?: Array<{ productId?: unknown; reason?: unknown }>
+    }
+    if (status.warning) {
+      await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', '0'], {
+        stage: '选品登记同步', code: 'WARNING_REGISTRY_OFFLINE_MODE',
+        message: '共享登记服务暂不可达，候选池使用本机登记结果继续。',
+        detail: String(status.warning)
+      })
+    }
+    if (status.syncConflicts?.length) {
+      const conflicts = status.syncConflicts.slice(0, 50)
+      await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', '0'], {
+        stage: '选品登记同步', code: 'WARNING_REGISTRY_OFFLINE_CONFLICT',
+        message: `服务器回读到 ${status.syncConflicts.length} 个跨客户端商品冲突，已从本批候选池剔除。`,
+        detail: conflicts.map((item) => `${String(item.productId ?? '')}：${String(item.reason ?? 'SERVER_CONFLICT')}`).join('；')
+      })
+    }
+  }
   return new Set(snapshot.usedProductIds.map(String))
+}
+
+function resetHotSpotRootOnlyCursors(
+  sourceState: BatchCandidatePool['sourceState'], hotRuleIds: Set<string>
+): boolean {
+  let changed = false
+  for (const collector of Object.values(sourceState.collectors)) {
+    collector.scrollPositions ??= {}
+    if (collector.scrollPositions['hotSpot:rootOnlyPlanVersion'] === 1) continue
+    changed = true
+    collector.tabOffsets ??= {}
+    delete collector.tabOffsets.hotSpot
+    for (const key of Object.keys(collector.scrollPositions)) {
+      if (key.startsWith('hotSpot:')) delete collector.scrollPositions[key]
+    }
+    collector.scrollPositions['hotSpot:rootOnlyPlanVersion'] = 1
+    for (const ruleId of hotRuleIds) {
+      const state = collector.ruleStates?.[ruleId]
+      if (!state) continue
+      state.categoryTabOffset = 0
+      state.scrollPosition = 0
+      state.detailAttemptedIds = []
+      state.samePoolCount = 0
+      state.exhausted = false
+      state.nextRetryAt = undefined
+    }
+  }
+  return changed
+}
+
+function batchCandidatePoolFingerprint(snapshot: Record<string, unknown>): string {
+  if (snapshot.candidatePoolMode === 'quota') {
+    return stableJson({
+      mode: 'quota', rules: snapshot.candidatePoolQuotas, sources: snapshot.sources,
+      thresholds: snapshot.thresholds, filters: snapshot.filters, bannedWords: snapshot.bannedWords,
+      excludedCategorySelection: snapshot.excludedCategorySelection
+    })
+  }
+  return stableJson({
+    sources: snapshot.sources, thresholds: snapshot.thresholds, filters: snapshot.filters,
+    bannedWords: snapshot.bannedWords, selectionMode: snapshot.selectionMode,
+    categoryMode: snapshot.categoryMode, categorySelection: snapshot.categorySelection,
+    excludedCategorySelection: snapshot.excludedCategorySelection,
+    candidatePoolMode: snapshot.candidatePoolMode, candidatePoolQuotas: snapshot.candidatePoolQuotas
+  })
 }
 
 async function collectBatchCandidatePoolByQuota(
   batch: SelectionRecoveryBatch,
   contexts: Map<number, AccountRunContext>
-): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean }> {
+): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean; autoResumeAllowed?: boolean }> {
   const snapshot = batch.payload.settingsSnapshot as Record<string, unknown>
   const rules = snapshot.candidatePoolQuotas as CandidatePoolQuotaRule[]
   const target = Number(snapshot.candidatePoolTarget)
@@ -2314,59 +3265,107 @@ async function collectBatchCandidatePoolByQuota(
       ![1, 2].includes(collectorIds.length) || new Set(collectorIds).size !== collectorIds.length) {
     throw new Error('批次品类配额与采集账号快照无效，未开始消费账号选品。')
   }
-  const filterFingerprint = stableJson({
-    mode: 'quota', rules, sources: snapshot.sources, thresholds: snapshot.thresholds,
-    filters: snapshot.filters, bannedWords: snapshot.bannedWords,
-    excludedCategorySelection: snapshot.excludedCategorySelection
-  })
+  if (rules.some((rule) => rule.sourceKey === 'hotSpot' && rule.categoryPath.length > 1)) {
+    throw new Error('旧批次包含热点二级或三级配额；热点页面只有一级入口，不能按旧配额继续采集。请新建符合当前设置的批次。')
+  }
+  const filterFingerprint = batchCandidatePoolFingerprint(snapshot)
   const oldPool = batch.payload.candidatePool as BatchCandidatePool | undefined
   const matches = oldPool?.mode === 'quota' && oldPool.target === target &&
-    oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') && oldPool.filterFingerprint === filterFingerprint
+    oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') &&
+    oldPool.filterFingerprint === filterFingerprint
+  const quotaTransfers = matches && Array.isArray(oldPool?.quotaTransfers) ? structuredClone(oldPool.quotaTransfers) : []
+  const effectiveTargets = new Map(rules.map((rule) => [rule.id, rule.target]))
+  for (const transfer of quotaTransfers) {
+    effectiveTargets.set(transfer.fromRuleId, (effectiveTargets.get(transfer.fromRuleId) ?? 0) - transfer.count)
+    effectiveTargets.set(transfer.toRuleId, (effectiveTargets.get(transfer.toRuleId) ?? 0) + transfer.count)
+  }
+  const excludedProductIds = new Set<string>(matches && Array.isArray(oldPool?.excludedProductIds) ? oldPool.excludedProductIds : [])
   const rowsById = new Map<string, SelectionCandidate>()
   if (matches) for (const row of oldPool?.rows ?? []) {
-    if (/^\d+$/.test(row.productId) && rules.some((rule) => rule.id === row.quotaRuleId)) rowsById.set(row.productId, row)
+    if (/^\d+$/.test(row.productId) && !excludedProductIds.has(row.productId) && rules.some((rule) => rule.id === row.quotaRuleId)) rowsById.set(row.productId, row)
   }
-  const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0])
+  const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0], batch.batchId)
   for (const productId of occupiedOldIds) rowsById.delete(productId)
+  for (const productId of occupiedOldIds) excludedProductIds.add(productId)
   const sourceState: BatchCandidatePool['sourceState'] = matches && oldPool?.sourceState?.collectors
     ? structuredClone(oldPool.sourceState) : { collectors: {} }
+  sourceState.autoResumeAllowed = true
+  const legacyCategoryCursors = matches && Object.values(sourceState.collectors).some((collector) =>
+    collector.scrollPositions?.['selectionSquare:categoryPlanVersion'] !== 2
+  )
+  if (legacyCategoryCursors) for (const collector of Object.values(sourceState.collectors)) {
+    collector.tabOffsets = {}
+    collector.scrollPositions = { 'selectionSquare:categoryPlanVersion': 2 }
+    collector.nextRetryAt = undefined
+    collector.samePoolCount = 0
+    for (const state of Object.values(collector.ruleStates ?? {})) {
+      state.exhausted = false
+      state.nextRetryAt = undefined
+      state.samePoolCount = 0
+      state.scrollPosition = 0
+      state.categoryTabOffset = 0
+    }
+  }
+  const legacyHotSpotCursors = matches && resetHotSpotRootOnlyCursors(
+    sourceState, new Set(rules.filter((rule) => rule.sourceKey === 'hotSpot').map((rule) => rule.id))
+  )
   const countFor = (ruleId: string): number => [...rowsById.values()].filter((row) => row.quotaRuleId === ruleId).length
-  const ready = (): boolean => rules.every((rule) => countFor(rule.id) >= rule.target)
+  const ready = (): boolean => rules.every((rule) => countFor(rule.id) >= (effectiveTargets.get(rule.id) ?? rule.target))
   const savePool = async (newRows: SelectionCandidate[], collectorId: number): Promise<void> => {
     const capturedAt = new Date().toISOString()
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
-      mode: 'quota', quotaRules: rules, target, collectorAccountIds: collectorIds,
+      mode: 'quota', quotaRules: rules, quotaTransfers, target, collectorAccountIds: collectorIds,
       collectorAccountId: collectorId, capturedAt, filterFingerprint,
-      rows: newRows.map((row) => ({ ...row, collectedByAccountId: collectorId, capturedAt })),
-      excludedProductIds: [...occupiedOldIds], sourceState
+      rows: newRows.map((row) => ({
+        ...row, collectedByAccountId: row.collectedByAccountId ?? collectorId,
+        capturedAt: row.capturedAt ?? capturedAt
+      })),
+      excludedProductIds: [...excludedProductIds], sourceState
     })
-    const result = saved.pool as { count?: number } | undefined
+    const result = saved.pool as { count?: number; status?: string } | undefined
     if (Number(result?.count) !== rowsById.size) throw new Error('品类配额候选池落盘数量不一致，未进入消费阶段。')
+    showConfirmedPoolSave(batch.batchId, target, 'quota', result?.status === 'ready' ? 'ready' : 'collecting',
+      [...rowsById.values()], rules, quotaTransfers)
   }
-  if (occupiedOldIds.size) await savePool([], collectorIds[0])
+  if (occupiedOldIds.size || legacyCategoryCursors || legacyHotSpotCursors) await savePool([], collectorIds[0])
   if (!ready() && collectorIds.some((id) => !contexts.has(id))) {
     throw new Error('采集账号缺少可用的本地资源，已保留品类配额检查点。')
   }
   let lastError = ''
+  let transferApplied = false
+  let rateLimited = false
   for (const collectorId of collectorIds) {
-    if (ready()) break
+    if (ready() || rateLimited || manualPausePending()) break
     const context = contexts.get(collectorId)!
     const collectorState = sourceState.collectors[String(collectorId)] ?? { tabOffsets: {}, samePoolCount: 0, ruleStates: {} }
     collectorState.ruleStates ??= {}
+    collectorState.scrollPositions ??= {}
+    collectorState.scrollPositions['selectionSquare:categoryPlanVersion'] = 2
+    collectorState.scrollPositions['hotSpot:rootOnlyPlanVersion'] = 1
     sourceState.collectors[String(collectorId)] = collectorState
     let browserUsed = false
     try {
-      for (const rule of rules) {
-        if (countFor(rule.id) >= rule.target) continue
-        const state: { samePoolCount: number; nextRetryAt?: string } = collectorState.ruleStates[rule.id] ?? { samePoolCount: 0 }
+      const schedule = Array.from({ length: 3 }, (_, pass) => rules.map((rule) => ({ rule, pass }))).flat()
+      for (const { rule, pass } of schedule) {
+        if (manualPausePending() || rateLimited || (collectorState.nextRetryAt && Date.parse(collectorState.nextRetryAt) > Date.now())) break
+        const ruleTarget = effectiveTargets.get(rule.id) ?? rule.target
+        if (countFor(rule.id) >= ruleTarget) continue
+        const state: NonNullable<BatchCandidatePool['sourceState']['collectors'][string]['ruleStates']>[string] =
+          collectorState.ruleStates[rule.id] ?? { samePoolCount: 0 }
         collectorState.ruleStates[rule.id] = state
+        if (state.exhausted) continue
         if (state.nextRetryAt && Date.parse(state.nextRetryAt) > Date.now()) continue
-        for (let round = 0; round < 3 && countFor(rule.id) < rule.target; round += 1) {
+        for (let round = pass; round < pass + 1 && countFor(rule.id) < (effectiveTargets.get(rule.id) ?? rule.target); round += 1) {
+          if (manualPausePending()) break
           const newRows: SelectionCandidate[] = []
+          const priorRows = new Map<string, SelectionCandidate | undefined>()
+          let newlyAssignedCount = 0
+          let reassignedCount = 0
           let persisted = false
+          const priorTabOffset = Number(state.categoryTabOffset ?? 0)
           reportSelectionProgress(collectorId, '按品类只读采集共享候选池', {
-            itemIndex: countFor(rule.id), itemTotal: rule.target,
-            message: `${formatQuotaRule(rule)}：${countFor(rule.id)}/${rule.target}，第 ${round + 1} 轮。`
+            itemIndex: countFor(rule.id), itemTotal: effectiveTargets.get(rule.id) ?? rule.target,
+            message: `${formatQuotaRule(rule)}：${countFor(rule.id)}/${effectiveTargets.get(rule.id) ?? rule.target}，第 ${round + 1} 轮。`
           })
           try {
             browserUsed = true
@@ -2386,57 +3385,201 @@ async function collectBatchCandidatePoolByQuota(
                 },
                 thresholds: snapshot.thresholds, filters: snapshot.filters, bannedWords: snapshot.bannedWords,
                 excludedCategorySelection: snapshot.excludedCategorySelection,
-                selectionMode: rule.sourceKey === 'selectionSquare' ? 'category' : 'general',
-                categoryMode: rule.sourceKey === 'selectionSquare' ? 'manual' : 'auto',
+                selectionMode: rule.sourceKey === 'selectionSquare' && rule.categoryPath.length ? 'category' : 'general',
+                categoryMode: rule.sourceKey === 'selectionSquare' && rule.categoryPath.length ? 'manual' : 'auto',
                 categorySelection: selection,
                 _quotaCategoryPath: rule.categoryPath, _visibleSourcesOnly: true, _candidatePoolCollectOnly: true,
-                _candidatePoolScrollSteps: Math.min(24, Math.max(6, Math.ceil(rule.target / 20)))
+                _collectorSourceKey: rule.sourceKey,
+                _candidatePoolLimit: Math.min(2000, Math.max(1, effectiveTargets.get(rule.id) ?? rule.target)),
+                _candidateDesiredPoolCount: Math.min(2000, Math.max(1, effectiveTargets.get(rule.id) ?? rule.target)),
+                _candidatePoolRawLimit: state.rawLimit ?? Math.min(2000, Math.max(40, (effectiveTargets.get(rule.id) ?? rule.target) * 8)),
+                _candidatePoolScrollSteps: Math.min(120, Math.max(
+                  state.scrollSteps ?? 0,
+                  6,
+                  Math.ceil((effectiveTargets.get(rule.id) ?? rule.target) / 20)
+                )),
+                _candidatePoolScrollPosition: state.scrollPosition ?? 0,
+                _categoryDetailSkipIds: state.detailAttemptedIds ?? [],
+                _sourceCategoryTabOffsets: { [rule.sourceKey]: priorTabOffset }
               }, previewOnly: true, closeAfterAutomation: true
             }))
             if (preview.ok !== true) throw new Error(String(preview.error ?? '品类采集失败'))
             const capturedRows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
-            const occupiedNewIds = await occupiedPoolProductIds(capturedRows, collectorId)
+            const occupiedNewIds = await occupiedPoolProductIds(capturedRows, collectorId, batch.batchId)
+            for (const productId of occupiedNewIds) excludedProductIds.add(productId)
             for (const row of capturedRows) {
-              if (countFor(rule.id) >= rule.target) break
               if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() ||
-                  rowsById.has(row.productId) || occupiedNewIds.has(row.productId)) continue
-              const assigned = { ...row, quotaRuleId: rule.id }
+                  occupiedNewIds.has(row.productId)) continue
+              const sourceRecord = {
+                sourceKey: rule.sourceKey,
+                categoryPath: [...rule.categoryPath],
+                ...(rule.sourceKey === 'allianceRank' ? { rankBoard: rule.rankBoard } : {}),
+                ...(row.sourceCategoryId ? { sourceCategoryId: String(row.sourceCategoryId) } : {}),
+                ...(row.sourceCategoryName ? { sourceCategoryName: String(row.sourceCategoryName) } : {})
+              }
+              const existing = rowsById.get(row.productId)
+              if (existing) {
+                if (!priorRows.has(row.productId)) priorRows.set(row.productId, existing)
+                const sources = [...new Set([...(existing.sources ?? []), ...(row.sources ?? []), rule.sourceKey])]
+                const sourceRecords = [...(existing.sourceRecords ?? [])]
+                if (!sourceRecords.some((item) => item.sourceKey === sourceRecord.sourceKey &&
+                    item.categoryPath?.join('/') === sourceRecord.categoryPath.join('/') && item.rankBoard === sourceRecord.rankBoard)) {
+                  sourceRecords.push(sourceRecord)
+                }
+                const currentRuleIndex = rules.findIndex((item) => item.id === rule.id)
+                const assignedRuleIndex = rules.findIndex((item) => item.id === existing.quotaRuleId)
+                const reassignToEarlierDeficit = assignedRuleIndex > currentRuleIndex &&
+                  countFor(rule.id) < (effectiveTargets.get(rule.id) ?? rule.target)
+                const merged = {
+                  ...existing, sources, sourceRecords,
+                  ...(reassignToEarlierDeficit ? {
+                    quotaRuleId: rule.id, sourceKey: rule.sourceKey,
+                    sourceCategoryIds: row.sourceCategoryIds, sourceCategoryId: row.sourceCategoryId,
+                    sourceCategoryName: row.sourceCategoryName, sourceCategorySelection: row.sourceCategorySelection,
+                    categoryIds: row.categoryIds, categoryStatus: row.categoryStatus,
+                    categorySource: row.categorySource, leafCategoryId: row.leafCategoryId
+                  } : {})
+                }
+                rowsById.set(row.productId, merged)
+                newRows.push(merged)
+                if (reassignToEarlierDeficit) reassignedCount += 1
+                continue
+              }
+              if (countFor(rule.id) >= (effectiveTargets.get(rule.id) ?? rule.target)) continue
+              const assigned = {
+                ...row, quotaRuleId: rule.id,
+                sources: [...new Set([...(row.sources ?? []), rule.sourceKey])],
+                sourceRecords: [...(row.sourceRecords ?? []), sourceRecord]
+              }
+              priorRows.set(row.productId, undefined)
               rowsById.set(row.productId, assigned)
               newRows.push(assigned)
+              newlyAssignedCount += 1
             }
-            state.samePoolCount = newRows.length ? 0 : state.samePoolCount + 1
-            state.nextRetryAt = newRows.length ? undefined : new Date(Date.now() + Math.min(30, 5 * 2 ** (state.samePoolCount - 1)) * 60_000).toISOString()
+            const sourceResults = Array.isArray(preview.prioritySourceResults)
+              ? preview.prioritySourceResults as PrioritySourceReadResult[] : []
+            const sourceResult = sourceResults.find((result) => result.sourceKey === rule.sourceKey)
+            if (sourceResult?.scrollPosition && typeof sourceResult.scrollPosition === 'object') {
+              const position = Number(sourceResult.scrollPosition.top)
+              if (Number.isFinite(position) && position >= 0) state.scrollPosition = position
+            } else if (Number.isFinite(Number(sourceResult?.scrollPosition)) && Number(sourceResult?.scrollPosition) >= 0) {
+              state.scrollPosition = Number(sourceResult?.scrollPosition)
+            }
+            const enrichment = preview.categoryEnrichment && typeof preview.categoryEnrichment === 'object'
+              ? preview.categoryEnrichment as { detailAttemptedProductIds?: unknown } : undefined
+            if (Array.isArray(enrichment?.detailAttemptedProductIds)) {
+              state.detailAttemptedIds = [...new Set([
+                ...(state.detailAttemptedIds ?? []),
+                ...enrichment.detailAttemptedProductIds.map(String).filter((id) => /^\d+$/.test(id))
+              ])].slice(-2000)
+            }
+            const sourceReadLimitReached = sourceResult?.sourceReadLimitReached === true ||
+              sourceResult?.categoryTabReadLimitReached === true
+            if (Number.isInteger(sourceResult?.categoryTabNextOffset)) {
+              state.categoryTabOffset = Number(sourceResult.categoryTabNextOffset)
+              collectorState.tabOffsets[rule.sourceKey] = state.categoryTabOffset
+            }
+            const offsetAdvanced = Number(state.categoryTabOffset ?? priorTabOffset) > priorTabOffset
+            if (sourceReadLimitReached) {
+              state.scrollSteps = Math.min(120, Math.max(state.scrollSteps ?? 0, 6, Math.ceil(ruleTarget / 20)) + 24)
+              state.rawLimit = Math.min(2000, Math.max(
+                state.rawLimit ?? Math.min(2000, Math.max(40, ruleTarget * 8)),
+                Math.min(2000, (state.rawLimit ?? Math.min(2000, Math.max(40, ruleTarget * 8))) + 200)
+              ))
+            }
+            state.samePoolCount = newlyAssignedCount || reassignedCount ? 0 : state.samePoolCount + 1
+            if (newlyAssignedCount || reassignedCount || offsetAdvanced) {
+              state.exhausted = false
+              state.nextRetryAt = undefined
+            } else {
+              const backoffWasElapsed = Boolean(state.nextRetryAt && Date.parse(state.nextRetryAt) <= Date.now())
+              const readComplete = sourceResult !== undefined &&
+                (sourceResult.status === 'read' || sourceResult.status === 'empty') &&
+                !sourceReadLimitReached &&
+                Number(sourceResult.categoryTabNextOffset ?? 0) >= Number(sourceResult.categoryTabTotal ?? 0)
+              state.exhausted = backoffWasElapsed && readComplete
+              state.nextRetryAt = state.exhausted ? undefined :
+                new Date(Date.now() + Math.min(30, 5 * 2 ** (state.samePoolCount - 1)) * 60_000).toISOString()
+            }
+            collectorState.nextRetryAt = undefined
             await savePool(newRows, collectorId)
             persisted = true
+            if (!newlyAssignedCount && !reassignedCount && (offsetAdvanced || sourceReadLimitReached)) continue
             await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
               stage: '候选池采集', code: 'INFO_CANDIDATE_POOL_QUOTA',
-              message: `${formatQuotaRule(rule)} ${countFor(rule.id)}/${rule.target}，本轮新增 ${newRows.length} 件。`,
-              detail: `只读采集，未加车；已登记 ID 入池前排除 ${occupiedNewIds.size} 件，商品 ID 跨规则去重。`
+              message: `${formatQuotaRule(rule)} ${countFor(rule.id)}/${effectiveTargets.get(rule.id) ?? rule.target}，本轮新增唯一商品 ${newlyAssignedCount} 件、改归属 ${reassignedCount} 件。`,
+              detail: `只读采集，未加车；已登记 ID 入池前排除 ${occupiedNewIds.size} 件，商品 ID 跨规则去重；本条规则类目游标 ${priorTabOffset}→${state.categoryTabOffset ?? priorTabOffset}。`
             })
-            if (!newRows.length) break
+            if (!newlyAssignedCount && !reassignedCount) break
           } catch (cause) {
-            if (!persisted) for (const row of newRows) rowsById.delete(row.productId)
+            if (!persisted) for (const [productId, original] of priorRows) {
+              if (original) rowsById.set(productId, original)
+              else rowsById.delete(productId)
+            }
             const rawError = String(cause instanceof Error ? cause.message : cause)
+            const isRateLimit = /11001|RATE_LIMIT|限流/i.test(rawError)
+            const requiresAttention = /验证码|安全验证|需要登录|未登录|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)
+            state.exhausted = false
+            if (isRateLimit) {
+              state.nextRetryAt = pauseCandidatePoolAfterRateLimit(sourceState, collectorIds)
+              rateLimited = true
+            } else {
+              state.nextRetryAt = new Date(Date.now() + 5 * 60_000).toISOString()
+            }
+            if (requiresAttention) sourceState.autoResumeAllowed = false
             lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
             await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
               stage: '候选池采集', code: 'WARNING_CANDIDATE_POOL_QUOTA_READ',
               message: `${formatQuotaRule(rule)} 本轮未能读取。`,
               detail: `${lastError}；${safeCandidateCollectorErrorDetail(rawError)}`
             })
-            if (/11001|RATE_LIMIT|限流|验证码|安全验证|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) throw cause
+            await savePool([], collectorId)
+            if (requiresAttention) throw cause
             break
+          }
+        }
+        const deficit = Math.max(0, (effectiveTargets.get(rule.id) ?? rule.target) - countFor(rule.id))
+        const confirmedExhausted = collectorIds.every((id) =>
+          sourceState.collectors[String(id)]?.ruleStates?.[rule.id]?.exhausted === true
+        )
+        if (deficit > 0 && confirmedExhausted) {
+          const receivers = rules.filter((candidateRule) => candidateRule.id !== rule.id)
+          const receiver = receivers.find((candidateRule) => candidateRule.id !== rule.id && collectorIds.some((id) =>
+            sourceState.collectors[String(id)]?.ruleStates?.[candidateRule.id]?.exhausted !== true
+          ))
+          if (receiver) {
+            effectiveTargets.set(rule.id, (effectiveTargets.get(rule.id) ?? rule.target) - deficit)
+            effectiveTargets.set(receiver.id, (effectiveTargets.get(receiver.id) ?? receiver.target) + deficit)
+            quotaTransfers.push({ fromRuleId: rule.id, toRuleId: receiver.id, count: deficit, transferredAt: new Date().toISOString() })
+            transferApplied = true
+            await savePool([], collectorId)
+            await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
+              stage: '候选池缺额转移', code: 'INFO_CANDIDATE_POOL_QUOTA_TRANSFER',
+              message: `${formatQuotaRule(rule)} 确认无新合格商品，缺额 ${deficit} 件转给 ${formatQuotaRule(receiver)}。`,
+              detail: '接收规则继续使用自身来源、类目、统一筛选和排除条件；没有放宽条件，候选仍按商品 ID 全池去重。'
+            })
           }
         }
       }
     } finally {
       if (browserUsed) {
-        const closed = await window.api.browser.closeAccount({ accountId: collectorId, profilePath: context.profilePath })
-        if (closed.ok !== true) {
+        try {
+          const closed = await window.api.browser.closeAccount({ accountId: collectorId, profilePath: context.profilePath })
+          if (closed.ok !== true) throw new Error('采集账号浏览器关闭未确认')
+        } catch {
+          sourceState.autoResumeAllowed = false
+          await savePool([], collectorId)
           await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
           throw new Error(`采集账号 ${collectorId} 浏览器关闭未确认，已停止后续账号。`)
         }
       }
     }
+  }
+  if (transferApplied && !manualPausePending()) {
+    const refreshed = await runRecovery(['batch', 'latest'])
+    const currentBatch = refreshed.batch as SelectionRecoveryBatch | null
+    if (!currentBatch || currentBatch.batchId !== batch.batchId) throw new Error('品类缺额转移后批次检查点发生变化。')
+    return collectBatchCandidatePoolByQuota(currentBatch, contexts)
   }
   if (!matches && rowsById.size === 0) await savePool([], collectorIds[0])
   const refreshed = await runRecovery(['batch', 'latest'])
@@ -2463,68 +3606,121 @@ async function collectBatchCandidatePoolByQuota(
 
 async function collectBatchCandidatePool(
   batch: SelectionRecoveryBatch,
-  contexts: Map<number, AccountRunContext>,
-  consumerTarget = 1
-): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean }> {
+  contexts: Map<number, AccountRunContext>
+): Promise<{ batch: SelectionRecoveryBatch; pool: BatchCandidatePool; ready: boolean; autoResumeAllowed?: boolean }> {
   const snapshot = batch.payload.settingsSnapshot as Record<string, unknown> | undefined
+  if (snapshot && !batch.payload.candidatePool) {
+    const selectedSourceBatchId = String(batch.payload.candidatePoolReuseBatchId ?? '')
+    const reused = await runRecovery(['batch', 'pool-reuse', '--batch-id', batch.batchId], {
+      filterFingerprint: batchCandidatePoolFingerprint(snapshot),
+      sourceBatchId: selectedSourceBatchId
+    })
+    const summary = reused.pool as { count?: number; sourceBatchId?: string; detail?: string } | undefined
+    if (selectedSourceBatchId && Number(summary?.count) < 1) {
+      throw new Error(`所选本机候选池已过期或与本次选品条件不符${summary?.detail ? `：${summary.detail}` : ''}；新批次检查点已保存，未重新抓取来源或启动消费账号。`)
+    }
+    if (Number(summary?.count) > 0) {
+      const refreshed = await runRecovery(['batch', 'latest'])
+      const checkpoint = refreshed.batch as SelectionRecoveryBatch | null
+      if (!checkpoint || checkpoint.batchId !== batch.batchId) {
+        throw new Error('本机候选池复用后批次检查点发生变化，已停止消费阶段。')
+      }
+      batch = checkpoint
+      showSavedPoolCheckpoint(batch)
+      await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
+        stage: '候选池采集', code: 'INFO_LOCAL_CANDIDATE_POOL_REUSED',
+        message: `从本机历史批次复用 ${summary?.count} 件候选商品；消费账号仍将按 ID 重新核验。`,
+        detail: `来源批次 ${summary?.sourceBatchId ?? '未知'}；历史采集游标及账号加车结果未复用。`
+      })
+    }
+  }
   if (snapshot?.candidatePoolMode === 'quota') return collectBatchCandidatePoolByQuota(batch, contexts)
   const target = Number(snapshot?.candidatePoolTarget)
   const collectorIds = Array.isArray(snapshot?.candidateCollectorAccountIds)
     ? (snapshot?.candidateCollectorAccountIds as unknown[]).map(Number) : []
-  const filterFingerprint = stableJson({
-    sources: snapshot?.sources, thresholds: snapshot?.thresholds, filters: snapshot?.filters,
-    bannedWords: snapshot?.bannedWords, selectionMode: snapshot?.selectionMode,
-    categoryMode: snapshot?.categoryMode, categorySelection: snapshot?.categorySelection,
-    excludedCategorySelection: snapshot?.excludedCategorySelection
-  })
+  const filterFingerprint = batchCandidatePoolFingerprint(snapshot ?? {})
   const oldPool = batch.payload.candidatePool as BatchCandidatePool | undefined
-  const poolConfigMatches = oldPool?.target === target && oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') && oldPool.filterFingerprint === filterFingerprint
+  const poolConfigMatches = oldPool?.target === target && oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') &&
+    oldPool.filterFingerprint === filterFingerprint
   if (!Number.isInteger(target) || target < 1 || target > 2000 || ![1, 2].includes(collectorIds.length) ||
       new Set(collectorIds).size !== collectorIds.length) {
     throw new Error('批次候选池缺少有效的目标数量或 1–2 个已启用采集账号；未开始消费账号选品。')
   }
   const rowsById = new Map<string, SelectionCandidate>()
+  const excludedProductIds = new Set<string>(poolConfigMatches && Array.isArray(oldPool?.excludedProductIds)
+    ? oldPool.excludedProductIds : [])
   if (poolConfigMatches && oldPool) {
     for (const row of oldPool.rows ?? []) {
-      if (/^\d+$/.test(String(row.productId ?? ''))) rowsById.set(row.productId, row)
+      if (/^\d+$/.test(String(row.productId ?? '')) && !excludedProductIds.has(row.productId)) rowsById.set(row.productId, row)
     }
   }
-  const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0])
-  for (const productId of occupiedOldIds) rowsById.delete(productId)
+  const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0], batch.batchId)
+  for (const productId of occupiedOldIds) { rowsById.delete(productId); excludedProductIds.add(productId) }
   const sourceState: BatchCandidatePool['sourceState'] = oldPool && poolConfigMatches && oldPool.sourceState?.collectors
     ? structuredClone(oldPool.sourceState) : { collectors: {} }
+  sourceState.autoResumeAllowed = true
+  const legacyCategoryCursors = poolConfigMatches && Object.values(sourceState.collectors).some((collector) =>
+    collector.scrollPositions?.['selectionSquare:categoryPlanVersion'] !== 2
+  )
+  if (legacyCategoryCursors) for (const collector of Object.values(sourceState.collectors)) {
+    collector.tabOffsets = {}
+    collector.scrollPositions = { 'selectionSquare:categoryPlanVersion': 2 }
+    collector.samePoolCount = 0
+    collector.nextRetryAt = undefined
+  }
+  const legacyHotSpotCursors = poolConfigMatches && resetHotSpotRootOnlyCursors(sourceState, new Set())
   const savePool = async (rows: SelectionCandidate[], collectorAccountId: number): Promise<void> => {
     const capturedAt = new Date().toISOString()
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
       target, collectorAccountIds: collectorIds, collectorAccountId, capturedAt, filterFingerprint,
       rows: rows.map((row) => ({ ...row, collectedByAccountId: collectorAccountId, capturedAt })),
-      excludedProductIds: [...occupiedOldIds], sourceState
+      excludedProductIds: [...excludedProductIds], sourceState
     })
-    const summary = saved.pool as { count?: number } | undefined
-    if (Number(summary?.count ?? rowsById.size) !== rowsById.size) {
+    const summary = saved.pool as { count?: number; status?: string } | undefined
+    if (Number(summary?.count) !== rowsById.size) {
       throw new Error('候选池落盘数量与本轮内存商品 ID 数不一致；已停止进入消费阶段。')
     }
+    showConfirmedPoolSave(batch.batchId, target, 'total', summary?.status === 'ready' ? 'ready' : 'collecting',
+      [...rowsById.values()])
   }
-  if (occupiedOldIds.size) await savePool([], collectorIds[0])
+  if (occupiedOldIds.size || legacyCategoryCursors || legacyHotSpotCursors) await savePool([], collectorIds[0])
   if (rowsById.size < target && collectorIds.some((id) => !contexts.has(id))) {
     throw new Error('剔除已登记商品后候选池未达目标，采集账号资源不可用；已保留检查点。')
   }
   let lastError = ''
-  if (rowsById.size < target && rowsById.size < consumerTarget) {
+  let autoResumeAllowed = true
+  let rateLimited = false
+  const configuredSources = snapshot?.sources && typeof snapshot.sources === 'object'
+    ? snapshot.sources as Record<string, unknown> : {}
+  const requestedSourceOrder = Array.isArray(configuredSources.priority)
+    ? configuredSources.priority.map(String) : []
+  const activeSourceOrder = [...new Set([...requestedSourceOrder, 'hotSpot', 'allianceRank', 'selectionSquare'])]
+    .filter((key) => ['hotSpot', 'allianceRank', 'selectionSquare'].includes(key) && configuredSources[`${key}Enabled`] !== false)
+  if (!activeSourceOrder.length) throw new Error('候选池没有已启用的来源；未开始采集。')
+  if (rowsById.size < target) {
     for (const collectorId of collectorIds) {
+      if (manualPausePending() || rateLimited || !autoResumeAllowed) break
       const context = contexts.get(collectorId)!
       const collectorState: BatchCandidatePool['sourceState']['collectors'][string] =
         sourceState.collectors[String(collectorId)] ?? { tabOffsets: {}, samePoolCount: 0 }
+      collectorState.scrollPositions ??= {}
+      collectorState.scrollPositions['selectionSquare:categoryPlanVersion'] = 2
+      collectorState.scrollPositions['hotSpot:rootOnlyPlanVersion'] = 1
       sourceState.collectors[String(collectorId)] = collectorState
       if (collectorState.nextRetryAt && new Date(collectorState.nextRetryAt).getTime() > Date.now()) continue
-      for (let round = 0; round < 3 && rowsById.size < target && rowsById.size < consumerTarget; round += 1) {
+      const finishedSources = new Set<string>()
+      // 来源仍有未读分类或新商品时沿持久化游标续采；上限只防止页面异常造成无界循环。
+      for (let round = 0; round < 1000 && rowsById.size < target; round += 1) {
+        if (manualPausePending()) break
+        const sourceKey = activeSourceOrder[round % activeSourceOrder.length]
+        if (finishedSources.has(sourceKey)) continue
         const before = rowsById.size
         const priorOffsets = JSON.stringify(collectorState.tabOffsets)
         const newRows: SelectionCandidate[] = []
         let persisted = false
         reportSelectionProgress(collectorId, '只读采集共享候选池', {
           itemIndex: before, itemTotal: target,
-          message: `采集账号 ${collectorId}：候选池 ${before}/${target}，第 ${round + 1} 轮读取。`
+          message: `采集账号 ${collectorId}：候选池 ${before}/${target}，第 ${round + 1} 轮读取 ${sourceKey}。`
         })
         try {
         try {
@@ -2539,25 +3735,55 @@ async function collectBatchCandidatePool(
               categorySelection: snapshot?.categorySelection,
               excludedCategorySelection: snapshot?.excludedCategorySelection,
               _visibleSourcesOnly: true, _candidatePoolCollectOnly: true,
-              _candidatePoolScrollSteps: Math.min(24, Math.max(6, Math.ceil(target / 20))),
+              _collectorSourceKey: sourceKey,
+              _candidatePoolLimit: Math.min(2000, target),
+              _candidateDesiredPoolCount: Math.min(2000, target),
+              _candidatePoolRawLimit: collectorState.rawLimit ?? Math.min(2000, Math.max(40, target * 8)),
+              _candidatePoolScrollSteps: Math.min(120, Math.max(
+                collectorState.scrollSteps ?? 0, 6, Math.ceil(target / 20)
+              )),
+              _candidatePoolScrollPositions: collectorState.scrollPositions ?? {},
+              _categoryDetailSkipIds: collectorState.detailAttemptedIds ?? [],
               _sourceCategoryTabOffsets: collectorState.tabOffsets
             },
             previewOnly: true, closeAfterAutomation: true
           }))
           if (preview.ok !== true) throw new Error(String(preview.error ?? '只读采集失败'))
           const capturedRows = Array.isArray(preview.candidates) ? preview.candidates as SelectionCandidate[] : []
-          const occupiedNewIds = await occupiedPoolProductIds(capturedRows, collectorId)
+          const occupiedNewIds = await occupiedPoolProductIds(capturedRows, collectorId, batch.batchId)
+          for (const productId of occupiedNewIds) excludedProductIds.add(productId)
           for (const row of capturedRows) {
             if (!/^\d+$/.test(String(row.productId ?? '')) || !String(row.title ?? '').trim() ||
-                rowsById.has(row.productId) || occupiedNewIds.has(row.productId)) continue
+                excludedProductIds.has(row.productId) || rowsById.has(row.productId) || occupiedNewIds.has(row.productId)) continue
             rowsById.set(row.productId, row)
             newRows.push(row)
           }
           const results = Array.isArray(preview.prioritySourceResults)
             ? preview.prioritySourceResults as PrioritySourceReadResult[] : []
-          const sourceSummary = results.map((result) =>
-            `${result.label}${result.status === 'disabled' ? '关闭' : `读取${result.productCount}、来源过滤${result.sourceFilterRejected ?? 0}`}`
-          ).join('；')
+          const currentSourceResult = results.find((result) => result.sourceKey === sourceKey)
+          collectorState.scrollPositions ??= {}
+          for (const result of results) {
+            if (result.scrollPositions && typeof result.scrollPositions === 'object') {
+              for (const [key, value] of Object.entries(result.scrollPositions)) {
+                const position = Number(value)
+                if (Number.isFinite(position) && position >= 0) collectorState.scrollPositions[key] = position
+              }
+            }
+            const rawPosition = result.scrollPosition && typeof result.scrollPosition === 'object'
+              ? result.scrollPosition.top : result.scrollPosition
+            const position = Number(rawPosition)
+            if (Number.isFinite(position) && position >= 0 && collectorState.scrollPositions[result.sourceKey] === undefined) {
+              collectorState.scrollPositions[result.sourceKey] = position
+            }
+          }
+          const sourceSummary = results.map((result) => {
+            if (result.status === 'disabled') return `${result.label}关闭`
+            const failure = result.status === 'skipped'
+              ? `，原因：${safeCandidateCollectorErrorDetail(result.detail || result.sourceOutcome || result.pageListDiagnosis).slice(0, 200) || '来源读取未完成'}` : ''
+            const remaining = Number.isInteger(result.categoryTabTotal) && Number.isInteger(result.categoryTabNextOffset)
+              ? `，分类 ${result.categoryTabNextOffset}/${result.categoryTabTotal}` : ''
+            return `${result.label}读取${result.productCount}、来源过滤${result.sourceFilterRejected ?? 0}${remaining}${failure}`
+          }).join('；')
           const rejectedRows = Array.isArray(preview.rejectedCandidates) ? preview.rejectedCandidates as SelectionCandidate[] : []
           const rejectedCount = rejectedRows.length
           const rejectionCounts = new Map<string, number>()
@@ -2572,9 +3798,34 @@ async function collectBatchCandidatePool(
               collectorState.tabOffsets[result.sourceKey] = Number(result.categoryTabNextOffset)
             }
           }
-          collectorState.samePoolCount = newRows.length ? 0 : collectorState.samePoolCount + 1
-          if (newRows.length) collectorState.nextRetryAt = undefined
-          else if (priorOffsets === JSON.stringify(collectorState.tabOffsets)) {
+          const incompleteSourceRead = results.some((result) =>
+            result.sourceReadLimitReached === true || result.categoryTabReadLimitReached === true
+          )
+          if (incompleteSourceRead) {
+            collectorState.scrollSteps = Math.min(120, Math.max(
+              collectorState.scrollSteps ?? 0, 6, Math.ceil(target / 20)
+            ) + 24)
+            collectorState.rawLimit = Math.min(2000, Math.max(
+              collectorState.rawLimit ?? Math.min(2000, Math.max(40, target * 8)),
+              Math.min(2000, (collectorState.rawLimit ?? Math.min(2000, Math.max(40, target * 8))) + 200)
+            ))
+          }
+          const enrichment = preview.categoryEnrichment && typeof preview.categoryEnrichment === 'object'
+            ? preview.categoryEnrichment as { detailAttemptedProductIds?: unknown } : undefined
+          if (Array.isArray(enrichment?.detailAttemptedProductIds)) {
+            collectorState.detailAttemptedIds = [...new Set([
+              ...(collectorState.detailAttemptedIds ?? []),
+              ...enrichment.detailAttemptedProductIds.map(String).filter((id) => /^\d+$/.test(id))
+            ])].slice(-2000)
+          }
+          const sourceAdvanced = newRows.length > 0 || priorOffsets !== JSON.stringify(collectorState.tabOffsets)
+          collectorState.samePoolCount = sourceAdvanced ? 0 : collectorState.samePoolCount + 1
+          if (sourceAdvanced) collectorState.nextRetryAt = undefined
+          if (!sourceAdvanced || currentSourceResult?.status === 'skipped' ||
+              (Number(currentSourceResult?.categoryTabTotal ?? 0) > 0 &&
+               Number(currentSourceResult?.categoryTabNextOffset ?? 0) >= Number(currentSourceResult?.categoryTabTotal) &&
+               currentSourceResult?.sourceReadLimitReached !== true)) finishedSources.add(sourceKey)
+          if (finishedSources.size >= activeSourceOrder.length) {
             const minutes = Math.min(30, 5 * 2 ** Math.max(0, collectorState.samePoolCount - 1))
             collectorState.nextRetryAt = new Date(Date.now() + minutes * 60_000).toISOString()
           }
@@ -2585,7 +3836,10 @@ async function collectBatchCandidatePool(
             message: `采集账号 ${collectorId} 本轮新增 ${newRows.length} 件，池内 ${rowsById.size}/${target}。`,
             detail: `${sourceSummary}；已登记 ID 入池前排除 ${occupiedNewIds.size} 件；统一条件淘汰或待核验 ${rejectedCount} 件：${rejectionSummary}。来源分类游标已保存；只读采集，未加车或计入账号配额。`
           })
-          if (!newRows.length && priorOffsets === JSON.stringify(collectorState.tabOffsets)) break
+          if (finishedSources.size >= activeSourceOrder.length) break
+          if ((round + 1) % 3 === 0 && rowsById.size < target) {
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 2_000))
+          }
         } catch (cause) {
           if (!persisted) for (const row of newRows) rowsById.delete(row.productId)
           const rawError = String(cause instanceof Error ? cause.message : cause)
@@ -2595,20 +3849,33 @@ async function collectBatchCandidatePool(
             message: `采集账号 ${collectorId} 本轮未完成读取。`,
             detail: `${lastError}；${safeCandidateCollectorErrorDetail(rawError)}`
           })
-          if (/11001|RATE_LIMIT|限流|验证码|安全验证|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) break
-          break
+          if (/验证码|安全验证|需要登录|未登录|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)) {
+            autoResumeAllowed = false
+            sourceState.autoResumeAllowed = false
+            await savePool([], collectorId)
+            break
+          }
+          if (/11001|RATE_LIMIT|限流/i.test(rawError)) {
+            pauseCandidatePoolAfterRateLimit(sourceState, collectorIds)
+            rateLimited = true
+            await savePool([], collectorId)
+            break
+          }
+          finishedSources.add(sourceKey)
+          if (finishedSources.size >= activeSourceOrder.length) break
         }
         } finally {
           try {
             const closed = await window.api.browser.closeAccount({ accountId: collectorId, profilePath: context.profilePath })
             if (closed.ok !== true) throw new Error('客户端未确认采集账号浏览器关闭')
           } catch {
+            sourceState.autoResumeAllowed = false
+            await savePool([], collectorId)
             await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
             throw new Error(`采集账号 ${collectorId} 浏览器关闭未确认；为避免同时打开两个账号，已停止后续采集。`)
           }
         }
       }
-      if (rowsById.size >= consumerTarget) break
     }
   }
   if (!oldPool && rowsById.size === 0) await savePool([], collectorIds[0])
@@ -2616,14 +3883,15 @@ async function collectBatchCandidatePool(
   const currentBatch = refreshed.batch as SelectionRecoveryBatch | null
   if (!currentBatch || currentBatch.batchId !== batch.batchId) throw new Error('候选池采集后批次检查点发生变化；已停止消费阶段。')
   const pool = currentBatch.payload.candidatePool as BatchCandidatePool
-  if (!pool || pool.rows.length < consumerTarget) {
+  if (!pool || pool.rows.length < target) {
     await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
       stage: '候选池采集', code: 'WARNING_CANDIDATE_POOL_TARGET_UNMET',
-      message: `共享候选池 ${pool?.rows.length ?? 0}/${target}，当前账号需要 ${consumerTarget} 件，尚未开始消费。`,
-      detail: lastError || '已保留采集游标和商品 ID；达到当前账号目标后可先消费，候选池总目标继续保留检查点补充。'
+      message: `共享候选池 ${pool?.rows.length ?? 0}/${target}，未达到设定目标，消费账号尚未开始。`,
+      detail: lastError || '已保留采集游标和商品 ID，等待来源产生新商品后续读。'
     })
     const updated = await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'needs_retry'])
-    return { batch: updated.batch as SelectionRecoveryBatch, pool, ready: false }
+    return { batch: updated.batch as SelectionRecoveryBatch, pool, ready: false,
+      autoResumeAllowed: autoResumeAllowed && sourceState.autoResumeAllowed !== false }
   }
   if (currentBatch.state === 'needs_retry') {
     const updated = await runRecovery(['batch', 'update', '--batch-id', batch.batchId, '--state', 'in_progress'])
@@ -2705,19 +3973,11 @@ async function prepareBatchCandidatePlans(
     const sameFilterDifferentVisibility = [...sharedPools.values()].some((pool) =>
       pool.filterFingerprint === filterFingerprint && pool.visibilityFingerprint !== visibilityFingerprint
     )
-    const accountTarget = Number.isFinite(configuredTarget) ? Math.max(1, Math.min(10, configuredTarget)) : 5
-    const cumulativeConsumerTarget = orderedTargets
-      .slice(0, targetIndex + 1)
-      .reduce((sum, targetAccount) => {
-        const targetContext = contexts.get(targetAccount.id)
-        const raw = Number(targetContext?.settings.candidateLimit ?? 5)
-        return sum + (Number.isFinite(raw) ? Math.max(1, Math.min(10, raw)) : 5)
-      }, 0)
     const seededPlan = seededPreviewPlans?.get(account.id)
     const seededRows = seededPlan?.candidatePool
     const seededSharedRows = seededPlan?.sharedCandidatePool
     const seededMeta = seededPlan?.candidatePoolMeta
-    const reusableSharedPool = collectorPool && collectorPool.rows.length >= cumulativeConsumerTarget
+    const reusableSharedPool = collectorPool?.status === 'ready' && collectorPool.rows.length >= collectorPool.target
       ? {
           rows: collectorPool.rows,
           createdByAccountId: collectorPool.collectorAccountIds[0],
@@ -2743,7 +4003,7 @@ async function prepareBatchCandidatePlans(
         }
       : sharedPools.get(sharedPoolKey)
     const reuseAllowed = Boolean(reusableSharedPool && reusableSharedPool.rows.length && (
-      Boolean(collectorPool && collectorPool.rows.length >= cumulativeConsumerTarget) || (
+      collectorPool?.status === 'ready' || (
         reusableSharedPool.filterFingerprint === filterFingerprint &&
         reusableSharedPool.visibilityFingerprint === visibilityFingerprint &&
         Boolean(visibilityFingerprint)
@@ -2935,8 +4195,19 @@ async function prepareBatchCandidatePlans(
       ? preview.rejectedCandidates as SelectionCandidate[] : [])
     sourcesByAccount.set(account.id, Array.isArray(preview.prioritySourceResults)
       ? preview.prioritySourceResults as PrioritySourceReadResult[] : [])
-    warningsByAccount.set(account.id, Array.isArray(preview.warnings)
-      ? preview.warnings.map(String) : [])
+    const registryStatus = snapshot as unknown as {
+      warning?: unknown
+      syncConflicts?: Array<{ productId?: unknown; reason?: unknown }>
+    }
+    const registryWarnings = [
+      ...(registryStatus.warning ? [String(registryStatus.warning)] : []),
+      ...(registryStatus.syncConflicts?.length
+        ? [`服务器同步发现 ${registryStatus.syncConflicts.length} 个跨客户端冲突；保留本机已确认加车事实并从后续候选排除。商品 ID：${registryStatus.syncConflicts.slice(0, 20).map((item) => String(item.productId ?? '')).join('、')}`] : [])
+    ]
+    warningsByAccount.set(account.id, [
+      ...(Array.isArray(preview.warnings) ? preview.warnings.map(String) : []),
+      ...registryWarnings
+    ])
     categoryEnrichmentByAccount.set(account.id, preview.categoryEnrichment && typeof preview.categoryEnrichment === 'object'
       ? preview.categoryEnrichment as AccountCandidatePlan['categoryEnrichment'] : undefined)
     recommendationsByAccount.set(account.id, Array.isArray(preview.recommendedCategories)
@@ -3121,12 +4392,12 @@ async function prepareAccountRunContext(
     level2: [...(globalCategory.level2 ?? [])],
     level3: [...(globalCategory.level3 ?? [])]
   }, categoryTree)
-  const normalizedGlobalExcludedCategory = normalizeCategorySelection({
+  const normalizedGlobalExcludedCategory = normalizeExcludedCategorySelection({
     level1: [...(globalExcludedCategory.level1 ?? [])],
     level2: [...(globalExcludedCategory.level2 ?? [])],
     level3: [...(globalExcludedCategory.level3 ?? [])]
   }, categoryTree)
-  const normalizedAccountExcludedCategory = normalizeCategorySelection({
+  const normalizedAccountExcludedCategory = normalizeExcludedCategorySelection({
     level1: [...(storedExcludedCategory.level1 ?? [])],
     level2: [...(storedExcludedCategory.level2 ?? [])],
     level3: [...(storedExcludedCategory.level3 ?? [])]
@@ -3267,6 +4538,7 @@ async function executeAccountSelection(
   let stage = '读取账号设置'
   let recoveryStage = recovery?.state.stage ?? 'quota_check'
   let categoryWarnings: string[] = []
+  let consumer11001Reason = ''
   const persistStage = async (nextStage: string, extra: Record<string, unknown> = {}): Promise<void> => {
     recoveryStage = nextStage
     const progressLabels: Record<string, string> = {
@@ -3303,6 +4575,38 @@ async function executeAccountSelection(
       ? recovery.state.selectedIndexes : []
     let completed: Array<Record<string, unknown>> = Array.isArray(recovery?.state.completed)
       ? recovery.state.completed : []
+    const stopCurrentAccountForPause = async (checkpointStage: string): Promise<{
+      status: '部分完成'; message: string; continueBatch: false
+    } | null> => {
+      if (!recovery || !manualPausePending()) return null
+      if (consumer11001Reason) {
+        const history = await runRecovery(['batch', 'logs', '--batch-id', recovery.batchId])
+        const { code, label, cooldownSeconds } = consumer11001RetryPlan(
+          consumer11001Reason, history.runLogs, targetAccountId
+        )
+        const reason = `${label}；客户端自动续选冷却约 ${cooldownSeconds} 秒。手动暂停后需点击“继续选品”；${consumer11001Reason}`
+        const retained = completed.filter((item) => item.cartAdded === true ||
+          (item.cartAttempted === true && item.skipped !== true))
+        await recovery.logEvent({
+          stage: '消费账号商品搜索', code,
+          message: `${label}；手动暂停，冷却约 ${cooldownSeconds} 秒后仍须用户继续。`,
+          detail: consumer11001Reason
+        })
+        await recovery.persist({
+          state: 'needs_retry', stage: 'cart_pending', error: reason,
+          candidates: [], selectedIndexes: [], completed: retained
+        })
+        accountStatuses[targetAccountId] = `手动暂停（11001 等待 ${cooldownSeconds} 秒）`
+        return { status: '部分完成', message: reason, continueBatch: false }
+      }
+      const message = '已手动暂停；当前操作结果和账号检查点已保存，等待点击“继续选品”。'
+      await recovery.persist({
+        state: 'needs_retry', stage: checkpointStage, error: message,
+        candidates: fetched, selectedIndexes, completed
+      })
+      accountStatuses[targetAccountId] = '手动暂停（待继续）'
+      return { status: '部分完成', message, continueBatch: false }
+    }
     const savedStage = recovery?.state.stage ?? ''
     const recoveryMode = getSelectionRecoveryMode(
       savedStage,
@@ -3826,6 +5130,18 @@ async function executeAccountSelection(
         const prioritySourceMatchStatus = String(preview.prioritySourceMatchStatus || 'complete')
         const listRejected = Array.isArray(preview.rejectedCandidates)
           ? preview.rejectedCandidates as SelectionCandidate[] : []
+        const registryWarnings = Array.isArray(preview.warnings)
+          ? preview.warnings.map(String).filter((warning) =>
+            warning.startsWith('共享选品登记服务暂时不可达') || warning.startsWith('服务器同步发现'))
+          : []
+        for (const warning of registryWarnings) {
+          await recovery?.logEvent({
+            stage: '选品登记同步',
+            code: warning.startsWith('服务器同步发现') ? 'WARNING_REGISTRY_OFFLINE_CONFLICT' : 'WARNING_REGISTRY_OFFLINE_MODE',
+            message: warning,
+            detail: '本机商品 ID 登记继续生效；离线期间无法保证其他客户端实时占用互斥，联网后会同步并排除冲突商品。'
+          })
+        }
         categoryWarnings = Array.isArray(preview.warnings)
           ? preview.warnings.map(String).filter((warning) =>
             warning.startsWith('跳过失败类目：') ||
@@ -3966,7 +5282,10 @@ async function executeAccountSelection(
         // Run every eligible product for this account in one account task. The
         // account quota remains the hard upper bound; candidateLimit only limits
         // how many candidates are discovered upstream.
-        maxSelectedProducts = poolConsumerOnly ? Math.min(maxProducts, candidateLimit) : maxProducts
+        const previouslyAddedCount = completed.filter((item) => item.cartAdded === true).length
+        maxSelectedProducts = poolConsumerOnly
+          ? Math.max(0, Math.min(maxProducts, candidateLimit - previouslyAddedCount))
+          : maxProducts
         eligible = fetched.filter((candidate) =>
           chosenProducts.has(candidate.productId) && !productLocks.has(candidate.productId) &&
           (usage[candidate.productId] ?? 0) < quotaSettings.perProductVideos
@@ -4027,6 +5346,8 @@ async function executeAccountSelection(
       }
 
       await persistStage('cart_pending', { candidates: fetched, selectedIndexes, completed: completed.length ? completed : null })
+      const pausedBeforeCart = await stopCurrentAccountForPause('cart_pending')
+      if (pausedBeforeCart) return pausedBeforeCart
       if (selectedIndexesToExecute.length) {
         await recovery?.logEvent({
           stage: '候选池准备', code: 'INFO_CANDIDATE_POOL_READY',
@@ -4064,6 +5385,7 @@ async function executeAccountSelection(
           closeAfterAutomation: !recovery
         }))
         if (result.ok !== true) throw new Error(String(result.error ?? '百应选品执行失败'))
+        consumer11001Reason = poolConsumerOnly ? String(result.poolConsumerRateLimit ?? '') : ''
 
         const registryRejected = Array.isArray(result.registryRejected)
           ? result.registryRejected as Array<{ productId: string; reason: string }> : []
@@ -4189,6 +5511,57 @@ async function executeAccountSelection(
           const analysis = returnedByProductId.get(candidate.productId)
           return analysis ? { ...candidate, ...analysis } as SelectionCandidate : candidate
         })
+        const consumerRejectedIds = poolConsumerOnly
+          ? [...new Set(returned.filter((item) => item.analysisRejected === true || item.titleFilterExcluded === true)
+            .map((item) => String(item.productId ?? '').trim()).filter((id) => /^\d+$/.test(id)))]
+          : []
+        if (consumerRejectedIds.length && recovery) {
+          const latest = await runRecovery(['batch', 'latest'])
+          const latestBatch = latest.batch as SelectionRecoveryBatch | null
+          const currentPool = latestBatch?.payload.candidatePool as BatchCandidatePool | undefined
+          const settingsSnapshot = latestBatch?.payload.settingsSnapshot as Record<string, unknown> | undefined
+          if (!latestBatch || latestBatch.batchId !== recovery.batchId || !currentPool || !settingsSnapshot || !currentPool.collectorAccountIds.length) {
+            throw new Error('消费账号淘汰商品后无法读取候选池检查点；已保留账号商品结果并暂停批次。')
+          }
+          const allExcluded = new Set([...(currentPool.excludedProductIds ?? []), ...consumerRejectedIds])
+          const poolSave = await runRecovery(['batch', 'pool-save', '--batch-id', recovery.batchId], {
+            mode: currentPool.mode ?? 'total',
+            quotaRules: currentPool.quotaRules ?? [],
+            quotaTransfers: currentPool.quotaTransfers ?? [],
+            target: currentPool.target,
+            collectorAccountIds: currentPool.collectorAccountIds,
+            collectorAccountId: currentPool.collectorAccountIds[0],
+            capturedAt: new Date().toISOString(),
+            filterFingerprint: currentPool.filterFingerprint,
+            rows: [],
+            excludedProductIds: [...allExcluded],
+            sourceState: currentPool.sourceState
+          })
+          const poolResult = poolSave.pool as { count?: number } | undefined
+          const expectedPoolCount = currentPool.rows.filter((row) => !allExcluded.has(row.productId)).length
+          if (Number(poolResult?.count) !== expectedPoolCount) {
+            throw new Error('消费淘汰商品后候选池落盘数量不一致；已暂停批次并保留检查点。')
+          }
+          for (const item of completed.filter((row) => row.cartAdded === true && String(row.productId ?? ''))) {
+            await runRecovery([
+              'quota-record-once', '--batch-id', recovery.batchId, '--account-id', String(targetAccountId),
+              '--product-id', String(item.productId), '--event', 'cart', '--videos', '0'
+            ])
+          }
+          const reason = `消费账号详情核验淘汰 ${consumerRejectedIds.length} 个商品，已从本批候选池全局排除；采集账号需按原规则补足后再继续。`
+          await recovery.logEvent({
+            stage: '候选池补采', code: 'WARNING_CONSUMER_DETAIL_REJECTED',
+            message: reason,
+            detail: `全局排除商品 ID：${consumerRejectedIds.join('、')}；剩余池内 ${poolResult?.count ?? 0}/${currentPool.target}。`,
+            productId: consumerRejectedIds[0]
+          })
+          await recovery.persist({
+            state: 'needs_retry', stage: 'candidate_refilling', error: reason,
+            candidates: [], selectedIndexes: [], completed
+          })
+          await runRecovery(['batch', 'update', '--batch-id', recovery.batchId, '--state', 'needs_retry'])
+          return { status: '部分完成', message: reason, continueBatch: false }
+        }
         if (accountId.value === targetAccountId) candidates.value = fetched
         const switchItem = returned.find((item) => {
           if (item.manualAction === 'complete_baiying_verification') return true
@@ -4260,6 +5633,8 @@ async function executeAccountSelection(
       }
     }
     await persistStage('video_pending', { candidates: fetched, selectedIndexes, completed })
+    const pausedBeforeVideo = await stopCurrentAccountForPause('video_pending')
+    if (pausedBeforeVideo) return pausedBeforeVideo
 
     stage = '商品详情图转视频'
     accountStatuses[targetAccountId] = '商品详情图转视频中'
@@ -4376,6 +5751,8 @@ async function executeAccountSelection(
       }
     }
     for (const [productIndex, item] of completed.entries()) {
+      const pausedBetweenProducts = await stopCurrentAccountForPause('video_pending')
+      if (pausedBetweenProducts) return pausedBetweenProducts
       const productId = String(item.productId ?? '')
       reportSelectionProgress(targetAccountId, '生成视频并写入发布队列', {
         itemIndex: productIndex + 1,
@@ -4432,6 +5809,7 @@ async function executeAccountSelection(
             closeAfterAutomation: !recovery
           }))
           if (detail.ok !== true) throw new Error(String(detail.error ?? '百应商品详情采集失败'))
+          if (detail.poolConsumerRateLimit) throw new Error(String(detail.poolConsumerRateLimit))
           const returned = Array.isArray(detail.completed) ? detail.completed as Array<Record<string, unknown>> : []
           const recovered = returned.find((entry) => String(entry.productId ?? '') === productId)
           if (!recovered || recovered.cartAdded !== true) throw new Error('没有按原商品 ID 恢复到已加车商品')
@@ -4446,6 +5824,8 @@ async function executeAccountSelection(
           })
           imagePaths = recoveredImages
           await recovery.persist({ state: 'in_progress', stage: 'video_pending', completed })
+          const pausedAfterDetail = await stopCurrentAccountForPause('video_pending')
+          if (pausedAfterDetail) return pausedAfterDetail
         } catch (cause) {
           const reason = String(cause instanceof Error ? cause.message : cause)
           const classification = toUserSelectionError(cause).classification
@@ -4519,6 +5899,8 @@ async function executeAccountSelection(
         item.status = String(item.status ?? '已加车') + '；详情图转视频完成'
         videoResults.push(String(item.title ?? productId) + '：9:16 与 1:1 视频已生成')
         if (recovery) await recovery.persist({ state: 'in_progress', stage: 'video_pending', completed })
+        const pausedAfterVideo = await stopCurrentAccountForPause('video_pending')
+        if (pausedAfterVideo) return pausedAfterVideo
         if (productId) {
           if (recovery) {
             await runRecovery([
@@ -4576,6 +5958,28 @@ async function executeAccountSelection(
     const publishSummary = `抖音发布确认 ${publishedConfirmedCount}/${targetProductCount}`
     const summary = [categorySummary, dedupeSummary, publishSummary, productSummary, videoResults.length ? '处理结果：' + videoResults.join('；') : '']
       .filter(Boolean).join('；')
+    if (consumer11001Reason && recovery) {
+      // 搜索 11001 发生在本商品加车之前。先完成本轮已确认商品的配额、视频与发布，
+      // 再保留这些结果并清除未触碰的候选快照；冷却后从现有池重新分配。
+      const history = await runRecovery(['batch', 'logs', '--batch-id', recovery.batchId])
+      const { code, label, cooldownSeconds } = consumer11001RetryPlan(
+        consumer11001Reason, history.runLogs, targetAccountId
+      )
+      const reason = `${label}；客户端自动续选冷却约 ${cooldownSeconds} 秒。已保留确认结果，冷却后从现有候选池重新分配；${consumer11001Reason}`
+      const retained = completed.filter((item) => item.cartAdded === true ||
+        (item.cartAttempted === true && item.skipped !== true))
+      await recovery.logEvent({
+        stage: '消费账号商品搜索', code,
+        message: `${label}；约 ${cooldownSeconds} 秒后自动续选。`,
+        detail: `本轮确认加车 ${quotaProducts.length}/${batchTarget}；未触碰商品已尝试释放预占，结算未确认的仍保持锁定；${consumer11001Reason}`
+      })
+      await recovery.persist({
+        state: 'needs_retry', stage: 'cart_pending', error: reason,
+        candidates: [], selectedIndexes: [], completed: retained
+      })
+      accountStatuses[targetAccountId] = `needs_retry（加车 ${quotaProducts.length}/${batchTarget}，等待 ${cooldownSeconds} 秒）`
+      return { status: '部分完成', message: reason, continueBatch: false }
+    }
     if (recovery) {
       if (hasCartFailure) {
         await recovery.persist({ state: 'needs_retry', stage: 'cart_pending', error: summary, candidates: fetched, selectedIndexes, completed })
@@ -4841,6 +6245,9 @@ async function loadRecoveryStatus(): Promise<void> {
   const recentResult = activeBatch ? null : await runRecovery(['batch', 'recent'])
   const batch = activeBatch ?? (recentResult?.batch as SelectionRecoveryBatch | null)
   recoveryBatch.value = batch
+  if (batch) showSavedPoolCheckpoint(batch)
+  else candidatePoolProgress.value = null
+  if (!selectionProgress.value) batchProgressPhase.value = candidatePoolProgress.value?.status === 'ready' ? 'account' : 'pool'
   restoreSelectionCooldown(batch)
   if (!batch || !['in_progress', 'needs_retry'].includes(batch.state)) return
   const stageNames: Record<string, string> = {
@@ -4896,6 +6303,7 @@ async function saveCandidateFetchRateLimitCheckpoint(
   await runRecovery(['batch', 'update', '--batch-id', batchId, '--state', 'needs_retry'])
   const latest = await runRecovery(['batch', 'latest'])
   recoveryBatch.value = latest.batch as SelectionRecoveryBatch | null
+  if (recoveryBatch.value) showSavedPoolCheckpoint(recoveryBatch.value)
   restoreSelectionCooldown(recoveryBatch.value)
   return cooldownSeconds
 }
@@ -4943,7 +6351,7 @@ function recoveryAccountStageLabel(account: SelectionRecoveryAccount): string {
 
 async function abandonStaleBatch(): Promise<void> {
   const batch = recoveryBatch.value
-  if (busy.value || !batch || batch.state !== 'needs_retry') return
+  if (busy.value || scheduledRetryWaiting.value || !batch || batch.state !== 'needs_retry') return
   const pending = batch.accounts.filter((item) => item.state !== 'completed')
   if (batch.accounts.some((item) => item.state === 'in_progress')) {
     error.value = '批次仍有执行中的账号任务，暂不能结束。'
@@ -4965,7 +6373,11 @@ async function abandonStaleBatch(): Promise<void> {
       '--reason', '用户在选品设置页面确认结束待恢复批次；保留检查点，不标记成功。'
     ])
     const ended = result.batch as SelectionRecoveryBatch
+    stopManualPauseAutoResume()
+    manualPauseRequested.value = false
     recoveryBatch.value = null
+    candidatePoolProgress.value = null
+    selectionProgress.value = null
     for (const item of ended.accounts) {
       if (item.state !== 'completed') accountStatuses[item.accountId] = '已结束（检查点保留）'
     }
@@ -5160,7 +6572,7 @@ function getAccountSwitchFailure(result: LoginPreflightAccount[]): AccountSwitch
   const hasVerification = platforms.some((item) => item.state === 'verification_required')
   const messageClassification = toUserSelectionError(messageText).classification
   // 频控仍由候选读取阶段的卡②检查点处理，不能误当登录失效换号。
-  if (messageClassification === 'BAIYING_RATE_LIMIT') return null
+  if (isBaiyingCooldownClassification(messageClassification)) return null
   const classification: AccountSwitchFailure['classification'] = hasVerification
     ? 'ACCOUNT_SWITCH_CAPTCHA'
     : messageClassification === 'ACCOUNT_SWITCH_CAPTCHA'
@@ -5400,8 +6812,10 @@ function toggleManualLoginConfirmation(account: LoginPreflightAccount, platform:
 async function runSelectionBatch(): Promise<void> {
   const requestedAutoResumeBatchId = automaticResumeBatchId
   const requestedAutoResumeAccountId = automaticResumeAccountId
+  const requestedPoolResumeBatchId = automaticPoolResumeBatchId
   automaticResumeBatchId = null
   automaticResumeAccountId = null
+  automaticPoolResumeBatchId = null
   if (busy.value) {
     const intent = cooldownAutoResumeIntent.value
     if (requestedAutoResumeBatchId && intent?.batchId === requestedAutoResumeBatchId &&
@@ -5413,16 +6827,20 @@ async function runSelectionBatch(): Promise<void> {
     }
     return
   }
-  if (!requestedAutoResumeBatchId && !ensureAccountPathsSaved()) return
-  if (requestedAutoResumeBatchId && accountPathsHaveUnsavedChanges.value) {
-    traceSelectionCooldown('automatic_recovery_unsaved_path_drift_ignored', requestedAutoResumeBatchId, {
+  clearCandidatePoolResumeTimer()
+  if (!requestedAutoResumeBatchId && !requestedPoolResumeBatchId && !ensureAccountPathsSaved()) return
+  if ((requestedAutoResumeBatchId || requestedPoolResumeBatchId) && accountPathsHaveUnsavedChanges.value) {
+    traceSelectionCooldown('automatic_recovery_unsaved_path_drift_ignored', requestedAutoResumeBatchId || requestedPoolResumeBatchId!, {
       source: 'selection_settings_database', accountId: requestedAutoResumeAccountId
     })
   }
   busy.value = true
+  activeSelectionRunBatchId.value = null
   error.value = ''
   notice.value = ''
   runLogWarning.value = ''
+  candidatePoolProgress.value = null
+  batchProgressPhase.value = 'pool'
   selectionProgress.value = {
     state: 'running', mode: 'batch', accountId: null, accountName: '',
     accountIndex: 0, accountTotal: 0, completedAccounts: 0,
@@ -5434,10 +6852,23 @@ async function runSelectionBatch(): Promise<void> {
     await loadAccounts()
     const latestResult = await runRecovery(['batch', 'latest'])
     let batch = latestResult.batch as SelectionRecoveryBatch | null
+    if (batch && batchIsManuallyPaused(batch)) {
+      recoveryBatch.value = batch
+      notice.value = '本批次已由用户手动暂停；只有点击“继续选品”才会恢复。'
+      selectionProgress.value = {
+        ...selectionProgress.value!, state: 'finished', stage: '手动暂停中',
+        message: notice.value, percent: null
+      }
+      return
+    }
+    if (batch) {
+      activeSelectionRunBatchId.value = batch.batchId
+      if (await pauseBatchAtSafeBoundary(batch.batchId, '手动暂停于批次准备阶段')) return
+    }
     if (requestedAutoResumeBatchId) {
       const limitedAccount = batch?.accounts.find((item) =>
         item.accountId === requestedAutoResumeAccountId && item.state === 'needs_retry' &&
-        toUserSelectionError(item.error).classification === 'BAIYING_RATE_LIMIT'
+        isBaiyingCooldownClassification(toUserSelectionError(item.error).classification)
       )
       const activeIntent = cooldownAutoResumeIntent.value
       const matchingIntent = Boolean(batch && activeIntent &&
@@ -5466,6 +6897,15 @@ async function runSelectionBatch(): Promise<void> {
           ...selectionProgress.value!, state: 'finished', stage: '自动恢复检查点已变化',
           message: notice.value, percent: null
         }
+        return
+      }
+      recoveryBatch.value = batch
+    }
+    if (requestedPoolResumeBatchId) {
+      const pool = batch?.payload.candidatePool as BatchCandidatePool | undefined
+      if (!batch || batch.batchId !== requestedPoolResumeBatchId || batch.state !== 'needs_retry' ||
+          !pool || (pool.status !== 'collecting' && !hasStaleReadyPoolAccount(batch, pool))) {
+        notice.value = '候选池自动续采检查点已变化，未启动其他批次。'
         return
       }
       recoveryBatch.value = batch
@@ -5504,8 +6944,10 @@ async function runSelectionBatch(): Promise<void> {
       if (!selectedPendingAccounts.length) {
         throw new Error('请至少勾选一个待恢复账号；未勾选的账号会保留原检查点。')
       }
-      const isAutomaticRecovery = requestedAutoResumeBatchId === batch.batchId
-      if (isAutomaticRecovery && !selectedPendingAccounts.some((item) => item.accountId === requestedAutoResumeAccountId)) {
+      const isAutomaticRecovery = requestedAutoResumeBatchId === batch.batchId ||
+        requestedPoolResumeBatchId === batch.batchId
+      if (requestedAutoResumeBatchId === batch.batchId &&
+          !selectedPendingAccounts.some((item) => item.accountId === requestedAutoResumeAccountId)) {
         notice.value = '冷却结束，但限流账号未包含在恢复范围内；请确认待恢复账号后继续。'
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '自动恢复范围已变化',
@@ -5515,7 +6957,7 @@ async function runSelectionBatch(): Promise<void> {
       }
       recoveryAccountIds = new Set(selectedPendingAccounts.map((item) => item.accountId))
 
-      const refreshableStage = selectedPendingAccounts.length > 0 && selectedPendingAccounts.every((item) =>
+      const refreshableStage = !requestedPoolResumeBatchId && selectedPendingAccounts.length > 0 && selectedPendingAccounts.every((item) =>
         ['', 'queued', 'quota_check', 'candidate_fetch'].includes(item.stage) &&
         !(item.candidates?.length) && !(item.selectedIndexes?.length) && !(item.completed?.length)
       )
@@ -5748,7 +7190,15 @@ async function runSelectionBatch(): Promise<void> {
           '请先保存通用选品设置，未创建新批次。'
         )
       }
+      if (!selectionUiDataReady.value) {
+        if (props.active || props.dialogOnly) await ensureSelectionUiData()
+        else await reloadCatalog()
+      }
       snapshot = JSON.parse(JSON.stringify(global)) as Record<string, unknown>
+      snapshot.categoryTree = JSON.parse(JSON.stringify(
+        selectedLocalPoolBatchId.value && selectedLocalPoolCategoryTree.value
+          ? selectedLocalPoolCategoryTree.value : categories.value
+      ))
       if (commissionRuleMigrationRequired.value) throw new Error('旧佣金设置按上限保存；请核对最低佣金率并保存通用设置后再新建批次。')
       const collectorIds = Array.isArray(snapshot.candidateCollectorAccountIds)
         ? snapshot.candidateCollectorAccountIds.map(Number) : []
@@ -5764,6 +7214,10 @@ async function runSelectionBatch(): Promise<void> {
           ![1, 2].includes(collectorIds.length) || new Set(collectorIds).size !== collectorIds.length ||
           collectorIds.some((id) => !enabled.some((account) => account.id === id))) {
         throw new Error('请先设置候选池目标数量，并从已启用账号中指定 1–2 个采集账号。')
+      }
+      const consumerDemand = await activeConsumerDemand(snapshot)
+      if (Number(snapshot.candidatePoolTarget) < consumerDemand.total) {
+        throw new Error(`候选池目标 ${snapshot.candidatePoolTarget} 件小于本批消费账号目标合计 ${consumerDemand.total} 件（${consumerDemand.detail}）；已停止创建批次。`)
       }
       const prepared = await prepareAccountRunContexts(enabled, snapshot)
       contexts = prepared.contexts
@@ -5796,7 +7250,7 @@ async function runSelectionBatch(): Promise<void> {
       if (!confirmSelectionScope(newBatchScopeFingerprint,
         `本批次将依次运行以下全部启用账号：\n\n${batchAccountSummary}\n\n` +
         `素材保存根目录（每账号独立，后续按日期和商品名称分层）：\n${batchPathSummary}\n\n` +
-        `先由采集账号 ${collectorIds.join('、')} 顺序只读采集并保存共享候选池；${snapshot.candidatePoolMode === 'quota' ? '每条品类配额全部达标' : '当前账号可用候选达到自身目标数量'}后即可开始消费，池总目标 ${snapshot.candidatePoolTarget} 件继续按检查点补充。每次只启动当前账号的浏览器；消费账号按池内商品 ID 用自身百应登录态核验详情和加车，完成选品发布并关闭浏览器后才会启动下一个账号。`
+        `${selectedLocalPoolBatchId.value ? `先读取已选的本机候选池 ${selectedLocalPoolBatchId.value}；` : '先尝试复用本机 24 小时内同条件、同采集账号的候选商品；'}缺额再由采集账号 ${collectorIds.join('、')} 顺序只读采集，${snapshot.candidatePoolMode === 'quota' ? '每条品类配额分别达标' : `候选池达到 ${snapshot.candidatePoolTarget} 件`}后才开始消费账号。每次只启动当前账号的浏览器；消费账号按池内商品 ID 用自身百应登录态核验详情和加车，完成选品发布并关闭浏览器后才会启动下一个账号。`
       )) {
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '已取消启动',
@@ -5819,9 +7273,18 @@ async function runSelectionBatch(): Promise<void> {
       reviewedProducts = reviewedAccountId !== null
         ? new Set(candidates.value.filter((candidate) => candidate.selected).map((candidate) => candidate.productId))
         : undefined
+      if (manualPauseRequested.value) {
+        selectionProgress.value = {
+          ...selectionProgress.value!, state: 'finished', stage: '手动暂停于新批次创建前',
+          message: '已停止本次选品，尚未创建批次或启动消费账号。', percent: null
+        }
+        manualPauseRequested.value = false
+        return
+      }
       const batchId = window.crypto.randomUUID()
       const payload: Record<string, unknown> = {
         settingsSnapshot: snapshot,
+        candidatePoolReuseBatchId: selectedLocalPoolBatchId.value,
         accountContexts: Object.fromEntries([...contexts].map(([id, context]) => [String(id), context])),
         reviewedAccountId,
         reviewedProductIds: reviewedProducts ? [...reviewedProducts] : null,
@@ -5831,13 +7294,18 @@ async function runSelectionBatch(): Promise<void> {
       selectionProgress.value = {
         ...selectionProgress.value!,
         stage: '保存选品批次',
-        message: '账号和资源配置已核对；先采集共享候选池，达到目标后再处理消费账号。'
+         message: '账号和资源配置已核对；先复用本机近期候选，缺额补采，达到目标后再处理消费账号。'
       }
       const created = await runRecovery(['batch', 'create', '--batch-id', batchId], payload)
       batch = created.batch as SelectionRecoveryBatch
       recoveryBatch.value = batch
+      activeSelectionRunBatchId.value = batch.batchId
+      selectedLocalPoolBatchId.value = null
+      selectedLocalPoolCategoryTree.value = null
     }
 
+    if (await pauseBatchAtSafeBoundary(batch.batchId, '手动暂停于候选池准备阶段')) return
+    showSavedPoolCheckpoint(batch)
     const persistedAccounts = batch.accounts
     const activeById = new Map(accounts.value.map((account) => [account.id, account]))
     const taskAccounts: AccountRow[] = persistedAccounts
@@ -5880,26 +7348,33 @@ async function runSelectionBatch(): Promise<void> {
     let batchPayload = batch.payload
     const poolMode = Array.isArray((batchPayload.settingsSnapshot as Record<string, unknown> | undefined)?.candidateCollectorAccountIds) &&
       ((batchPayload.settingsSnapshot as Record<string, unknown>).candidateCollectorAccountIds as unknown[]).length > 0
+    if (poolMode) {
+      selectionProgress.value = {
+        ...selectionProgress.value!, stage: '建立共享候选池',
+        message: '先复用本机符合条件的候选商品，缺额由采集账号顺序补采；池达标后才开始消费账号。'
+      }
+    } else {
+      batchProgressPhase.value = 'account'
+    }
     let collectorPool: BatchCandidatePool | undefined
     if (poolMode) {
-      const firstConsumer = activeTaskAccounts.find((account) => contexts.has(account.id))
-      const configuredConsumerTarget = Number(
-        firstConsumer ? contexts.get(firstConsumer.id)?.settings.candidateLimit ?? 5 : 5
-      )
-      const firstConsumerTarget = Number.isFinite(configuredConsumerTarget)
-        ? Math.max(1, Math.min(10, configuredConsumerTarget)) : 5
-      const collected = await collectBatchCandidatePool(batch, contexts, firstConsumerTarget)
+      const collected = await collectBatchCandidatePool(batch, contexts)
       batch = collected.batch
       recoveryBatch.value = batch
+      showSavedPoolCheckpoint(batch)
       batchPayload = batch.payload
       collectorPool = collected.pool
+      if (await pauseBatchAtSafeBoundary(batchId, '手动暂停于候选池采集后')) return
       if (!collected.ready) {
+        const autoResumePool = collected.autoResumeAllowed !== false && collectorPool?.status === 'collecting'
+        if (autoResumePool && collectorPool) scheduleCandidatePoolResume(batch, collectorPool)
         const quotaDeficits = collectorPool?.mode === 'quota'
           ? collectorPool.quotaProgress?.filter((item) => item.deficit > 0)
             .map((item) => `${quotaProgressLabel(item.ruleId)} 缺 ${item.deficit} 件`).join('；') : ''
-        notice.value = quotaDeficits
+        notice.value = (quotaDeficits
           ? `候选池品类配额尚未达标：${quotaDeficits}。已保存检查点，消费账号未启动。`
-          : `候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}，当前账号还需要 ${firstConsumerTarget} 件合格候选；已保存检查点，消费账号未启动。`
+          : `候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}，尚未达到设定目标；已保存检查点，消费账号未启动。`) +
+          (autoResumePool ? '客户端将按退避时间自动续采，重启后也会恢复等待。' : '请检查来源失败原因后手动继续。')
         selectionProgress.value = {
           ...selectionProgress.value!, state: 'finished', stage: '候选池待补充',
           message: notice.value, percent: null
@@ -5907,11 +7382,110 @@ async function runSelectionBatch(): Promise<void> {
         return
       }
     }
+    if (collectorPool) {
+      let occupied = await occupiedPoolProductIds(
+        collectorPool.rows, collectorPool.collectorAccountIds[0], batchId
+      )
+      while (occupied.size) {
+        const allExcluded = new Set(collectorPool.excludedProductIds ?? [])
+        const newlyOccupied = [...occupied].filter((productId) => !allExcluded.has(productId))
+        if (!newlyOccupied.length) break
+        for (const productId of newlyOccupied) allExcluded.add(productId)
+        const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batchId], {
+          mode: collectorPool.mode ?? 'total', quotaRules: collectorPool.quotaRules ?? [],
+          quotaTransfers: collectorPool.quotaTransfers ?? [], target: collectorPool.target,
+          collectorAccountIds: collectorPool.collectorAccountIds,
+          collectorAccountId: collectorPool.collectorAccountIds[0],
+          capturedAt: new Date().toISOString(), filterFingerprint: collectorPool.filterFingerprint,
+          rows: [], excludedProductIds: [...allExcluded], sourceState: collectorPool.sourceState
+        })
+        const savedPool = saved.pool as { count?: number } | undefined
+        const expectedCount = collectorPool.rows.filter((row) => !allExcluded.has(row.productId)).length
+        if (Number(savedPool?.count) !== expectedCount) {
+          throw new Error('服务器同步冲突剔除后的候选池数量不一致；消费账号未启动。')
+        }
+        const latest = await runRecovery(['batch', 'latest'])
+        const latestBatch = latest.batch as SelectionRecoveryBatch | null
+        if (!latestBatch || latestBatch.batchId !== batchId) throw new Error('服务器冲突处理后批次检查点发生变化。')
+        showSavedPoolCheckpoint(latestBatch)
+        const refilled = await collectBatchCandidatePool(latestBatch, contexts)
+        batch = refilled.batch
+        recoveryBatch.value = batch
+        showSavedPoolCheckpoint(batch)
+        batchPayload = batch.payload
+        collectorPool = refilled.pool
+        if (await pauseBatchAtSafeBoundary(batchId, '手动暂停于候选池补采后')) return
+        if (!refilled.ready) {
+          const unmet = collectorPool?.mode === 'quota'
+            ? collectorPool.quotaProgress?.filter((item) => item.deficit > 0)
+              .map((item) => `${quotaProgressLabel(item.ruleId)} 缺 ${item.deficit} 件`).join('；') : ''
+          notice.value = unmet
+            ? `服务器同步冲突后候选池配额未补足：${unmet}。已保存检查点，消费账号未启动。`
+            : `服务器同步冲突后候选池 ${collectorPool?.rows.length ?? 0}/${collectorPool?.target ?? '?'}；已保存检查点，消费账号未启动。`
+          selectionProgress.value = {
+            ...selectionProgress.value!, state: 'finished', stage: '候选池待补充',
+            message: notice.value, percent: null
+          }
+          return
+        }
+        if (await pauseBatchAtSafeBoundary(batchId, '手动暂停于候选池补采后')) return
+        occupied = await occupiedPoolProductIds(
+          collectorPool.rows, collectorPool.collectorAccountIds[0], batchId
+        )
+      }
+    }
+    if (collectorPool?.status === 'ready') {
+      if (selectionProgressFlushTimer !== null) window.clearTimeout(selectionProgressFlushTimer)
+      selectionProgressFlushTimer = null
+      pendingSelectionProgressUpdate = null
+      batchProgressPhase.value = 'account'
+      selectionProgress.value = {
+        ...selectionProgress.value!, accountId: null, accountName: '',
+        stage: '从共享候选池准备账号商品分配',
+        message: '候选池已达标；消费账号将按精确商品 ID 分别核验，池内商品不等于已加车商品。',
+        itemIndex: null, itemTotal: null, percent: null
+      }
+    }
     const batchCandidatePlans = {
       ...preparedCandidatePlans,
       ...((batchPayload.candidatePlan ?? {}) as Record<string, AccountCandidatePlan>)
     }
-    if (collectorPool) {
+    if (collectorPool?.status === 'ready') {
+      const availablePoolIds = new Set(collectorPool.rows.map((row) => row.productId))
+      for (const account of activeTaskAccounts) {
+        const task = persistedAccounts.find((item) => item.accountId === account.id)
+        if (!task || task.state === 'completed') continue
+        const savedCandidates = Array.isArray(task.candidates) ? task.candidates : []
+        const savedCompleted = Array.isArray(task.completed) ? task.completed : []
+        // 已加车或加车结果不明的商品必须保留检查点，不能借换池重复执行。
+        const onlyConfirmedSkips = savedCompleted.every((item) =>
+          item.skipped === true && item.cartAttempted !== true && item.cartAdded !== true)
+        const staleSnapshot = savedCandidates.length > 0 && onlyConfirmedSkips &&
+          savedCandidates.every((item) => !availablePoolIds.has(item.productId))
+        if (staleSnapshot) {
+          const saved = await runRecovery([
+            'account', 'update', '--batch-id', batchId, '--account-id', String(account.id)
+          ], {
+            state: 'needs_retry', stage: 'candidate_fetch', error: '',
+            candidates: [], selectedIndexes: [], completed: []
+          })
+          Object.assign(task, saved.account as SelectionRecoveryAccount)
+          try {
+            await runRecovery(['log', 'append', '--batch-id', batchId, '--account-id', String(account.id)], {
+              stage: '候选池恢复', code: 'INFO_STALE_ACCOUNT_PLAN_REPLACED',
+              message: `旧账号候选 ${savedCandidates.length} 件均已不在本批可用池；已从现成池重新分配。`,
+              detail: '旧商品的登记状态和历史日志保留；未重新采集三来源，也未释放结果不明的登记。'
+            })
+          } catch (cause) {
+            runLogWarning.value = '账号候选重建日志写入失败：' + conciseFailureMessage(cause)
+          }
+        }
+        const savedPlan = batchCandidatePlans[String(account.id)]
+        if (savedPlan?.candidates?.length && savedPlan.candidates.every((item) =>
+          !availablePoolIds.has(item.productId))) {
+          delete batchCandidatePlans[String(account.id)]
+        }
+      }
       const unplanned = activeTaskAccounts.filter((account) => {
         const task = persistedAccounts.find((item) => item.accountId === account.id)
         return contexts.has(account.id) && !contextErrors.has(account.id) &&
@@ -5964,6 +7538,7 @@ async function runSelectionBatch(): Promise<void> {
     const persistedReviewedAccountId = typeof batchPayload.reviewedAccountId === 'number'
       ? batchPayload.reviewedAccountId : reviewedAccountId
 
+    if (await pauseBatchAtSafeBoundary(batchId, '手动暂停于消费账号启动前')) return
     const outcomes = await runSequentialSelectionBatch(
       taskAccounts,
       async (account) => {
@@ -5995,6 +7570,9 @@ async function runSelectionBatch(): Promise<void> {
           }
         }
         const logFailure = appendAccountLog
+        if (manualPausePending()) {
+          return { status: '部分完成' as const, message: '手动暂停，当前账号尚未启动。', continueBatch: false }
+        }
         const contextError = contextErrors.get(account.id)
         if (contextError) {
           await logFailure({
@@ -6071,6 +7649,10 @@ async function runSelectionBatch(): Promise<void> {
             await persist({ state: 'needs_retry', stage: 'queued', error: reason })
             keepBrowserOpenForLogin = false
             accountOutcome = { status: '部分完成', message: reason, continueBatch: true }
+          } else if (manualPausePending()) {
+            const reason = '手动暂停；登录预检已完成，当前账号尚未开始加车或发布。'
+            await persist({ state: 'needs_retry', stage: task.stage || 'queued', error: reason })
+            accountOutcome = { status: '部分完成', message: reason, continueBatch: false }
           } else {
             const switchFailure = loginFailures.get(account.id) ?? accountSwitchFailures.get(account.id)
             if (switchFailure) {
@@ -6137,15 +7719,15 @@ async function runSelectionBatch(): Promise<void> {
           const reason = String(cause instanceof Error ? cause.message : cause)
           accountFailure = cause
           const classification = toUserSelectionError(cause).classification
-          pauseAfterAccount = classification === 'BAIYING_RATE_LIMIT'
+          pauseAfterAccount = isBaiyingCooldownClassification(classification)
           accountSkipped = [
             'ACCOUNT_SWITCH_CAPTCHA', 'ACCOUNT_SWITCH_LOGIN', 'ACCOUNT_SWITCH_DISCONNECT',
             'LOGIN_OR_PAGE_STATE_UNCONFIRMED'
           ].includes(String(classification ?? '')) || /权限不足|无权限|未授权|广告主.*不可见/.test(reason)
           if (task.state !== 'failed' && task.state !== 'needs_retry') {
-            if (classification === 'BAIYING_RATE_LIMIT') {
+            if (isBaiyingCooldownClassification(classification)) {
               await logFailure({
-                stage: '获取候选', code: 'BAIYING_RATE_LIMIT',
+                stage: '获取候选', code: classification ?? 'BAIYING_RATE_LIMIT',
                 message: toUserSelectionMessage(reason), detail: reason
               })
               await persist({ state: 'needs_retry', stage: task.stage || 'candidate_fetch', error: reason })
@@ -6206,6 +7788,10 @@ async function runSelectionBatch(): Promise<void> {
             }
           }
           throw accountFailure
+        }
+        if (manualPausePending()) {
+          return { ...(accountOutcome ?? { status: '部分完成' as const, message: '当前账号已保存检查点。' }),
+            continueBatch: false }
         }
         return accountOutcome ?? { status: '部分完成' as const, message: '当前账号没有返回处理结果。' }
       },
@@ -6277,7 +7863,7 @@ async function runSelectionBatch(): Promise<void> {
       outcomes.map((item) => item.accountName + '：' + item.status).join('；')
     const rateLimitedAccount = persistedAccounts.find((item) =>
       item.state === 'needs_retry' &&
-      toUserSelectionError(item.error).classification === 'BAIYING_RATE_LIMIT'
+      isBaiyingCooldownClassification(toUserSelectionError(item.error).classification)
     )
     const accountSwitchFailure = persistedAccounts.find((item) =>
       item.state === 'failed' && [
@@ -6319,7 +7905,15 @@ async function runSelectionBatch(): Promise<void> {
       const recentAfterRun = await runRecovery(['batch', 'recent'])
       recoveryBatch.value = recentAfterRun.batch as SelectionRecoveryBatch | null
     }
+    if (recoveryBatch.value) showSavedPoolCheckpoint(recoveryBatch.value)
+    else candidatePoolProgress.value = null
+    if (!allComplete && !terminalFailed && await pauseBatchAtSafeBoundary(batchId, '手动暂停于当前账号收尾后')) return
     restoreSelectionCooldown(recoveryBatch.value)
+    const readyPoolAfterRun = recoveryBatch.value?.payload.candidatePool as BatchCandidatePool | undefined
+    if (recoveryBatch.value && readyPoolAfterRun && !loginPreflight.value &&
+        hasStaleReadyPoolAccount(recoveryBatch.value, readyPoolAfterRun)) {
+      scheduleCandidatePoolResume(recoveryBatch.value, readyPoolAfterRun)
+    }
     if (runLogWarning.value) notice.value += '；' + runLogWarning.value
   } catch (cause) {
     error.value = String(cause instanceof Error ? cause.message : cause)
@@ -6338,7 +7932,7 @@ async function runSelectionBatch(): Promise<void> {
     }
   } finally {
     const pendingAutoResume = cooldownAutoResumeIntent.value
-    if (requestedAutoResumeBatchId && pendingAutoResume?.batchId === requestedAutoResumeBatchId &&
+    if (!manualPausePending() && requestedAutoResumeBatchId && pendingAutoResume?.batchId === requestedAutoResumeBatchId &&
       pendingAutoResume.accountId === requestedAutoResumeAccountId && pendingAutoResume.phase === 'starting') {
       if (loginPreflight.value) {
         cooldownAutoResumeIntent.value = { ...pendingAutoResume, phase: 'blocked' }
@@ -6372,6 +7966,10 @@ async function runSelectionBatch(): Promise<void> {
         }
       }
     }
+    if (manualPauseRequested.value && (!activeSelectionRunBatchId.value || recoveryBatch.value?.state === 'completed')) {
+      manualPauseRequested.value = false
+    }
+    activeSelectionRunBatchId.value = null
     busy.value = false
   }
 }
@@ -6385,6 +7983,7 @@ function discardUnsavedAccountPaths(): void {
 }
 
 async function startSelectionFromButton(): Promise<void> {
+  clearCandidatePoolResumeTimer()
   if (accountPathsHaveUnsavedChanges.value) {
     if (accountId.value === null) {
       error.value = '请先选择账号，再开始选品。'
@@ -6392,10 +7991,12 @@ async function startSelectionFromButton(): Promise<void> {
     }
     if (!await saveAccount()) return
   }
+  if (manualPausePending() && !await clearManualSelectionPause()) return
   await startSelection()
 }
 
 async function startSelection(): Promise<boolean> {
+  if (manualPausePending()) return false
   const autoStartBatchId = automaticResumeBatchId
   const autoStartAccountId = automaticResumeAccountId
   const intent = cooldownAutoResumeIntent.value
@@ -6536,6 +8137,7 @@ async function waitForScheduledRetry(milliseconds: number): Promise<void> {
     const deadline = Date.now() + milliseconds
     let nextScheduleCheck = 0
     while (Date.now() < deadline) {
+      if (manualPausePending()) return
       if (Date.now() >= nextScheduleCheck) {
         if (!(await isScheduledSelectionEnabled())) return
         nextScheduleCheck = Date.now() + 5_000
@@ -6560,7 +8162,7 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
   handledScheduledStartDates.add(due.date)
   automaticScheduledStartActive = true
   activeScheduledStartDate = due.date
-  let outcome: 'completed' | 'login-blocked' | 'disabled' | 'failed' | null = null
+  let outcome: 'completed' | 'login-blocked' | 'disabled' | 'manual-paused' | 'failed' | null = null
   let attempts = 0
   let currentRunStarted = false
   const initialBatch = recoveryBatch.value
@@ -6570,6 +8172,11 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
     while (!outcome) {
       let attemptCounted = false
       try {
+        if (manualPausePending()) {
+          outcome = 'manual-paused'
+          notice.value = '本批次已手动暂停；每日定时续做等待点击“继续选品”。'
+          break
+        }
         const scheduleEnabled = await isScheduledSelectionEnabled()
         if (!scheduleEnabled) {
           outcome = 'disabled'
@@ -6622,6 +8229,11 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
         error.value = ''
         notice.value = `每日计划 ${due.time}：正在运行选品流程（第 ${attempts} 次尝试）。`
         const started = await startSelection()
+        if (manualPausePending()) {
+          outcome = 'manual-paused'
+          notice.value = '本批次已手动暂停；每日定时续做等待点击“继续选品”。'
+          break
+        }
         if (started) {
           currentRunStarted = true
           const latestBatch = recoveryBatch.value
@@ -6669,6 +8281,11 @@ async function handleScheduledSelectionStart(due: SelectionScheduleDue): Promise
         if (attempts === 1 || attempts % 5 === 0) notifyGlobal(retryMessage, 'error')
         await waitForScheduledRetry(delayMs)
       } catch (cause) {
+        if (manualPausePending()) {
+          outcome = 'manual-paused'
+          notice.value = '本批次已手动暂停；每日定时续做等待点击“继续选品”。'
+          break
+        }
         error.value = `每日定时选品本轮遇到错误：${String(cause instanceof Error ? cause.message : cause)}`
         const loginBlock = scheduledLoginBlockReason()
         if (loginBlock) {
@@ -6719,10 +8336,17 @@ watch(accountId, () => {
   candidateSelectionCustomized.value = false
   previewCandidatePool.value = null
   previewCandidatePoolCount.value = 0
-  if (activeTab.value === '账号个性化') void loadAccountSettings()
+  if (selectionUiDataReady.value && (props.active || props.dialogOnly) && activeTab.value === '账号个性化') {
+    void loadAccountSettings()
+  }
 })
 watch(activeTab, (tab) => {
-  if (tab === '账号个性化') void loadAccountSettings()
+  if (selectionUiDataReady.value && (props.active || props.dialogOnly) && tab === '账号个性化') {
+    void loadAccountSettings()
+  }
+})
+watch([() => props.active, selectionInitialized], ([active, initialized]) => {
+  if (active && initialized) void ensureSelectionUiData()
 })
 
 onMounted(async () => {
@@ -6771,19 +8395,29 @@ onMounted(async () => {
   try {
     defaultDownloadRoot.value = await window.api.dir.getDownloadDir()
     await Promise.all([loadDailySelectionSchedule(), loadGlobal(), loadAccounts()])
-    await loadAccountSettings()
-    await Promise.all([reloadCatalog(), loadCachedFilterCatalog()])
+    if (props.active || props.dialogOnly) await ensureSelectionUiData()
     await loadRecoveryStatus()
   } catch (cause) {
     error.value = String(cause instanceof Error ? cause.message : cause)
   } finally {
     busy.value = false
     selectionInitialized.value = true
+    const pendingPool = recoveryBatch.value?.payload.candidatePool as BatchCandidatePool | undefined
+    if (recoveryBatch.value?.state === 'needs_retry' && pendingPool?.status === 'collecting' &&
+        !loginPreflight.value && await canResumePendingCandidatePool(recoveryBatch.value, pendingPool)) {
+      scheduleCandidatePoolResume(recoveryBatch.value, pendingPool)
+      notice.value = `候选池 ${pendingPool.rows.length}/${pendingPool.target}，已从检查点恢复自动续采等待；达到目标前不启动消费账号。`
+    } else if (recoveryBatch.value && pendingPool && !loginPreflight.value &&
+        hasStaleReadyPoolAccount(recoveryBatch.value, pendingPool)) {
+      scheduleCandidatePoolResume(recoveryBatch.value, pendingPool)
+      notice.value = '候选池已达标；旧账号候选均不可用，客户端将从现成池自动重分配并续选。'
+    }
   }
 })
 
 onUnmounted(() => {
   selectionViewUnmounted = true
+  savedPoolItemsRequest += 1
   stopSelectionProgress?.()
   stopAutoPublishProgress?.()
   stopSelectionCooldownExpired?.()
@@ -6794,6 +8428,7 @@ onUnmounted(() => {
   selectionProgressFlushTimer = null
   pendingSelectionProgressUpdate = null
   clearAutoResumeTimer()
+  clearCandidatePoolResumeTimer()
 })
 
 </script>
@@ -6837,12 +8472,13 @@ onUnmounted(() => {
           <p v-else class="hint">该账号使用品类模式；下方排除类目会在选定的品类范围内继续生效。</p>
           <details v-if="accountDraft.selectionMode !== 'inherit'" class="category-picker">
             <summary>排除类目（本账号）· 已选 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 项</summary>
-            <p class="hint">只影响当前账号；选中上级类目时会排除其下级。账号沿用通用模式时，请到通用设置调整排除类目。</p>
+            <p class="hint">只影响当前账号；“展开下级”不会排除上级。排除三级时按其二级父类目整支排除。</p>
             <div class="category-grid">
               <div v-for="(group, index) in [level1Options, accountExcludedLevel2Options, accountExcludedLevel3Options]" :key="index" class="category-level">
                 <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
                 <div class="category-options">
-                  <label v-for="item in group" :key="item.id" class="category-option">
+                  <div v-for="item in group" :key="item.id" class="category-option">
+                    <label>
                     <input
                       type="checkbox"
                       :checked="accountDraft.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
@@ -6850,8 +8486,10 @@ onUnmounted(() => {
                       @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', ($event.target as HTMLInputElement).checked)"
                     >
                     <span>{{ item.name }}</span>
-                  </label>
-                  <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                    </label>
+                    <button v-if="index < 2" type="button" :disabled="busy" @click="showExcludedCategoryChildren(item.id, (['level1', 'level2'][index] as CategoryLevel), 'account')">展开下级</button>
+                  </div>
+                  <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请在上一级点击“展开下级”' }}</div>
                 </div>
                 <div class="mini-actions">
                   <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'all')">全选</button>
@@ -6949,7 +8587,10 @@ onUnmounted(() => {
     </div>
   </section>
 
-  <section v-else class="selection-page">
+  <section v-else-if="props.active && !selectionUiDataReady" class="selection-page">
+    <p class="hint">正在读取选品设置…</p>
+  </section>
+  <section v-else-if="props.active" class="selection-page">
     <Teleport to="body">
       <div v-if="selectionSettingsDialogOpen" class="selection-settings-dialog-backdrop" @click="closeSelectionSettingsDialog" @keydown.esc.window.stop="closeSelectionSettingsDialog"></div>
     </Teleport>
@@ -6960,11 +8601,18 @@ onUnmounted(() => {
       </div>
       <div class="head-actions">
         <button class="btn" type="button" :disabled="busy" title="在当前客户端内打开居中设置面板" @click="openSelectionSettingsDialog">打开设置面板</button>
-        <button class="btn primary" :disabled="busy || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelectionFromButton">
+        <button v-if="(busy && selectionProgress?.mode === 'batch' && selectionProgress?.state === 'running') || (!busy && recoveryBatch?.state === 'needs_retry') || manualPausePending()" class="btn selection-pause-action" type="button" :disabled="manualPausePending() || manualPauseSaving" @click="requestManualSelectionPause">
+          {{ manualPausePending() ? (busy ? '正在安全暂停…' : '已暂停选品') : '暂停选品' }}
+        </button>
+        <button v-if="recoveryBatch?.state === 'needs_retry'" class="btn selection-end-action" type="button" :disabled="busy || scheduledRetryWaiting || manualPauseSaving" @click="abandonStaleBatch">结束上一批次</button>
+        <button class="btn primary" :disabled="busy || manualPauseSaving || scheduledRetryWaiting || selectionCooldownRemaining > 0 || (recoveryBatch?.state === 'needs_retry' && selectedRecoveryAccounts.length === 0)" @click="startSelectionFromButton">
           {{ selectionCooldownRemaining > 0 ? `冷却中（${selectionCooldownRemaining} 秒）` : accountPathsHaveUnsavedChanges ? '保存设置并开始选品' : recoveryBatch?.state === 'needs_retry' ? '继续选品' : '自动选品一起工作' }}
         </button>
       </div>
     </header>
+    <div v-if="manualPausePending()" class="selection-manual-pause-banner" role="status">
+      {{ busy ? '已请求安全暂停。当前操作返回并保存检查点后，会关闭账号浏览器并停止下一步。' : '本批次已手动暂停；冷却和每日计划不会自动续做。点击“继续选品”恢复。' }}
+    </div>
     <div v-if="accountPathsHaveUnsavedChanges" class="selection-path-warning" role="status">
       <span>账号路径有改动。点击上方按钮会先保存，再开始选品；如果路径填错，可撤销本次修改。</span>
       <button class="btn" type="button" :disabled="busy" @click="discardUnsavedAccountPaths">撤销路径修改</button>
@@ -6974,13 +8622,17 @@ onUnmounted(() => {
       <summary>查看错误详情</summary><pre>{{ selectionErrorPresentation.diagnostic }}</pre>
     </details>
     <p v-if="notice" class="notice selection-top-feedback" role="status">{{ selectionNoticePresentation.userMessage }}</p>
+    <div v-if="savedLocalPools[0]?.recentCount" class="saved-local-pool-banner" role="status">
+      <span>本机已有候选池：{{ savedLocalPools[0].count }} 件已存，{{ savedLocalPools[0].recentCount }} 件在 24 小时内。可先从池内按商品 ID 选品。</span>
+      <button class="btn" type="button" :disabled="busy" @click="openSelectionSettingsDialog">查看并使用</button>
+    </div>
     <details class="client-advanced">
       <summary>每日定时选品：{{ dailySelectionSchedule.enabled ? `已开启，每天 ${dailySelectionSchedule.time}` : '未开启' }}</summary>
     <section class="daily-selection-schedule" aria-label="每日定时选品">
       <div class="daily-selection-copy">
         <strong>每日定时选品</strong>
         <span>{{ dailySelectionSchedule.enabled ? `每天 ${dailySelectionSchedule.time} 为所有启用账号启动当前自动流程` : '关闭中；启用后按每天设定时间自动开始' }}</span>
-        <small>到设定时间自动启动；未登录或需人工验证时暂停，其余失败会保留进度并持续重试直至完成。完成后等待下一天计划；客户端需保持运行，安装版可选登录启动。</small>
+        <small>到设定时间自动启动；用户手动暂停时等待点击“继续选品”，未登录或需人工验证时暂停，其余失败保留进度并持续重试。完成后等待下一天计划；客户端需保持运行，安装版可选登录启动。</small>
       </div>
       <label class="daily-schedule-toggle">
         <input v-model="dailySelectionSchedule.enabled" type="checkbox" :disabled="dailySelectionSchedule.saving" @change="!dailySelectionSchedule.enabled && (dailySelectionSchedule.launchAtLogin = false)">
@@ -7007,9 +8659,49 @@ onUnmounted(() => {
       <p v-else-if="autoResumeAccountId !== null">冷却已结束，正在从保存的检查点自动继续；也可手动点击“继续选品”。</p>
       <p v-else>冷却已结束；当前没有可自动恢复的限流检查点，可在确认页面后重新选品。</p>
     </section>
-    <section v-if="selectionProgress" class="selection-progress-card" :class="selectionProgress.state" aria-live="polite">
+    <section v-if="showCandidatePoolProgress" class="selection-progress-card selection-pool-progress" :class="{ finished: candidatePoolProgress?.status === 'ready', failed: batchProgressPhase === 'pool' && selectionProgress?.state === 'failed' }" aria-live="polite">
       <div class="selection-progress-head">
-        <strong>{{ selectionProgress.mode === 'preview' ? '候选预览进度' : '自动选品进度' }}</strong>
+        <strong>{{ candidatePoolProgress?.status === 'ready' ? '第一阶段 · 共享候选池已完成' : '第一阶段 · 建立共享候选池' }}</strong>
+        <span v-if="candidatePoolProgress?.status === 'ready'">已保存 {{ candidatePoolProgress?.count }}/{{ candidatePoolProgress?.target }} 件唯一商品</span>
+        <span v-else-if="selectionProgress?.state === 'running'">采集与复用检查中</span>
+        <span v-else>检查点待续</span>
+      </div>
+      <template v-if="batchProgressPhase === 'pool' || candidatePoolProgress?.status !== 'ready'">
+        <div class="selection-progress-overall">
+          <strong>{{ candidatePoolProgressPercent === null ? '待读取' : `${candidatePoolProgressPercent}%` }}</strong>
+          <span>已保存 {{ candidatePoolProgress?.count ?? '待读取' }}/{{ candidatePoolProgress?.target || '待读取' }} 件；候选池达标后才开始消费账号</span>
+        </div>
+        <div class="selection-progress-track" role="progressbar"
+          :aria-valuenow="candidatePoolProgressPercent" :aria-valuemin="0" :aria-valuemax="100"
+          :aria-valuetext="`候选池已保存 ${candidatePoolProgress?.count ?? '待读取'}/${candidatePoolProgress?.target || '待读取'} 件`">
+          <span v-if="candidatePoolProgressPercent === null && selectionProgress?.state === 'running'" class="selection-progress-indeterminate"></span>
+          <span v-else-if="candidatePoolProgressPercent !== null" class="selection-progress-fill" :style="{ width: `${candidatePoolProgressPercent}%` }"></span>
+        </div>
+        <p v-if="batchProgressPhase === 'pool' && selectionProgress?.stage" class="selection-progress-message">
+          {{ selectionProgress.stage }}<span v-if="selectionProgress.message"> · {{ selectionProgressPresentation.userMessage }}</span>
+        </p>
+        <div v-if="candidatePoolSourceProgress.length" class="selection-pool-source-progress">
+          <span v-for="source in candidatePoolSourceProgress" :key="source.key">
+            {{ source.label }}：{{ source.collected }}{{ source.target === null ? ' 件' : `/${source.target} 件` }}
+          </span>
+        </div>
+        <details v-if="candidatePoolProgress?.mode === 'quota' && candidatePoolProgress?.quotaProgress.length" class="selection-progress-details">
+          <summary>查看来源与类目配额</summary>
+          <ul class="selection-pool-quota-progress">
+            <li v-for="quota in candidatePoolProgress?.quotaProgress ?? []" :key="quota.ruleId">
+              {{ candidatePoolProgressRuleLabel(quota.ruleId) }}：{{ quota.collected }}/{{ quota.effectiveTarget ?? quota.target }} 件，缺 {{ quota.deficit }} 件
+              <small v-if="quota.transferredIn || quota.transferredOut">（原配额 {{ quota.target }}，转入 {{ quota.transferredIn ?? 0 }}、转出 {{ quota.transferredOut ?? 0 }}）</small>
+            </li>
+          </ul>
+        </details>
+        <details v-if="batchProgressPhase === 'pool' && selectionProgress?.message && selectionProgressPresentation.diagnostic" class="selection-diagnostic">
+          <summary>查看诊断详情</summary><pre>{{ selectionProgressPresentation.diagnostic }}</pre>
+        </details>
+      </template>
+    </section>
+    <section v-if="selectionProgress && (selectionProgress.mode === 'preview' || (batchProgressPhase === 'account' && candidatePoolProgress?.status !== 'collecting'))" class="selection-progress-card" :class="selectionProgress.state" aria-live="polite">
+      <div class="selection-progress-head">
+        <strong>{{ selectionProgress.mode === 'preview' ? '候选预览进度' : candidatePoolProgress ? '第二阶段 · 逐账号处理进度' : '自动选品进度' }}</strong>
         <span v-if="selectionProgress.accountId !== null">
           已处理 {{ selectionProgress.completedAccounts }}/{{ selectionProgress.accountTotal }} 个账号 · 当前 {{ selectionProgress.accountName }}（{{ selectionProgress.accountIndex }}/{{ selectionProgress.accountTotal }}）
         </span>
@@ -7018,13 +8710,14 @@ onUnmounted(() => {
         </span>
       </div>
       <div class="selection-progress-overall">
-        <strong>{{ selectionWorkflowPercent }}%</strong>
+        <strong>{{ selectionWorkflowPercent === null ? selectionProgress.state === 'running' ? '执行中' : '本轮待续' : `${selectionWorkflowPercent}%` }}</strong>
         <span>{{ selectionProgress.stage }}</span>
       </div>
       <div class="selection-progress-track" role="progressbar"
         :aria-valuenow="selectionWorkflowPercent" :aria-valuemin="0" :aria-valuemax="100"
-        :aria-valuetext="`当前账号流程 ${selectionWorkflowPercent}%`">
-        <span class="selection-progress-fill" :style="{ width: `${selectionWorkflowPercent}%` }"></span>
+        :aria-valuetext="selectionWorkflowPercent === null ? selectionProgress.state === 'running' ? '账号阶段执行中' : '账号阶段本轮结束，仍需核对检查点' : `当前账号流程估算 ${selectionWorkflowPercent}%`">
+        <span v-if="selectionWorkflowPercent === null && selectionProgress.state === 'running'" class="selection-progress-indeterminate"></span>
+        <span v-else-if="selectionWorkflowPercent !== null" class="selection-progress-fill" :style="{ width: `${selectionWorkflowPercent}%` }"></span>
       </div>
       <p v-if="selectionProgress.resultSummary" class="selection-progress-result">{{ selectionProgress.resultSummary }}</p>
       <div class="selection-progress-meta">
@@ -7049,7 +8742,7 @@ onUnmounted(() => {
           </span>
           <span v-if="selectionProgress.itemTotal !== null">当前商品 {{ selectionProgress.itemIndex ?? 0 }}/{{ selectionProgress.itemTotal }}</span>
         </div>
-        <small>流程百分比按阶段权重估算；商品计数和可用的阶段比例来自实时回报。</small>
+        <small>{{ candidatePoolProgress && selectionProgress.mode === 'batch' ? '当前账号百分比按阶段权重估算；候选池已存数量以上方落盘结果为准。' : '流程百分比按阶段权重估算；商品计数和可用的阶段比例来自实时回报。' }}</small>
         <p v-if="selectionProgress.message" class="selection-progress-message">{{ selectionProgressPresentation.userMessage }}</p>
         <details v-if="selectionProgress.message && selectionProgressPresentation.diagnostic" class="selection-diagnostic">
           <summary>查看诊断详情</summary><pre>{{ selectionProgressPresentation.diagnostic }}</pre>
@@ -7067,6 +8760,7 @@ onUnmounted(() => {
       <p v-else-if="selectionSettingsDialogOpen && notice" class="notice selection-settings-dialog-feedback" role="status">{{ selectionNoticePresentation.userMessage }}</p>
       <div class="advanced-actions">
         <button class="btn" :disabled="busy || (activeTab === '账号个性化' && accountId === null)" @click="activeTab === '通用设置' ? saveGlobal() : saveAccount()">{{ busy ? '保存中…' : activeTab === '通用设置' ? '保存通用设置' : '保存账号设置' }}</button>
+        <button class="btn" type="button" :disabled="busy" @click="refreshSelectionAccounts()">刷新账号（{{ accounts.length }}）</button>
         <button class="btn" :disabled="busy" @click="previewCandidates">预览候选</button>
       </div>
     <div class="tabs">
@@ -7093,6 +8787,81 @@ onUnmounted(() => {
           </template>
           <button v-if="candidates.length" class="btn" type="button" @click="jumpToSelectionSection('candidate-pool')">候选池 {{ candidates.length }}</button>
         </nav>
+        <section v-if="activeTab === '通用设置' && activeQuotaPool?.rows.length" class="card" aria-label="当前批次候选池商品">
+          <h2>当前批次候选池（{{ activeQuotaPool.rows.length }}/{{ activeQuotaPool.target }}）</h2>
+          <p class="hint">这里显示当前批次检查点已保存的候选商品；查看详情只读取本机数据，不代表消费账号已核验或加车。</p>
+          <label class="active-pool-search">搜索商品 ID 或名称
+            <input v-model="activePoolSearch" type="search" placeholder="输入商品 ID 或名称">
+          </label>
+          <p v-if="!activePoolFilteredItems.length" class="hint">没有找到匹配的商品。</p>
+          <ul v-else class="saved-pool-items">
+            <li v-for="item in activePoolVisibleItems" :key="item.productId">
+              <button type="button" class="candidate-detail-trigger" @click="openCandidateDetails(item, $event)">
+                <strong :title="item.title">{{ item.title }}</strong><small>商品 ID：{{ item.productId }} · {{ localPoolSourceLabels[item.sourceKey ?? ''] ?? item.sourceKey ?? '来源未采集' }}</small>
+              </button>
+            </li>
+          </ul>
+          <div v-if="activePoolFilteredItems.length" class="saved-pool-pagination">
+            <span>共 {{ activePoolFilteredItems.length }} 件 · 第 {{ activePoolPage }}/{{ activePoolPageCount }} 页</span>
+            <button class="btn" type="button" :disabled="activePoolPage <= 1" @click="activePoolPage -= 1">上一页</button>
+            <button class="btn" type="button" :disabled="activePoolPage >= activePoolPageCount" @click="activePoolPage += 1">下一页</button>
+          </div>
+        </section>
+        <section v-if="activeTab === '通用设置'" class="card saved-local-pools" aria-label="本机已有候选池">
+          <div class="section-title">
+            <h2>本机已有候选池</h2>
+            <button class="btn" type="button" :disabled="busy || savedLocalPoolLoading" @click="loadSavedLocalPools">刷新候选池</button>
+          </div>
+          <p class="hint">这里显示已落盘的商品 ID。使用时会把该池的筛选条件保存为当前通用设置，保留当前账号目标与执行设置；启动后先剔除已登记商品，再由当前启用账号逐个核验详情。池内数量不等于已加车数量。</p>
+          <p v-if="savedLocalPoolLoading" class="hint">正在读取本机候选池…</p>
+          <p v-else-if="!savedLocalPools.length" class="hint">本机还没有达到目标并保存的候选池。</p>
+          <article v-for="pool in savedLocalPools.slice(0, 3)" :key="pool.batchId" class="saved-local-pool">
+            <div class="saved-local-pool-heading">
+              <div>
+                <strong>已存 {{ pool.count }} 件 / 原目标 {{ pool.target }} 件</strong>
+                <span>24 小时内 {{ pool.recentCount }} 件 · {{ pool.mode === 'quota' ? '按来源与类目配额' : '总数目标' }}</span>
+                <small>佣金 {{ pool.minimumCommissionRate ?? '不限' }}%–{{ pool.maximumCommissionRate ?? '不限' }}% · 排除类目 {{ pool.excludedCategoryCount }} 项</small>
+                <small>采集于 {{ pool.capturedAt ? new Date(pool.capturedAt).toLocaleString('zh-CN') : '时间未知' }} · 原批次 {{ pool.batchId }}</small>
+              </div>
+              <button class="btn primary" type="button" :disabled="busy || savedLocalPoolLoading || pool.recentCount < 1 || ['in_progress', 'needs_retry'].includes(recoveryBatch?.state ?? '')" @click="useSavedLocalPool(pool)">使用此池开始选品</button>
+            </div>
+            <div class="saved-local-pool-meter" :aria-label="`已存 ${pool.count} 件，原目标 ${pool.target} 件`">
+              <span :style="{ width: `${Math.min(100, Math.round(pool.count / Math.max(1, pool.target) * 100))}%` }"></span>
+            </div>
+            <div class="saved-local-pool-sources">
+              <div v-for="(count, source) in pool.sourceCounts" :key="source">
+                <span>{{ localPoolSourceLabels[source] ?? source }} {{ count }} 件</span>
+                <div class="saved-local-pool-source-meter"><span :style="{ width: `${localPoolSourcePercent(pool, count)}%` }"></span></div>
+              </div>
+            </div>
+            <div class="saved-pool-browser">
+              <button class="btn" type="button" :aria-expanded="savedPoolBrowserBatchId === pool.batchId" @click="toggleSavedPoolBrowser(pool)">
+                {{ savedPoolBrowserBatchId === pool.batchId ? '收起商品列表' : `查看全部 ${pool.count} 件商品` }}
+              </button>
+              <div v-if="savedPoolBrowserBatchId === pool.batchId" class="saved-pool-browser-content">
+                <form class="saved-pool-search" @submit.prevent="loadSavedPoolItems(1)">
+                  <input v-model="savedPoolSearch" type="search" aria-label="按商品 ID 或名称搜索候选池" placeholder="搜索商品 ID 或名称">
+                  <button class="btn" type="submit" :disabled="savedPoolItemsLoading">搜索</button>
+                </form>
+                <p v-if="savedPoolItemsLoading" class="hint" role="status">正在读取商品…</p>
+                <p v-if="savedPoolItemsError" class="error" role="alert">{{ savedPoolItemsError }}</p>
+                <p v-if="!savedPoolItemsLoading && !savedPoolItemsError && !savedPoolItems.length" class="hint">没有找到匹配的商品。</p>
+                <ul v-if="savedPoolItems.length" class="saved-pool-items">
+                  <li v-for="item in savedPoolItems" :key="item.productId">
+                    <button type="button" class="candidate-detail-trigger" @click="openCandidateDetails(item, $event)">
+                      <strong :title="item.title">{{ item.title }}</strong><small>商品 ID：{{ item.productId }} · {{ localPoolSourceLabels[item.sourceKey ?? ''] ?? item.sourceKey ?? '来源未采集' }}</small>
+                    </button>
+                  </li>
+                </ul>
+                <div v-if="savedPoolTotal > 0" class="saved-pool-pagination">
+                  <span>共 {{ savedPoolTotal }} 件 · 第 {{ savedPoolPage }}/{{ savedPoolPageCount }} 页</span>
+                  <button class="btn" type="button" :disabled="savedPoolItemsLoading || savedPoolPage <= 1" @click="loadSavedPoolItems(savedPoolPage - 1)">上一页</button>
+                  <button class="btn" type="button" :disabled="savedPoolItemsLoading || savedPoolPage >= savedPoolPageCount" @click="loadSavedPoolItems(savedPoolPage + 1)">下一页</button>
+                </div>
+              </div>
+            </div>
+          </article>
+        </section>
         <details v-if="notice && selectionNoticePresentation.diagnostic" class="selection-diagnostic">
           <summary>查看诊断详情</summary><pre>{{ selectionNoticePresentation.diagnostic }}</pre>
         </details>
@@ -7123,7 +8892,6 @@ onUnmounted(() => {
               <span class="hint">已选 {{ selectedRecoveryAccounts.length }} / {{ pendingRecoveryAccounts.length }} 个待恢复账号</span>
             </div>
           </div>
-          <button class="btn" :disabled="busy" @click="abandonStaleBatch">结束旧批次并保留检查点</button>
         </section>
         <details v-if="!dialogOnly" class="card failure-log-card">
           <summary>选品过程日志{{ recoveryBatch ? ` · 最近批次 ${recoveryBatch.batchId}` : '' }}</summary>
@@ -7153,12 +8921,13 @@ onUnmounted(() => {
             <template v-if="global.selectionMode === 'general'">
               <details class="category-picker">
                 <summary>排除类目（可选）· 已选 {{ selectedCategoryCount(global.excludedCategorySelection) }} 项</summary>
-                <p class="hint">选中上级类目时会排除其下级；类目未知的商品仍按数据门槛处理。</p>
+                <p class="hint">勾选表示排除；点“展开下级”只浏览，不会排除上级。排除三级时按其二级父类目整支排除。</p>
               <div class="category-grid">
                 <div v-for="(group, index) in [level1Options, excludedLevel2Options, excludedLevel3Options]" :key="index" class="category-level">
                   <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
                   <div class="category-options">
-                    <label v-for="item in group" :key="item.id" class="category-option">
+                    <div v-for="item in group" :key="item.id" class="category-option">
+                      <label>
                       <input
                         type="checkbox"
                         :checked="global.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
@@ -7166,8 +8935,10 @@ onUnmounted(() => {
                         @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', ($event.target as HTMLInputElement).checked)"
                       >
                       <span>{{ item.name }}</span>
-                    </label>
-                    <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                      </label>
+                      <button v-if="index < 2" type="button" :disabled="busy" @click="showExcludedCategoryChildren(item.id, (['level1', 'level2'][index] as CategoryLevel), 'global')">展开下级</button>
+                    </div>
+                    <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请在上一级点击“展开下级”' }}</div>
                   </div>
                   <div class="mini-actions">
                     <button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'global', 'all')">全选</button>
@@ -7251,7 +9022,13 @@ onUnmounted(() => {
               <label v-if="global.candidatePoolMode === 'total'">采集目标商品数<input v-model.number="global.candidatePoolTarget" type="number" min="1" max="2000" step="1"></label>
             </div>
             <template v-if="global.candidatePoolMode === 'quota'">
-              <p class="hint">每行分别达标后才开始各账号选品。规则按显示顺序分配，同一商品只计一次；被排除品类和缺少可核实类目 ID 的商品不计数。</p>
+              <p class="hint">分别填写三个来源的合计目标；下方指定品类配额计入所属来源，剩余数量由该来源其他允许类目补足。总池目标为三个来源之和；若要填 0，先移除该来源的指定品类配额。</p>
+              <div class="form-grid">
+                <label>热点趋势目标件数<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget('hotSpot')" :disabled="busy" @change="setSourceQuotaTarget('hotSpot', ($event.target as HTMLInputElement).value)"></label>
+                <label>联盟榜单目标件数<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget('allianceRank')" :disabled="busy" @change="setSourceQuotaTarget('allianceRank', ($event.target as HTMLInputElement).value)"></label>
+                <label>选品广场目标件数<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget('selectionSquare')" :disabled="busy" @change="setSourceQuotaTarget('selectionSquare', ($event.target as HTMLInputElement).value)"></label>
+              </div>
+              <p class="hint">按下方规则顺序轮流读取来源，重复商品归入先出现且仍缺额的规则；指定品类规则可排在来源余量规则前。每条配额分别达标后才开始账号选品；排除类目及统一筛选条件始终生效，来源确实耗尽后才转移缺额。</p>
               <div v-for="(rule, index) in global.candidatePoolQuotas" :key="rule.id" class="form-grid">
                 <label>来源<select v-model="rule.sourceKey" :disabled="busy">
                   <option value="allianceRank">联盟榜单</option><option value="hotSpot">选品热点</option><option value="selectionSquare">选品广场</option>
@@ -7260,8 +9037,8 @@ onUnmounted(() => {
                   <option>爆款榜</option><option>趋势榜</option><option>带货榜</option><option>常销榜</option>
                 </select></label>
                 <label>品类<select :value="rule.categoryPath.join('|')" :disabled="busy" @change="setQuotaCategory(rule, ($event.target as HTMLSelectElement).value)">
-                  <option value="">选择百应品类</option>
-                  <option v-for="category in quotaCategoryOptions" :key="category.path.join('|')" :value="category.path.join('|')">{{ category.label }}（{{ category.id }}）</option>
+                  <option value="">全部允许类目（来源目标）</option>
+                  <option v-for="category in quotaCategoryOptionsForSource(rule.sourceKey)" :key="category.path.join('|')" :value="category.path.join('|')">{{ category.label }}（{{ category.id }}）</option>
                 </select></label>
                 <label>目标件数<input v-model.number="rule.target" type="number" min="1" max="2000" step="1" :disabled="busy"></label>
                 <div><button type="button" :disabled="busy || index === 0" @click="moveQuotaRule(index, -1)">上移</button>
@@ -7272,7 +9049,10 @@ onUnmounted(() => {
               <p class="hint">配额合计：{{ quotaPoolTarget }} 件（最多 2000 件）。榜单默认爆款榜，可逐行选其他榜单。原有排除品类继续生效。</p>
               <div v-if="activeQuotaPool?.mode === 'quota'">
                 <p v-for="progress in activeQuotaPool.quotaProgress" :key="progress.ruleId" class="hint">
-                  {{ quotaProgressLabel(progress.ruleId) }}：{{ progress.collected }}/{{ progress.target }}，缺 {{ progress.deficit }} 件
+                  {{ quotaProgressLabel(progress.ruleId) }}：{{ progress.collected }}/{{ progress.effectiveTarget ?? progress.target }}，原配额 {{ progress.target }}，转入 {{ progress.transferredIn ?? 0 }}、转出 {{ progress.transferredOut ?? 0 }}，缺 {{ progress.deficit }} 件
+                </p>
+                <p v-for="(transfer, index) in activeQuotaPool.quotaTransfers ?? []" :key="`${transfer.fromRuleId}-${transfer.toRuleId}-${index}`" class="hint">
+                  缺额转移：{{ quotaProgressLabel(transfer.fromRuleId) }} → {{ quotaProgressLabel(transfer.toRuleId) }}，{{ transfer.count }} 件
                 </p>
               </div>
             </template>
@@ -7312,12 +9092,13 @@ onUnmounted(() => {
             <p v-else class="hint">该账号使用品类模式；下方排除类目会在选定的品类范围内继续生效。</p>
             <details v-if="accountDraft.selectionMode !== 'inherit'" class="category-picker">
               <summary>排除类目（本账号）· 已选 {{ selectedCategoryCount(accountDraft.excludedCategorySelection) }} 项</summary>
-              <p class="hint">只影响当前账号；选中上级类目时会排除其下级。账号沿用通用模式时，请到通用设置调整排除类目。</p>
+            <p class="hint">只影响当前账号；“展开下级”不会排除上级。排除三级时按其二级父类目整支排除。</p>
               <div class="category-grid">
                 <div v-for="(group, index) in [level1Options, accountExcludedLevel2Options, accountExcludedLevel3Options]" :key="index" class="category-level">
                   <label>{{ ['排除一级类目', '排除二级类目', '排除三级类目'][index] }}</label>
                   <div class="category-options">
-                    <label v-for="item in group" :key="item.id" class="category-option">
+                    <div v-for="item in group" :key="item.id" class="category-option">
+                      <label>
                       <input
                         type="checkbox"
                         :checked="accountDraft.excludedCategorySelection[(['level1', 'level2', 'level3'][index] as CategoryLevel)].includes(item.id)"
@@ -7325,8 +9106,10 @@ onUnmounted(() => {
                         @change="toggleExcludedCategory(item.id, (['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', ($event.target as HTMLInputElement).checked)"
                       >
                       <span>{{ item.name }}</span>
-                    </label>
-                    <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请先选择上一级排除类目' }}</div>
+                      </label>
+                      <button v-if="index < 2" type="button" :disabled="busy" @click="showExcludedCategoryChildren(item.id, (['level1', 'level2'][index] as CategoryLevel), 'account')">展开下级</button>
+                    </div>
+                  <div v-if="!group.length" class="category-empty">{{ index === 0 ? '登录百应后等待类目捕获' : '请在上一级点击“展开下级”' }}</div>
                   </div>
                   <div class="mini-actions"><button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'all')">全选</button><button :disabled="busy || !group.length" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'invert')">反选</button><button :disabled="busy" @click="excludedCategoryAction((['level1', 'level2', 'level3'][index] as CategoryLevel), 'account', 'clear')">清空</button></div>
                 </div>
@@ -7425,10 +9208,11 @@ onUnmounted(() => {
               </span>
             </details>
           </div>
-          <label v-for="candidate in candidates" :key="candidate.productId" class="candidate-row">
+          <div v-for="candidate in candidates" :key="candidate.productId" class="candidate-row">
             <input type="checkbox" :checked="candidate.selected" disabled>
-            <span class="candidate-main"><b>{{ candidate.title }}</b><small>商品 ID：{{ candidate.productId }} · 月销：{{ candidate.monthSales ?? '平台未提供' }} · 佣金：{{ candidate.commissionRate ?? '平台未提供' }}% · 体验分：{{ candidate.dataMetrics?.experienceScore ?? candidate.shopScore ?? '平台未提供' }} · {{ candidate.trendRising ? '走势上升' : '走势未确认上升' }}</small><small v-if="candidate.detailCapturedAt || candidate.analysisScore !== undefined || candidate.unifiedScore !== undefined">统一分：{{ candidate.unifiedScore ?? candidate.analysisScore ?? '暂无可评分实测数据' }}/100<span v-if="candidate.hotOrRankBoost">（热点/榜单加权 +{{ candidate.hotOrRankBoost }}）</span><span v-if="candidate.businessPriorityBoost">（经营推荐加权 +{{ candidate.businessPriorityBoost }}）</span> · 数据覆盖 {{ candidate.analysisCoverage ?? 0 }}/{{ candidate.analysisMetricCount ?? 0 }} 项 · {{ candidate.analysisStatus ?? '已分析' }}<span v-if="candidate.status"> · {{ candidate.status }}</span></small><details v-if="candidate.analysisReasons?.length" class="candidate-analysis" @click.stop><summary>查看数据分析依据</summary><small>{{ candidate.analysisReasons.join('；') }}</small></details><small v-if="candidate.sources?.length" class="source-badges">来源命中：{{ candidateSourceLabels(candidate) }}</small><small v-if="candidate.categoryStatus === '类目未知'" class="warning">类目未知；通用数据模式可按数据门槛参与，品类推荐不计入</small><small v-if="candidate.publicationLock" class="warning">{{ productPublishLockLabel(candidate.publicationLock) }}</small></span>
-          </label>
+            <span class="candidate-main"><b :title="candidate.title">{{ candidate.title }}</b><small>商品 ID：{{ candidate.productId }} · 月销：{{ candidate.monthSales ?? '平台未提供' }} · 佣金：{{ candidate.commissionRate ?? '平台未提供' }}% · 体验分：{{ candidate.dataMetrics?.experienceScore ?? candidate.shopScore ?? '平台未提供' }} · {{ candidate.trendRising ? '走势上升' : '走势未确认上升' }}</small><small v-if="candidate.detailCapturedAt || candidate.analysisScore !== undefined || candidate.unifiedScore !== undefined">统一分：{{ candidate.unifiedScore ?? candidate.analysisScore ?? '暂无可评分实测数据' }}/100<span v-if="candidate.hotOrRankBoost">（热点/榜单加权 +{{ candidate.hotOrRankBoost }}）</span><span v-if="candidate.businessPriorityBoost">（经营推荐加权 +{{ candidate.businessPriorityBoost }}）</span> · 数据覆盖 {{ candidate.analysisCoverage ?? 0 }}/{{ candidate.analysisMetricCount ?? 0 }} 项 · {{ candidate.analysisStatus ?? '已分析' }}<span v-if="candidate.status"> · {{ candidate.status }}</span></small><details v-if="candidate.analysisReasons?.length" class="candidate-analysis" @click.stop><summary>查看数据分析依据</summary><small>{{ candidate.analysisReasons.join('；') }}</small></details><small v-if="candidate.sources?.length" class="source-badges">来源命中：{{ candidateSourceLabels(candidate) }}</small><small v-if="candidate.categoryStatus === '类目未知'" class="warning">类目未知；通用数据模式可按数据门槛参与，品类推荐不计入</small><small v-if="candidate.publicationLock" class="warning">{{ productPublishLockLabel(candidate.publicationLock) }}</small></span>
+            <button class="btn candidate-detail-action" type="button" @click="openCandidateDetails(candidate, $event)">查看详情</button>
+          </div>
         </section>
       </div>
 
@@ -7447,6 +9231,24 @@ onUnmounted(() => {
       </footer>
       </div>
     </details>
+    <Teleport to="body">
+      <section v-if="candidateDetails" class="candidate-detail-mask" @click.self="closeCandidateDetails" @keydown.esc.window.stop="closeCandidateDetails">
+        <div class="candidate-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="candidate-detail-title">
+          <header class="candidate-detail-head">
+            <div><h2 id="candidate-detail-title">候选商品详情</h2><p>本机已保存的信息；消费账号仍须按精确商品 ID 核验后才能加车。</p></div>
+            <button ref="candidateDetailsCloseButton" class="btn" type="button" aria-label="关闭候选商品详情" @click="closeCandidateDetails">关闭</button>
+          </header>
+          <div class="candidate-detail-body">
+            <section v-for="group in candidateDetailGroups" :key="group.title" class="candidate-detail-group">
+              <h3>{{ group.title }}</h3>
+              <dl class="candidate-detail-fields">
+                <div v-for="field in group.fields" :key="field.label"><dt>{{ field.label }}</dt><dd>{{ field.value }}</dd></div>
+              </dl>
+            </section>
+          </div>
+        </div>
+      </section>
+    </Teleport>
     <Teleport to="body">
       <section
         v-if="bannedWordsDialogOpen"
@@ -7608,6 +9410,12 @@ onUnmounted(() => {
 .selection-settings-dialog-footer > div { display: flex; gap: 8px; }
 .page-head { position: relative; z-index: 3; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 4px 0; background: var(--bg-app); }
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.selection-pause-action, .selection-end-action { min-height: 36px; padding: 7px 14px; font-weight: 700; }
+.selection-pause-action { border-color: #d97706; background: #fff4dd; color: #824900; }
+.selection-pause-action:hover:not(:disabled) { border-color: #b45309; background: #ffebbd; }
+.selection-end-action { border-color: #dc2626; background: #fff1f1; color: #991b1b; }
+.selection-end-action:hover:not(:disabled) { border-color: #b91c1c; background: #ffe0e0; }
+.selection-manual-pause-banner { margin: 8px 0; padding: 11px 13px; border: 1px solid #d97706; border-radius: var(--radius); background: #fff8e8; color: #704b00; font-size: 12px; font-weight: 600; line-height: 1.5; }
 .daily-selection-schedule { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 11px 14px; border: 1px solid #cfdef8; border-radius: var(--radius); background: linear-gradient(110deg, #f5f9ff, #ffffff); font-size: 12px; box-shadow: var(--shadow-card); }
 .daily-selection-copy { display: flex; flex-direction: column; gap: 3px; min-width: 190px; margin-right: auto; }
 .daily-selection-copy span, .daily-schedule-login-hint { color: var(--text-muted); }
@@ -7624,7 +9432,7 @@ onUnmounted(() => {
 .account-statuses summary { width: fit-content; cursor: pointer; }
 .account-statuses span { display: inline-flex; margin: 7px 14px 0 0; }
 .global-download-path { margin-top: 10px; }
-.selection-progress-card { padding: 11px 13px; border: 1px solid #93c5fd; border-radius: var(--radius); background: #eff6ff; color: #1e3a8a; }
+.selection-progress-card { padding: 11px 13px; border: 1px solid #93c5fd; border-radius: var(--radius); background: var(--brand-soft); color: #1e3a8a; }
 .selection-progress-card.finished { border-color: #86efac; background: #f0fdf4; color: #166534; }
 .selection-progress-card.failed { border-color: #fecaca; background: #fef2f2; color: #991b1b; }
 .selection-cooldown { margin: 10px 0; padding: 11px 13px; border: 1px solid #f0c36d; border-radius: var(--radius); background: #fff8e8; color: #704b00; }
@@ -7634,16 +9442,19 @@ onUnmounted(() => {
 .selection-diagnostic pre { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .selection-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .selection-progress-head span, .selection-progress-card small, .selection-progress-message { color: var(--text-muted); font-size: 11px; }
+.selection-pool-progress { margin-bottom: 8px; }
+.selection-pool-source-progress { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 9px; color: var(--text-muted); font-size: 12px; }
+.selection-pool-quota-progress { display: grid; gap: 5px; margin: 7px 0 0; padding-left: 19px; color: var(--text); font-size: 12px; }
 .selection-progress-overall { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-top: 8px; }
 .selection-progress-overall strong { flex: 0 0 auto; font-size: 24px; line-height: 1; }
 .selection-progress-overall span { min-width: 0; overflow: hidden; color: var(--text-muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .selection-progress-track { position: relative; height: 7px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: rgba(59, 130, 246, .16); }
-.selection-progress-fill { display: block; height: 100%; border-radius: inherit; background: #3478f6; transition: width .2s ease; }
+.selection-progress-fill { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .2s ease; }
 .selection-progress-card.failed .selection-progress-fill { background: #dc2626; }
-.selection-progress-indeterminate { position: absolute; inset: 0 auto 0 0; width: 35%; border-radius: inherit; background: #3478f6; animation: selection-progress-slide 1.2s ease-in-out infinite alternate; }
+.selection-progress-indeterminate { position: absolute; inset: 0 auto 0 0; width: 35%; border-radius: inherit; background: var(--brand); animation: selection-progress-slide 1.2s ease-in-out infinite alternate; }
 .selection-progress-steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 5px 8px; margin: 9px 0 0; padding: 0; list-style: none; }
 .selection-progress-steps li { display: flex; align-items: center; min-width: 0; gap: 7px; padding: 5px 7px; border: 1px solid rgba(100, 116, 139, .16); border-radius: 6px; color: var(--text-muted); background: rgba(255, 255, 255, .48); font-size: 11px; }
-.selection-progress-steps li.running { border-color: #93c5fd; color: #1d4ed8; background: rgba(219, 234, 254, .7); }
+.selection-progress-steps li.running { border-color: #93c5fd; color: var(--brand); background: rgba(219, 234, 254, .7); }
 .selection-progress-steps li.completed { color: #15803d; }
 .selection-progress-steps li.failed { border-color: #fca5a5; color: #b91c1c; background: rgba(254, 226, 226, .6); }
 .selection-progress-step-marker { display: inline-flex; flex: 0 0 19px; width: 19px; height: 19px; align-items: center; justify-content: center; border-radius: 50%; background: rgba(100, 116, 139, .12); font-size: 10px; font-weight: 700; }
@@ -7693,6 +9504,8 @@ onUnmounted(() => {
 .category-level > label, .form-grid label, .path-field { display: flex; flex-direction: column; gap: 5px; color: var(--text-muted); font-size: 12px; }
 .category-options { width: 100%; height: 132px; box-sizing: border-box; overflow: auto; padding: 5px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-app); }
 .category-option { display: flex !important; flex-direction: row !important; align-items: center; gap: 7px !important; min-height: 24px; padding: 2px 4px; border-radius: 4px; color: var(--text) !important; cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto 28px; }
+.category-option > label { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; cursor: pointer; }
+.category-option > button { border: 0; background: transparent; color: var(--brand); font-size: 11px; white-space: nowrap; cursor: pointer; }
 .category-option:hover { background: var(--brand-soft); }
 .category-option input { margin: 0; }
 .category-empty { padding: 8px 4px; color: var(--text-muted); font-size: 12px; }
@@ -7722,10 +9535,12 @@ onUnmounted(() => {
 .platform-filter-multi .check-row { margin: 0; font-size: 12px; }
 .filter-chip { display: inline-flex; align-items: center; gap: 5px; padding: 5px 9px; border: 1px solid var(--border); border-radius: 16px; color: var(--text); cursor: pointer; }
 .filter-chip:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); }
-.candidate-row { display: flex; align-items: flex-start; gap: 9px; padding: 9px 2px; border-top: 1px solid var(--border); cursor: pointer; content-visibility: auto; contain-intrinsic-size: auto 120px; }
+.candidate-row { display: flex; align-items: flex-start; gap: 8px; padding: 7px 2px; border-top: 1px solid var(--border); content-visibility: auto; contain-intrinsic-size: auto 120px; }
 .candidate-row > input { margin-top: 3px; }
+.candidate-main { flex: 1; min-width: 0; }
+.candidate-detail-action { flex: 0 0 auto; align-self: center; }
 .candidate-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.candidate-main b { overflow-wrap: anywhere; color: var(--text); font-size: 13px; }
+.candidate-main b { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; color: var(--text); font-size: 13px; }
 .candidate-main small { color: var(--text-muted); font-size: 11px; }
 .candidate-analysis { color: var(--text-muted); font-size: 11px; }
 .candidate-analysis summary { cursor: pointer; }
@@ -7780,6 +9595,47 @@ onUnmounted(() => {
 .notice { background: var(--brand-soft); color: var(--text); }
 .error { background: #fdecea; color: #b73b2f; }
 .recovery-card { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin: 8px 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.saved-local-pools { margin: 10px 0; }
+.saved-local-pool-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text); font-size: 13px; }
+.saved-local-pools > .hint { margin: 7px 0; }
+.saved-local-pool { margin-top: 9px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.saved-local-pool-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+.saved-local-pool-heading > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.saved-local-pool-heading span, .saved-local-pool-heading small { color: var(--text-muted); }
+.saved-local-pool-heading small { overflow-wrap: anywhere; }
+.saved-local-pool-meter, .saved-local-pool-source-meter { height: 8px; overflow: hidden; border-radius: 99px; background: var(--border); }
+.saved-local-pool-meter { margin: 10px 0; }
+.saved-local-pool-meter > span, .saved-local-pool-source-meter > span { display: block; height: 100%; border-radius: inherit; background: var(--brand); }
+.saved-local-pool-sources { display: flex; flex-wrap: wrap; gap: 8px; }
+.saved-local-pool-sources > div { min-width: 130px; flex: 1 1 130px; font-size: 12px; color: var(--text-muted); }
+.saved-local-pool-source-meter { height: 5px; margin-top: 4px; }
+.saved-pool-browser { margin-top: 12px; }
+.saved-pool-browser-content { margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
+.active-pool-search { display: flex; flex-direction: column; gap: 6px; max-width: 380px; margin-top: 12px; color: var(--text-muted); font-size: 12px; }
+.active-pool-search input { min-height: 32px; padding: 5px 9px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--bg-panel); color: var(--text); }
+.saved-pool-search { display: flex; gap: 8px; }
+.saved-pool-search input { flex: 1; min-width: 0; min-height: 32px; padding: 5px 9px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--bg-app); color: var(--text); }
+.active-pool-search input:focus-visible, .saved-pool-search input:focus-visible, .candidate-detail-trigger:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.saved-pool-items { list-style: none; margin: 10px 0 0; padding: 0; max-height: 320px; overflow: auto; }
+.saved-pool-items li + li { border-top: 1px solid var(--border); }
+.candidate-detail-trigger { display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 7px 4px; border: 0; border-radius: var(--radius-control); background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+.candidate-detail-trigger:hover { background: var(--brand-soft); }
+.candidate-detail-trigger strong { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.candidate-detail-trigger small { color: var(--text-muted); overflow-wrap: anywhere; }
+.saved-pool-pagination { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--text-muted); }
+.saved-pool-pagination span { margin-right: auto; }
+.candidate-detail-mask { position: fixed; inset: 0; z-index: 1400; display: grid; place-items: center; padding: 16px; background: rgb(29 29 31 / 40%); }
+.candidate-detail-dialog { display: flex; flex-direction: column; width: min(860px, 100%); max-height: min(90vh, 900px); overflow: hidden; border: 1px solid var(--border); border-radius: 20px; background: var(--bg-panel); color: var(--text); box-shadow: var(--shadow-float); }
+.candidate-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 17px 19px 12px; border-bottom: 1px solid var(--border); }
+.candidate-detail-head h2 { margin: 0; font-size: 19px; }
+.candidate-detail-head p { margin: 6px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+.candidate-detail-body { display: grid; gap: 12px; overflow: auto; padding: 16px 19px 20px; }
+.candidate-detail-group { padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-app); }
+.candidate-detail-group h3 { margin: 0 0 10px; font-size: 14px; }
+.candidate-detail-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 18px; margin: 0; }
+.candidate-detail-fields > div { min-width: 0; }
+.candidate-detail-fields dt { margin-bottom: 3px; color: var(--text-muted); font-size: 11px; }
+.candidate-detail-fields dd { margin: 0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .recovery-card p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
 .recovery-account-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
 .recovery-account-option, .recovery-account-completed { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 4px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); color: var(--text); font-size: 12px; }
@@ -7803,7 +9659,7 @@ onUnmounted(() => {
 .run-log-action strong { color: var(--text); font-size: 12px; }
 .run-log-level { display: inline-flex; align-items: center; min-height: 20px; padding: 1px 7px; border-radius: 10px; font-size: 10px; }
 .run-log-level.is-success { background: #e7f6ee; color: #087443; }
-.run-log-level.is-info { background: #eaf1ff; color: #2458a6; }
+.run-log-level.is-info { background: var(--brand-soft); color: var(--brand); }
 .run-log-level.is-warning { background: #fff4dc; color: #9a6700; }
 .run-log-level.is-error { background: #fdecea; color: #a33125; }
 .run-log-message { margin: 5px 0; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -7825,10 +9681,40 @@ onUnmounted(() => {
   .browser-panel { order: 2; flex: 0 1 180px; width: 100%; max-height: 240px; overflow: auto; }
   .settings-jumps { position: static; }
 }
+@media (max-width: 650px) {
+  .candidate-row { flex-wrap: wrap; }
+  .candidate-detail-action { margin-left: 22px; }
+  .candidate-detail-fields { grid-template-columns: minmax(0, 1fr); }
+  .candidate-detail-head, .candidate-detail-body { padding-left: 14px; padding-right: 14px; }
+}
 @media (max-height: 700px) {
   .browser-panel { max-height: 150px; }
   .card { margin-bottom: 8px; padding: 11px; }
   .account-settings-mask { padding: 8px; }
   .account-settings-dialog { height: calc(100vh - 16px); max-height: calc(100vh - 16px); }
 }
+/* 设置弹窗与候选池保持清晰层级，避免高密度配置变得拥挤。 */
+.selection-page { gap: 12px; }
+.page-head { padding: 7px 2px 10px; }
+.page-head h1 { font-size: 24px; letter-spacing: -.03em; }
+.selection-settings-dialog-backdrop { background: rgb(29 29 31 / 40%); backdrop-filter: none; }
+.selection-settings-advanced--dialog { border-radius: 20px; box-shadow: var(--shadow-float); }
+.selection-settings-advanced--dialog > summary { font-size: 19px; letter-spacing: -.02em; }
+.selection-settings-dialog-close { border-radius: var(--radius-control); }
+.settings-jumps { gap: 7px; padding: 9px 2px; background: var(--bg-panel); }
+.card { margin-bottom: 12px; padding: 16px; }
+.card h2 { font-size: 16px; letter-spacing: -.01em; }
+.form-grid { gap: 10px; }
+.form-grid input, .form-grid select, .path-field input, .account-select { min-height: 32px; border-radius: var(--radius-control); background: var(--bg-panel); }
+.form-grid textarea { border-radius: var(--radius-control); background: var(--bg-panel); }
+.btn { min-height: 32px; border-radius: var(--radius-control); }
+.selection-pause-action, .selection-end-action { min-height: 36px; }
+.btn.primary { border-color: var(--brand); background: var(--brand); color: #fff; }
+.filter-chip { border-radius: 999px; }
+.banned-words-dialog, .login-preflight-dialog { border-radius: 20px; box-shadow: var(--shadow-float); }
+.account-settings-dialog { border-radius: 20px; box-shadow: var(--shadow-float); }
+.account-settings-mask, .banned-words-mask, .login-preflight-mask { background: rgb(29 29 31 / 40%); }
+.selection-progress-card { padding: 14px 16px; }
+.selection-progress-steps { gap: 8px; }
+.selection-progress-steps li { border-radius: var(--radius-control); }
 </style>

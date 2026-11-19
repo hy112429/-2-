@@ -25,12 +25,12 @@ defineProps<{
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 0 16px;
+  padding: 0 14px;
   background: var(--bg-status);
   border-top: 1px solid var(--border);
   color: var(--text-muted);
   font-size: 12px;
-  box-shadow: 0 -2px 10px rgba(28, 50, 89, .035);
+  box-shadow: 0 -1px 0 rgba(0, 0, 0, .025);
   /* 路径可能要选中复制，这里放开文本选择 */
   user-select: text;
 }
@@ -45,16 +45,16 @@ defineProps<{
 }
 
 .status-details { position: relative; }
-.status-details summary { cursor: pointer; color: #687894; }
-.status-popover { position: absolute; z-index: 5; bottom: 25px; left: 0; display: flex; flex-direction: column; gap: 6px; width: min(440px, 75vw); padding: 12px; border: 1px solid var(--border); border-radius: 7px; background: #fff; box-shadow: var(--shadow-card); color: var(--text); overflow-wrap: anywhere; }
+.status-details summary { cursor: pointer; color: var(--text-muted); }
+.status-popover { position: absolute; z-index: 5; bottom: 28px; left: 0; display: flex; flex-direction: column; gap: 6px; width: min(440px, 75vw); padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: #fff; box-shadow: var(--shadow-float); color: var(--text); overflow-wrap: anywhere; }
 
 .state {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: #24825e;
+  color: var(--success);
   white-space: nowrap;
 }
-.state::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #3aaf7b; }
+.state::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
 </style>

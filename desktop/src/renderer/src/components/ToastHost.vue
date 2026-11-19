@@ -26,7 +26,7 @@ import { appNotifications, dismissAllNotifications, dismissNotification } from '
   position: fixed;
   z-index: 9999;
   top: calc(var(--h-top, 48px) + 12px);
-  right: 18px;
+  right: 22px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -35,7 +35,7 @@ import { appNotifications, dismissAllNotifications, dismissNotification } from '
   overflow: auto;
   pointer-events: none;
 }
-.clear-all { align-self: flex-end; padding: 3px 9px; border: 1px solid var(--border); border-radius: 999px; background: #fff; color: var(--text-muted); font-size: 11px; box-shadow: var(--shadow-card); pointer-events: auto; }
+.clear-all { align-self: flex-end; padding: 5px 11px; border: 1px solid var(--border); border-radius: 999px; background: #fff; color: var(--text-muted); font-size: 11px; box-shadow: var(--shadow-card); pointer-events: auto; }
 .clear-all:hover { color: var(--brand); border-color: var(--brand); }
 
 .toast {
@@ -43,20 +43,20 @@ import { appNotifications, dismissAllNotifications, dismissNotification } from '
   grid-template-columns: 22px minmax(0, 1fr) 24px;
   align-items: start;
   gap: 9px;
-  padding: 12px;
-  border: 1px solid #d7deea;
-  border-left: 4px solid #64748b;
-  border-radius: var(--radius);
+  padding: 14px 15px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-muted);
+  border-radius: 14px;
   background: #fff;
   box-shadow: var(--shadow-float);
-  color: #344054;
+  color: var(--text);
   pointer-events: auto;
 }
 
-.toast.success { border-left-color: #16a34a; }
-.toast.info { border-left-color: #397af5; }
-.toast.warning { border-left-color: #d97706; }
-.toast.error { border-left-color: #dc2626; }
+.toast.success { border-left-color: var(--success); }
+.toast.info { border-left-color: var(--brand); }
+.toast.warning { border-left-color: var(--warning); }
+.toast.error { border-left-color: var(--danger); }
 
 .toast-icon {
   display: grid;
@@ -71,7 +71,7 @@ import { appNotifications, dismissAllNotifications, dismissNotification } from '
 }
 
 .success .toast-icon { background: #dcfce7; color: #15803d; }
-.info .toast-icon { background: #dbeafe; color: #1d4ed8; }
+.info .toast-icon { background: #dbeafe; color: var(--brand); }
 .warning .toast-icon { background: #fef3c7; color: #b45309; }
 .error .toast-icon { background: #fee2e2; color: #b91c1c; }
 
@@ -92,13 +92,13 @@ import { appNotifications, dismissAllNotifications, dismissNotification } from '
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: #667085;
+  color: var(--text-muted);
   cursor: pointer;
   font-size: 20px;
   line-height: 1;
 }
 
-.toast button:hover { background: #f2f4f7; color: #344054; }
+.toast button:hover { background: #f2f4f7; color: var(--text); }
 .toast-enter-active, .toast-leave-active, .toast-move { transition: opacity 160ms ease, transform 160ms ease; }
 .toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(14px); }
 .toast-leave-active { position: absolute; right: 0; left: 0; }

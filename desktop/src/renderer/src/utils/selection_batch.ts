@@ -215,7 +215,8 @@ export function isUnconfirmedLoginFalseNegative(value: unknown): boolean {
     const message = String(item.message ?? '')
     const classification = classifySelectionError(message)
     if (classification === 'ACCOUNT_SWITCH_CAPTCHA' || classification === 'ACCOUNT_SWITCH_DISCONNECT' ||
-      classification === 'BAIYING_RATE_LIMIT') return false
+      classification === 'BAIYING_RATE_LIMIT' || classification === 'BAIYING_NETWORK_ERROR' ||
+      classification === 'BAIYING_11001_UNCONFIRMED') return false
     return /页面已?(?:打开|开).{0,50}(?:未识别到|未确认|无法确认).{0,50}(?:登录|工作台)|未识别到足以确认登录.{0,30}工作台/i.test(message)
   })
 }
@@ -445,18 +446,20 @@ export function getSelectionRecoveryMode(
   completed: readonly Record<string, unknown>[]
 ): { resumeAfterCart: boolean; resumeCart: boolean } {
   const hasCartFailure = completed.some((item) => item.cartAdded !== true && item.skipped !== true)
+  const hasConfirmedCart = completed.some((item) => item.cartAdded === true)
   const isAfterCartStage = stage === 'quota_cart' || stage === 'video_pending'
   return {
-    resumeAfterCart: isAfterCartStage && completed.length > 0 && !hasCartFailure,
+    resumeAfterCart: isAfterCartStage && hasConfirmedCart && !hasCartFailure,
     resumeCart: hasCandidateCheckpoint && (
       stage === 'cart_pending' || (isAfterCartStage && hasCartFailure)
     )
   }
 }
 
-/** 百应限流和登录失效保留检查点；验证码、断连等人工闸门仍停止本账号。 */
+/** 百应可恢复的 11001 和登录失效保留检查点；验证码、断连等人工闸门仍停止本账号。 */
 export function getSelectionErrorRecoveryState(reason: string): 'needs_retry' | 'failed' {
-  return ['BAIYING_RATE_LIMIT', 'ACCOUNT_SWITCH_LOGIN'].includes(classifySelectionError(reason) ?? '')
+  return ['BAIYING_RATE_LIMIT', 'BAIYING_NETWORK_ERROR', 'BAIYING_11001_UNCONFIRMED',
+    'ACCOUNT_SWITCH_LOGIN'].includes(classifySelectionError(reason) ?? '')
     ? 'needs_retry'
     : 'failed'
 }

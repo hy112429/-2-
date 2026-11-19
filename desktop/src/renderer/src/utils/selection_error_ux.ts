@@ -1,5 +1,7 @@
 export type SelectionErrorClassification =
   | 'BAIYING_RATE_LIMIT'
+  | 'BAIYING_NETWORK_ERROR'
+  | 'BAIYING_11001_UNCONFIRMED'
   | 'CATEGORY_FILTER_APPLY_FAILED'
   | 'ACCOUNT_SWITCH_CAPTCHA'
   | 'ACCOUNT_SWITCH_LOGIN'
@@ -68,6 +70,19 @@ function rawMessage(input: unknown): { message: string; diagnostic: string; expl
 
 function classify(input: unknown, raw: string, explicitClassification: string): SelectionErrorClassification | undefined {
   const combined = `${explicitClassification}\n${raw}`.toUpperCase()
+  if (/BAIYING_NETWORK_ERROR/i.test(explicitClassification)) return 'BAIYING_NETWORK_ERROR'
+  if (/BAIYING_11001_UNCONFIRMED/i.test(explicitClassification)) return 'BAIYING_11001_UNCONFIRMED'
+  if (/百应商品搜索返回\s*11001/i.test(combined)) {
+    // 旧日志的“限流”是客户端生成的文案；只有平台响应说明能证明错误类别。
+    const platformMessage = combined.match(/百应响应说明[:：]([^；\n]{0,160})/i)?.[1] ?? ''
+    if (/限流|频控|选品(?:太多|过多)|(?:请求|访问|操作)(?:过多|太多|频繁|太频繁|过于频繁)|RATE[_ -]?LIMIT|TOO MANY REQUESTS|FREQUENCY CONTROL/i.test(platformMessage)) {
+      return 'BAIYING_RATE_LIMIT'
+    }
+    if (/网络(?:不稳定|错误|异常|故障|超时)|网络连接(?:失败|异常)/i.test(platformMessage)) {
+      return 'BAIYING_NETWORK_ERROR'
+    }
+    return 'BAIYING_11001_UNCONFIRMED'
+  }
   if (
     /BAIYING_RATE_LIMIT|11001|RATE[_ -]?LIMIT|TOO MANY REQUESTS|TOO MANY SELECTIONS|REQUEST TOO FREQUENT|FREQUENCY CONTROL/i.test(combined) ||
     /百应.{0,12}(限流|冷却|频控|选品太多|请求过多|请求太多|请求频繁|访问频繁|操作频繁)|(?:限流|冷却|频控|请求频繁|访问频繁|操作频繁).{0,12}百应|(?:选品太多|选品过多|请求过多|请求太多|接口请求过多|请求频繁|访问频繁|操作频繁|操作过于频繁)/i.test(combined)
@@ -121,7 +136,7 @@ function numericSeconds(value: unknown): number | undefined {
   return Math.min(3_600, Math.ceil(parsed))
 }
 
-function cooldownSeconds(input: unknown, raw: string): number {
+function cooldownSeconds(input: unknown, raw: string, fallback = 60, allowLooseDuration = true): number {
   const record = asRecord(input)
   const nested = asRecord(record?.data)
   for (const value of [
@@ -137,14 +152,14 @@ function cooldownSeconds(input: unknown, raw: string): number {
   }
   const patterns = [
     /(?:还需|剩余|冷却(?:剩余)?)(?:约)?\s*(\d+(?:\.\d+)?)\s*秒/i,
-    /约\s*(\d+(?:\.\d+)?)\s*秒/i,
-    /(\d+(?:\.\d+)?)\s*秒/i
+    /约\s*(\d+(?:\.\d+)?)\s*秒/i
   ]
+  if (allowLooseDuration) patterns.push(/(\d+(?:\.\d+)?)\s*秒/i)
   for (const pattern of patterns) {
     const match = raw.match(pattern)
-    if (match) return numericSeconds(match[1]) ?? 60
+    if (match) return numericSeconds(match[1]) ?? fallback
   }
-  return 60
+  return fallback
 }
 
 function hasTechnicalDetails(value: string, input: unknown, explicitClassification: string): boolean {
@@ -169,6 +184,22 @@ function safeUnwrappedMessage(value: string): string {
 export function toUserSelectionError(input: unknown): UserSelectionError {
   const extracted = rawMessage(input)
   const classification = classifySelectionError(input)
+  if (classification === 'BAIYING_NETWORK_ERROR' || classification === 'BAIYING_11001_UNCONFIRMED') {
+    const networkError = classification === 'BAIYING_NETWORK_ERROR'
+    const seconds = cooldownSeconds(input, `${extracted.message}\n${extracted.diagnostic}`, networkError ? 30 : 60, false)
+    const pausedByUser = /手动暂停|等待点击.{0,8}继续选品/.test(extracted.message)
+    const nextStep = pausedByUser
+      ? '已手动暂停，等待点击“继续选品”。'
+      : `客户端约 ${seconds} 秒后自动续选。`
+    return {
+      userMessage: networkError
+        ? `百应商品搜索提示网络错误；${nextStep}`
+        : `百应商品搜索返回 11001，原因未确认；${nextStep}`,
+      classification,
+      diagnostic: extracted.diagnostic || undefined,
+      cooldownSeconds: seconds
+    }
+  }
   if (classification === 'BAIYING_RATE_LIMIT') {
     const seconds = cooldownSeconds(input, `${extracted.message}\n${extracted.diagnostic}`)
     return {

@@ -153,10 +153,14 @@ def _newer_orphan_global_settings(
             continue
         lower = thresholds.get("commissionRate")
         upper = thresholds.get("commissionRateMax")
-        if value.get("commissionRateRule") != "minimum" or lower is None or upper is None:
+        if value.get("commissionRateRule") != "minimum":
             continue
         try:
-            if not (0 <= float(lower) <= 100 and 0 <= float(upper) <= 100 and float(lower) <= float(upper)):
+            lower_value = None if lower is None or lower == "" else float(lower)
+            upper_value = None if upper is None or upper == "" else float(upper)
+            if any(bound is not None and not 0 <= bound <= 100 for bound in (lower_value, upper_value)):
+                continue
+            if lower_value is not None and upper_value is not None and lower_value > upper_value:
                 continue
         except (TypeError, ValueError):
             continue
@@ -282,18 +286,45 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
             raise ValueError("候选上限必须是 1–10 的整数")
         if not isinstance(value.get("candidatePoolTarget"), int) or isinstance(value["candidatePoolTarget"], bool) or not 1 <= value["candidatePoolTarget"] <= 2000:
             raise ValueError("共享候选池目标数必须是 1–2000 的整数")
+        if value["candidatePoolTarget"] < value["candidateLimit"]:
+            raise ValueError("共享候选池目标数不能少于通用单账号候选目标")
         mode = value.get("candidatePoolMode", "total")
         rules = value.get("candidatePoolQuotas", [])
         if mode not in {"total", "quota"} or not isinstance(rules, list):
             raise ValueError("候选池配额模式或规则格式无效")
         if mode == "quota":
             if not rules:
-                raise ValueError("按品类配额模式至少需要一条规则")
+                raise ValueError("按来源和品类配额模式至少需要一条规则")
             keys: set[tuple[str, str, tuple[str, ...]]] = set()
             ids: set[str] = set()
             total = 0
             excluded = value.get("excludedCategorySelection", {})
             excluded = excluded if isinstance(excluded, dict) else {}
+            tree = value.get("categoryTree") if isinstance(value.get("categoryTree"), list) else []
+            excluded_second_paths: set[tuple[str, str]] = set()
+            for level in (2, 3):
+                for blocked in (excluded.get(f"level{level}") if isinstance(excluded.get(f"level{level}"), list) else []):
+                    blocked_id = str(blocked).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                    matches: set[tuple[str, str]] = set()
+                    for root in tree:
+                        if not isinstance(root, dict):
+                            continue
+                        for second in (root.get("children") if isinstance(root.get("children"), list) else []):
+                            if not isinstance(second, dict):
+                                continue
+                            if level == 2:
+                                found = str(second.get("id")).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] == blocked_id
+                            else:
+                                found = any(
+                                    isinstance(third, dict) and
+                                    str(third.get("id")).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] == blocked_id
+                                    for third in (second.get("children") if isinstance(second.get("children"), list) else [])
+                                )
+                            if found:
+                                matches.add((str(root.get("id")), str(second.get("id"))))
+                    if len(matches) != 1:
+                        raise ValueError(f"排除的{level}级类目 ID 无法在当前百应目录中唯一定位父分支")
+                    excluded_second_paths.update(matches)
             for rule in rules:
                 if not isinstance(rule, dict):
                     raise ValueError("品类配额规则格式无效")
@@ -303,8 +334,12 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
                     raise ValueError("品类配额规则 ID 或来源无效")
                 if board not in {"爆款榜", "趋势榜", "带货榜", "常销榜"}:
                     raise ValueError("品类配额榜单类型无效")
-                if not isinstance(path, list) or not 1 <= len(path) <= 3 or any(not isinstance(part, str) or not part.strip() for part in path) or rule.get("categoryId") != path[-1]:
-                    raise ValueError("品类配额必须提供稳定类目 ID 路径")
+                if (not isinstance(path, list) or len(path) > 3 or
+                        any(not isinstance(part, str) or not part.strip() for part in path) or
+                        rule.get("categoryId") != (path[-1] if path else "")):
+                    raise ValueError("来源配额须使用空类目路径，品类配额须提供稳定类目 ID 路径")
+                if source == "hotSpot" and len(path) > 1:
+                    raise ValueError("选品热点只有一级类目入口，不能设置二级或三级品类配额")
                 if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 2000:
                     raise ValueError("品类配额数量必须是 1–2000 的整数")
                 for level, category_id in enumerate(path, start=1):
@@ -315,7 +350,21 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
                         for blocked in excluded_ids
                     ):
                         raise ValueError("品类配额不能选择已排除的类目")
-                key = (source, board if source == "allianceRank" else "", tuple(path))
+                if len(path) >= 2 and any(
+                    str(path[0]).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                    root_id.rsplit("__RC_CASCADER_SPLIT__", 1)[-1] and
+                    str(path[1]).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                    second_id.rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                    for root_id, second_id in excluded_second_paths
+                ):
+                    raise ValueError("品类配额不能选择已排除的二级分支")
+                if source == "hotSpot" and path and any(
+                    str(path[0]).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
+                    root_id.rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+                    for root_id, _ in excluded_second_paths
+                ):
+                    raise ValueError("热点一级类目下有二级或三级排除项，热点会跳过整个一级，不能设置该配额")
+                key = (source, board if source == "allianceRank" and path else "", tuple(path))
                 if key in keys:
                     raise ValueError("来源、榜单和类目重复的品类配额")
                 keys.add(key)
@@ -323,6 +372,8 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
                 total += count
             if total > 2000:
                 raise ValueError("品类配额合计不能超过 2000 件")
+            if total != value["candidatePoolTarget"]:
+                raise ValueError("候选池目标必须等于所有来源/类目配额之和")
         collector_ids = value.get("candidateCollectorAccountIds")
         if not isinstance(collector_ids, list) or len(collector_ids) > 2 or any(
             not isinstance(account_id, int) or isinstance(account_id, bool) or account_id <= 0

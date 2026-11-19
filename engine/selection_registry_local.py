@@ -41,7 +41,7 @@ def connect(database: Path) -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS selection_local_registry ("
         " product_id TEXT PRIMARY KEY, account_key TEXT NOT NULL, leaf_category_id TEXT NOT NULL,"
         " reservation_token TEXT NOT NULL UNIQUE, request_id TEXT NOT NULL, state TEXT NOT NULL,"
-        " updated_at TEXT NOT NULL);"
+        " updated_at TEXT NOT NULL, sync_state TEXT NOT NULL DEFAULT 'PENDING', sync_conflict TEXT NOT NULL DEFAULT '');"
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_selection_local_account_category_active "
         "ON selection_local_registry(account_key, leaf_category_id) "
         "WHERE state IN ('RESERVED','ATTEMPTING','COMMITTED','UNCERTAIN');"
@@ -52,6 +52,11 @@ def connect(database: Path) -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS selection_local_registry_meta ("
         " key TEXT PRIMARY KEY, value TEXT NOT NULL);"
     )
+    columns = table_columns(connection, "selection_local_registry")
+    if "sync_state" not in columns:
+        connection.execute("ALTER TABLE selection_local_registry ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'PENDING'")
+    if "sync_conflict" not in columns:
+        connection.execute("ALTER TABLE selection_local_registry ADD COLUMN sync_conflict TEXT NOT NULL DEFAULT ''")
     # 老表索引只在首次需要时建立，后续历史检查可直接按候选 ID 查找。
     existing_tables = {str(row[0]) for row in connection.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
@@ -356,7 +361,7 @@ def snapshot_batch(
         placeholders = ",".join("?" for _ in chunk)
         rows = connection.execute(
             f"SELECT product_id FROM selection_local_registry "
-            f"WHERE state IN ({','.join('?' for _ in ACTIVE_STATES)}) "
+            f"WHERE (state IN ({','.join('?' for _ in ACTIVE_STATES)}) OR sync_state='CONFLICT') "
             f"AND product_id IN ({placeholders})",
             [*ACTIVE_STATES, *chunk],
         )
@@ -421,7 +426,7 @@ def reserve(
             chunk = candidate_ids[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             for row in connection.execute(
-                f"SELECT product_id,state,account_key,leaf_category_id,reservation_token,request_id "
+                f"SELECT product_id,state,account_key,leaf_category_id,reservation_token,request_id,sync_state "
                 f"FROM selection_local_registry WHERE product_id IN ({placeholders})", chunk
             ):
                 existing_by_product[str(row["product_id"])] = dict(row)
@@ -458,7 +463,7 @@ def reserve(
                 # 通用数据模式下类目可能未知；商品 ID 仍必须纳入全局互斥登记。
                 leaf_category_id = f"__unknown__:{product_id}"
             existing = existing_by_product.get(product_id)
-            if existing and existing["state"] in ACTIVE_STATES:
+            if existing and (existing["state"] in ACTIVE_STATES or existing.get("sync_state") == "CONFLICT"):
                 if (
                     existing["state"] == "RESERVED"
                     and str(existing["account_key"]) == account_key
@@ -513,8 +518,8 @@ def reserve(
 
 def begin(connection: sqlite3.Connection, token: str) -> dict[str, Any]:
     cursor = connection.execute(
-        "UPDATE selection_local_registry SET state='ATTEMPTING', updated_at=? "
-        "WHERE reservation_token=? AND state='RESERVED'",
+        "UPDATE selection_local_registry SET state='ATTEMPTING', sync_state='PENDING', sync_conflict='', updated_at=? "
+        "WHERE reservation_token=? AND state='RESERVED' AND sync_state!='CONFLICT'",
         (now_text(), token),
     )
     if cursor.rowcount != 1:
@@ -522,7 +527,7 @@ def begin(connection: sqlite3.Connection, token: str) -> dict[str, Any]:
             "SELECT state FROM selection_local_registry WHERE reservation_token=?", (token,)
         ).fetchone()
         if not row or row["state"] != "ATTEMPTING":
-            raise ValueError("找不到本机预留记录，未执行加车。")
+            raise ValueError("本机预留不存在或已发现服务器冲突，未执行加车。")
     return {"ok": True}
 
 
@@ -532,7 +537,7 @@ def finish(connection: sqlite3.Connection, token: str, outcome: str) -> dict[str
         raise ValueError("本机登记结算状态无效。")
     target = states[outcome]
     cursor = connection.execute(
-        "UPDATE selection_local_registry SET state=?, updated_at=? WHERE reservation_token=? "
+        "UPDATE selection_local_registry SET state=?, sync_state='PENDING', sync_conflict='', updated_at=? WHERE reservation_token=? "
         "AND state IN ('RESERVED','ATTEMPTING')",
         (target, now_text(), token),
     )
@@ -543,6 +548,56 @@ def finish(connection: sqlite3.Connection, token: str, outcome: str) -> dict[str
         if not row or row["state"] != target:
             raise ValueError("找不到本机预留记录，登记未结算。")
     return {"ok": True, "state": target}
+
+
+def sync_export(connection: sqlite3.Connection, limit: int = 500, account_key: Optional[str] = None) -> dict[str, Any]:
+    where = "sync_state='PENDING' AND account_key LIKE 'local:%'"
+    parameters: list[Any] = []
+    if account_key:
+        where += " AND account_key=?"
+        parameters.append(account_key)
+    rows = connection.execute(
+        "SELECT product_id,account_key,leaf_category_id,reservation_token,request_id,state,updated_at "
+        f"FROM selection_local_registry WHERE {where} "
+        "ORDER BY updated_at,product_id LIMIT ?", (*parameters, max(1, min(5000, limit)))
+    ).fetchall()
+    items = [{
+        "productId": str(row["product_id"]),
+        "accountKey": str(row["account_key"]),
+        "leafCategoryId": str(row["leaf_category_id"]),
+        "localToken": str(row["reservation_token"]),
+        "requestId": str(row["request_id"]),
+        "state": str(row["state"]),
+        "updatedAt": str(row["updated_at"]),
+    } for row in rows if _is_uuid(str(row["reservation_token"]))]
+    return {"items": items}
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+        return True
+    except (ValueError, AttributeError):
+        return False
+
+
+def sync_apply(connection: sqlite3.Connection, outcomes: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(outcomes) > 5000:
+        raise ValueError("离线同步回执超过单次处理上限")
+    updated = 0
+    for outcome in outcomes:
+        local_token = str(outcome.get("localToken") or "").strip()
+        status = str(outcome.get("status") or "").strip().lower()
+        if not local_token or status not in {"synced", "conflict"}:
+            raise ValueError("离线同步回执格式无效")
+        reason = str(outcome.get("reason") or "")[:500]
+        cursor = connection.execute(
+            "UPDATE selection_local_registry SET sync_state=?,sync_conflict=?,updated_at=? "
+            "WHERE reservation_token=? AND sync_state='PENDING'",
+            ("SYNCED" if status == "synced" else "CONFLICT", reason, now_text(), local_token),
+        )
+        updated += max(0, cursor.rowcount)
+    return {"updated": updated}
 
 
 def parse_json_argument(value: str, label: str) -> list[dict[str, Any]]:
@@ -573,6 +628,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finish_parser = commands.add_parser("finish")
     finish_parser.add_argument("--token", required=True)
     finish_parser.add_argument("--outcome", choices=("ADDED", "NOT_ADDED", "UNKNOWN"), required=True)
+    sync_export_parser = commands.add_parser("sync-export")
+    sync_export_parser.add_argument("--limit", type=int, default=500)
+    sync_export_parser.add_argument("--account-key")
+    commands.add_parser("sync-apply")
     args = parser.parse_args(argv)
     connection = connect(Path(args.db))
     try:
@@ -597,6 +656,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
         elif args.command == "begin":
             result = begin(connection, args.token)
+        elif args.command == "sync-export":
+            result = sync_export(connection, args.limit, args.account_key)
+        elif args.command == "sync-apply":
+            payload = json.load(sys.stdin)
+            outcomes = payload.get("outcomes") if isinstance(payload, dict) else None
+            if not isinstance(outcomes, list) or any(not isinstance(row, dict) for row in outcomes):
+                raise ValueError("离线同步回执必须包含对象列表")
+            result = sync_apply(connection, outcomes)
         else:
             result = finish(connection, args.token, args.outcome)
         return emit({"ok": True, **result})

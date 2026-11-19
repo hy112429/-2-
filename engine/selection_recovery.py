@@ -10,7 +10,7 @@ import ntpath
 import re
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -341,9 +341,68 @@ POOL_CANDIDATE_FIELDS = frozenset({
     "trendRising", "trendKnown", "trendStatus", "trendSlope", "trendPoints",
     "dataMetrics", "metricSources", "poolRank", "sources", "sourceKey",
     "categoryIds", "leafCategoryId", "categoryStatus", "categorySource", "sourceCategoryIds",
-    "quotaRuleId",
-    "analysisScore", "unifiedScore",
+    "sourceCategoryId", "sourceCategoryName", "sources", "sourceRecords",
+    "quotaRuleId", "sourceCategorySelection",
+    "analysisScore", "unifiedScore", "reusedFromBatchId",
 })
+
+
+def _bounded_checkpoint_int(value: Any, maximum: int) -> int:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(maximum, number))
+
+
+def _pool_category_id(value: Any) -> str:
+    return str(value or "").strip().rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
+
+
+def _pool_excluded_branches(settings: Dict[str, Any]) -> tuple[set[str], set[tuple[str, str]]]:
+    """把二、三级排除项映射到唯一的二级分支；映射不明时拒绝新商品入池。"""
+    selection = settings.get("excludedCategorySelection")
+    selection = selection if isinstance(selection, dict) else {}
+    tree = settings.get("categoryTree") if isinstance(settings.get("categoryTree"), list) else []
+    excluded_roots = selection.get("level1")
+    blocked_roots = set()
+    if isinstance(excluded_roots, list):
+        blocked_roots = {_pool_category_id(item) for item in excluded_roots if _pool_category_id(item)}
+    blocked_seconds: set[tuple[str, str]] = set()
+    for level in (2, 3):
+        values = selection.get(f"level{level}")
+        if not isinstance(values, list):
+            continue
+        for blocked in values:
+            blocked_id = _pool_category_id(blocked)
+            if not blocked_id:
+                continue
+            matches: set[tuple[str, str]] = set()
+            for root in tree:
+                if not isinstance(root, dict):
+                    continue
+                root_id = _pool_category_id(root.get("id"))
+                seconds = root.get("children")
+                if not isinstance(seconds, list):
+                    continue
+                for second in seconds:
+                    if not isinstance(second, dict):
+                        continue
+                    second_id = _pool_category_id(second.get("id"))
+                    if level == 2:
+                        found = second_id == blocked_id
+                    else:
+                        thirds = second.get("children")
+                        found = isinstance(thirds, list) and any(
+                            isinstance(third, dict) and _pool_category_id(third.get("id")) == blocked_id
+                            for third in thirds
+                        )
+                    if root_id and second_id and found:
+                        matches.add((root_id, second_id))
+            if len(matches) != 1:
+                raise ValueError(f"排除的{level}级类目无法在批次百应目录中唯一定位二级分支")
+            blocked_seconds.update(matches)
+    return blocked_roots, blocked_seconds
 
 
 def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: Any) -> Dict[str, Any]:
@@ -392,9 +451,15 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
     excluded_ids = value.get("excludedProductIds", [])
     if not isinstance(excluded_ids, list) or any(not isinstance(item, str) or not item.isdigit() for item in excluded_ids):
         raise ValueError("候选池防重剔除 ID 格式无效")
-    excluded = set(excluded_ids)
+    prior_excluded = previous.get("excludedProductIds", [])
+    if not isinstance(prior_excluded, list) or any(not isinstance(item, str) or not item.isdigit() for item in prior_excluded):
+        prior_excluded = []
+    excluded = set(prior_excluded) | set(excluded_ids)
     by_product: dict[str, dict[str, Any]] = {}
-    for candidate in [*existing_rows, *incoming_rows]:
+    origin_rows_by_batch: dict[str, dict[str, dict[str, Any]]] = {}
+    excluded_branches: Optional[tuple[set[str], set[tuple[str, str]]]] = None
+    for candidate, is_existing in ([(row, True) for row in existing_rows] +
+                                   [(row, False) for row in incoming_rows]):
         if not isinstance(candidate, dict):
             continue
         product_id = str(candidate.get("productId") or "").strip()
@@ -418,37 +483,119 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
                 str(expected).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
                 for index, expected in enumerate(path)
             )
-            matches_source_path = (safe.get("categoryStatus") == "source_level" and
-                                   len(source_ids) >= len(path) and all(
+            matches_source_path = (safe.get("categoryStatus") in {"source_level", "known"} and
+                                   len(source_ids) >= max(1, len(path)) and all(
                 str(source_ids[index]).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
                 str(expected).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
                 for index, expected in enumerate(path)
             ))
-            if safe.get("sourceKey") != rule["sourceKey"] or not (matches_exact or matches_source_path):
+            quota_path_confirmed = (matches_exact or matches_source_path) if is_existing else matches_source_path
+            if safe.get("sourceKey") != rule["sourceKey"] or not quota_path_confirmed:
                 raise ValueError("候选商品来源或类目与所归属配额不一致")
-            known_path = category_ids if len(category_ids) == 3 else source_ids
-            excluded = settings.get("excludedCategorySelection")
-            excluded = excluded if isinstance(excluded, dict) else {}
-            if any(
-                str(category_id).rsplit("__RC_CASCADER_SPLIT__", 1)[-1] ==
-                str(blocked).rsplit("__RC_CASCADER_SPLIT__", 1)[-1]
-                for index, category_id in enumerate(known_path[:3], start=1)
-                for blocked in (excluded.get(f"level{index}") if isinstance(excluded.get(f"level{index}"), list) else [])
-            ) or (len(known_path) < 3 and any(excluded.get(f"level{level}") for level in range(len(known_path) + 1, 4))):
-                raise ValueError("候选商品命中排除品类或缺少判断排除条件的类目")
+            if not is_existing:
+                if not 1 <= len(source_ids) <= 3 or any(not _pool_category_id(item) for item in source_ids):
+                    raise ValueError("候选商品缺少已确认的页面类目路径")
+                if len(category_ids) == 3 and any(
+                    _pool_category_id(category_ids[index]) != _pool_category_id(source_ids[index])
+                    for index in range(min(len(source_ids), 3))
+                ):
+                    raise ValueError("候选商品详情类目与来源页面类目路径冲突")
+                if excluded_branches is None:
+                    excluded_branches = _pool_excluded_branches(settings)
+                blocked_roots, blocked_seconds = excluded_branches
+                root_id = _pool_category_id(source_ids[0])
+                blocked_under_root = {second for root, second in blocked_seconds if root == root_id}
+                if root_id in blocked_roots or (blocked_under_root and (
+                    len(source_ids) < 2 or _pool_category_id(source_ids[1]) in blocked_under_root
+                )):
+                    raise ValueError("候选商品来源路径命中排除分支或不足以避开排除分支")
         safe["collectedByAccountId"] = int(candidate.get("collectedByAccountId") or value.get("collectorAccountId") or 0)
         safe["capturedAt"] = str(candidate.get("capturedAt") or value.get("capturedAt") or now_text())[:40]
-        if safe["collectedByAccountId"] not in collector_ids:
+        origin_batch_id = str(safe.get("reusedFromBatchId") or "").strip()
+        if origin_batch_id:
+            if origin_batch_id not in origin_rows_by_batch:
+                origin_row = connection.execute(
+                    "SELECT payload_json FROM selection_run_batches WHERE batch_id=? AND batch_id<>?",
+                    (origin_batch_id, batch_id),
+                ).fetchone()
+                origin_payload = decode_json(origin_row["payload_json"], {}) if origin_row else {}
+                origin_pool = origin_payload.get("candidatePool") if isinstance(origin_payload, dict) else None
+                origin_rows = origin_pool.get("rows") if isinstance(origin_pool, dict) and origin_pool.get("status") == "ready" else None
+                origin_rows_by_batch[origin_batch_id] = {
+                    str(item.get("productId")): item for item in origin_rows if isinstance(item, dict)
+                } if isinstance(origin_rows, list) else {}
+            origin_candidate = origin_rows_by_batch[origin_batch_id].get(product_id)
+            if not origin_candidate or origin_candidate.get("collectedByAccountId") != safe["collectedByAccountId"] or (
+                str(origin_candidate.get("capturedAt") or "") != safe["capturedAt"]
+            ):
+                raise ValueError("复用候选商品的原批次来源无法核对")
+        elif safe["collectedByAccountId"] not in collector_ids:
             raise ValueError("候选商品来源账号不属于本批采集账号")
-        by_product.setdefault(product_id, safe)
+        previous_candidate = by_product.get(product_id)
+        if previous_candidate is None:
+            by_product[product_id] = safe
+        else:
+            if mode == "quota" and safe.get("quotaRuleId") != previous_candidate.get("quotaRuleId"):
+                for field in (
+                    "quotaRuleId", "sourceKey", "categoryIds", "sourceCategoryIds", "categoryStatus",
+                    "categorySource", "sourceCategoryId", "sourceCategoryName", "sourceCategorySelection",
+                ):
+                    if field in safe:
+                        previous_candidate[field] = safe[field]
+            merged_sources = list(dict.fromkeys([
+                *(previous_candidate.get("sources") if isinstance(previous_candidate.get("sources"), list) else []),
+                *(safe.get("sources") if isinstance(safe.get("sources"), list) else []),
+            ]))
+            if merged_sources:
+                previous_candidate["sources"] = merged_sources
+            records = [
+                item for item in [
+                    *(previous_candidate.get("sourceRecords") if isinstance(previous_candidate.get("sourceRecords"), list) else []),
+                    *(safe.get("sourceRecords") if isinstance(safe.get("sourceRecords"), list) else []),
+                ] if isinstance(item, dict)
+            ]
+            unique_records: list[dict[str, Any]] = []
+            seen_records: set[tuple[str, str, str]] = set()
+            for item in records:
+                key = (str(item.get("sourceKey") or ""),
+                       "/".join(str(part) for part in item.get("categoryPath", []) if str(part))
+                       if isinstance(item.get("categoryPath"), list) else "",
+                       str(item.get("rankBoard") or ""))
+                if key in seen_records:
+                    continue
+                seen_records.add(key)
+                unique_records.append({
+                    key: value for key, value in item.items()
+                    if key in {"sourceKey", "categoryPath", "rankBoard", "sourceCategoryId", "sourceCategoryName"}
+                })
+            if unique_records:
+                previous_candidate["sourceRecords"] = unique_records[:20]
     if len(by_product) > 2000:
         raise ValueError("候选池超过 2000 件上限")
+    quota_transfers = value.get("quotaTransfers", previous.get("quotaTransfers", [])) if mode == "quota" else []
+    if mode == "quota":
+        if not isinstance(quota_transfers, list) or len(quota_transfers) > 2000:
+            raise ValueError("候选池缺额转移记录格式无效")
+        effective_targets = dict(rule_targets)
+        for transfer in quota_transfers:
+            if not isinstance(transfer, dict):
+                raise ValueError("候选池缺额转移记录格式无效")
+            from_id, to_id, count = transfer.get("fromRuleId"), transfer.get("toRuleId"), transfer.get("count")
+            if (from_id not in effective_targets or to_id not in effective_targets or from_id == to_id or
+                    not isinstance(count, int) or isinstance(count, bool) or count < 1):
+                raise ValueError("候选池缺额转移引用或数量无效")
+            effective_targets[from_id] -= count
+            effective_targets[to_id] += count
+        if any(number < 0 for number in effective_targets.values()) or sum(effective_targets.values()) != target:
+            raise ValueError("候选池缺额转移不能改变总池目标")
+    else:
+        effective_targets = {}
     quota_counts = {rule_id: 0 for rule_id in rule_targets}
     for candidate in by_product.values():
         if mode == "quota":
             quota_counts[candidate["quotaRuleId"]] += 1
-    if any(quota_counts[rule_id] > limit for rule_id, limit in rule_targets.items()):
-        raise ValueError("候选商品超过单条品类配额")
+    if any(quota_counts[rule_id] > effective_targets[rule_id] for rule_id in rule_targets):
+        raise ValueError("候选商品超过单条有效品类配额")
     state = value.get("sourceState")
     if not isinstance(state, dict):
         raise ValueError("候选池采集游标无效")
@@ -460,23 +607,54 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
             continue
         offsets = collector.get("tabOffsets") if isinstance(collector.get("tabOffsets"), dict) else {}
         clean_offsets = {str(key): max(0, int(number)) for key, number in offsets.items()
-                         if str(key) in {"hotSpot", "allianceRank"} and str(number).isdigit()}
+                         if str(key) in {"hotSpot", "allianceRank", "selectionSquare"} and str(number).isdigit()}
+        raw_scroll_positions = collector.get("scrollPositions") if isinstance(collector.get("scrollPositions"), dict) else {}
+        clean_scroll_positions = {
+            str(key): _bounded_checkpoint_int(number, 100_000_000)
+            for key, number in raw_scroll_positions.items()
+            if len(str(key)) <= 512 and any(
+                str(key) == source or str(key).startswith(f"{source}:")
+                for source in ("hotSpot", "allianceRank", "selectionSquare")
+            )
+        }
         clean_collectors[str(account_id)] = {
             "tabOffsets": clean_offsets,
             "samePoolCount": max(0, int(collector.get("samePoolCount") or 0)),
+            "rateLimitCount": _bounded_checkpoint_int(collector.get("rateLimitCount"), 5),
             "nextRetryAt": str(collector.get("nextRetryAt") or "")[:40],
+            "scrollSteps": max(0, min(120, int(collector.get("scrollSteps") or 0))),
+            "rawLimit": max(0, min(2000, int(collector.get("rawLimit") or 0))),
+            "scrollPositions": clean_scroll_positions,
+            "detailAttemptedIds": sorted({str(item) for item in collector.get("detailAttemptedIds", [])
+                                           if str(item).isdigit()})[-2000:]
+            if isinstance(collector.get("detailAttemptedIds", []), list) else [],
             "ruleStates": {
                 str(rule_id): {
                     "samePoolCount": max(0, min(100, int(rule_state.get("samePoolCount") or 0))),
                     "nextRetryAt": str(rule_state.get("nextRetryAt") or "")[:40],
+                    "exhausted": rule_state.get("exhausted") is True,
+                    "scrollSteps": max(0, min(120, int(rule_state.get("scrollSteps") or 0))),
+                    "rawLimit": max(0, min(2000, int(rule_state.get("rawLimit") or 0))),
+                    "scrollPosition": _bounded_checkpoint_int(rule_state.get("scrollPosition"), 100_000_000),
+                    "categoryTabOffset": _bounded_checkpoint_int(rule_state.get("categoryTabOffset"), 100_000),
+                    "detailAttemptedIds": sorted({str(item) for item in rule_state.get("detailAttemptedIds", [])
+                                                   if str(item).isdigit()})[-2000:]
+                    if isinstance(rule_state.get("detailAttemptedIds", []), list) else [],
                 }
                 for rule_id, rule_state in (collector.get("ruleStates") or {}).items()
                 if rule_id in rule_targets and isinstance(rule_state, dict)
             } if isinstance(collector.get("ruleStates"), dict) else {},
         }
+    transfer_in = {rule_id: 0 for rule_id in rule_targets}
+    transfer_out = {rule_id: 0 for rule_id in rule_targets}
+    for transfer in quota_transfers:
+        transfer_out[transfer["fromRuleId"]] += transfer["count"]
+        transfer_in[transfer["toRuleId"]] += transfer["count"]
     quota_progress = [
         {"ruleId": rule["id"], "collected": quota_counts[rule["id"]], "target": rule["target"],
-         "deficit": rule["target"] - quota_counts[rule["id"]]}
+         "effectiveTarget": effective_targets[rule["id"]], "transferredIn": transfer_in[rule["id"]],
+         "transferredOut": transfer_out[rule["id"]],
+         "deficit": effective_targets[rule["id"]] - quota_counts[rule["id"]]}
         for rule in quota_rules
     ]
     pool = {
@@ -484,10 +662,15 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         "mode": mode,
         "quotaRules": quota_rules,
         "quotaProgress": quota_progress,
+        "quotaTransfers": quota_transfers,
+        "excludedProductIds": sorted(excluded),
         "collectorAccountIds": collector_ids,
         "filterFingerprint": fingerprint,
         "rows": list(by_product.values()),
-        "sourceState": {"collectors": clean_collectors},
+        "sourceState": {
+            "autoResumeAllowed": state.get("autoResumeAllowed") is not False,
+            "collectors": clean_collectors,
+        },
         "status": "ready" if (all(item["deficit"] == 0 for item in quota_progress) if mode == "quota" else len(by_product) >= target) else "collecting",
         "capturedAt": str(value.get("capturedAt") or now_text())[:40],
     }
@@ -498,6 +681,253 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
             (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), now_text(), batch_id),
         )
     return {"status": pool["status"], "count": len(by_product), "target": target}
+
+
+def _candidate_captured_at(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        captured = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if captured.tzinfo is None:
+        captured = captured.astimezone()
+    return captured.astimezone(timezone.utc)
+
+
+def _same_collector_profiles(current: Dict[str, Any], previous: Dict[str, Any], collector_ids: list[int]) -> bool:
+    current_contexts = current.get("accountContexts")
+    previous_contexts = previous.get("accountContexts")
+    if not isinstance(current_contexts, dict) or not isinstance(previous_contexts, dict):
+        return False
+    for account_id in collector_ids:
+        current_context = current_contexts.get(str(account_id))
+        previous_context = previous_contexts.get(str(account_id))
+        if not isinstance(current_context, dict) or not isinstance(previous_context, dict):
+            return False
+        for field in ("profileKey", "resolvedProfilePath"):
+            identity = str(current_context.get(field) or "").strip()
+            if not identity or identity != str(previous_context.get(field) or "").strip():
+                return False
+    return True
+
+
+def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    pool = payload.get("candidatePool")
+    if not isinstance(pool, dict) or pool.get("status") != "ready":
+        return None
+    rows = pool.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    now = datetime.now(timezone.utc)
+    earliest = now - timedelta(hours=24)
+    eligible = [item for item in rows if isinstance(item, dict) and
+                (captured := _candidate_captured_at(item.get("capturedAt"))) is not None and
+                earliest <= captured <= now]
+    source_counts: dict[str, int] = {}
+    for item in rows:
+        if isinstance(item, dict):
+            source = str(item.get("sourceKey") or "unknown")
+            source_counts[source] = source_counts.get(source, 0) + 1
+    settings = payload.get("settingsSnapshot") if isinstance(payload.get("settingsSnapshot"), dict) else {}
+    thresholds = settings.get("thresholds") if isinstance(settings.get("thresholds"), dict) else {}
+    excluded = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
+    return {
+        "batchId": batch_id,
+        "count": len(rows), "recentCount": len(eligible),
+        "target": pool.get("target"), "mode": pool.get("mode", "total"),
+        "capturedAt": pool.get("capturedAt"), "updatedAt": updated_at,
+        "collectorAccountIds": pool.get("collectorAccountIds", []),
+        "sourceCounts": source_counts,
+        "minimumCommissionRate": thresholds.get("commissionRate"),
+        "maximumCommissionRate": thresholds.get("commissionRateMax"),
+        "excludedCategoryCount": sum(len(excluded.get(level, [])) for level in ("level1", "level2", "level3")
+                                     if isinstance(excluded.get(level), list)),
+        "preview": [
+            {"productId": str(item.get("productId") or ""), "title": str(item.get("title") or "")[:120],
+             "sourceKey": str(item.get("sourceKey") or "")}
+            for item in rows[:20] if isinstance(item, dict)
+        ],
+    }
+
+
+def list_saved_candidate_pools(connection: sqlite3.Connection, limit: int = 10) -> list[Dict[str, Any]]:
+    output: list[Dict[str, Any]] = []
+    for row in connection.execute(
+        "SELECT batch_id,payload_json,updated_at FROM selection_run_batches ORDER BY updated_at DESC LIMIT 200"
+    ):
+        summary = saved_candidate_pool_summary(
+            row["batch_id"], decode_json(row["payload_json"], {}), row["updated_at"]
+        )
+        if summary:
+            output.append(summary)
+        if len(output) >= limit:
+            break
+    return output
+
+
+def list_saved_candidate_pool_items(connection: sqlite3.Connection, batch_id: str,
+                                    query: str = "", limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+    row = connection.execute(
+        "SELECT payload_json,updated_at FROM selection_run_batches WHERE batch_id=?", (batch_id,)
+    ).fetchone()
+    payload = decode_json(row["payload_json"], {}) if row else {}
+    if not row or not saved_candidate_pool_summary(batch_id, payload, row["updated_at"]):
+        raise ValueError("所选本机候选池不存在或未达标")
+    rows = payload["candidatePool"]["rows"]
+    keyword = query.strip().casefold()[:120]
+    matching = [item for item in rows if isinstance(item, dict) and (
+        not keyword or keyword in str(item.get("productId") or "").casefold() or
+        keyword in str(item.get("title") or "").casefold()
+    )]
+    page_size = max(1, min(int(limit), 50))
+    start = max(0, int(offset))
+    visible_fields = POOL_CANDIDATE_FIELDS | {"capturedAt", "collectedByAccountId"}
+    return {
+        "batchId": batch_id, "total": len(matching), "limit": page_size, "offset": start,
+        "rows": [{key: item[key] for key in visible_fields if key in item}
+                 for item in matching[start:start + page_size]],
+    }
+
+
+def saved_candidate_pool_settings(connection: sqlite3.Connection, batch_id: str) -> Dict[str, Any]:
+    row = connection.execute(
+        "SELECT payload_json,updated_at FROM selection_run_batches WHERE batch_id=?", (batch_id,)
+    ).fetchone()
+    payload = decode_json(row["payload_json"], {}) if row else {}
+    summary = saved_candidate_pool_summary(batch_id, payload, row["updated_at"]) if row else None
+    settings = payload.get("settingsSnapshot") if isinstance(payload, dict) else None
+    if not summary or not isinstance(settings, dict):
+        raise ValueError("所选本机候选池不存在或未达标")
+    return {
+        "pool": summary, "settingsSnapshot": settings,
+        "filterFingerprint": payload["candidatePool"].get("filterFingerprint"),
+    }
+
+
+def reuse_candidate_pool(
+    connection: sqlite3.Connection, batch_id: str, fingerprint: Any, source_batch_id: str = ""
+) -> Dict[str, Any]:
+    """新批次复用本机近期同条件候选；只搬运发现数据，绝不搬运采集游标或账号加车结果。"""
+    if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 100_000:
+        raise ValueError("候选池复用缺少有效的筛选指纹")
+    current_row = connection.execute(
+        "SELECT state,payload_json FROM selection_run_batches WHERE batch_id=?", (batch_id,)
+    ).fetchone()
+    if not current_row or current_row["state"] not in {"in_progress", "needs_retry"}:
+        raise ValueError("候选池复用的目标批次不存在或已经结束")
+    current = decode_json(current_row["payload_json"], {})
+    if not isinstance(current, dict):
+        raise ValueError("候选池复用的目标批次快照无效")
+    existing = current.get("candidatePool")
+    if isinstance(existing, dict):
+        return {"count": 0, "reason": "current_pool_exists"}
+    settings = current.get("settingsSnapshot")
+    if not isinstance(settings, dict):
+        raise ValueError("候选池复用的目标批次缺少设置快照")
+    collector_ids = settings.get("candidateCollectorAccountIds")
+    if not isinstance(collector_ids, list) or not 1 <= len(collector_ids) <= 2 or any(
+        not isinstance(item, int) or isinstance(item, bool) for item in collector_ids
+    ):
+        raise ValueError("候选池复用的采集账号快照无效")
+    mode = settings.get("candidatePoolMode", "total")
+    if mode not in {"total", "quota"}:
+        raise ValueError("候选池复用的模式无效")
+    current_time = datetime.now(timezone.utc)
+    earliest = current_time - timedelta(hours=24)
+    comparable_fields = (
+        ("sources", "thresholds", "filters", "bannedWords", "excludedCategorySelection")
+        if mode == "quota" else
+        ("sources", "thresholds", "filters", "bannedWords", "selectionMode", "categoryMode",
+         "categorySelection", "excludedCategorySelection", "candidatePoolMode", "candidatePoolQuotas")
+    )
+    historical_sql = "SELECT batch_id,payload_json FROM selection_run_batches WHERE batch_id<>?"
+    historical_params: tuple[Any, ...] = (batch_id,)
+    if source_batch_id:
+        historical_sql += " AND batch_id=?"
+        historical_params += (source_batch_id,)
+    historical_sql += " ORDER BY updated_at DESC"
+    validation_error = ""
+    for historical in connection.execute(historical_sql, historical_params).fetchall():
+        previous = decode_json(historical["payload_json"], {})
+        if not isinstance(previous, dict):
+            continue
+        old_pool = previous.get("candidatePool")
+        old_settings = previous.get("settingsSnapshot")
+        if not isinstance(old_pool, dict) or not isinstance(old_settings, dict):
+            continue
+        if old_pool.get("status") != "ready" or old_pool.get("filterFingerprint") != fingerprint:
+            continue
+        if old_pool.get("mode", "total") != mode:
+            continue
+        if not source_batch_id and old_pool.get("collectorAccountIds") != collector_ids:
+            continue
+        if any(settings.get(field) != old_settings.get(field) for field in comparable_fields):
+            continue
+        if settings.get("categoryTree") != old_settings.get("categoryTree"):
+            continue
+        if not source_batch_id and not _same_collector_profiles(current, previous, collector_ids):
+            continue
+        old_rows = old_pool.get("rows")
+        if not isinstance(old_rows, list):
+            continue
+        rule_targets = {
+            str(rule.get("id")): rule.get("target")
+            for rule in settings.get("candidatePoolQuotas", [])
+            if isinstance(rule, dict)
+        } if mode == "quota" else {}
+        rule_counts = {rule_id: 0 for rule_id in rule_targets}
+        eligible_rows = []
+        for candidate in old_rows:
+            if not isinstance(candidate, dict):
+                continue
+            captured = _candidate_captured_at(candidate.get("capturedAt"))
+            source_path = candidate.get("sourceCategoryIds")
+            if captured is None or not earliest <= captured <= current_time:
+                continue
+            if not isinstance(source_path, list) or not 1 <= len(source_path) <= 3 or any(
+                _pool_category_id(part) in {"", "0"} for part in source_path
+            ):
+                continue
+            if candidate.get("categoryStatus") not in {"source_level", "known"}:
+                continue
+            if not source_batch_id and candidate.get("collectedByAccountId") not in collector_ids:
+                continue
+            if mode == "quota":
+                rule_id = str(candidate.get("quotaRuleId") or "")
+                target = rule_targets.get(rule_id)
+                if not isinstance(target, int) or rule_counts.get(rule_id, 0) >= target:
+                    continue
+                rule_counts[rule_id] += 1
+            eligible_rows.append({**candidate, "reusedFromBatchId": historical["batch_id"]})
+        if not eligible_rows:
+            continue
+        value = {
+            "target": settings.get("candidatePoolTarget"),
+            "mode": mode,
+            "quotaRules": settings.get("candidatePoolQuotas") if mode == "quota" else [],
+            "quotaTransfers": [],
+            "collectorAccountIds": collector_ids,
+            "collectorAccountId": collector_ids[0],
+            "filterFingerprint": fingerprint,
+            "capturedAt": current_time.isoformat(),
+            "rows": eligible_rows,
+            "sourceState": {"collectors": {}},
+        }
+        try:
+            saved = save_candidate_pool(connection, batch_id, value)
+        except ValueError as cause:
+            # 历史池可能由旧版类目规则产生；不要让旧数据阻断新批次正常采集。
+            validation_error = str(cause)[:240]
+            continue
+        return {"count": saved["count"], "status": saved["status"], "sourceBatchId": historical["batch_id"]}
+    return {
+        "count": 0,
+        "reason": "selected_pool_unavailable" if source_batch_id else "no_compatible_recent_pool",
+        "detail": validation_error,
+    }
 
 
 def latest_incomplete_batch(connection: sqlite3.Connection) -> Optional[Dict[str, Any]]:
@@ -1172,6 +1602,40 @@ def update_batch(connection: sqlite3.Connection, batch_id: str, state: str) -> D
     return batch_dict(connection, row)
 
 
+def set_batch_manual_pause(connection: sqlite3.Connection, batch_id: str, paused: bool) -> Dict[str, Any]:
+    """持久化用户手动暂停闸门；运行中的平台命令由 renderer 在安全边界收尾。"""
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM selection_run_batches WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if not row or row["state"] not in {"in_progress", "needs_retry"}:
+            raise ValueError("只有未完成的选品批次可设置手动暂停")
+        payload = decode_json(row["payload_json"], {})
+        if not isinstance(payload, dict):
+            raise ValueError("选品批次检查点格式无效")
+        previous = payload.get("manualPause")
+        previous = previous if isinstance(previous, dict) else {}
+        timestamp = now_text()
+        payload["manualPause"] = {
+            "active": paused,
+            "requestedAt": (str(previous.get("requestedAt") or timestamp)
+                            if paused and previous.get("active") is True else
+                            timestamp if paused else str(previous.get("requestedAt") or "")),
+            "resumedAt": "" if paused else timestamp,
+        }
+        connection.execute(
+            "UPDATE selection_run_batches SET payload_json=?,updated_at=? WHERE batch_id=?",
+            (json.dumps(payload, ensure_ascii=False, separators=(",", ":")), timestamp, batch_id),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    updated = connection.execute("SELECT * FROM selection_run_batches WHERE batch_id=?", (batch_id,)).fetchone()
+    return batch_dict(connection, updated)
+
+
 def abandon_batch(connection: sqlite3.Connection, batch_id: str, reason: str) -> Dict[str, Any]:
     """显式结束待恢复批次；保留检查点和配额事件，不把任务伪装成成功。"""
     normalized_reason = str(reason or "").strip()
@@ -1446,6 +1910,15 @@ def build_parser() -> argparse.ArgumentParser:
     batch_sub = batch.add_subparsers(dest="action", required=True)
     batch_sub.add_parser("latest")
     batch_sub.add_parser("recent")
+    saved_pools = batch_sub.add_parser("pool-list")
+    saved_pools.add_argument("--limit", type=int, default=10)
+    saved_pool_items = batch_sub.add_parser("pool-items")
+    saved_pool_items.add_argument("--batch-id", required=True)
+    saved_pool_items.add_argument("--query", default="")
+    saved_pool_items.add_argument("--limit", type=int, default=20)
+    saved_pool_items.add_argument("--offset", type=int, default=0)
+    saved_pool_settings = batch_sub.add_parser("pool-settings")
+    saved_pool_settings.add_argument("--batch-id", required=True)
     batch_list = batch_sub.add_parser("list", help="只读分页查询历史选品批次")
     batch_list.add_argument("--limit", type=int, default=25)
     batch_list.add_argument("--offset", type=int, default=0)
@@ -1463,6 +1936,8 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument("--batch-id", required=True)
     save_pool = batch_sub.add_parser("pool-save")
     save_pool.add_argument("--batch-id", required=True)
+    reuse_pool = batch_sub.add_parser("pool-reuse")
+    reuse_pool.add_argument("--batch-id", required=True)
     update_paths = batch_sub.add_parser("update-download-paths")
     update_paths.add_argument("--batch-id", required=True)
     abandon = batch_sub.add_parser("abandon")
@@ -1471,6 +1946,9 @@ def build_parser() -> argparse.ArgumentParser:
     update = batch_sub.add_parser("update")
     update.add_argument("--batch-id", required=True)
     update.add_argument("--state", required=True)
+    manual_pause = batch_sub.add_parser("manual-pause")
+    manual_pause.add_argument("--batch-id", required=True)
+    manual_pause.add_argument("--state", choices=["request", "clear"], required=True)
 
     account = commands.add_parser("account")
     account_sub = account.add_subparsers(dest="action", required=True)
@@ -1523,7 +2001,9 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         # 所有批次读取先走 mode=ro；不能调用会建表、切换 WAL 的写连接。
-        if args.command == "batch" and args.action in {"latest", "recent", "list", "logs"}:
+        if args.command == "batch" and args.action in {"latest", "recent", "list", "logs", "pool-list", "pool-items", "pool-settings"}:
+            if args.action == "pool-list" and not args.db.expanduser().is_file():
+                return emit({"pools": []})
             if args.action in {"latest", "recent"} and not args.db.expanduser().is_file():
                 return emit({"batch": None})
             connection = connect_readonly(args.db)
@@ -1540,6 +2020,13 @@ def main() -> int:
                         start_date=args.start_date,
                         end_date=args.end_date,
                     ))
+                if args.action == "pool-list":
+                    return emit({"pools": list_saved_candidate_pools(connection, max(1, min(args.limit, 20)))})
+                if args.action == "pool-items":
+                    return emit(list_saved_candidate_pool_items(
+                        connection, args.batch_id, args.query, args.limit, args.offset))
+                if args.action == "pool-settings":
+                    return emit(saved_candidate_pool_settings(connection, args.batch_id))
                 return emit(batch_log_details(connection, args.batch_id))
             finally:
                 connection.close()
@@ -1555,6 +2042,13 @@ def main() -> int:
             if args.command == "batch" and args.action == "pool-save":
                 payload = json.load(sys.stdin)
                 return emit({"pool": save_candidate_pool(connection, args.batch_id, payload)})
+            if args.command == "batch" and args.action == "pool-reuse":
+                payload = json.load(sys.stdin)
+                return emit({"pool": reuse_candidate_pool(
+                    connection, args.batch_id,
+                    payload.get("filterFingerprint") if isinstance(payload, dict) else None,
+                    str(payload.get("sourceBatchId") or "") if isinstance(payload, dict) else "",
+                )})
             if args.command == "batch" and args.action == "update-download-paths":
                 payload = json.load(sys.stdin)
                 paths = payload.get("downloadPaths") if isinstance(payload, dict) else None
@@ -1563,6 +2057,9 @@ def main() -> int:
                 return emit({"batch": abandon_batch(connection, args.batch_id, args.reason)})
             if args.command == "batch" and args.action == "update":
                 return emit({"batch": update_batch(connection, args.batch_id, args.state)})
+            if args.command == "batch" and args.action == "manual-pause":
+                return emit({"batch": set_batch_manual_pause(
+                    connection, args.batch_id, args.state == "request")})
             if args.command == "account" and args.action == "get":
                 return emit({"account": get_account(connection, args.batch_id, args.account_id)})
             if args.command == "account" and args.action == "update":

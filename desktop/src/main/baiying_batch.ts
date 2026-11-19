@@ -1,6 +1,5 @@
 import { clipboard, ipcMain, type WebContents } from 'electron'
-import { createHash } from 'node:crypto'
-import { createReadStream, existsSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { onProductCaptured } from './probe'
 import { runEngineCommand, runScript } from './engine'
@@ -398,16 +397,6 @@ async function cartState(command: string, accountId?: number, productId?: string
   return outcome.result as Record<string, unknown>
 }
 
-async function fileContentHash(filePath: string): Promise<string> {
-  return new Promise((resolveHash, rejectHash) => {
-    const hash = createHash('sha256')
-    const stream = createReadStream(filePath)
-    stream.on('data', (chunk) => hash.update(chunk))
-    stream.on('error', rejectHash)
-    stream.on('end', () => resolveHash(hash.digest('hex')))
-  })
-}
-
 async function existingCartVideos(dbPath: string, accountId: number, productId: string): Promise<{
   videoIds: string[]; files: Array<{ videoId: string; filePath: string }>
 }> {
@@ -443,9 +432,25 @@ async function runCartVideoDownload(accountId: number, productId: string, commod
     const profilePath = validateManagedProfilePath(`account-${accountId}`, account.profilePath)
     const existing = await existingCartVideos(dbPath, accountId, productId)
     const downloadedIds = new Set(existing.videoIds)
-    const uniqueHashes = new Set<string>()
-    for (const file of existing.files) uniqueHashes.add(await fileContentHash(file.filePath))
-    uniqueCount = uniqueHashes.size
+    if (existing.files.length) {
+      const checked = await runScript('video_visual_dedupe.py', {
+        internal: true,
+        stdinJson: {
+          anchors: [],
+          candidates: existing.files.map((file, index) => ({ id: index + 1, path: file.filePath })),
+          limit: 500,
+          overlapLimit: 0.80,
+          maxSamples: 18
+        },
+        onEvent: () => undefined
+      }).promise
+      if (!checked.ok || !checked.result) throw new Error(checked.error ?? '无法核对已有视频的画面数量')
+      const result = checked.result as { ok?: boolean; acceptedIds?: number[]; error?: string }
+      if (result.ok !== true || !Array.isArray(result.acceptedIds)) {
+        throw new Error(result.error ?? '已有视频画面核对没有返回数量')
+      }
+      uniqueCount = result.acceptedIds.length
+    }
     if (uniqueCount < target) {
       const attempt = Number((claim['job'] as { attemptCount?: number } | undefined)?.attemptCount ?? 1)
       const candidateLimit = Math.min(500, target + 40 * Math.max(1, attempt))
@@ -467,15 +472,33 @@ async function runCartVideoDownload(accountId: number, productId: string, commod
         if (!/^\d{8,25}$/.test(video.videoId) || !/^https:\/\//.test(video.url) || downloadedIds.has(video.videoId)) continue
         const task = {
           id: `cart-${accountId}-${productId}-${video.videoId}`,
-          product_id: productId, account_id: accountId, verify_video: true, url: video.url,
+          product_id: productId, account_id: accountId, verify_video: true,
+          visual_dedupe: true, url: video.url,
           dest: cartDownloadDestination(folder, productId, video.videoId, index + 1, video.publishTime)
         }
+        let skipReason = ''
         const outcome = await runScript('download_queue.py', {
           internal: true, args: ['--db', dbPath, '--workers', '1', '--max-retries', '2'],
-          stdinJson: [task], onEvent: () => undefined
+          stdinJson: [task],
+          onEvent: (event) => {
+            const taskEvent = event as unknown as { type: string; status?: string; message?: string }
+            if (taskEvent.type === 'task' && taskEvent.status === 'skipped') {
+              skipReason = taskEvent.message ?? ''
+            }
+          }
         }).promise
         if (!outcome.ok) {
           failure ||= outcome.error ?? `视频 ${video.videoId} 下载失败`
+          continue
+        }
+        const queue = outcome.result as { data?: { success?: number; skipped?: number } } | undefined
+        if (queue?.data?.skipped) {
+          downloadedIds.add(video.videoId)
+          console.info(`[加车后视频] 账号 ${accountId} 商品 ${productId}：视频 ${video.videoId} ${skipReason || '已跳过'}，继续下一条`)
+          continue
+        }
+        if (queue?.data?.success !== 1) {
+          failure ||= `视频 ${video.videoId} 没有取得明确的下载成功结果`
           continue
         }
         const registered = await existingCartVideos(dbPath, accountId, productId)
@@ -484,11 +507,7 @@ async function runCartVideoDownload(accountId: number, productId: string, commod
           continue
         }
         downloadedIds.add(video.videoId)
-        const hash = await fileContentHash(task.dest)
-        if (!uniqueHashes.has(hash)) {
-          uniqueHashes.add(hash)
-          uniqueCount = uniqueHashes.size
-        }
+        uniqueCount += 1
       }
     }
     console.info(`[加车后视频] 账号 ${accountId} 商品 ${productId}：不同内容 ${uniqueCount}/${target}，候选 ${availableCount}`)

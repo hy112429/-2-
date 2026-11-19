@@ -1,42 +1,48 @@
 /* ============================================================
    全局样式与设计变量
-   所有颜色、尺寸都定义成 CSS 变量，改主题只需改这一处。
+   新页面沿用这些语义变量与间距层级，保留运营信息密度。
    ============================================================ */
 
 :root {
   /* --- 颜色 --- */
-  --bg-app: #f3f6fb;          /* 应用底色 */
+  --bg-app: #f5f5f7;          /* 应用底色 */
   --bg-panel: #ffffff;        /* 内容面板 */
-  --bg-top: #18243c;          /* 顶部菜单栏 */
-  --bg-nav: #15213a;          /* 左侧导航 */
-  --bg-nav-hover: #243654;
+  --bg-top: #ffffff;          /* 顶部菜单栏 */
+  --bg-nav: #fbfbfd;          /* 左侧导航 */
+  --bg-nav-hover: #ececf0;
   --bg-status: #ffffff;       /* 底部状态栏 */
-  --bg-placeholder: #f1f5fb; /* 占位区块 */
+  --bg-placeholder: #f5f5f7; /* 占位区块 */
 
-  --border: #dfe7f1;
-  --border-dark: #32425c;
+  --border: #e5e5e9;
+  --border-dark: #d2d2d7;
 
-  --text: #25334b;
-  --text-muted: #69788f;
-  --text-on-dark: #b7c5dc;
-  --text-on-dark-strong: #ffffff;
+  --text: #1d1d1f;
+  --text-muted: #6e6e73;
+  --text-on-dark: #515154;        /* 兼容旧组件变量名 */
+  --text-on-dark-strong: #1d1d1f; /* 兼容旧组件变量名 */
 
-  --brand: #356fe4;
-  --brand-soft: #eaf1ff;
+  --brand: #0071e3;
+  --brand-hover: #0077ed;
+  --brand-soft: #eaf4ff;
   --surface: #ffffff;
-  --surface-muted: #f4f7fc;
+  --surface-muted: #f5f5f7;
+  --surface-raised: #ffffff;
   --muted: var(--text-muted);
-  --shadow-card: 0 3px 14px rgba(28, 50, 89, .055);
-  --shadow-float: 0 18px 48px rgba(16, 32, 61, .18);
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, .045);
+  --shadow-float: 0 24px 70px rgba(0, 0, 0, .16);
+  --success: #248a5b;
+  --warning: #ad6800;
+  --danger: #c73535;
 
   /* --- 尺寸 --- */
-  --h-top: 56px;      /* 顶部菜单高度 */
+  --h-top: 54px;      /* 顶部菜单高度 */
   --h-status: 32px;   /* 底部状态栏高度 */
-  --w-nav: 176px;     /* 左侧导航宽度 */
+  --w-nav: 180px;     /* 左侧导航宽度 */
 
-  --radius: 9px;
+  --radius: 14px;
+  --radius-control: 9px;
 
-  font-family: 'Segoe UI Variable', 'Microsoft YaHei UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Microsoft YaHei UI', 'PingFang SC', sans-serif;
   font-size: 14px;
   line-height: 1.5;
   color: var(--text);
@@ -75,6 +81,8 @@ button {
   color: inherit;
 }
 
+button:not(:disabled) { transition: background-color .16s ease, border-color .16s ease, color .16s ease, box-shadow .16s ease; }
+
 button:not(:disabled), summary, select, input[type='checkbox'], input[type='radio'] { cursor: pointer; }
 button:disabled { cursor: not-allowed; }
 button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
@@ -82,18 +90,19 @@ button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-v
   outline-offset: 2px;
 }
 input, select, textarea { font: inherit; }
+input:not([type='checkbox']):not([type='radio']), select, textarea { color: var(--text); }
 input[type='checkbox'], input[type='radio'] { accent-color: var(--brand); }
 input::placeholder, textarea::placeholder { color: #97a4b8; }
-::selection { background: #d7e6ff; color: #173967; }
+::selection { background: #d8ebff; color: #123f70; }
 
-* { scrollbar-width: thin; scrollbar-color: #c4d0df transparent; }
+* { scrollbar-width: thin; scrollbar-color: #c7c7cc transparent; }
 
 @media (max-width: 1120px) {
-  :root { --w-nav: 150px; --h-top: 52px; }
+  :root { --w-nav: 160px; --h-top: 50px; }
 }
 
 @media (max-width: 980px) {
-  :root { --w-nav: 138px; --h-top: 50px; font-size: 13px; }
+  :root { --w-nav: 144px; --h-top: 48px; font-size: 13px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

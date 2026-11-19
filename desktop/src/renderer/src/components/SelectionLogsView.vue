@@ -469,7 +469,7 @@ onUnmounted(() => {
 .batch-id { overflow-wrap: anywhere; }
 .state-pill, .log-level { display: inline-flex; flex: 0 0 auto; align-items: center; min-height: 19px; padding: 1px 7px; border: 0; border-radius: 10px; font-size: 10px; font-style: normal; font-weight: 500; }
 .state-pill.is-success, .log-level.is-success { background: #e7f6ee; color: #087443; }
-.state-pill.is-info, .log-level.is-info { background: #eaf1ff; color: #2458a6; }
+.state-pill.is-info, .log-level.is-info { background: var(--brand-soft); color: var(--brand); }
 .state-pill.is-warning, .log-level.is-warning { background: #fff4dc; color: #9a6700; }
 .log-level.is-error { background: #fdecea; color: #a33125; }
 .pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px; }
@@ -516,4 +516,13 @@ onUnmounted(() => {
   .detail-panel { min-height: 300px; }
 }
 @media (max-width: 760px) { .logs-layout { grid-template-columns: 1fr; } .batch-panel { max-height: 330px; } }
+.logs-page { gap: 14px; }
+.page-header h1 { font-size: 24px; letter-spacing: -.03em; }
+.filters-card { gap: 10px; padding: 14px; }
+.filters-card input, .filters-card select, .timeline-header select { min-height: 32px; border-radius: var(--radius-control); background: var(--bg-panel); }
+.btn { min-height: 32px; border-radius: var(--radius-control); }
+.logs-layout { gap: 14px; }
+.panel-title { padding: 14px; font-weight: 600; }
+.batch-item { padding: 11px 14px; }
+.batch-detail { padding: 16px; }
 </style>

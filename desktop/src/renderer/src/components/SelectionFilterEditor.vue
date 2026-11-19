@@ -286,4 +286,15 @@ const sourceLabels: Record<'hotSpot' | 'allianceRank', string> = {
 .pool-list button { padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-app); color: var(--text); }
 .disabled { opacity: .6; }
 @media (max-width: 820px) { .form-grid, .platform-filter-grid { grid-template-columns: 1fr; } }
+/* 与客户端表单、分类标签共用同一套控件节奏。 */
+.filter-editor { gap: 10px; }
+.form-grid { gap: 10px; }
+.form-grid > label { gap: 5px; font-weight: 500; }
+.form-grid input, .form-grid select, .platform-filter-field select, .commission-threshold-input input {
+  min-height: 32px;
+  border-radius: var(--radius-control);
+  background: var(--bg-panel);
+}
+.filter-chip { border-radius: 999px; background: var(--bg-panel); }
+.filter-chip:has(input:checked) { border-color: var(--brand); background: var(--brand-soft); color: var(--brand); }
 </style>

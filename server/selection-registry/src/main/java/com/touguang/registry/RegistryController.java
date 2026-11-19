@@ -45,6 +45,10 @@ public class RegistryController {
             @NotBlank String requestId,
             @NotBlank @Size(max = 128) String accountKey,
             @NotEmpty @Size(max = 50) List<@Valid Candidate> items) {}
+    public record ReservationReadbackRequest(
+            @NotBlank String requestId,
+            @NotBlank @Size(max = 128) String accountKey,
+            @NotEmpty @Size(max = 50) List<@NotBlank @Size(max = 96) String> productIds) {}
     public record FinishRequest(@NotBlank String outcome) {}
     public record ResolveRequest(@NotBlank String outcome, boolean manuallyConfirmed) {}
     public record ImportItem(
@@ -54,6 +58,14 @@ public class RegistryController {
             @Size(max = 512) String title,
             @Size(max = 16) String state) {}
     public record ImportRequest(@NotEmpty @Size(max = 5000) List<@Valid ImportItem> items) {}
+    public record OfflineItem(
+            @NotBlank @Size(max = 96) String productId,
+            @NotBlank @Size(max = 36) String localToken,
+            @NotBlank @Size(max = 128) String accountKey,
+            @Size(max = 96) String leafCategoryId,
+            @Size(max = 512) String title,
+            @NotBlank @Size(max = 16) String state) {}
+    public record OfflineSyncRequest(@NotEmpty @Size(max = 50) List<@Valid OfflineItem> items) {}
 
     @GetMapping("/health")
     public Map<String, Object> health() {
@@ -113,6 +125,107 @@ public class RegistryController {
             else rejected.add(outcome);
         }
         return Map.of("reserved", reserved, "rejected", rejected);
+    }
+
+    @PostMapping("/reservations/readback")
+    public Map<String, Object> readbackReservations(@Valid @RequestBody ReservationReadbackRequest request) {
+        UUID requestId = parseUuid(request.requestId(), "requestId");
+        List<String> products = normalizedIds(request.productIds());
+        if (products.stream().anyMatch(value -> !value.matches("\\d{1,96}")))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "productId must contain digits only");
+        if (products.isEmpty()) return Map.of("reserved", List.of());
+        List<Map<String, Object>> reserved = jdbc.query(
+                "SELECT product_id,reservation_token,state FROM selection_reservation " +
+                        "WHERE request_id=? AND account_key=? AND state <> 'RELEASED' AND product_id IN (" + placeholders(products.size()) + ")",
+                (rs, row) -> Map.of("productId", rs.getString(1), "token", rs.getString(2), "state", rs.getString(3)),
+                requestId.toString(), request.accountKey().trim(), products.toArray());
+        return Map.of("reserved", reserved);
+    }
+
+    @PostMapping("/offline-sync")
+    public Map<String, Object> syncOffline(@Valid @RequestBody OfflineSyncRequest request) {
+        List<Map<String, Object>> outcomes = new ArrayList<>();
+        for (OfflineItem item : request.items()) {
+            Map<String, Object> result = transactions.execute(status -> syncOfflineOne(item));
+            outcomes.add(result);
+        }
+        return Map.of("outcomes", outcomes);
+    }
+
+    private Map<String, Object> syncOfflineOne(OfflineItem item) {
+        String productId = item.productId().trim();
+        String account = item.accountKey().trim();
+        String category = item.leafCategoryId() == null ? "" : item.leafCategoryId().trim();
+        String localToken;
+        String desiredState = item.state().trim().toUpperCase();
+        if (!productId.matches("\\d{1,96}")) throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "productId must contain digits only");
+        if (!List.of("RESERVED", "ATTEMPTING", "COMMITTED", "UNCERTAIN", "RELEASED").contains(desiredState))
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "offline state is invalid");
+        try { localToken = UUID.fromString(item.localToken()).toString(); }
+        catch (RuntimeException error) { throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "localToken must be a UUID"); }
+
+        List<Map<String, Object>> sameRequest = jdbc.query(
+                "SELECT product_id,state,account_key,leaf_category_id FROM selection_reservation WHERE request_id=? AND product_id=? FOR UPDATE",
+                (rs, row) -> Map.of("productId", rs.getString(1), "state", rs.getString(2), "account", rs.getString(3), "category", rs.getString(4)),
+                localToken, productId);
+        if (!sameRequest.isEmpty()) {
+            Map<String, Object> existing = sameRequest.get(0);
+            if (!account.equals(existing.get("account")) || !category.equals(existing.get("category")))
+                return offlineOutcome(item, "conflict", "LOCAL_TOKEN_REUSED");
+            String existingState = String.valueOf(existing.get("state"));
+            boolean stateRegression =
+                    ("ATTEMPTING".equals(existingState) && "RESERVED".equals(desiredState)) ||
+                    ("UNCERTAIN".equals(existingState) && List.of("RESERVED", "ATTEMPTING").contains(desiredState)) ||
+                    ("COMMITTED".equals(existingState) && !"COMMITTED".equals(desiredState)) ||
+                    ("RELEASED".equals(existingState) && !"RELEASED".equals(desiredState));
+            if (stateRegression)
+                return offlineOutcome(item, "conflict", "SERVER_STATE_REGRESSION");
+            jdbc.update("UPDATE selection_reservation SET state=? WHERE request_id=? AND product_id=?", desiredState, localToken, productId);
+            if ("RELEASED".equals(desiredState)) {
+                jdbc.update("DELETE FROM account_category_history WHERE product_id=? AND account_key=?", productId, account);
+            } else if (!category.isEmpty()) {
+                jdbc.update("UPDATE account_category_history SET state=? WHERE product_id=? AND account_key=?", desiredState, productId, account);
+            }
+            return offlineOutcome(item, "synced", "");
+        }
+
+        List<Map<String, Object>> existingProduct = jdbc.query(
+                "SELECT state,request_id FROM selection_reservation WHERE product_id=? FOR UPDATE",
+                (rs, row) -> Map.of("state", rs.getString(1), "requestId", rs.getString(2)), productId);
+        if (!existingProduct.isEmpty() && !"RELEASED".equals(existingProduct.get(0).get("state")))
+            return offlineOutcome(item, "conflict", "PRODUCT_ALREADY_REGISTERED");
+        if (!category.isEmpty() && !"RELEASED".equals(desiredState)) {
+            List<String> usedCategory = jdbc.query(
+                    "SELECT product_id FROM account_category_history WHERE account_key=? AND leaf_category_id=? FOR UPDATE",
+                    (rs, row) -> rs.getString(1), account, category);
+            if (!usedCategory.isEmpty() && !productId.equals(usedCategory.get(0)))
+                return offlineOutcome(item, "conflict", "ACCOUNT_CATEGORY_ALREADY_USED");
+        }
+        if (!existingProduct.isEmpty()) {
+            jdbc.update("DELETE FROM account_category_history WHERE product_id=? AND state='RELEASED'", productId);
+        }
+        String serverToken = UUID.randomUUID().toString();
+        if (existingProduct.isEmpty()) {
+            jdbc.update("INSERT INTO selection_reservation(product_id,reservation_token,request_id,account_key,leaf_category_id,title,state) VALUES(?,?,?,?,?,?,?)",
+                    productId, serverToken, localToken, account, category, item.title(), desiredState);
+        } else {
+            jdbc.update("UPDATE selection_reservation SET reservation_token=?,request_id=?,account_key=?,leaf_category_id=?,title=?,state=? WHERE product_id=? AND state='RELEASED'",
+                    serverToken, localToken, account, category, item.title(), desiredState, productId);
+        }
+        if (!category.isEmpty() && !"RELEASED".equals(desiredState)) {
+            jdbc.update("INSERT INTO account_category_history(account_key,leaf_category_id,product_id,state) VALUES(?,?,?,?) " +
+                    "ON DUPLICATE KEY UPDATE state=VALUES(state)", account, category, productId, desiredState);
+        }
+        return offlineOutcome(item, "synced", "");
+    }
+
+    private Map<String, Object> offlineOutcome(OfflineItem item, String status, String reason) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("localToken", item.localToken());
+        result.put("productId", item.productId());
+        result.put("status", status);
+        result.put("reason", reason);
+        return result;
     }
 
     private Map<String, Object> reserveOne(UUID requestId, String account, Candidate item) {
