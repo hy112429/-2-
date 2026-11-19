@@ -476,6 +476,11 @@ const qianchuan = {
     ipcRenderer.invoke('qianchuan:plan:candidates', toPlainIpcPayload(params)),
   createManualPlan: (params: { publishQueueId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
     ipcRenderer.invoke('qianchuan:plan:createManual', toPlainIpcPayload(params)),
+  planScheduleContext: (params: { publishQueueId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:scheduleContext', toPlainIpcPayload(params)),
+  savePlanSchedule: (params: { publishQueueId: number; qianchuanAccountId: number; scheduledAt: string; confirmationJson: string }): Promise<Record<string, unknown>> =>
+    ipcRenderer.invoke('qianchuan:plan:saveSchedule', toPlainIpcPayload(params)),
+  cancelPlanSchedule: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:cancelSchedule', jobId),
   planSupplements: (): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:supplements'),
   runPlan: (jobId: number, expectedDailyBudgetYuan?: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:run', jobId, expectedDailyBudgetYuan),
   retryBlockedPlan: (jobId: number): Promise<Record<string, unknown>> => ipcRenderer.invoke('qianchuan:plan:retryBlocked', jobId),

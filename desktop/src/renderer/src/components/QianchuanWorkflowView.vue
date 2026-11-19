@@ -24,6 +24,8 @@ interface WorkflowCandidate {
   dailyBudgetYuan?: number
   commissionRate?: number
   roiTarget?: number
+  scheduleState?: string
+  scheduledAt?: string
 }
 interface WorkflowJob {
   id: number
@@ -52,6 +54,7 @@ interface WorkflowPlanJob {
   commission_rate: number
   roi_target: number
   status: string
+  schedule_state?: string
 }
 
 const emit = defineEmits<{
@@ -124,7 +127,9 @@ async function runWorkflow(): Promise<void> {
   workflowMessage.value = ''
   workflowProgress.value = '正在核对已发布商品、千川账户和计划配置…'
   const createdQueueIds = new Set<number>()
+  const startedQianchuanBrowserIds = new Set<number>()
   const blocked: string[] = []
+  const scheduledProducts = new Set<string>()
   let publishedCount = 0
   try {
     const targetResult = checked(await window.api.qianchuan.uploadTargets())
@@ -157,6 +162,10 @@ async function runWorkflow(): Promise<void> {
       const candidates = rows<WorkflowCandidate>(candidateResult).filter(matchesProduct)
       const jobs = rows<WorkflowJob>(checked(await window.api.qianchuan.uploadJobs(binding.account_id)))
       for (const candidate of candidates) {
+        if (candidate.scheduleState) {
+          scheduledProducts.add(`${candidate.qianchuanAccountId}:${candidate.productId}`)
+          continue
+        }
         const productJobs = jobs.filter((job) => job.productId === candidate.productId &&
           Number(job.qianchuanAccountId) === Number(binding.qianchuan_account_id))
         if (productJobs.some((job) => job.status === 'needs_review')) {
@@ -188,6 +197,10 @@ async function runWorkflow(): Promise<void> {
         const jobs = usesUploadedVideo
           ? rows<WorkflowJob>(checked(await window.api.qianchuan.uploadJobs(binding.account_id))) : []
         for (const candidate of candidates) {
+          if (candidate.scheduleState) {
+            scheduledProducts.add(`${candidate.qianchuanAccountId}:${candidate.productId}`)
+            continue
+          }
           if (createdQueueIds.has(candidate.publishQueueId)) continue
           const productJobs = jobs.filter((job) => job.productId === candidate.productId && Number(job.qianchuanAccountId) === qcId)
           const reviewJob = usesUploadedVideo ? productJobs.find((job) => job.status === 'needs_review') : undefined
@@ -202,11 +215,28 @@ async function runWorkflow(): Promise<void> {
             (!job.nextRetryAt || job.nextRetryAt <= new Date().toLocaleString('sv-SE').replace(' ', 'T')))
           if (dueJobs.length) {
             pending += dueJobs.length
+            if (!startedQianchuanBrowserIds.has(qcId)) {
+              workflowProgress.value = `正在启动 ${binding.account_name} 的千川专属浏览器…`
+              const browser = await window.api.qianchuan.openLogin(qcId)
+              if (!browser.ok) {
+                throw new Error(`${binding.account_name} 千川浏览器启动失败：${browser.error ?? '浏览器未确认启动'}`)
+              }
+              startedQianchuanBrowserIds.add(qcId)
+            }
             for (const job of dueJobs) {
               workflowProgress.value = `正在计划页为 ${binding.account_name} 上传视频任务 #${job.id}…`
               const result = await window.api.qianchuan.runUpload(job.id)
-              if (result.status === 'needs_review' || result.manualActionRequired === true) {
-                blocked.push(`${binding.account_name} / ${candidate.productName || candidate.productId}：任务 #${job.id} 上传结果待核查`)
+              const uploadStatus = String(result.status ?? '')
+              const uploadError = String(result.error ?? '上传器未返回成功状态')
+              if (uploadStatus === 'needs_review' || result.manualActionRequired === true) {
+                const reason = `${binding.account_name} / ${candidate.productName || candidate.productId}：任务 #${job.id} 上传结果待人工核查：${uploadError}`
+                blocked.push(reason)
+                throw new Error(reason)
+              }
+              if (result.ok === false && !['deferred', 'retry_wait'].includes(uploadStatus)) {
+                const reason = `${binding.account_name} / ${candidate.productName || candidate.productId}：任务 #${job.id} 上传未启动：${uploadError}`
+                blocked.push(reason)
+                throw new Error(reason)
               }
             }
           }
@@ -258,6 +288,7 @@ async function runWorkflow(): Promise<void> {
 
     const planResult = checked(await window.api.qianchuan.planJobs({ limit: 200 }))
     const plans = rows<WorkflowPlanJob>(planResult).filter((job) => job.status === 'ready' &&
+      !job.schedule_state &&
       createdQueueIds.has(job.publish_queue_id) &&
       bindings.some((binding) => binding.account_id === job.account_id &&
         Number(binding.qianchuan_account_id) === job.qianchuan_account_id) &&
@@ -266,7 +297,9 @@ async function runWorkflow(): Promise<void> {
       workflowProgress.value = ''
       workflowMessage.value = blocked.length
         ? `流程已停止，需先处理：${blocked.slice(0, 3).join('；')}${blocked.length > 3 ? `；另有 ${blocked.length - 3} 项` : ''}`
-        : '当前没有可安全提交的计划；素材或我的视频尚未就绪时，请先查看具体账号的任务状态。'
+        : scheduledProducts.size
+          ? `${scheduledProducts.size} 个商品已有定时或保留草稿，本次按其已保存安排处理；请在计划列表查看时间和状态。`
+          : '当前没有可安全提交的计划；素材或我的视频尚未就绪时，请先查看具体账号的任务状态。'
       return
     }
     if (pendingAtExit > 0) blocked.push(`另有 ${pendingAtExit} 个素材任务仍在处理，本次只提交已就绪计划`)

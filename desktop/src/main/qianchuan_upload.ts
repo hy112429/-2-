@@ -266,7 +266,7 @@ async function runOneUploadCore(rawJobId: unknown): Promise<Json> {
   }
 }
 
-async function runOneUpload(rawJobId: unknown): Promise<Json> {
+export async function runOneUpload(rawJobId: unknown): Promise<Json> {
   const id = jobIdFrom(rawJobId)
   if (pendingJobs.has(id)) return { ok: false, error: '该上传任务已在执行或预检查中' }
   pendingJobs.add(id)

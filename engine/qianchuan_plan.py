@@ -6,7 +6,7 @@ import argparse
 import json
 import re
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS qianchuan_plan_jobs (
   published_video_title TEXT NOT NULL DEFAULT '',
   plan_name TEXT NOT NULL,
   creation_source TEXT NOT NULL DEFAULT 'auto',
+  scheduled_at TEXT NOT NULL DEFAULT '',
+  schedule_state TEXT NOT NULL DEFAULT '',
+  schedule_snapshot_json TEXT NOT NULL DEFAULT '{}',
   daily_budget_yuan INTEGER NOT NULL DEFAULT 0,
   commission_rate REAL NOT NULL DEFAULT 0,
   roi_target REAL NOT NULL DEFAULT 0,
@@ -97,6 +100,10 @@ def ensure_schema(db: sqlite3.Connection) -> None:
         # 旧版本若曾启用，迁移时从当前时刻开始；禁止将历史作品批量建成付费计划。
         db.execute("UPDATE qianchuan_plan_settings SET activated_at=? WHERE enabled=1", (now_text(),))
     plan_columns = {row["name"] for row in db.execute("PRAGMA table_info(qianchuan_plan_jobs)")}
+    for name, default in (("scheduled_at", ""), ("schedule_state", ""), ("schedule_snapshot_json", "{}")):
+        if name not in plan_columns:
+            db.execute(f"ALTER TABLE qianchuan_plan_jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT '{default}'")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_qc_plan_schedule ON qianchuan_plan_jobs(schedule_state,status,scheduled_at,id)")
     for name in ("selected_material_ids_json", "applied_material_ids_json"):
         if name not in plan_columns:
             db.execute(f"ALTER TABLE qianchuan_plan_jobs ADD COLUMN {name} TEXT NOT NULL DEFAULT '[]'")
@@ -199,7 +206,11 @@ def save_settings(db: sqlite3.Connection, qc_id: int, budget: int, source: str,
         raise ValueError("当前只支持从今天起长期投放；自定义结束日期尚未配置")
     activated_at = (str(previous.get("activated_at") or "") if previous["enabled"] and enabled
                     else now_text() if enabled else "")
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
     with db:
+        if db.execute("SELECT 1 FROM qianchuan_plan_jobs WHERE qianchuan_account_id=? AND status='submitting' AND schedule_state='scheduled' LIMIT 1", (qc_id,)).fetchone():
+            raise ValueError("该账户的定时计划正在提交，请等提交结果明确后再修改计划设置")
         db.execute("""INSERT INTO qianchuan_plan_settings
             (qianchuan_account_id,enabled,daily_budget_yuan,video_source,delivery_mode,
              long_running,smart_coupon,aigc_enabled,activated_at,updated_at)
@@ -212,7 +223,176 @@ def save_settings(db: sqlite3.Connection, qc_id: int, budget: int, source: str,
             updated_at=excluded.updated_at""",
             (qc_id, int(enabled), budget, source, "控成本投放", int(long_running),
              int(coupon), int(aigc), activated_at, now_text()))
+        # 配置发生变化即撤回旧定时授权；即便之后改回原值也须重新确认。
+        sync_schedules(db)
     return _settings(db, qc_id)
+
+
+SCHEDULE_TZ = timezone(timedelta(hours=8))
+
+
+def schedule_context(db: sqlite3.Connection, queue_id: int, qc_id: int) -> dict[str, Any]:
+    """定时只确认商品、绑定与预算；素材未就绪仍可保存待办。"""
+    if queue_id in {38, 39, 42}:
+        raise ValueError("该发布队列任务受保护，不支持改为千川定时任务")
+    row = db.execute("""SELECT p.*,a.name account_name,q.qc_name,q.qc_id advertiser_id
+        FROM publish_queue p JOIN accounts a ON a.id=p.account_id
+        JOIN account_qianchuan aq ON aq.account_row_id=p.account_id
+        JOIN qianchuan_accounts q ON q.id=aq.qianchuan_row_id
+        WHERE p.id=? AND q.id=? AND a.status='active' AND p.platform_status='published'
+        AND p.product_id<>''""", (queue_id, qc_id)).fetchone()
+    if not row or not re.fullmatch(r"\d{8,20}", str(row["advertiser_id"] or "")):
+        raise ValueError("商品发布回执、启用账号或千川广告主绑定已变化，请重新核对")
+    settings = _settings(db, qc_id)
+    if not 50 <= int(settings["daily_budget_yuan"]) <= 10000000:
+        raise ValueError("请先保存至少 50 元的日预算，再设置定时")
+    columns = {r["name"] for r in db.execute("PRAGMA table_info(baiying_products)")}
+    rate_row = (db.execute("SELECT cos_ratio FROM baiying_products WHERE account_id=? AND product_id=?",
+                          (row["account_id"], row["product_id"])).fetchone()
+                if {"account_id", "product_id", "cos_ratio"}.issubset(columns) else None)
+    try:
+        rate = float(rate_row["cos_ratio"]) if rate_row else 0
+    except (TypeError, ValueError):
+        rate = 0
+    if not 0 < rate <= 100:
+        raise ValueError("商品佣金率缺失或无效，不能确认定时预算与 ROI")
+    if settings["video_source"] == "my_video" and not str(row["title"] or "").strip():
+        raise ValueError("已发布作品标题缺失，无法核对我的视频")
+    snapshot = {
+        "publish_queue_id": queue_id, "account_id": int(row["account_id"]),
+        "qianchuan_account_id": qc_id, "advertiser_id": str(row["advertiser_id"]),
+        "product_id": str(row["product_id"]), "published_video_title": str(row["title"] or ""),
+        "daily_budget_yuan": int(settings["daily_budget_yuan"]),
+        "commission_rate": rate, "roi_target": round(100 / rate, 2),
+        "video_source": settings["video_source"], "delivery_mode": settings["delivery_mode"],
+        "long_running": int(settings["long_running"]), "smart_coupon": int(settings["smart_coupon"]),
+        "aigc_enabled": int(settings["aigc_enabled"]),
+    }
+    return {"ok": True, "snapshot": snapshot,
+            "confirmationJson": json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+            "productName": str(row["product_name"] or ""), "accountName": str(row["account_name"]),
+            "qcName": str(row["qc_name"] or "")}
+
+
+def _schedule_problem(db: sqlite3.Connection, row: sqlite3.Row) -> str:
+    try:
+        current = schedule_context(db, int(row["publish_queue_id"]), int(row["qianchuan_account_id"]))["snapshot"]
+        if current != json.loads(row["schedule_snapshot_json"] or "{}"):
+            return "定时确认后的预算、佣金率/ROI、账号绑定或计划设置已变化，请重新确认定时"
+    except (ValueError, TypeError, sqlite3.Error) as error:
+        return f"定时条件已变化，请重新确认：{error}"
+    return ""
+
+
+def _pause_schedule(db: sqlite3.Connection, row: sqlite3.Row, reason: str) -> None:
+    updated = db.execute("""UPDATE qianchuan_plan_jobs SET schedule_state='confirm_required',reason=?,updated_at=?
+        WHERE id=? AND schedule_state='scheduled' AND status='ready' AND submit_attempted=0""",
+        (reason[:2000], now_text(), row["id"]))
+    if updated.rowcount:
+        record_event(db, int(row["id"]), "PLAN_SCHEDULE_CONFIRM_REQUIRED", "schedule", "ready",
+                     "定时授权暂停，需重新确认", reason)
+
+
+def sync_schedules(db: sqlite3.Connection) -> dict[str, Any]:
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    rows = db.execute("SELECT * FROM qianchuan_plan_jobs WHERE schedule_state='scheduled' AND status='ready' AND submit_attempted=0").fetchall()
+    changed = 0
+    for row in rows:
+        reason = _schedule_problem(db, row)
+        if reason:
+            _pause_schedule(db, row, reason)
+            changed += 1
+    return {"ok": True, "paused": changed}
+
+
+def save_schedule(db: sqlite3.Connection, queue_id: int, qc_id: int,
+                  scheduled_at: str, confirmation_json: str) -> dict[str, Any]:
+    due = datetime.fromisoformat(scheduled_at)
+    if due.tzinfo is None or due <= datetime.now(SCHEDULE_TZ):
+        raise ValueError("请选择未来的北京时间（UTC+8）")
+    due_text = due.astimezone(SCHEDULE_TZ).isoformat(timespec="seconds")
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        context = schedule_context(db, queue_id, qc_id)
+        snapshot = context["snapshot"]
+        if json.loads(confirmation_json) != snapshot:
+            raise ValueError("确认期间商品、预算或 ROI 已变化，请刷新摘要后重新确认")
+        row = db.execute("SELECT * FROM qianchuan_plan_jobs WHERE account_id=? AND qianchuan_account_id=? AND product_id=?",
+                         (snapshot["account_id"], qc_id, snapshot["product_id"])).fetchone()
+        if row and (row["status"] not in {"ready", "blocked"} or row["submit_attempted"] or row["remote_plan_id"]):
+            raise ValueError("任务已经执行、发布中或待核查，不能设置或修改定时")
+        if row and int(row["publish_queue_id"]) != queue_id:
+            raise ValueError("同一商品已有其他作品的计划任务，请在原计划中继续处理")
+        if not row:
+            cursor = db.execute("""INSERT INTO qianchuan_plan_jobs
+                (publish_queue_id,account_id,qianchuan_account_id,advertiser_id,product_id,
+                 product_name,published_video_title,plan_name,creation_source,status,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?, 'manual','ready',?,?)""",
+                (queue_id, snapshot["account_id"], qc_id, snapshot["advertiser_id"], snapshot["product_id"],
+                 context["productName"], snapshot["published_video_title"],
+                 f"{due_text[:10]}_商品全域投放_{snapshot['product_id']}"[:50], now_text(), now_text()))
+            job_id = int(cursor.lastrowid)
+        else:
+            job_id = int(row["id"])
+        db.execute("""UPDATE qianchuan_plan_jobs SET creation_source='manual',status='ready',
+            advertiser_id=?,published_video_title=?,product_name=?,
+            scheduled_at=?,schedule_state='scheduled',schedule_snapshot_json=?,daily_budget_yuan=?,
+            commission_rate=?,roi_target=?,reason='已保存定时；前置条件就绪后不早于设定时间提交',updated_at=? WHERE id=?""",
+            (snapshot["advertiser_id"], snapshot["published_video_title"], context["productName"],
+             due_text, context["confirmationJson"], snapshot["daily_budget_yuan"], snapshot["commission_rate"],
+             snapshot["roi_target"], now_text(), job_id))
+        record_event(db, job_id, "PLAN_SCHEDULE_SAVED", "schedule", "ready", "已确认千川定时提交",
+                     f"北京时间={due_text}; " + context["confirmationJson"])
+        db.commit()
+        return {"ok": True, "job": _row(db.execute("SELECT * FROM qianchuan_plan_jobs WHERE id=?", (job_id,)).fetchone())}
+    except Exception:
+        db.rollback()
+        raise
+
+
+def cancel_schedule(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
+    db.commit()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        row = db.execute("SELECT * FROM qianchuan_plan_jobs WHERE id=?", (job_id,)).fetchone()
+        if (not row or row["status"] not in {"ready", "blocked"} or row["submit_attempted"]
+                or row["remote_plan_id"] or row["schedule_state"] not in {"scheduled", "confirm_required"}):
+            raise ValueError("只有尚未提交的定时任务可以取消；发布中或结果待核查请先核对平台")
+        db.execute("""UPDATE qianchuan_plan_jobs SET schedule_state='cancelled',creation_source='manual',
+            reason='定时已取消；草稿保留，等待手动发布或重新设置定时',updated_at=? WHERE id=?""", (now_text(), job_id))
+        record_event(db, job_id, "PLAN_SCHEDULE_CANCELLED", "schedule", str(row["status"]),
+                     "已取消定时并保留手动草稿", "不会自动恢复该商品的立即提交")
+        db.commit()
+        return {"ok": True}
+    except Exception:
+        db.rollback()
+        raise
+
+
+def schedule_preflight(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT * FROM qianchuan_plan_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row or row["status"] != "ready" or row["schedule_state"] != "scheduled" or row["submit_attempted"]:
+        return {"ok": True, "ready": False, "reason": "定时状态已变化，等待重新确认或核查"}
+    reason = _schedule_problem(db, row)
+    if reason:
+        _pause_schedule(db, row, reason)
+        return {"ok": True, "ready": False, "reason": reason}
+    snapshot = json.loads(row["schedule_snapshot_json"])
+    if datetime.fromisoformat(row["scheduled_at"]) > datetime.now(SCHEDULE_TZ):
+        reason = "素材可提前准备；尚未到设定的千川提交时间"
+    elif snapshot["video_source"] != "my_video":
+        account, qc_id, product = int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"])
+        if duplicate_material_ids(db, account, qc_id, product):
+            reason = "远端素材 ID 存在重复，请先核查素材归属"
+        elif not uploads_settled(db, account, qc_id, product, int(row["publish_queue_id"])):
+            reason = "已到定时时间，等待素材上传或发布后素材处理完成"
+        elif not usable_material_ids(db, account, qc_id, product):
+            reason = "已到定时时间，等待该商品的可用已上传素材"
+    return {"ok": True, "ready": not reason, "reason": reason}
 
 
 def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
@@ -268,7 +448,7 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
         except (TypeError, ValueError):
             rate = 0
         roi = round(100 / rate, 2) if 0 < rate <= 100 else 0
-        existing = db.execute("""SELECT id,status,submit_attempted FROM qianchuan_plan_jobs
+        existing = db.execute("""SELECT id,status,submit_attempted,schedule_state,scheduled_at FROM qianchuan_plan_jobs
             WHERE account_id=? AND qianchuan_account_id=? AND product_id=?""",
             (account, qc_id, product_id)).fetchone()
         reason = ""
@@ -298,6 +478,11 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
             "videoSource": source, "materialCount": len(ids), "remoteMaterialIds": ids,
             "existingPlanId": int(existing["id"]) if existing else 0,
             "existingPlanStatus": str(existing["status"]) if existing else "",
+            "scheduleState": str(existing["schedule_state"]) if existing else "",
+            "scheduledAt": str(existing["scheduled_at"]) if existing else "",
+            "canSchedule": (queue_id not in {38, 39, 42} and not existing and
+                            bool(re.fullmatch(r"\d{8,20}", advertiser)) and roi > 0 and
+                            int(row["daily_budget_yuan"] or 0) >= 50),
             "canCreate": not reason, "reason": reason,
         })
     return {"ok": True, "rows": result}
@@ -588,7 +773,8 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
         WHERE p.platform_status='published' AND a.status='active' AND s.enabled=1 AND s.daily_budget_yuan>=50
         AND s.activated_at<>'' AND p.published_at>s.activated_at
         AND p.product_id<>'' AND (existing.id IS NULL OR
-            (existing.status IN ('ready','blocked') AND existing.submit_attempted=0))
+            (existing.status IN ('ready','blocked') AND existing.submit_attempted=0
+             AND existing.schedule_snapshot_json='{{}}'))
         ORDER BY p.id""").fetchall()
     created = 0
     for row in candidates:
@@ -601,7 +787,7 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
                 db.execute("""UPDATE qianchuan_plan_jobs SET status='blocked',
                     reason='目标千川账户内发现重复远端素材 ID，请先核对素材归属',updated_at=?
                     WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
-                    AND status IN ('ready','blocked') AND submit_attempted=0""",
+                    AND status IN ('ready','blocked') AND submit_attempted=0 AND schedule_snapshot_json='{}'""",
                     (now_text(), account_id, qc_id, product_id))
             continue
         ids = usable_material_ids(db, account_id, qc_id, product_id)
@@ -643,24 +829,37 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
                     status=CASE WHEN status='blocked' AND reason LIKE '无法计算保本 ROI：%' THEN 'ready' ELSE status END,
                     reason=CASE WHEN status='blocked' AND reason LIKE '无法计算保本 ROI：%' THEN '' ELSE reason END,
                     updated_at=? WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
-                    AND status IN ('ready','blocked') AND submit_attempted=0""",
+                    AND status IN ('ready','blocked') AND submit_attempted=0 AND schedule_snapshot_json='{}'""",
                     (int(row["daily_budget_yuan"]), commission_rate, roi_target, now_text(), account_id, qc_id, product_id))
             else:
                 db.execute("""UPDATE qianchuan_plan_jobs SET commission_rate=0,roi_target=0,
                     status='blocked',reason=?,updated_at=?
                     WHERE account_id=? AND qianchuan_account_id=? AND product_id=?
-                    AND status='ready' AND submit_attempted=0""",
+                    AND status='ready' AND submit_attempted=0 AND schedule_snapshot_json='{}'""",
                     (reason, now_text(), account_id, qc_id, product_id))
     return {"ok": True, "created": created}
 
 
-def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int = 0) -> dict[str, Any]:
+def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int = 0,
+          expected_scheduled_at: str = "") -> dict[str, Any]:
     db.commit()
     db.execute("BEGIN IMMEDIATE")
     try:
         row = db.execute("SELECT * FROM qianchuan_plan_jobs WHERE id=?", (job_id,)).fetchone()
         if not row or row["status"] != "ready":
             raise ValueError("计划任务不存在或已执行；不会重复发布")
+        if expected_scheduled_at and (row["schedule_state"] != "scheduled" or row["scheduled_at"] != expected_scheduled_at):
+            raise ValueError("定时已取消或改期，本次调度停止")
+        if row["schedule_state"] not in {"", "cancelled"}:
+            if row["schedule_state"] != "scheduled":
+                raise ValueError("定时授权已暂停，请重新确认定时后再提交")
+            problem = _schedule_problem(db, row)
+            if problem:
+                _pause_schedule(db, row, problem)
+                db.commit()
+                raise ValueError(problem)
+            if datetime.fromisoformat(row["scheduled_at"]) > datetime.now(SCHEDULE_TZ):
+                raise ValueError("尚未到设定的千川提交时间")
         settings = _settings(db, int(row["qianchuan_account_id"]))
         if (not settings["enabled"] and str(row["creation_source"] or "auto") != "manual") or int(settings["daily_budget_yuan"]) < 50:
             raise ValueError("该千川账户未启用自动发布或未配置至少 50 元日预算")
@@ -761,6 +960,9 @@ def finish(db: sqlite3.Connection, job_id: int, status: str, submitted: bool,
              status, json.dumps(selected), now_text(), job_id))
         if updated.rowcount != 1:
             raise ValueError("计划任务状态已改变，禁止覆盖")
+        db.execute("""UPDATE qianchuan_plan_jobs SET schedule_state=CASE
+            WHEN ?='published' THEN 'completed' WHEN ?='blocked' THEN 'confirm_required'
+            ELSE schedule_state END WHERE id=? AND schedule_state='scheduled'""", (status, status, job_id))
         event_type = {
             "published": "PLAN_PUBLISHED",
             "needs_review": "PLAN_SUBMISSION_UNCERTAIN",
@@ -846,7 +1048,11 @@ def plan_log_details(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path(DEFAULT_DB_PATH))
-    parser.add_argument("command", choices=["settings", "set-settings", "sync", "candidates", "create-manual", "jobs", "logs", "claim", "finish", "defer", "recover", "retry-blocked", "resolve-present", "resolve-absent", "sync-supplements", "supplement-jobs", "claim-supplement", "finish-supplement"])
+    parser.add_argument("command", choices=["settings", "set-settings", "sync", "candidates", "create-manual", "jobs", "logs", "claim", "finish", "defer", "recover", "retry-blocked", "resolve-present", "resolve-absent", "sync-supplements", "supplement-jobs", "claim-supplement", "finish-supplement", "schedule-context", "save-schedule", "cancel-schedule", "sync-schedules", "schedule-preflight", "pause-schedule"])
+    parser.add_argument("--scheduled-at", default="")
+    parser.add_argument("--confirmation-json", default="{}")
+    parser.add_argument("--expected-scheduled-at", default="")
+    parser.add_argument("--scheduled-only", action="store_true")
     parser.add_argument("--account-id", type=int, default=0)
     parser.add_argument("--publish-queue-id", type=int, default=0)
     parser.add_argument("--qianchuan-account-id", type=int, default=0)
@@ -883,6 +1089,27 @@ def main() -> int:
                     bool(args.smart_coupon), bool(args.aigc_enabled))}
             elif args.command == "sync":
                 result = sync(db)
+            elif args.command == "sync-schedules":
+                with db:
+                    result = sync_schedules(db)
+            elif args.command == "schedule-context":
+                result = schedule_context(db, args.publish_queue_id, args.qianchuan_account_id)
+            elif args.command == "save-schedule":
+                result = save_schedule(db, args.publish_queue_id, args.qianchuan_account_id,
+                                       args.scheduled_at, args.confirmation_json)
+            elif args.command == "cancel-schedule":
+                result = cancel_schedule(db, args.id)
+            elif args.command == "schedule-preflight":
+                with db:
+                    result = schedule_preflight(db, args.id)
+            elif args.command == "pause-schedule":
+                db.commit()
+                db.execute("BEGIN IMMEDIATE")
+                with db:
+                    row = db.execute("SELECT * FROM qianchuan_plan_jobs WHERE id=?", (args.id,)).fetchone()
+                    if row:
+                        _pause_schedule(db, row, args.reason[:2000] or "定时任务需要人工处理并重新确认")
+                result = {"ok": True}
             elif args.command == "candidates":
                 result = plan_candidates(db, args.account_id, args.qianchuan_account_id)
             elif args.command == "create-manual":
@@ -905,6 +1132,8 @@ def main() -> int:
                 if args.status:
                     conditions.append("status=?")
                     filters.append(args.status)
+                if args.scheduled_only:
+                    conditions.append("schedule_state='scheduled' AND submit_attempted=0 AND status='ready'")
                 if conditions:
                     query += " WHERE " + " AND ".join(conditions)
                 order = "ASC" if args.status == "ready" else "DESC"
@@ -913,7 +1142,7 @@ def main() -> int:
                     count_query += " WHERE " + " AND ".join(conditions)
                 total = int(db.execute(count_query, filters).fetchone()[0])
                 result = {"ok": True, "rows": [dict(r) for r in db.execute(
-                    query + f" ORDER BY id {order} LIMIT ? OFFSET ?", [*filters, args.limit, args.offset])],
+                    query + (" ORDER BY scheduled_at,id" if args.scheduled_only else f" ORDER BY id {order}") + " LIMIT ? OFFSET ?", [*filters, args.limit, args.offset])],
                     "total": total, "offset": args.offset, "limit": args.limit}
             elif args.command == "logs":
                 if args.id:
@@ -945,7 +1174,7 @@ def main() -> int:
                           else " ORDER BY s.id DESC LIMIT 200 OFFSET ?")
                 result = {"ok": True, "rows": [dict(r) for r in db.execute(query, [*filters, args.offset])]}
             elif args.command == "claim":
-                result = claim(db, args.id, args.expected_daily_budget_yuan)
+                result = claim(db, args.id, args.expected_daily_budget_yuan, args.expected_scheduled_at)
             elif args.command == "defer":
                 result = defer(db, args.id, args.reason)
             elif args.command == "claim-supplement":
@@ -977,6 +1206,8 @@ def main() -> int:
                     if not row:
                         raise ValueError("计划任务不存在")
                     if args.command == "retry-blocked":
+                        if row["schedule_state"] == "confirm_required":
+                            raise ValueError("定时授权已暂停，请使用重新确认定时入口")
                         if row["status"] != "blocked" or row["submit_attempted"]:
                             raise ValueError("只有发布前停止的计划可直接重试")
                         if float(row["roi_target"] or 0) <= 0:
@@ -998,6 +1229,10 @@ def main() -> int:
                             AND selected_material_ids_json<>'[]' THEN selected_material_ids_json
                             ELSE applied_material_ids_json END,updated_at=? WHERE id=?""",
                         (status, remote_id, args.reason.strip()[:2000], status, now_text(), args.id))
+                    if row["schedule_snapshot_json"] != "{}" and args.command in {"resolve-present", "resolve-absent"}:
+                        db.execute("UPDATE qianchuan_plan_jobs SET schedule_state=?,submit_attempted=? WHERE id=?",
+                                   ("completed" if status == "published" else "confirm_required",
+                                    int(status == "published"), args.id))
                     if args.command == "retry-blocked":
                         record_event(db, args.id, "PLAN_RETRY_QUEUED", "recovery", "ready",
                                      "发布前停止的计划已重新排队，等待再次确认预算后提交",

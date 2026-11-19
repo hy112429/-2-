@@ -72,6 +72,15 @@ function displayDate(value: string): string {
   return Number.isNaN(date.getTime()) ? value.replace('T', ' ') : date.toLocaleString('zh-CN', { hour12: false })
 }
 
+async function copyId(value: string, label: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value)
+    notifyGlobal(`${label}已复制`, 'success')
+  } catch {
+    notifyGlobal(`${label}复制失败，剪贴板不可用`, 'error')
+  }
+}
+
 function materialQuality(record: MaterialRecord): string {
   const value = (record.materialEvaluation ?? '').trim()
   if (!record.evaluationCheckedAt || !value || value === '-') return '待判定'
@@ -479,7 +488,7 @@ onMounted(() => { void load() })
       <div class="table-scroll">
         <table>
           <thead>
-            <tr><th class="check-col"></th><th>商品信息</th><th>状态</th><th>编码</th><th>日期时间</th><th class="action-col">操作</th></tr>
+            <tr><th class="check-col"></th><th>商品信息</th><th>状态</th><th class="code-col">推广 ID</th><th>日期时间</th><th class="action-col">操作</th></tr>
           </thead>
           <tbody v-if="!loading && rows.length">
             <tr v-for="row in rows" :key="rowKey(row)">
@@ -492,7 +501,10 @@ onMounted(() => { void load() })
                   </div>
                   <div class="product-copy">
                     <strong :title="row.title">{{ row.title || '未获取商品名称' }}</strong>
-                    <span>{{ row.accountName }} · ID {{ row.productId }}</span>
+                    <div class="product-id-row">
+                      <span :title="`商品 ID ${row.productId}`">{{ row.accountName }} · 商品 ID {{ row.productId }}</span>
+                      <button type="button" class="copy-id-button" :aria-label="`复制商品 ID ${row.productId}`" @click.stop="copyId(row.productId, '商品 ID')">复制</button>
+                    </div>
                     <small>规格：{{ row.sku || '—' }}　分类：{{ row.categoryLabels.join(' / ') || '—' }}</small>
                     <button v-if="row.materialCount" type="button" class="material-summary" @click="openMaterialRecords(row)">千川已上传 {{ row.materialCount }} · 首发 {{ row.materialFirstCount }} · 搬运 {{ row.materialMovedCount }} · 待判定 {{ row.materialPendingCount }}<template v-if="row.materialOtherCount"> · 其他 {{ row.materialOtherCount }}</template>　查看素材质量</button>
                     <small v-if="row.failureReason" class="failure-reason">{{ row.failureReason }}</small>
@@ -500,8 +512,13 @@ onMounted(() => { void load() })
                 </div>
               </td>
               <td><span class="status-pill" :class="`status-${row.status}`">{{ statusLabel(row.status) }}</span></td>
-              <td class="code-cell">{{ row.commodityId || '—' }}</td>
-              <td class="date-cell" :title="`选品时间：${displayDate(row.selectedAt)}`">{{ displayDate(row.updatedAt) }}</td>
+              <td class="code-cell">
+                <div class="code-id-row">
+                  <span :title="row.commodityId || '—'">{{ row.commodityId || '—' }}</span>
+                  <button v-if="row.commodityId" type="button" class="copy-id-button" :aria-label="`复制推广 ID ${row.commodityId}`" @click.stop="copyId(row.commodityId, '推广 ID')">复制</button>
+                </div>
+              </td>
+              <td class="date-cell" :title="`更新时间：${displayDate(row.updatedAt)} · 选品时间：${displayDate(row.selectedAt)}`">{{ displayDate(row.updatedAt) }}</td>
               <td>
                 <div class="row-actions">
                   <button v-if="row.status === 'pending' || row.status === 'selection_failed'" class="text-button" :disabled="busy" @click="runCart([row], '单品加车')">加车</button>
@@ -591,12 +608,12 @@ select,input { height:32px; min-width:135px; padding:0 9px; border:1px solid var
 .table-caption strong { font-size:13px; }
 .table-caption span,.table-caption small { color:var(--text-muted); font-size:11px; }
 .table-scroll { min-height:0; flex:1; overflow:auto; }
-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+table { width:100%; min-width:1020px; border-collapse:collapse; table-layout:fixed; }
 thead { position:sticky; top:0; z-index:1; background:#f7f9fc; }
 th { padding:8px 8px; color:var(--text-muted); font-size:11px; font-weight:600; text-align:left; white-space:nowrap; }
 td { padding:7px 8px; border-top:1px solid #edf0f5; font-size:12px; vertical-align:middle; }
-.check-col { width:34px; }.action-col { width:196px; }
-th:nth-child(3) { width:116px; } th:nth-child(4) { width:125px; } th:nth-child(5) { width:150px; }
+.check-col { width:34px; }.action-col { width:186px; }.code-col { width:178px; }
+th:nth-child(3) { width:96px; } th:nth-child(5) { width:145px; }
 .product-cell { display:flex; align-items:center; min-width:0; gap:8px; }
 .thumb { width:46px; height:46px; flex:0 0 46px; display:grid; place-items:center; overflow:hidden; border:1px solid #e6eaf0; border-radius:7px; color:#98a3b5; background:#f3f5f8; font-size:10px; }
 .thumb img { width:100%; height:100%; object-fit:cover; }
@@ -610,7 +627,14 @@ th:nth-child(3) { width:116px; } th:nth-child(4) { width:125px; } th:nth-child(5
 .status-cart_added,.status-published,.status-uploaded { color:#168044; background:#e9f8ef; }
 .status-selection_failed,.status-publish_failed { color:#b42318; background:#fff0ef; }
 .status-needs_review { color:#a15c00; background:#fff5dc; }
-.code-cell { color:#475569; font-variant-numeric:tabular-nums; }.date-cell { color:var(--text-muted); font-size:11px; white-space:nowrap; }
+.code-cell { overflow:hidden; color:#475569; font-variant-numeric:tabular-nums; }
+.code-id-row { display:flex; align-items:center; gap:5px; min-width:0; }
+.code-id-row span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.product-id-row { display:flex; align-items:center; gap:6px; min-width:0; }
+.product-id-row span { min-width:0; overflow-wrap:anywhere; }
+.copy-id-button { flex:0 0 auto; padding:2px 5px; border:1px solid var(--border); border-radius:5px; background:var(--bg-panel); color:var(--brand); font-size:10px; line-height:1.3; cursor:pointer; white-space:nowrap; }
+.copy-id-button:hover { border-color:var(--brand); background:var(--brand-soft); }
+.date-cell { overflow:hidden; color:var(--text-muted); font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
 .row-actions { display:flex; align-items:center; flex-wrap:wrap; gap:5px; }
 .text-button { padding:3px 0; border:0; color:var(--brand); background:transparent; font-size:11px; cursor:pointer; white-space:nowrap; }
 .text-button:disabled { color:#a5adba; cursor:not-allowed; }.text-button.danger { color:#cf3f3f; }
@@ -634,7 +658,7 @@ th:nth-child(3) { width:116px; } th:nth-child(4) { width:125px; } th:nth-child(5
 .material-hint { margin:0; line-height:1.5; }.material-dialog-actions { padding:5px 0; }.material-empty { padding:24px; color:var(--text-muted); text-align:center; }
 .material-list { display:flex; flex-direction:column; gap:8px; overflow:auto; }.material-record { padding:11px; border:1px solid var(--border); border-radius:8px; }.material-record-title strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }.material-meta { justify-content:flex-start; flex-wrap:wrap; margin-top:7px; }.material-meta .text-button { margin-left:auto; }
 .quality-pill { flex-shrink:0; padding:3px 8px; border-radius:99px; color:#64748b; background:#f1f5f9; font-size:11px; }.quality-pill.first { color:#168044; background:#e9f8ef; }.quality-pill.moved { color:#b42318; background:#fff0ef; }
-@media (max-width:1100px) { th:nth-child(4),td:nth-child(4),th:nth-child(5),td:nth-child(5) { display:none; }.action-col { width:170px; } }
+@media (max-width:1100px) { .action-col { width:176px; } }
 @media (max-width:920px) { .page-header { align-items:flex-start; flex-direction:column; }.header-actions { align-self:flex-end; }.toolbar-end { width:100%; justify-content:flex-end; }.action-col { width:160px; }.row-actions { gap:5px; } }
 .product-list-view { color: var(--text); gap: 15px; }
 .page-header { padding: 3px 2px 6px; }

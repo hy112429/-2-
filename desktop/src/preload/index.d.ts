@@ -570,6 +570,9 @@ declare global {
         planLogs(params?: { id?: number; qianchuanAccountId?: number; accountId?: number; status?: string; startDate?: string; endDate?: string; offset?: number; limit?: number }): Promise<Record<string, unknown>>
         planCandidates(params: { accountId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>
         createManualPlan(params: { publishQueueId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>
+        planScheduleContext(params: { publishQueueId: number; qianchuanAccountId: number }): Promise<Record<string, unknown>>
+        savePlanSchedule(params: { publishQueueId: number; qianchuanAccountId: number; scheduledAt: string; confirmationJson: string }): Promise<Record<string, unknown>>
+        cancelPlanSchedule(jobId: number): Promise<Record<string, unknown>>
         planSupplements(): Promise<Record<string, unknown>>
         runPlan(jobId: number, expectedDailyBudgetYuan?: number): Promise<Record<string, unknown>>
         retryBlockedPlan(jobId: number): Promise<Record<string, unknown>>

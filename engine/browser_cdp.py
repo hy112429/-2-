@@ -6597,6 +6597,16 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
     return bool(expected_ids.intersection(category_values))
 
 
+def _response_matches_search_keyword(response: Any, settings: Dict[str, Any]) -> bool:
+    """只接受请求词与当前批次设置完全相同的商品列表响应。"""
+    body = _response_request_body(response)
+    if not isinstance(body, dict) or "search_text" not in body:
+        return False
+    expected = str(settings.get("searchKeyword") or "").strip()
+    actual = str(body.get("search_text") or "").strip()
+    return actual == expected
+
+
 def _title_banned_word(title: Any, settings: Optional[Dict[str, Any]]) -> str:
     """返回标题命中的屏蔽词；封建迷信词作为系统规则始终生效。"""
     configured_words = settings.get("bannedWords", []) if isinstance(settings, dict) else []
@@ -8075,6 +8085,7 @@ def _read_priority_source_product_ids(
     rank_requests: list[Dict[str, Any]] = []
     rank_root_catalog: Dict[str, set[str]] = {}
     hot_category_requests: list[set[str]] = []
+    source_product_request_ids: set[int] = set()
 
     def observe_hot_category_request(request: Any) -> None:
         if source_key != "hotSpot":
@@ -8082,10 +8093,12 @@ def _read_priority_source_product_ids(
         ids = _hotspot_request_category_ids(request)
         if ids:
             hot_category_requests.append(ids)
+            source_product_request_ids.add(id(request))
 
     def observe_rank_request(request: Any) -> None:
         if source_key != "allianceRank" or "/pc/leaderboard_26/board_pmt" not in str(request.url):
             return
+        source_product_request_ids.add(id(request))
         try:
             payload = request.post_data_json
             if isinstance(payload, dict):
@@ -8115,6 +8128,10 @@ def _read_priority_source_product_ids(
     def observe_rate_limit(response: Any) -> None:
         request = getattr(response, "request", None)
         try:
+            parsed_url = urlparse(str(getattr(response, "url", "")))
+            if (parsed_url.hostname != "buyin.jinritemai.com" or request is None or
+                    id(request) not in source_product_request_ids):
+                return
             resource_type = str(getattr(request, "resource_type", ""))
             if callable(getattr(request, "resource_type", None)):
                 resource_type = str(request.resource_type())
@@ -8128,7 +8145,11 @@ def _read_priority_source_product_ids(
                 return
             payload = response.json()
             if isinstance(payload, dict) and str(payload.get("code")) == "11001":
-                rate_limit_errors.append("百应来源请求返回 11001")
+                diagnostics = _material_list_response_diagnostics(response, payload)
+                rate_limit_errors.append(
+                    f"百应{label}商品来源请求返回业务码 11001；"
+                    f"接口 {parsed_url.path[:180]}；百应响应诊断：{diagnostics[:320]}"
+                )
         except Exception:
             return
 
@@ -11353,11 +11374,19 @@ class _MaterialListCollector:
         self.login_errors: list[tuple[int, Any, str]] = []
         self.failures: list[tuple[int, str]] = []
         self.category_mismatch_count = 0
+        self.search_keyword_mismatch_count = 0
         self.last_activity_at = time.time()
 
     @staticmethod
     def _is_material_request(request: Any) -> bool:
-        return "material_list" in str(getattr(request, "url", ""))
+        try:
+            parsed = urlparse(str(getattr(request, "url", "")))
+            return (
+                parsed.hostname == "buyin.jinritemai.com"
+                and parsed.path.rstrip("/").endswith("/pc/selection/common/material_list")
+            )
+        except Exception:
+            return False
 
     def _next_sequence(self) -> int:
         self.sequence += 1
@@ -11393,6 +11422,8 @@ class _MaterialListCollector:
             "businessCode": None,
             "businessMessage": "",
             "categoryMatched": None,
+            "searchKeywordMatched": None,
+            "queryMatched": None,
             "failure": "",
         }
         self.request_events.append(event)
@@ -11412,11 +11443,11 @@ class _MaterialListCollector:
         return sequence
 
     def on_response(self, response: Any) -> None:
-        if "material_list" not in str(getattr(response, "url", "")):
+        request = getattr(response, "request", None)
+        if request is None or not self._is_material_request(request):
             return
         sequence = self._sequence_for_response(response)
         self.last_activity_at = time.time()
-        request = getattr(response, "request", None)
         event = self.request_event_by_key.get(id(request)) if request is not None else None
         status = getattr(response, "status", None)
         if callable(status):
@@ -11436,8 +11467,12 @@ class _MaterialListCollector:
             return
 
         is_matching_category = _response_matches_category(response, self.settings)
+        is_matching_search_keyword = _response_matches_search_keyword(response, self.settings)
+        is_matching_query = is_matching_category and is_matching_search_keyword
         if event is not None:
             event["categoryMatched"] = is_matching_category
+            event["searchKeywordMatched"] = is_matching_search_keyword
+            event["queryMatched"] = is_matching_query
             if isinstance(result, dict):
                 code = result.get("code")
                 event["businessCode"] = str(code)[:40] if code is not None else None
@@ -11449,6 +11484,8 @@ class _MaterialListCollector:
                     event["productCount"] = len(rows)
         if not is_matching_category:
             self.category_mismatch_count += 1
+        if not is_matching_search_keyword:
+            self.search_keyword_mismatch_count += 1
 
         if isinstance(result, dict) and result.get("code") not in (None, 0, "0"):
             code = result.get("code")
@@ -11460,13 +11497,13 @@ class _MaterialListCollector:
             )
             if is_login_error:
                 self.login_errors.append((sequence, code, diagnostics))
-            # 11001、登录失效，或当前类目响应的其他业务错误都必须阻止消费。
-            if str(code) == "11001" or is_matching_category or is_login_error:
+            # 只有当前类目与关键词的 11001 才进入冷却；旧关键词异步请求会单独记录并丢弃。
+            if (str(code) == "11001" and is_matching_query) or (is_matching_query and not is_login_error) or is_login_error:
                 self.errors.append((sequence, code, diagnostics))
                 if event is not None:
                     event["diagnostic"] = diagnostics
             return
-        if is_matching_category:
+        if is_matching_query:
             data = result.get("data") if isinstance(result, dict) else None
             if isinstance(data, dict) and isinstance(data.get("summary_promotions"), list):
                 self.successes.append((sequence, result))
@@ -11639,8 +11676,14 @@ def _classify_selection_failure(
     """结合当前页面和 DOM 判断失败阶段，避免登录探测 unknown 覆盖真实筛选错误。"""
     if isinstance(error, CommissionFilterUnconfirmed):
         return "COMMISSION_FILTER_UNCONFIRMED"
-    if any(str(event.get("businessCode")) == "11001" for event in request_events):
-        return "BAIYING_RATE_LIMIT"
+    code_11001_events = [event for event in request_events if str(event.get("businessCode")) == "11001"]
+    if code_11001_events:
+        platform_message = " ".join(str(event.get("businessMessage") or "") for event in code_11001_events)
+        if re.search(r"网络(?:不稳定|错误|异常|故障|超时)|网络连接(?:失败|异常)", platform_message, re.I):
+            return "BAIYING_NETWORK_ERROR"
+        if re.search(r"限流|频控|选品(?:太多|过多)|(?:请求|访问|操作)(?:过多|太多|频繁|太频繁|过于频繁)|rate.?limit|too many requests|frequency control", platform_message, re.I):
+            return "BAIYING_RATE_LIMIT"
+        return "BAIYING_11001_UNCONFIRMED"
     if "SEARCHBOX_ZERO_EXHAUSTED" in str(error):
         return "SEARCHBOX_ZERO_EXHAUSTED"
     if "SEARCHBOX_CONTROL_EXHAUSTED" in str(error):
@@ -12611,6 +12654,9 @@ def _apply_one_category_and_collect_candidates(
             warnings = apply_filter_settings(page, settings, replace_category_selection=True)
         else:
             warnings = apply_filter_settings(page, settings)
+        # 百应筛选控件会触发异步重渲染；在选项变更后重新核对关键词，
+        # 避免页面恢复旧的推荐词并将它带入后续 material_list 请求。
+        _apply_search_keyword(page, settings, collector=collector, collector_mark=apply_mark)
         collection_status = "idle"
         if not filters_already_applied:
             # pending 时不重复发送 material_list，按三个有界窗口继续等同一请求，避免请求重叠/触发 11001。
@@ -12709,6 +12755,10 @@ def _apply_one_category_and_collect_candidates(
     if collector.category_mismatch_count and _expected_category_ids(settings):
         warnings.append(
             f"已忽略 {collector.category_mismatch_count} 个未匹配当前类目 ID 的旧商品列表响应，正在按当前筛选重新搜索。"
+        )
+    if collector.search_keyword_mismatch_count:
+        warnings.append(
+            f"已忽略 {collector.search_keyword_mismatch_count} 个搜索词与当前设置不一致的商品列表响应，正在按当前搜索词重新查询。"
         )
     if collection_status == "settled" and outcome in {"error", "failure"}:
         detail = value[2] if outcome == "error" else value[1]

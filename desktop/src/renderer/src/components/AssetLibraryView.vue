@@ -37,6 +37,7 @@ interface AccountOption { account_id: number; account_name: string }
 
 const DB_PATH = 'D:\\software\\投广客户端\\data\\ad_client.db'
 const ROOT = 'D:\\software\\投广客户端\\downloads'
+const ASSET_PAGE_SIZE = 60
 
 // ---------------------------------------------------------------- 状态
 
@@ -50,14 +51,21 @@ const categories = ref<string[]>([])
 const filter = reactive({ account: '', productId: '', tag: '', date: '', status: 'ready' })
 const selected = ref<Set<number>>(new Set())
 const viewMode = ref<'all' | 'account'>('all')
+const assetPage = ref(1)
+const gridWrap = ref<HTMLElement | null>(null)
 const scanning = ref(false)
 const notice = ref('')
 const thumbMap = reactive<Record<number, string>>({})
 const UNASSIGNED_ACCOUNT = '__unassigned__'
+const assetPageCount = computed(() => Math.max(1, Math.ceil(assets.value.length / ASSET_PAGE_SIZE)))
+const pageAssets = computed(() => assets.value.slice((assetPage.value - 1) * ASSET_PAGE_SIZE, assetPage.value * ASSET_PAGE_SIZE))
+const thumbLoading = new Set<number>()
+const thumbTargets = new Map<number, Element>()
+let thumbObserver: IntersectionObserver | null = null
 
 const groupedAssets = computed(() => {
   const grouped = new Map<string, AssetRow[]>()
-  for (const asset of assets.value) {
+  for (const asset of pageAssets.value) {
     const key = asset.account?.trim() || UNASSIGNED_ACCOUNT
     const rows = grouped.get(key) ?? []
     rows.push(asset)
@@ -124,7 +132,7 @@ async function loadList(): Promise<void> {
   const data = await runCli(args)
   assets.value = (data.rows ?? []) as AssetRow[]
   accountCounts.value = (data.account_counts ?? []) as AccountAssetCount[]
-  await preloadThumbs()
+  assetPage.value = Math.min(assetPage.value, assetPageCount.value)
 }
 
 async function loadAccountNames(): Promise<void> {
@@ -149,13 +157,51 @@ async function loadCategories(): Promise<void> {
   categories.value = (data.categories ?? []) as string[]
 }
 
-/** 预加载可见素材的缩略图（reactive map，避免大列表全量 IO） */
-async function preloadThumbs(): Promise<void> {
-  const batch = assets.value.slice(0, 80).filter((a) => a.thumb_path && !thumbMap[a.id])
-  for (const a of batch) {
-    const url = await window.api.assets.getThumb(a.thumb_path!)
-    if (url) thumbMap[a.id] = url
+/** 卡片进入素材滚动区域附近时才读取缩略图，避免页面打开后串行读取几十张图片。 */
+function registerThumbTarget(asset: AssetRow, target: unknown): void {
+  const previous = thumbTargets.get(asset.id)
+  if (previous) {
+    thumbObserver?.unobserve(previous)
+    thumbTargets.delete(asset.id)
   }
+  if (!(target instanceof Element) || !asset.thumb_path || thumbMap[asset.id] || thumbLoading.has(asset.id)) return
+
+  thumbTargets.set(asset.id, target)
+  if (typeof IntersectionObserver === 'undefined') {
+    void loadThumb(asset)
+    return
+  }
+
+  thumbObserver ??= new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue
+      const id = Number((entry.target as HTMLElement).dataset.assetId)
+      thumbObserver?.unobserve(entry.target)
+      thumbTargets.delete(id)
+      const visibleAsset = assets.value.find((row) => row.id === id)
+      if (visibleAsset) void loadThumb(visibleAsset)
+    }
+  }, { root: gridWrap.value, rootMargin: '160px' })
+  ;(target as HTMLElement).dataset.assetId = String(asset.id)
+  thumbObserver.observe(target)
+}
+
+async function loadThumb(asset: AssetRow): Promise<void> {
+  if (!asset.thumb_path || thumbMap[asset.id] || thumbLoading.has(asset.id)) return
+  thumbLoading.add(asset.id)
+  try {
+    const url = await window.api.assets.getThumb(asset.thumb_path)
+    if (url) thumbMap[asset.id] = url
+  } catch {
+    // 缩略图失败时保留占位图，不阻断素材列表和其他操作。
+  } finally {
+    thumbLoading.delete(asset.id)
+  }
+}
+
+function goToAssetPage(nextPage: number): void {
+  assetPage.value = Math.max(1, Math.min(assetPageCount.value, nextPage))
+  gridWrap.value?.scrollTo({ top: 0 })
 }
 
 async function scan(): Promise<void> {
@@ -232,6 +278,7 @@ async function confirmSelectedWebSource(): Promise<void> {
 
 function applyFilter(): void {
   selected.value = new Set()
+  assetPage.value = 1
   void refresh()
 }
 
@@ -316,6 +363,8 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   offEngine?.()
+  thumbObserver?.disconnect()
+  thumbTargets.clear()
 })
 </script>
 
@@ -384,15 +433,15 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- ---------- 素材网格 ---------- -->
-    <div class="grid-wrap">
+    <div ref="gridWrap" class="grid-wrap">
       <div v-if="assets.length === 0" class="empty">
         <p>当前筛选条件下没有素材。清除筛选后可重新查看，或点「重新扫描目录」登记下载目录里的成品素材。</p>
         <p class="sub">约定目录：{下载目录}/{账号}/{日期}/{商品ID}/{文件}.mp4</p>
       </div>
 
       <div v-else-if="viewMode === 'all'" class="grid">
-        <div v-for="a in assets" :key="a.id" class="card" :class="{ selected: selected.has(a.id) }">
-          <div class="cover" role="button" tabindex="0" :aria-label="`${selected.has(a.id) ? '取消选择' : '选择'}素材 ${a.file_name}`" @click="toggleRow(a.id)" @keydown.enter.prevent="toggleRow(a.id)" @keydown.space.prevent="toggleRow(a.id)">
+        <div v-for="a in pageAssets" :key="a.id" class="card" :class="{ selected: selected.has(a.id) }">
+          <div :ref="(el) => registerThumbTarget(a, el)" class="cover" role="button" tabindex="0" :aria-label="`${selected.has(a.id) ? '取消选择' : '选择'}素材 ${a.file_name}`" @click="toggleRow(a.id)" @keydown.enter.prevent="toggleRow(a.id)" @keydown.space.prevent="toggleRow(a.id)">
             <img v-if="thumbMap[a.id]" :src="thumbMap[a.id]" alt="" />
             <div v-else class="cover-ph">{{ a.file_name.slice(-3) }}</div>
           </div>
@@ -427,7 +476,7 @@ onBeforeUnmount(() => {
           </header>
           <div class="grid">
             <div v-for="a in group.rows" :key="a.id" class="card" :class="{ selected: selected.has(a.id) }">
-              <div class="cover" role="button" tabindex="0" :aria-label="`${selected.has(a.id) ? '取消选择' : '选择'}素材 ${a.file_name}`" @click="toggleRow(a.id)" @keydown.enter.prevent="toggleRow(a.id)" @keydown.space.prevent="toggleRow(a.id)">
+              <div :ref="(el) => registerThumbTarget(a, el)" class="cover" role="button" tabindex="0" :aria-label="`${selected.has(a.id) ? '取消选择' : '选择'}素材 ${a.file_name}`" @click="toggleRow(a.id)" @keydown.enter.prevent="toggleRow(a.id)" @keydown.space.prevent="toggleRow(a.id)">
                 <img v-if="thumbMap[a.id]" :src="thumbMap[a.id]" alt="" />
                 <div v-else class="cover-ph">{{ a.file_name.slice(-3) }}</div>
               </div>
@@ -454,6 +503,14 @@ onBeforeUnmount(() => {
         </section>
       </div>
     </div>
+
+    <footer v-if="assets.length > ASSET_PAGE_SIZE" class="asset-pagination" aria-label="素材分页">
+      <span>第 {{ assetPage }} / {{ assetPageCount }} 页 · 每页 {{ ASSET_PAGE_SIZE }} 条</span>
+      <div>
+        <button class="btn" :disabled="assetPage <= 1" @click="goToAssetPage(assetPage - 1)">上一页</button>
+        <button class="btn" :disabled="assetPage >= assetPageCount" @click="goToAssetPage(assetPage + 1)">下一页</button>
+      </div>
+    </footer>
   </section>
 </template>
 
@@ -576,6 +633,21 @@ onBeforeUnmount(() => {
   flex: 1;
   min-height: 0;
   overflow: auto;
+}
+
+.asset-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.asset-pagination > div {
+  display: flex;
+  gap: 6px;
 }
 
 .empty {

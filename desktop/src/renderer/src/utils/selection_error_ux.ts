@@ -72,9 +72,10 @@ function classify(input: unknown, raw: string, explicitClassification: string): 
   const combined = `${explicitClassification}\n${raw}`.toUpperCase()
   if (/BAIYING_NETWORK_ERROR/i.test(explicitClassification)) return 'BAIYING_NETWORK_ERROR'
   if (/BAIYING_11001_UNCONFIRMED/i.test(explicitClassification)) return 'BAIYING_11001_UNCONFIRMED'
-  if (/百应商品搜索返回\s*11001/i.test(combined)) {
-    // 旧日志的“限流”是客户端生成的文案；只有平台响应说明能证明错误类别。
-    const platformMessage = combined.match(/百应响应说明[:：]([^；\n]{0,160})/i)?.[1] ?? ''
+  if (/BAIYING_RATE_LIMIT/i.test(explicitClassification)) return 'BAIYING_RATE_LIMIT'
+  if (/\b11001\b/.test(combined)) {
+    // 业务码 11001 单独不能说明是网络错误还是频控；只按百应原始响应提示分类。
+    const platformMessage = combined.match(/(?:百应响应说明|BUSINESSMESSAGE)\s*[:：=]\s*([^；;\n]{0,160})/i)?.[1] ?? ''
     if (/限流|频控|选品(?:太多|过多)|(?:请求|访问|操作)(?:过多|太多|频繁|太频繁|过于频繁)|RATE[_ -]?LIMIT|TOO MANY REQUESTS|FREQUENCY CONTROL/i.test(platformMessage)) {
       return 'BAIYING_RATE_LIMIT'
     }
@@ -84,7 +85,7 @@ function classify(input: unknown, raw: string, explicitClassification: string): 
     return 'BAIYING_11001_UNCONFIRMED'
   }
   if (
-    /BAIYING_RATE_LIMIT|11001|RATE[_ -]?LIMIT|TOO MANY REQUESTS|TOO MANY SELECTIONS|REQUEST TOO FREQUENT|FREQUENCY CONTROL/i.test(combined) ||
+    /BAIYING_RATE_LIMIT|RATE[_ -]?LIMIT|TOO MANY REQUESTS|TOO MANY SELECTIONS|REQUEST TOO FREQUENT|FREQUENCY CONTROL/i.test(combined) ||
     /百应.{0,12}(限流|冷却|频控|选品太多|请求过多|请求太多|请求频繁|访问频繁|操作频繁)|(?:限流|冷却|频控|请求频繁|访问频繁|操作频繁).{0,12}百应|(?:选品太多|选品过多|请求过多|请求太多|接口请求过多|请求频繁|访问频繁|操作频繁|操作过于频繁)/i.test(combined)
   ) {
     return 'BAIYING_RATE_LIMIT'
@@ -193,8 +194,8 @@ export function toUserSelectionError(input: unknown): UserSelectionError {
       : `客户端约 ${seconds} 秒后自动续选。`
     return {
       userMessage: networkError
-        ? `百应商品搜索提示网络错误；${nextStep}`
-        : `百应商品搜索返回 11001，原因未确认；${nextStep}`,
+        ? `百应返回 11001，平台提示网络错误；${nextStep}`
+        : `百应返回 11001，原因未确认；${nextStep}`,
       classification,
       diagnostic: extracted.diagnostic || undefined,
       cooldownSeconds: seconds

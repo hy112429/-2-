@@ -16,6 +16,8 @@ interface PlanLogSummary {
   daily_budget_yuan: number
   commission_rate: number
   roi_target: number
+  scheduled_at?: string
+  schedule_state?: string
   status: string
   remote_plan_id: string
   reason: string
@@ -71,9 +73,16 @@ function statusLabel(status: string): string {
 function statusTone(status: string): string {
   return status === 'published' ? 'success' : status === 'needs_review' || status === 'blocked' ? 'warning' : 'info'
 }
+function scheduleStateLabel(state: string | undefined): string {
+  return ({ scheduled: '已确认定时', confirm_required: '已暂停，需重新确认', cancelled: '已取消，保留手动草稿', completed: '定时提交已完成' } as Record<string, string>)[state || ''] || '已记录'
+}
 function eventLabel(type: string): string {
   return ({
     PLAN_DRAFT_CREATED: '生成待发布计划',
+    PLAN_SCHEDULE_SAVED: '保存或修改定时',
+    PLAN_SCHEDULE_CANCELLED: '取消定时，保留草稿',
+    PLAN_SCHEDULE_CONFIRM_REQUIRED: '定时授权需重新确认',
+    PLAN_DEFERRED: '等待前置条件',
     PLAN_SUBMIT_STARTED: '开始提交千川',
     PLAN_PUBLISHED: '千川计划发布成功',
     PLAN_SUBMISSION_UNCERTAIN: '提交结果待核查',
@@ -203,6 +212,7 @@ onMounted(() => { void load() })
           <section class="summary-card"><div><b>账号</b><span>{{ selectedJob.account_name || selectedJob.account_id }}</span></div><div><b>商品 ID</b><span>{{ selectedJob.product_id }}</span></div><div><b>广告主 ID</b><span>{{ selectedJob.advertiser_id || '未记录' }}</span></div><div><b>日预算</b><span>{{ selectedJob.daily_budget_yuan }} 元</span></div><div><b>保本 ROI</b><span>{{ Number(selectedJob.roi_target || 0).toFixed(2) }}</span></div><div><b>千川计划 ID</b><span>{{ selectedJob.remote_plan_id || '尚未确认' }}</span></div><div class="wide"><b>素材上传结果</b><span>{{ uploadLabel(selectedJob.upload_summary) }}</span></div><div class="wide"><b>远端素材 ID</b><span class="material-ids">{{ materialIds(selectedJob.upload_summary) }}</span></div><div><b>当前阶段</b><span>{{ currentStage() }}</span></div></section>
           <p v-if="selectedJob.upload_summary?.lastFailure" class="reason">素材待核查：{{ selectedJob.upload_summary.lastFailure }}</p>
           <p v-if="selectedJob.reason" class="reason">当前说明：{{ selectedJob.reason }}</p>
+          <p v-if="selectedJob.scheduled_at">定时提交（北京时间）：{{ format(selectedJob.scheduled_at) }} · {{ scheduleStateLabel(selectedJob.schedule_state) }}</p>
           <section class="timeline"><div class="timeline-title"><h3>发布过程记录</h3><span>{{ events.length }} 条</span></div><p v-if="!events.length" class="panel-message">该计划没有可显示的过程记录。</p><article v-for="event in events" :key="event.id" class="event"><div class="event-head"><strong>{{ eventLabel(event.event_type) }}</strong><time>{{ format(event.created_at) }}</time></div><div class="event-meta"><i class="log-level" :class="'is-' + eventTone(event.event_type, event.status)">{{ event.status || '记录' }}</i><span>阶段：{{ event.stage || '未记录' }}</span><span v-if="event.supplement_id">追加任务 #{{ event.supplement_id }}</span></div><p :class="'message is-' + eventTone(event.event_type, event.status)">{{ event.message }}</p><small v-if="event.remote_plan_id">千川计划 ID：{{ event.remote_plan_id }}</small><details v-if="event.detail || event.screenshot_path"><summary>查看技术细节</summary><pre v-if="event.detail">{{ event.detail }}</pre><button v-if="event.screenshot_path" class="link-button" type="button" @click="openScreenshot(event.screenshot_path)">打开诊断截图</button></details></article></section>
         </div>
         <div v-else class="panel-message">选择左侧计划查看发布过程。</div>

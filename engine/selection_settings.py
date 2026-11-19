@@ -275,7 +275,7 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
     )
     if isinstance(incoming_thresholds, dict) and incoming_thresholds.get("commissionRate") is not None and rule != "minimum":
         raise ValueError("旧佣金率上限设置不能自动解释为最低值；请核对后重新保存")
-    key = scope_key(account_id)
+    settings_scope = scope_key(account_id)
     if account_id is None:
         merged = dict(DEFAULT_SETTINGS)
         merged.update(value)
@@ -364,10 +364,10 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
                     for root_id, _ in excluded_second_paths
                 ):
                     raise ValueError("热点一级类目下有二级或三级排除项，热点会跳过整个一级，不能设置该配额")
-                key = (source, board if source == "allianceRank" and path else "", tuple(path))
-                if key in keys:
+                quota_key = (source, board if source == "allianceRank" and path else "", tuple(path))
+                if quota_key in keys:
                     raise ValueError("来源、榜单和类目重复的品类配额")
-                keys.add(key)
+                keys.add(quota_key)
                 ids.add(rule_id)
                 total += count
             if total > 2000:
@@ -402,8 +402,8 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
             ) for item in rank_path
         ):
             raise ValueError("榜单分类路径必须是最多三级的有效类目 ID")
-        for key in ("hotSpotMinExposure", "hotSpotMinRelatedProducts"):
-            threshold = sources.get(key)
+        for threshold_key in ("hotSpotMinExposure", "hotSpotMinRelatedProducts"):
+            threshold = sources.get(threshold_key)
             if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold < 0):
                 raise ValueError("热点筛选阈值须为非负数")
         thresholds = value.get("thresholds", {})
@@ -426,10 +426,10 @@ def save_settings(connection: sqlite3.Connection, account_id: Optional[int], val
     connection.execute(
         "INSERT INTO selection_settings(scope_key, settings_json, updated_at) VALUES (?, ?, ?) "
         "ON CONFLICT(scope_key) DO UPDATE SET settings_json=excluded.settings_json, updated_at=excluded.updated_at",
-        (key, json.dumps(value, ensure_ascii=False), now_text()),
+        (settings_scope, json.dumps(value, ensure_ascii=False), now_text()),
     )
     connection.commit()
-    return {"ok": True, "scope": key, "settings": value}
+    return {"ok": True, "scope": settings_scope, "settings": value}
 
 
 def banned_words_from_connection(connection: sqlite3.Connection) -> list[str]:

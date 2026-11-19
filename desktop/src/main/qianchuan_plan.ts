@@ -10,10 +10,14 @@ import {
   validateManagedProfilePath
 } from './external_browser'
 import { reserveQianchuanAccount, releaseQianchuanAccount } from './qianchuan_account_lock'
+import { runOneUpload } from './qianchuan_upload'
+import { douyinBatchGate, prepareScheduledQianchuanMaterial } from './post_publish_qianchuan_material'
 
 type Json = Record<string, unknown>
 let timer: ReturnType<typeof setInterval> | null = null
 let running = false
+let tickRunning = false
+let preparingScheduled = false
 
 function object(value: unknown): Json { return value && typeof value === 'object' ? value as Json : {} }
 function validId(value: unknown): number {
@@ -77,14 +81,39 @@ async function ensurePlanBrowser(job: Json): Promise<{ lease?: PlanBrowserLease;
   return { error: '没有可复用的千川或抖音账号登录资料。请先在账号管理打开对应专属浏览器并完成登录；自动流程不会创建空白登录态。' }
 }
 
-async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<Json> {
-  if (running) return { ok: false, error: '已有千川计划正在处理' }
+async function runOne(jobId: number, expectedDailyBudgetYuan?: number, expectedScheduledAt?: string): Promise<Json> {
+  if (running || preparingScheduled) return { ok: false, error: '已有千川计划或定时素材正在处理' }
+  running = true
+  try { return await runOneCore(jobId, expectedDailyBudgetYuan, expectedScheduledAt) }
+  finally { running = false }
+}
+
+async function runOneCore(jobId: number, expectedDailyBudgetYuan?: number, expectedScheduledAt?: string): Promise<Json> {
+  await command('sync-schedules')
   const all = await command('jobs', ['--id', String(jobId)])
   const job = (Array.isArray(all['rows']) ? all['rows'] as Json[] : []).find((row) => Number(row['id']) === jobId)
   if (!job || job['status'] !== 'ready') return { ok: false, error: '任务已经处理或待核查，不能重复发布' }
+  if (expectedScheduledAt && (job['schedule_state'] !== 'scheduled' || job['scheduled_at'] !== expectedScheduledAt)) {
+    return { ok: false, error: '定时已取消、暂停或改期，本次调度停止' }
+  }
+  if (job['schedule_state'] === 'confirm_required') return { ok: false, error: '定时授权已暂停，请重新确认定时' }
+  const scheduledAt = job['schedule_state'] === 'scheduled' ? value(job['scheduled_at']) : ''
+  if (scheduledAt) {
+    const preflight = await command('schedule-preflight', ['--id', String(jobId)])
+    const gate = await douyinBatchGate()
+    const reviews = await command('jobs', ['--qianchuan-account-id', value(job['qianchuan_account_id']), '--status', 'needs_review', '--limit', '1'])
+    const uploadReviews = await uploadCommand('review-accounts')
+    const hasReview = (Array.isArray(reviews['rows']) && reviews['rows'].length > 0) ||
+      (Array.isArray(uploadReviews['qianchuanAccountIds']) && uploadReviews['qianchuanAccountIds'].map(Number).includes(Number(job['qianchuan_account_id'])))
+    const reason = !gate.ready ? gate.reason : hasReview ? '同一千川账户存在上传或计划结果待核查，定时提交等待人工核实' :
+      preflight['ready'] !== true ? value(preflight['reason']) : ''
+    if (reason) {
+      await command('defer', ['--id', String(jobId), '--reason', reason])
+      return { ok: false, status: 'waiting', error: reason }
+    }
+  }
   const qcId = validId(job['qianchuan_account_id'])
   if (!reserveQianchuanAccount(qcId)) return { ok: false, error: '该千川账户正在上传或读取素材' }
-  running = true
   let claimed = false
   let lease: PlanBrowserLease | undefined
   let keepAutomationBrowserOpen = false
@@ -99,6 +128,7 @@ async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<
     lease = activeLease
     await command('claim', [
       '--id', String(jobId),
+      ...(scheduledAt ? ['--expected-scheduled-at', scheduledAt] : []),
       ...(expectedDailyBudgetYuan == null ? [] : ['--expected-daily-budget-yuan', String(expectedDailyBudgetYuan)])
     ])
     claimed = true
@@ -142,13 +172,18 @@ async function runOne(jobId: number, expectedDailyBudgetYuan?: number): Promise<
       try { await closeAutomationLaunchedBrowser({ profileKey: lease.profileKey }) }
       catch (error) { console.warn(`[千川计划] 自动启动的浏览器未能关闭：${String(error)}`) }
     }
-    running = false
     releaseQianchuanAccount(qcId)
   }
 }
 
 async function runSupplement(id: number): Promise<Json> {
-  if (running) return { ok: false, error: '已有千川计划正在处理' }
+  if (running || preparingScheduled) return { ok: false, error: '已有千川计划或定时素材正在处理' }
+  running = true
+  try { return await runSupplementCore(id) }
+  finally { running = false }
+}
+
+async function runSupplementCore(id: number): Promise<Json> {
   const all = await command('supplement-jobs', ['--id', String(id)])
   const job = (Array.isArray(all['rows']) ? all['rows'] as Json[] : [])
     .find((row) => Number(row['id']) === id)
@@ -156,7 +191,6 @@ async function runSupplement(id: number): Promise<Json> {
   const qcId = validId(job['qianchuan_account_id'])
   const accountId = validId(job['account_id'])
   if (!reserveQianchuanAccount(qcId)) return { ok: false, error: '该千川账户正在执行其他任务' }
-  running = true
   let claimed = false
   let lease: PlanBrowserLease | undefined
   let keepAutomationBrowserOpen = false
@@ -202,14 +236,84 @@ async function runSupplement(id: number): Promise<Json> {
       try { await closeAutomationLaunchedBrowser({ profileKey: lease.profileKey }) }
       catch (error) { console.warn(`[千川计划] 自动补素材后浏览器未能关闭：${String(error)}`) }
     }
-    running = false
     releaseQianchuanAccount(qcId)
   }
 }
 
-async function tick(): Promise<void> {
-  if (running) return
+async function uploadCommand(action: string, args: string[] = []): Promise<Json> {
+  const outcome = await runEngineCommand('qianchuan_upload.py', ['--db', getClientPaths().databasePath, action, ...args])
+  const data = object(outcome.result)
+  if (!outcome.ok || data['ok'] === false) throw new Error(value(data['error']) || outcome.error || '读取定时素材任务失败')
+  return data
+}
+
+async function prepareScheduledJob(job: Json): Promise<void> {
+  const id = validId(job['id'])
+  await command('sync-schedules')
+  const freshPlan = await command('jobs', ['--id', String(id)])
+  const active = object((freshPlan['rows'] as Json[] | undefined)?.[0])
+  if (active['schedule_state'] !== 'scheduled' || active['status'] !== 'ready') return
+  job = active
+  const snapshot = object(JSON.parse(value(job['schedule_snapshot_json']) || '{}'))
+  if (snapshot['video_source'] === 'my_video') return
+  const prepared = await prepareScheduledQianchuanMaterial(validId(job['publish_queue_id']))
+  if (prepared['waiting'] === true && !prepared['status']) {
+    await command('defer', ['--id', String(id), '--reason', value(prepared['reason'])])
+    return
+  }
+  if (prepared['ok'] === false || ['needs_review', 'blocked_auth', 'failed_query', 'failed_download'].includes(value(prepared['status']))) {
+    await command('defer', ['--id', String(id), '--reason', value(prepared['error'] ?? prepared['reason']) || '素材准备需要人工处理'])
+    return
+  }
+  const qcId = validId(job['qianchuan_account_id'])
+  const reviews = await uploadCommand('review-accounts')
+  if ((Array.isArray(reviews['qianchuanAccountIds']) ? reviews['qianchuanAccountIds'] as unknown[] : []).map(Number).includes(qcId)) {
+    await command('defer', ['--id', String(id), '--reason', '该千川账户有上传结果待核查，定时素材准备暂停'])
+    return
+  }
+  const uploads = await uploadCommand('jobs', ['--account-id', value(job['account_id']),
+    '--qianchuan-account-id', String(qcId), '--product-id', value(job['product_id']),
+    '--due-only', '--limit', '500'])
+  const due = Array.isArray(uploads['rows']) ? uploads['rows'] as Json[] : []
+  if (!due.length) return
+  // 仅有已到期上传任务才启动已有登录资料；复用上传器的账号锁和逐件回执。
+  const browser = await ensurePlanBrowser(job)
+  if (!browser.lease) {
+    const reason = browser.error || '等待千川浏览器登录'
+    await command(/登录|验证|权限/.test(reason) ? 'pause-schedule' : 'defer', ['--id', String(id), '--reason', reason])
+    return
+  }
+  let keepOpen = false
   try {
+    for (const upload of due) {
+      // 准备素材期间也允许取消；停止下一件，已提交的上传仍保存回执。
+      const fresh = await command('jobs', ['--id', String(id)])
+      const current = (fresh['rows'] as Json[] | undefined)?.[0]
+      if (current?.['schedule_state'] !== 'scheduled' || current['status'] !== 'ready') break
+      const outcome = await runOneUpload(upload['id'])
+      if (outcome['manualActionRequired'] === true || outcome['status'] === 'needs_review') {
+        keepOpen = true
+        await command('pause-schedule', ['--id', String(id), '--reason', value(outcome['error']) || '素材上传结果待核查'])
+        break
+      }
+      if (outcome['ok'] === false) {
+        keepOpen = /登录|验证|权限/.test(value(outcome['error']))
+        await command(keepOpen ? 'pause-schedule' : 'defer', ['--id', String(id), '--reason', value(outcome['error']) || '素材上传等待续行'])
+        break
+      }
+    }
+  } finally {
+    if (browser.lease.automationOpened && !keepOpen) {
+      await closeAutomationLaunchedBrowser({ profileKey: browser.lease.profileKey })
+    }
+  }
+}
+
+async function tick(): Promise<void> {
+  if (running || tickRunning) return
+  tickRunning = true
+  try {
+    await command('sync-schedules')
     await command('sync')
     await command('sync-supplements')
     const pausedAccounts = new Set<number>()
@@ -219,6 +323,38 @@ async function tick(): Promise<void> {
       const page = Array.isArray(reviews['rows']) ? reviews['rows'] as Json[] : []
       for (const review of page) pausedAccounts.add(validId(review['qianchuan_account_id']))
       if (page.length < 200) break
+    }
+
+    // 单独确认的逐商品定时不依赖“后续新商品自动发布”开关，仍遵守抖音阶段闸门。
+    const scheduled: Json[] = []
+    for (let offset = 0; ; offset += 200) {
+      const result = await command('jobs', ['--scheduled-only', '--offset', String(offset)])
+      const page = Array.isArray(result['rows']) ? result['rows'] as Json[] : []
+      scheduled.push(...page)
+      if (page.length < 200) break
+    }
+    const gate = scheduled.length ? await douyinBatchGate() : { ready: true, reason: '' }
+    for (const job of scheduled) {
+      if (running) break
+      const id = validId(job['id'])
+      if (pausedAccounts.has(validId(job['qianchuan_account_id'])) || !gate.ready) {
+        await command('defer', ['--id', String(id), '--reason', gate.reason || '同一千川账户有计划提交结果待核查'])
+        continue
+      }
+      try {
+        preparingScheduled = true
+        try { await prepareScheduledJob(job) }
+        finally { preparingScheduled = false }
+        if (Date.parse(value(job['scheduled_at'])) <= Date.now()) {
+          await runOne(id, Number(job['daily_budget_yuan']), value(job['scheduled_at']))
+          const latest = await command('jobs', ['--id', String(id)])
+          if (object((latest['rows'] as Json[] | undefined)?.[0])['status'] === 'needs_review') {
+            pausedAccounts.add(validId(job['qianchuan_account_id']))
+          }
+        }
+      } catch (error) {
+        console.warn(`[千川定时] 任务 #${id} 等待续行：${String(error)}`)
+      }
     }
 
     // 始终从队首重新找一条本轮未尝试的任务；已完成任务会离开 ready 集合，
@@ -288,6 +424,8 @@ async function tick(): Promise<void> {
     }
   } catch (error) {
     console.warn(`[千川计划] 后台检查失败：${String(error)}`)
+  } finally {
+    tickRunning = false
   }
 }
 
@@ -296,6 +434,21 @@ function reply(operation: () => Promise<Json>): Promise<Json> {
 }
 
 export function registerQianchuanPlanIpc(): void {
+  ipcMain.handle('qianchuan:plan:scheduleContext', (_event, raw: unknown) => reply(() => {
+    const params = object(raw)
+    return command('schedule-context', ['--publish-queue-id', String(validId(params['publishQueueId'])),
+      '--qianchuan-account-id', String(validId(params['qianchuanAccountId']))])
+  }))
+  ipcMain.handle('qianchuan:plan:saveSchedule', (_event, raw: unknown) => reply(async () => {
+    const params = object(raw)
+    const result = await command('save-schedule', ['--publish-queue-id', String(validId(params['publishQueueId'])),
+      '--qianchuan-account-id', String(validId(params['qianchuanAccountId'])),
+      '--scheduled-at', value(params['scheduledAt']), '--confirmation-json', value(params['confirmationJson'])])
+    void tick()
+    return result
+  }))
+  ipcMain.handle('qianchuan:plan:cancelSchedule', (_event, id: unknown) => reply(() =>
+    command('cancel-schedule', ['--id', String(validId(id))])))
   ipcMain.handle('qianchuan:plan:settings', (_event, id: unknown) => reply(() =>
     command('settings', ['--qianchuan-account-id', String(validId(id))])))
   ipcMain.handle('qianchuan:plan:saveSettings', (_event, raw: unknown) => reply(() => {

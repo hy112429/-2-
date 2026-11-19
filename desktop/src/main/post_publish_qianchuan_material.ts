@@ -59,7 +59,7 @@ async function stateCommand(...args: string[]): Promise<Json> {
   return result
 }
 
-async function douyinBatchGate(): Promise<{ ready: boolean; reason: string }> {
+export async function douyinBatchGate(): Promise<{ ready: boolean; reason: string }> {
   const outcome = await runEngineCommand('selection_recovery.py', [
     '--db', getClientPaths().databasePath, 'batch', 'recent'
   ])
@@ -449,6 +449,27 @@ export async function runPostPublishQianchuanMaterialForQueue(
   } finally {
     activeQueueIds.delete(id)
   }
+}
+
+/** 定时仅复用现有准备流程；不打开全局开关，不自动重试登录或未知提交结果。 */
+export async function prepareScheduledQianchuanMaterial(queueId: number): Promise<Json> {
+  const gate = await douyinBatchGate()
+  if (!gate.ready) return { ok: true, waiting: true, reason: gate.reason }
+  if (!await enabled()) return { ok: true, waiting: true, reason: '自动素材准备已关闭；开启后继续定时素材准备' }
+  const current = object((await stateCommand('get', '--publish-queue-id', String(queueId)))['run'])
+  const status = String(current['status'] ?? '')
+  if (!status || status === 'enqueued' || status === 'running') {
+    return runPostPublishQianchuanMaterialForQueue(queueId, 'reconcile')
+  }
+  if (status === 'disabled') return runPostPublishQianchuanMaterialForQueue(queueId, 'reconcile', true)
+  // 等待补位仅在已有调度确认外部进展后恢复，防止每分钟重复查询/下载。
+  if (['awaiting_upload', 'needs_fill', 'candidate_exhausted', 'blocked_binding'].includes(status)) {
+    const due = rows((await stateCommand('due', '--limit', '100'))['rows'])
+    if (due.some((item) => Number(item['publishQueueId']) === queueId)) {
+      return runPostPublishQianchuanMaterialForQueue(queueId, 'reconcile', status === 'blocked_binding')
+    }
+  }
+  return { ok: true, status, waiting: status !== 'completed', reason: current['reason'] ?? '' }
 }
 
 /** 发布成功钩子：只排入本机异步微任务，不等待千川 API / 下载 / Step17。 */

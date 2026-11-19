@@ -401,6 +401,7 @@ interface SelectionCandidate {
   selected: boolean
   sourceCategorySelection?: { level1: string[]; level2: string[]; level3: string[] }
   sourceCategoryId?: string
+  sourceCategoryIds?: string[]
   sourceCategoryName?: string
   sourceRecords?: Array<{ sourceKey: string; categoryPath?: string[]; rankBoard?: string; sourceCategoryId?: string; sourceCategoryName?: string }>
   categoryIds?: string[]
@@ -1651,18 +1652,18 @@ function hasStaleReadyPoolAccount(batch: SelectionRecoveryBatch, pool: BatchCand
   })
 }
 
-function candidatePoolRateLimitRetryAt(count: number): string {
+function candidatePoolBackoffRetryAt(count: number): string {
   const minutes = Math.min(15, 2 ** Math.min(Math.max(0, count - 1), 4))
   return new Date(Date.now() + minutes * 60_000).toISOString()
 }
 
-function pauseCandidatePoolAfterRateLimit(
+function scheduleCandidatePoolBackoff(
   sourceState: BatchCandidatePool['sourceState'], collectorIds: number[]
 ): string {
   const count = Math.min(5, Math.max(0, ...collectorIds.map((id) =>
     sourceState.collectors[String(id)]?.rateLimitCount ?? 0
   )) + 1)
-  const retryAt = candidatePoolRateLimitRetryAt(count)
+  const retryAt = candidatePoolBackoffRetryAt(count)
   for (const id of collectorIds) {
     const collector: BatchCandidatePool['sourceState']['collectors'][string] =
       sourceState.collectors[String(id)] ?? { tabOffsets: {}, samePoolCount: 0 }
@@ -2570,6 +2571,27 @@ const quotaCategoryOptions = computed(() => {
   return options
 })
 const quotaPoolTarget = computed(() => global.candidatePoolQuotas.reduce((sum, rule) => sum + Number(rule.target || 0), 0))
+const quotaSources = [
+  { key: 'hotSpot', label: '热点趋势', enabledKey: 'hotSpotEnabled' },
+  { key: 'allianceRank', label: '联盟榜单', enabledKey: 'allianceRankEnabled' },
+  { key: 'selectionSquare', label: '选品广场', enabledKey: 'selectionSquareEnabled' }
+] as const
+const quotaAddDraft = reactive<Record<CandidatePoolQuotaRule['sourceKey'], {
+  categoryPath: string; target: number; rankBoard: CandidatePoolQuotaRule['rankBoard']
+}>>({
+  hotSpot: { categoryPath: '', target: 10, rankBoard: '爆款榜' },
+  allianceRank: { categoryPath: '', target: 10, rankBoard: '爆款榜' },
+  selectionSquare: { categoryPath: '', target: 10, rankBoard: '爆款榜' }
+})
+const quotaEditorSource = ref<CandidatePoolQuotaRule['sourceKey'] | null>(null)
+const quotaEditError = ref('')
+function reportQuotaEditError(cause: unknown): void {
+  quotaEditError.value = cause instanceof Error ? cause.message : String(cause)
+  error.value = quotaEditError.value
+}
+function quotaSourceLabel(sourceKey: CandidatePoolQuotaRule['sourceKey']): string {
+  return quotaSources.find((source) => source.key === sourceKey)?.label ?? sourceKey
+}
 function quotaCategoryOptionsForSource(sourceKey: CandidatePoolQuotaRule['sourceKey']) {
   return sourceKey === 'hotSpot'
     ? quotaCategoryOptions.value.filter((category) => category.path.length === 1)
@@ -2580,48 +2602,97 @@ function sourceQuotaTarget(sourceKey: CandidatePoolQuotaRule['sourceKey']): numb
     .filter((rule) => rule.sourceKey === sourceKey)
     .reduce((sum, rule) => sum + Number(rule.target || 0), 0)
 }
-function setSourceQuotaTarget(sourceKey: CandidatePoolQuotaRule['sourceKey'], raw: string): void {
-  const target = Number(raw)
-  const rule = global.candidatePoolQuotas.find((item) => item.sourceKey === sourceKey && !item.categoryPath.length)
+function sourceQuotaRemainder(sourceKey: CandidatePoolQuotaRule['sourceKey']): number {
+  return global.candidatePoolQuotas.filter((rule) => rule.sourceKey === sourceKey && !rule.categoryPath.length)
+    .reduce((sum, rule) => sum + Number(rule.target || 0), 0)
+}
+/** 只调整当前来源的余量；保留其他来源、已存类目规则及其顺序。 */
+function withSourceQuotaTotal(
+  rules: CandidatePoolQuotaRule[], sourceKey: CandidatePoolQuotaRule['sourceKey'], target: number
+): CandidatePoolQuotaRule[] {
   if (!Number.isInteger(target) || target < 0 || target > 2000) {
-    error.value = '来源目标须为 0–2000 的整数。'
-    return
+    throw new Error('来源目标须为 0–2000 的整数。')
   }
-  const categoryTarget = global.candidatePoolQuotas
+  const categoryTarget = rules
     .filter((item) => item.sourceKey === sourceKey && item.categoryPath.length > 0)
     .reduce((sum, item) => sum + Number(item.target || 0), 0)
   if (target < categoryTarget) {
-    error.value = `该来源已设置 ${categoryTarget} 件指定品类配额，来源合计不能低于此数。`
-    return
+    throw new Error(`${quotaSourceLabel(sourceKey)}的指定类目合计为 ${categoryTarget} 件，超过来源目标 ${target} 件；请先增加来源目标或减少类目配额。`)
   }
-  error.value = ''
   const remaining = target - categoryTarget
-  if (remaining === 0) {
-    if (rule) global.candidatePoolQuotas.splice(global.candidatePoolQuotas.indexOf(rule), 1)
-    return
+  const remainderRule = rules.find((item) => item.sourceKey === sourceKey && !item.categoryPath.length)
+  const result = rules.filter((item) => item.sourceKey !== sourceKey || item.categoryPath.length > 0 ||
+    (item === remainderRule && remaining > 0))
+    .map((item) => item === remainderRule ? { ...item, target: remaining } : item)
+  if (remaining > 0 && !remainderRule) {
+    result.push({
+      id: crypto.randomUUID(), sourceKey, rankBoard: global.sources.rankBoard,
+      categoryId: '', categoryPath: [], target: remaining
+    })
   }
-  if (rule) {
-    rule.target = remaining
-    return
-  }
-  global.candidatePoolQuotas.push({
-    id: crypto.randomUUID(), sourceKey, rankBoard: global.sources.rankBoard,
-    categoryId: '', categoryPath: [], target: remaining
-  })
+  return result
 }
-function addQuotaRule(): void {
-  const category = quotaCategoryOptions.value[0]
+function setSourceQuotaTarget(sourceKey: CandidatePoolQuotaRule['sourceKey'], input: HTMLInputElement): void {
+  const previous = sourceQuotaTarget(sourceKey)
+  try {
+    global.candidatePoolQuotas = withSourceQuotaTotal(global.candidatePoolQuotas, sourceKey, Number(input.value))
+    quotaEditError.value = ''
+    error.value = ''
+  } catch (cause) {
+    input.value = String(previous)
+    reportQuotaEditError(cause)
+  }
+}
+function addQuotaRule(sourceKey: CandidatePoolQuotaRule['sourceKey']): void {
+  const draft = quotaAddDraft[sourceKey]
+  const category = quotaCategoryOptionsForSource(sourceKey).find((item) => item.path.join('|') === draft.categoryPath)
   if (!category) {
-    error.value = '请先同步百应类目目录，再添加指定品类配额。'
+    reportQuotaEditError(quotaCategoryOptions.value.length
+      ? `请先选择${quotaSourceLabel(sourceKey)}的具体类目。`
+      : '本机类目目录为空，请先在选品条件中同步百应类目目录。')
     return
   }
-  const rule: CandidatePoolQuotaRule = {
-    id: crypto.randomUUID(), sourceKey: 'allianceRank', rankBoard: '爆款榜',
-    categoryId: category.id, categoryPath: category.path, target: 10
+  try {
+    if (!Number.isInteger(draft.target) || draft.target < 1 || draft.target > 2000) throw new Error('类目目标须为 1–2000 的整数。')
+    const target = sourceQuotaTarget(sourceKey)
+    const rule: CandidatePoolQuotaRule = {
+      id: crypto.randomUUID(), sourceKey, rankBoard: draft.rankBoard,
+      categoryId: category.id, categoryPath: [...category.path], target: draft.target
+    }
+    const rules = [...global.candidatePoolQuotas]
+    const remainderIndex = rules.findIndex((item) => item.sourceKey === sourceKey && !item.categoryPath.length)
+    rules.splice(remainderIndex < 0 ? rules.length : remainderIndex, 0, rule)
+    const next = withSourceQuotaTotal(rules, sourceKey, target)
+    validateQuotaRules('quota', next, global.sources, global.excludedCategorySelection)
+    global.candidatePoolQuotas = next
+    draft.categoryPath = ''
+    quotaEditError.value = ''
+    error.value = ''
+  } catch (cause) { reportQuotaEditError(cause) }
+}
+function setQuotaTarget(rule: CandidatePoolQuotaRule, input: HTMLInputElement): void {
+  const target = Number(input.value)
+  try {
+    if (!Number.isInteger(target) || target < 1 || target > 2000) throw new Error('类目目标须为 1–2000 的整数。')
+    const sourceTarget = sourceQuotaTarget(rule.sourceKey)
+    const rules = global.candidatePoolQuotas.map((item) => item.id === rule.id ? { ...item, target } : item)
+    global.candidatePoolQuotas = withSourceQuotaTotal(rules, rule.sourceKey, sourceTarget)
+    quotaEditError.value = ''
+    error.value = ''
+  } catch (cause) {
+    input.value = String(rule.target)
+    reportQuotaEditError(cause)
   }
-  const sourceWideIndex = global.candidatePoolQuotas.findIndex((item) =>
-    item.sourceKey === rule.sourceKey && !item.categoryPath.length)
-  global.candidatePoolQuotas.splice(sourceWideIndex < 0 ? global.candidatePoolQuotas.length : sourceWideIndex, 0, rule)
+}
+function removeQuotaRule(rule: CandidatePoolQuotaRule): void {
+  try {
+    const target = sourceQuotaTarget(rule.sourceKey)
+    global.candidatePoolQuotas = withSourceQuotaTotal(
+      global.candidatePoolQuotas.filter((item) => item.id !== rule.id), rule.sourceKey, target
+    )
+    quotaEditError.value = ''
+    error.value = ''
+  } catch (cause) { reportQuotaEditError(cause) }
 }
 function moveQuotaRule(index: number, step: number): void {
   const next = index + step
@@ -2826,9 +2897,10 @@ async function saveGlobal(): Promise<void> {
     ]))
     global.bannedWordsSeedVersion = 2
     bannedWordsText.value = global.bannedWords.join('\n')
-    await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify({
+    const saved = await runEngine('selection_settings.py', ['--db', DB_PATH, 'save'], JSON.parse(JSON.stringify({
       ...global, categoryTree: categories.value
     })))
+    if (saved.scope !== 'global') throw new Error('通用设置未保存到正确位置，请使用已修正的选品设置程序后重新保存。')
     selectedLocalPoolBatchId.value = null
     selectedLocalPoolCategoryTree.value = null
     commissionRuleMigrationRequired.value = false
@@ -3382,9 +3454,9 @@ async function collectBatchCandidatePoolByQuota(
   }
   let lastError = ''
   let transferApplied = false
-  let rateLimited = false
+  let backoffScheduled = false
   for (const collectorId of collectorIds) {
-    if (ready() || rateLimited || manualPausePending()) break
+    if (ready() || backoffScheduled || manualPausePending()) break
     const context = contexts.get(collectorId)!
     const collectorState = sourceState.collectors[String(collectorId)] ?? { tabOffsets: {}, samePoolCount: 0, ruleStates: {} }
     collectorState.ruleStates ??= {}
@@ -3396,7 +3468,7 @@ async function collectBatchCandidatePoolByQuota(
     try {
       const schedule = Array.from({ length: 3 }, (_, pass) => rules.map((rule) => ({ rule, pass }))).flat()
       for (const { rule, pass } of schedule) {
-        if (manualPausePending() || rateLimited || (collectorState.nextRetryAt && Date.parse(collectorState.nextRetryAt) > Date.now())) break
+        if (manualPausePending() || backoffScheduled || (collectorState.nextRetryAt && Date.parse(collectorState.nextRetryAt) > Date.now())) break
         const ruleTarget = effectiveTargets.get(rule.id) ?? rule.target
         if (countFor(rule.id) >= ruleTarget) continue
         const state: NonNullable<BatchCandidatePool['sourceState']['collectors'][string]['ruleStates']>[string] =
@@ -3527,7 +3599,7 @@ async function collectBatchCandidatePoolByQuota(
             const sourceReadLimitReached = sourceResult?.sourceReadLimitReached === true ||
               sourceResult?.categoryTabReadLimitReached === true
             if (Number.isInteger(sourceResult?.categoryTabNextOffset)) {
-              state.categoryTabOffset = Number(sourceResult.categoryTabNextOffset)
+              state.categoryTabOffset = Number(sourceResult?.categoryTabNextOffset)
               collectorState.tabOffsets[rule.sourceKey] = state.categoryTabOffset
             }
             const offsetAdvanced = Number(state.categoryTabOffset ?? priorTabOffset) > priorTabOffset
@@ -3571,16 +3643,17 @@ async function collectBatchCandidatePoolByQuota(
               restorePoolCollectorCheckpoint(collectorState, beforeCommandState)
             }
             const rawError = String(cause instanceof Error ? cause.message : cause)
-            const isRateLimit = /11001|RATE_LIMIT|限流/i.test(rawError)
+            const classification = toUserSelectionError(cause).classification
+            const shouldBackoff = isBaiyingCooldownClassification(classification)
             const requiresAttention = /验证码|安全验证|需要登录|未登录|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)
             collectorState.ruleStates ??= {}
             const retryState: NonNullable<BatchCandidatePool['sourceState']['collectors'][string]['ruleStates']>[string] =
               collectorState.ruleStates[rule.id] ?? { samePoolCount: 0 }
             collectorState.ruleStates[rule.id] = retryState
             retryState.exhausted = false
-            if (isRateLimit) {
-              retryState.nextRetryAt = pauseCandidatePoolAfterRateLimit(sourceState, collectorIds)
-              rateLimited = true
+            if (shouldBackoff) {
+              retryState.nextRetryAt = scheduleCandidatePoolBackoff(sourceState, collectorIds)
+              backoffScheduled = true
             } else {
               retryState.nextRetryAt = new Date(Date.now() + 5 * 60_000).toISOString()
             }
@@ -3762,7 +3835,7 @@ async function collectBatchCandidatePool(
   }
   let lastError = ''
   let autoResumeAllowed = true
-  let rateLimited = false
+  let backoffScheduled = false
   const configuredSources = snapshot?.sources && typeof snapshot.sources === 'object'
     ? snapshot.sources as Record<string, unknown> : {}
   const requestedSourceOrder = Array.isArray(configuredSources.priority)
@@ -3772,7 +3845,7 @@ async function collectBatchCandidatePool(
   if (!activeSourceOrder.length) throw new Error('候选池没有已启用的来源；未开始采集。')
   if (rowsById.size < target) {
     for (const collectorId of collectorIds) {
-      if (manualPausePending() || rateLimited || !autoResumeAllowed) break
+      if (manualPausePending() || backoffScheduled || !autoResumeAllowed) break
       const context = contexts.get(collectorId)!
       const collectorState: BatchCandidatePool['sourceState']['collectors'][string] =
         sourceState.collectors[String(collectorId)] ?? { tabOffsets: {}, samePoolCount: 0 }
@@ -3933,9 +4006,9 @@ async function collectBatchCandidatePool(
             await savePool([], collectorId)
             break
           }
-          if (/11001|RATE_LIMIT|限流/i.test(rawError)) {
-            pauseCandidatePoolAfterRateLimit(sourceState, collectorIds)
-            rateLimited = true
+          if (isBaiyingCooldownClassification(toUserSelectionError(cause).classification)) {
+            scheduleCandidatePoolBackoff(sourceState, collectorIds)
+            backoffScheduled = true
             await savePool([], collectorId)
             break
           }
@@ -8754,7 +8827,7 @@ onUnmounted(() => {
           <span>已保存 {{ candidatePoolProgress?.count ?? '待读取' }}/{{ candidatePoolProgress?.target || '待读取' }} 件；候选池达标后才开始消费账号</span>
         </div>
         <div class="selection-progress-track" role="progressbar"
-          :aria-valuenow="candidatePoolProgressPercent" :aria-valuemin="0" :aria-valuemax="100"
+          :aria-valuenow="candidatePoolProgressPercent ?? undefined" :aria-valuemin="0" :aria-valuemax="100"
           :aria-valuetext="`候选池已保存 ${candidatePoolProgress?.count ?? '待读取'}/${candidatePoolProgress?.target || '待读取'} 件`">
           <span v-if="candidatePoolProgressPercent === null && selectionProgress?.state === 'running'" class="selection-progress-indeterminate"></span>
           <span v-else-if="candidatePoolProgressPercent !== null" class="selection-progress-fill" :style="{ width: `${candidatePoolProgressPercent}%` }"></span>
@@ -8796,7 +8869,7 @@ onUnmounted(() => {
         <span>{{ selectionProgress.stage }}</span>
       </div>
       <div class="selection-progress-track" role="progressbar"
-        :aria-valuenow="selectionWorkflowPercent" :aria-valuemin="0" :aria-valuemax="100"
+        :aria-valuenow="selectionWorkflowPercent ?? undefined" :aria-valuemin="0" :aria-valuemax="100"
         :aria-valuetext="selectionWorkflowPercent === null ? selectionProgress.state === 'running' ? '账号阶段执行中' : '账号阶段本轮结束，仍需核对检查点' : `当前账号流程估算 ${selectionWorkflowPercent}%`">
         <span v-if="selectionWorkflowPercent === null && selectionProgress.state === 'running'" class="selection-progress-indeterminate"></span>
         <span v-else-if="selectionWorkflowPercent !== null" class="selection-progress-fill" :style="{ width: `${selectionWorkflowPercent}%` }"></span>
@@ -8855,6 +8928,7 @@ onUnmounted(() => {
       <div ref="settingsScrollRef" class="settings-scroll">
         <nav class="settings-jumps" aria-label="快速定位设置">
           <template v-if="activeTab === '通用设置'">
+            <button class="btn" type="button" @click="jumpToSelectionSection('candidate-collector-pool')">候选池配额</button>
             <button class="btn" type="button" @click="jumpToSelectionSection('global-mode')">选品模式</button>
             <button class="btn" type="button" @click="jumpToSelectionSection('global-path')">下载路径</button>
             <button class="btn" type="button" @click="jumpToSelectionSection('global-filters')">选品条件</button>
@@ -9102,41 +9176,57 @@ onUnmounted(() => {
           </details>
 
           <section id="candidate-collector-pool" class="card">
-            <h2>共享候选池采集</h2>
-            <div class="form-grid">
-              <label>池量设置方式<select v-model="global.candidatePoolMode" :disabled="busy">
-                <option value="total">总数目标</option><option value="quota">按来源和品类逐项配额</option>
-              </select></label>
+            <h2>候选池来源与类目配额</h2>
+            <p class="hint">可分别设置热点趋势、联盟榜单、选品广场各选多少件，并继续细分每个来源下的类目数量。</p>
+            <div class="candidate-quota-modes" role="group" aria-label="候选池数量设置方式">
+              <button type="button" class="btn" :class="{ active: global.candidatePoolMode === 'total' }" :aria-pressed="global.candidatePoolMode === 'total'" :disabled="busy" @click="global.candidatePoolMode = 'total'">仅设置总数</button>
+              <button type="button" class="btn" :class="{ active: global.candidatePoolMode === 'quota' }" :aria-pressed="global.candidatePoolMode === 'quota'" :disabled="busy" @click="global.candidatePoolMode = 'quota'">分别设置来源与类目数量</button>
             </div>
+            <p v-if="quotaEditError" class="warning" role="alert">{{ quotaEditError }}</p>
             <div class="form-grid">
-              <label v-if="global.candidatePoolMode === 'total'">采集目标商品数<input v-model.number="global.candidatePoolTarget" type="number" min="1" max="2000" step="1"></label>
+              <label v-if="global.candidatePoolMode === 'total'">采集目标商品数<input v-model.number="global.candidatePoolTarget" type="number" min="1" max="2000" step="1" :disabled="busy"></label>
             </div>
+            <p v-if="global.candidatePoolMode === 'total'" class="hint">当前仅设总数，不限定各来源占比。需要分别填写三来源数量时，请点击上方“分别设置来源与类目数量”。</p>
             <template v-if="global.candidatePoolMode === 'quota'">
-              <p class="hint">分别填写三个来源的合计目标；下方指定品类配额计入所属来源，剩余数量由该来源其他允许类目补足。总池目标为三个来源之和；若要填 0，先移除该来源的指定品类配额。</p>
-              <div class="form-grid">
-                <label>热点趋势目标件数<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget('hotSpot')" :disabled="busy" @change="setSourceQuotaTarget('hotSpot', ($event.target as HTMLInputElement).value)"></label>
-                <label>联盟榜单目标件数<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget('allianceRank')" :disabled="busy" @change="setSourceQuotaTarget('allianceRank', ($event.target as HTMLInputElement).value)"></label>
-                <label>选品广场目标件数<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget('selectionSquare')" :disabled="busy" @change="setSourceQuotaTarget('selectionSquare', ($event.target as HTMLInputElement).value)"></label>
+              <p class="hint">先填写各来源合计，再分配其中的类目数量。例：热点共 30 件，可分为指定类目 10 件、其他允许类目 20 件；细分类目不会增加来源合计。来源目标为 0 时不分配，需先移除该来源的指定类目。</p>
+              <div class="candidate-quota-sources">
+                <section v-for="source in quotaSources" :key="source.key" class="candidate-quota-source">
+                  <div class="candidate-quota-source-head"><strong>{{ source.label }}</strong><label><input v-model="global.sources[source.enabledKey]" type="checkbox" :disabled="busy">启用来源</label></div>
+                  <label>来源合计（件）<input type="number" min="0" max="2000" step="1" :value="sourceQuotaTarget(source.key)" :disabled="busy" @change="setSourceQuotaTarget(source.key, $event.target as HTMLInputElement)"></label>
+                  <p class="hint">指定类目 {{ sourceQuotaTarget(source.key) - sourceQuotaRemainder(source.key) }} 件 · 其他允许类目 {{ sourceQuotaRemainder(source.key) }} 件</p>
+                  <p v-if="!global.sources[source.enabledKey] && sourceQuotaTarget(source.key) > 0" class="warning">来源已停用；请重新启用，或先移除类目并将来源合计设为 0。</p>
+                  <button class="btn" type="button" :disabled="busy || !global.sources[source.enabledKey]" :aria-expanded="quotaEditorSource === source.key" @click="quotaEditorSource = quotaEditorSource === source.key ? null : source.key">{{ quotaEditorSource === source.key ? '收起类目分配' : '细分该来源的类目数量' }}</button>
+                  <template v-if="quotaEditorSource === source.key">
+                  <label>分配到类目<select v-model="quotaAddDraft[source.key].categoryPath" :disabled="busy || !global.sources[source.enabledKey]">
+                    <option value="">{{ quotaCategoryOptionsForSource(source.key).length ? '选择具体类目' : '暂无类目，请先同步类目目录' }}</option>
+                    <option v-for="category in quotaCategoryOptionsForSource(source.key)" :key="category.path.join('|')" :value="category.path.join('|')">{{ category.label }}</option>
+                  </select></label>
+                  <div class="candidate-quota-add-options">
+                    <label v-if="source.key === 'allianceRank'">榜单<select v-model="quotaAddDraft[source.key].rankBoard" :disabled="busy"><option>爆款榜</option><option>趋势榜</option><option>带货榜</option><option>常销榜</option></select></label>
+                    <label>类目件数<input v-model.number="quotaAddDraft[source.key].target" type="number" min="1" :max="sourceQuotaRemainder(source.key) || 1" step="1" :disabled="busy"></label>
+                  </div>
+                  <button class="btn" type="button" :disabled="busy || !global.sources[source.enabledKey] || sourceQuotaRemainder(source.key) < 1" @click="addQuotaRule(source.key)">添加{{ source.label }}类目配额</button>
+                  </template>
+                  <small class="hint">{{ source.key === 'hotSpot' ? '热点仅支持一级类目。' : '支持一级、二级、三级类目。' }}余量不足时先增加来源合计；排除类目仍不可选入配额。</small>
+                </section>
               </div>
+              <p class="hint">三来源合计：{{ quotaPoolTarget }} 件（最多 2000 件）。下方可修改类目数量；其他允许类目的余量自动调整。</p>
               <p class="hint">按下方规则顺序轮流读取来源，重复商品归入先出现且仍缺额的规则；指定品类规则可排在来源余量规则前。每条配额分别达标后才开始账号选品；排除类目及统一筛选条件始终生效，来源确实耗尽后才转移缺额。</p>
-              <div v-for="(rule, index) in global.candidatePoolQuotas" :key="rule.id" class="form-grid">
-                <label>来源<select v-model="rule.sourceKey" :disabled="busy">
-                  <option value="allianceRank">联盟榜单</option><option value="hotSpot">选品热点</option><option value="selectionSquare">选品广场</option>
-                </select></label>
+              <div v-for="(rule, index) in global.candidatePoolQuotas" :key="rule.id" class="form-grid candidate-quota-rule">
+                <div class="candidate-quota-rule-title"><strong>规则 {{ index + 1 }} · {{ quotaSourceLabel(rule.sourceKey) }}</strong><small>{{ rule.categoryPath.length ? '指定类目 · 包含在来源合计中' : '来源余量 · 随类目数量自动调整' }}</small></div>
                 <label v-if="rule.sourceKey === 'allianceRank'">榜单<select v-model="rule.rankBoard" :disabled="busy">
                   <option>爆款榜</option><option>趋势榜</option><option>带货榜</option><option>常销榜</option>
                 </select></label>
-                <label>品类<select :value="rule.categoryPath.join('|')" :disabled="busy" @change="setQuotaCategory(rule, ($event.target as HTMLSelectElement).value)">
-                  <option value="">全部允许类目（来源目标）</option>
+                <label v-if="rule.categoryPath.length">类目<select :value="rule.categoryPath.join('|')" :disabled="busy" @change="setQuotaCategory(rule, ($event.target as HTMLSelectElement).value)">
+                  <option disabled value="">选择具体类目</option>
                   <option v-for="category in quotaCategoryOptionsForSource(rule.sourceKey)" :key="category.path.join('|')" :value="category.path.join('|')">{{ category.label }}（{{ category.id }}）</option>
                 </select></label>
-                <label>目标件数<input v-model.number="rule.target" type="number" min="1" max="2000" step="1" :disabled="busy"></label>
+                <label v-else>类目范围<input value="该来源的其他允许类目" readonly></label>
+                <label>目标件数<input type="number" min="1" max="2000" step="1" :value="rule.target" :readonly="!rule.categoryPath.length" :disabled="busy" @change="setQuotaTarget(rule, $event.target as HTMLInputElement)"></label>
                 <div><button type="button" :disabled="busy || index === 0" @click="moveQuotaRule(index, -1)">上移</button>
                   <button type="button" :disabled="busy || index === global.candidatePoolQuotas.length - 1" @click="moveQuotaRule(index, 1)">下移</button>
-                  <button type="button" :disabled="busy" @click="global.candidatePoolQuotas.splice(index, 1)">删除</button></div>
+                  <button v-if="rule.categoryPath.length" type="button" :disabled="busy" @click="removeQuotaRule(rule)">删除类目</button></div>
               </div>
-              <button type="button" :disabled="busy" @click="addQuotaRule">添加品类配额</button>
-              <p class="hint">配额合计：{{ quotaPoolTarget }} 件（最多 2000 件）。榜单默认爆款榜，可逐行选其他榜单。原有排除品类继续生效。</p>
               <div v-if="activeQuotaPool?.mode === 'quota'">
                 <p v-for="progress in activeQuotaPool.quotaProgress" :key="progress.ruleId" class="hint">
                   {{ quotaProgressLabel(progress.ruleId) }}：{{ progress.collected }}/{{ progress.effectiveTarget ?? progress.target }}，原配额 {{ progress.target }}，转入 {{ progress.transferredIn ?? 0 }}、转出 {{ progress.transferredOut ?? 0 }}，缺 {{ progress.deficit }} 件
@@ -9450,6 +9540,12 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.candidate-quota-modes{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.candidate-quota-modes .btn.active{border-color:var(--brand);background:var(--brand-soft);color:var(--brand)}
+.candidate-quota-sources{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px}.candidate-quota-source{display:flex;flex-direction:column;gap:8px;min-width:0;padding:12px;border:1px solid var(--border);border-radius:var(--radius-control);background:var(--bg-panel)}
+.candidate-quota-source-head{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}.candidate-quota-source-head>strong{font-size:13px}.candidate-quota-source>label,.candidate-quota-add-options>label{display:flex;flex-direction:column;gap:5px;color:var(--text-muted);font-size:12px}.candidate-quota-source-head>label{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-muted)}
+.candidate-quota-source input[type=number],.candidate-quota-source select{width:100%;min-width:0;height:32px;box-sizing:border-box;padding:0 8px;border:1px solid var(--border);border-radius:var(--radius-control);background:var(--bg-panel);color:var(--text);font:inherit}.candidate-quota-source .hint{margin:0;font-size:12px}.candidate-quota-add-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.candidate-quota-rule{padding:10px;border:1px solid var(--border);border-radius:var(--radius-control)}.candidate-quota-rule-title{display:flex;flex-direction:column;gap:5px;justify-content:center;font-size:12px}.candidate-quota-rule-title small{color:var(--text-muted)}.candidate-quota-rule input[readonly]{color:var(--text-muted);background:var(--bg-app)}
+@media(max-width:900px){.candidate-quota-sources{grid-template-columns:1fr}}
 .account-settings-mask { position: fixed; inset: 0; z-index: 1200; display: grid; place-items: center; overflow: auto; padding: 16px; background: rgb(15 23 42 / 46%); }
 .account-settings-dialog { display: flex; flex: 0 1 auto; flex-direction: column; width: min(1120px, 96vw); height: min(92vh, 900px); max-height: calc(100vh - 32px); min-height: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-panel); box-shadow: 0 18px 56px rgb(15 23 42 / 24%); }
 .account-settings-head, .account-settings-foot { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 15px 18px; border-bottom: 1px solid var(--border); }
