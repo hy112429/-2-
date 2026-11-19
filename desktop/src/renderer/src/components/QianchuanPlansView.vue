@@ -21,6 +21,7 @@ interface PlanCandidate {
   dailyBudgetYuan: number
   commissionRate: number
   roiTarget: number
+  videoSource: string
   materialCount: number
   remoteMaterialIds: string[]
   existingPlanId: number
@@ -357,7 +358,7 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
             <span><strong>自动创建并发布</strong><small>开启后，新发布商品在千川素材就绪时由独立调度器创建并提交计划；无需再逐条点击发布。</small></span>
           </label>
           <label>日预算（元）<input v-model.number="settings.dailyBudgetYuan" type="number" min="50" max="10000000" step="1" @input="settingsDirty = true" /></label>
-          <label>素材来源<select v-model="settings.videoSource" @change="settingsDirty = true"><option value="uploaded">千川已上传素材</option><option value="both">已上传素材并兼容我的视频</option></select></label>
+          <label>素材来源<select v-model="settings.videoSource" @change="settingsDirty = true"><option value="uploaded">计划页上传的视频</option><option value="my_video">我的视频（已发布作品）</option><option value="both">计划页上传视频并选我的视频</option></select></label>
         </div>
         <p class="formula">投放方式固定为「控成本投放」。保本 ROI = 100 ÷ 佣金率（%）；例如佣金率 20%，ROI 为 5.00。佣金率缺失或账号不匹配时会阻止创建/发布。</p>
         <p v-if="settings.enabled && settings.dailyBudgetYuan < 50" class="reason">自动创建并发布已勾选；请先填写至少 50 元日预算，再保存设置。</p>
@@ -365,13 +366,13 @@ onBeforeUnmount(() => { if (refreshTimer) clearInterval(refreshTimer) })
       </section>
 
       <section class="card">
-        <div class="section-head"><div><h2>新建计划</h2><p>只列出本账号已确认抖音发布、千川素材已完成上传且可核对的商品。</p></div></div>
+        <div class="section-head"><div><h2>新建计划</h2><p>只列出本账号已确认抖音发布、素材来源与预算可核对的商品。</p></div></div>
         <div v-if="loading" class="empty-state">正在读取可创建的商品…</div>
         <div v-else-if="!candidates.length" class="empty-state">暂无已发布且绑定当前千川账户的商品。</div>
         <div v-else class="candidate-list">
           <article v-for="candidate in candidates" :key="candidate.publishQueueId" class="candidate">
             <div class="candidate-select">
-              <span><strong>{{ candidate.productName || `商品 ${candidate.productId}` }}</strong><small>{{ selectedAccountName }} · 千川广告主 {{ candidate.advertiserId }} · 商品 ID {{ candidate.productId }} · {{ candidate.materialCount }} 条可用已上传素材</small><small v-if="candidate.remoteMaterialIds.length">素材 ID：{{ candidate.remoteMaterialIds.join('、') }}</small><small v-if="candidate.canCreate">日预算 {{ candidate.dailyBudgetYuan }} 元 · 佣金率 {{ candidate.commissionRate }}% · 保本 ROI {{ Number(candidate.roiTarget).toFixed(2) }}</small><small v-else class="reason">{{ candidate.reason }}</small></span>
+              <span><strong>{{ candidate.productName || `商品 ${candidate.productId}` }}</strong><small>{{ selectedAccountName }} · 千川广告主 {{ candidate.advertiserId }} · 商品 ID {{ candidate.productId }} · {{ candidate.videoSource === 'my_video' ? '计划页核对我的视频' : `${candidate.materialCount} 条可用已上传视频` }}</small><small v-if="candidate.remoteMaterialIds.length && candidate.videoSource !== 'my_video'">素材 ID：{{ candidate.remoteMaterialIds.join('、') }}</small><small v-if="candidate.canCreate">日预算 {{ candidate.dailyBudgetYuan }} 元 · 佣金率 {{ candidate.commissionRate }}% · 保本 ROI {{ Number(candidate.roiTarget).toFixed(2) }}</small><small v-else class="reason">{{ candidate.reason }}</small></span>
             </div>
             <button class="btn" :disabled="busy || !candidate.canCreate" @click="createPlan(candidate)">{{ candidate.canCreate ? '生成待发布计划' : '暂不可创建' }}</button>
           </article>

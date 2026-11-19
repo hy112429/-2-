@@ -454,10 +454,10 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
             uploaded_count += len(selected)
             selected_material_ids.extend(selected)
             skipped_material_ids.extend(skipped)
-        if uploaded_count == 0:
+        if source in ("uploaded", "both") and uploaded_count == 0:
             raise UploadStopped("千川计划页尚无可选的已上传视频；已停止发布，稍后重试", stage=stage)
-        if source == "my_video":
-            raise UploadStopped("千川自选素材要求至少一条非主页视频；当前仅配置主页作品", stage=stage)
+        if selected_count == 0:
+            raise UploadStopped("千川计划页没有可确认的视频素材", stage=stage)
         stage = "title"
         add_title(page, str(job["published_video_title"] or job["product_name"]))
         stage = "plan_name"
@@ -546,9 +546,10 @@ def create_plan(db_path: Path, job_id: int, profile_path: Path, port: int,
             except Exception:
                 # 列表暂未同步时保留待核查，绝不再次点击发布。
                 pass
-        material_note = (f"；本次选中 {uploaded_count} 条已上传视频，另有 "
+        material_note = (f"；本次选中 {selected_count} 条视频，其中已上传素材 {uploaded_count} 条，另有 "
                          f"{len(skipped_material_ids)} 条平台暂不可选：{','.join(skipped_material_ids)}"
-                         if skipped_material_ids else f"；本次选中 {uploaded_count} 条已上传视频")
+                         if skipped_material_ids else
+                         f"；本次选中 {selected_count} 条视频，其中已上传素材 {uploaded_count} 条")
         if len(unique) == 1:
             return {"ok": True, "status": "published", "remotePlanId": unique.pop(),
                     "submitAttempted": True, "screenshotPath": str(screenshot),

@@ -316,6 +316,7 @@ interface BatchCandidatePool {
   collectorAccountIds: number[]
   filterFingerprint: string
   rows: SelectionCandidate[]
+  revalidationRows?: SelectionCandidate[]
   sourceState: { autoResumeAllowed?: boolean; collectors: Record<string, { tabOffsets: Record<string, number>; samePoolCount: number; rateLimitCount?: number; nextRetryAt?: string; scrollSteps?: number; rawLimit?: number; scrollPositions?: Record<string, number>; detailAttemptedIds?: string[]; ruleStates?: Record<string, { samePoolCount: number; nextRetryAt?: string; exhausted?: boolean; scrollSteps?: number; rawLimit?: number; scrollPosition?: number; categoryTabOffset?: number; detailAttemptedIds?: string[] }> }> }
   status: 'collecting' | 'ready'
   capturedAt: string
@@ -324,8 +325,10 @@ interface BatchCandidatePool {
 interface SavedLocalCandidatePool {
   batchId: string
   duplicateBatches: Array<{ batchId: string; capturedAt: string; updatedAt: string }>
+  status: 'collecting' | 'ready'
   count: number
   recentCount: number
+  pendingRevalidationCount: number
   target: number
   mode: 'total' | 'quota'
   capturedAt: string
@@ -419,6 +422,7 @@ interface CandidateDetail extends Partial<SelectionCandidate> {
   title: string
   sourceCategoryIds?: string[]
   reusedFromBatchId?: string
+  revalidationPending?: boolean
 }
 
 type CategoryLevel = 'level1' | 'level2' | 'level3'
@@ -1414,10 +1418,10 @@ async function loadSavedLocalPools(): Promise<void> {
   try {
     const result = await runRecovery(['batch', 'pool-list', '--limit', '10'])
     savedLocalPools.value = Array.isArray(result.pools) ? result.pools as SavedLocalCandidatePool[] : []
-    if (savedLocalPools.value.some((pool) => pool.recentCount > 0) &&
+    if (savedLocalPools.value.some((pool) => pool.count + pool.pendingRevalidationCount > 0) &&
         error.value.includes('请先设置候选池目标数量')) {
       error.value = ''
-      notice.value = '本机已有可复用候选池，可在下方查看商品并选择“使用此池开始选品”。'
+      notice.value = '本机已有已存候选商品，可在下方查看并选择“使用此池继续选品”；旧商品按当前规则重核。'
     }
   } catch (cause) {
     savedLocalPools.value = []
@@ -1454,7 +1458,8 @@ async function ensureSelectionUiData(): Promise<void> {
   await selectionUiDataPromise
 }
 function localPoolSourcePercent(pool: SavedLocalCandidatePool, count: number): number {
-  return pool.count > 0 ? Math.max(0, Math.min(100, Math.round(count / pool.count * 100))) : 0
+  const savedCount = pool.count + pool.pendingRevalidationCount
+  return savedCount > 0 ? Math.max(0, Math.min(100, Math.round(count / savedCount * 100))) : 0
 }
 async function useSavedLocalPool(pool: SavedLocalCandidatePool): Promise<void> {
   if (busy.value || savedLocalPoolLoading.value) return
@@ -1471,8 +1476,8 @@ async function useSavedLocalPool(pool: SavedLocalCandidatePool): Promise<void> {
     const result = await runRecovery(['batch', 'pool-settings', '--batch-id', pool.batchId])
     const currentPool = result.pool as SavedLocalCandidatePool | undefined
     const savedSettings = result.settingsSnapshot as Record<string, unknown> | undefined
-    if (!currentPool || currentPool.recentCount < 1 || !savedSettings || !Array.isArray(savedSettings.categoryTree)) {
-      throw new Error('所选候选池没有 24 小时内可复用的商品，请重新采集。')
+    if (!currentPool || currentPool.count + currentPool.pendingRevalidationCount < 1 || !savedSettings || !Array.isArray(savedSettings.categoryTree)) {
+      throw new Error('所选候选池没有已保存的商品 ID，请重新采集。')
     }
     const poolSettingKeys = [
       'candidatePoolTarget', 'candidatePoolMode', 'candidatePoolQuotas', 'commissionRateRule',
@@ -1495,7 +1500,7 @@ async function useSavedLocalPool(pool: SavedLocalCandidatePool): Promise<void> {
     selectedLocalPoolBatchId.value = pool.batchId
     selectedLocalPoolCategoryTree.value = savedSettings.categoryTree as CategoryNode[]
     selectionSettingsDialogOpen.value = false
-    notice.value = `已选择本机候选池 ${currentPool.recentCount}/${currentPool.target}；将先按商品 ID 给当前启用账号核验，缺额再补采。`
+    notice.value = `已选择本机候选池，已存 ${currentPool.count + currentPool.pendingRevalidationCount} 个商品 ID；需重核的旧 ID 先按当前来源和设置核验，缺额再补采。`
     void startSelectionFromButton().catch((cause) => {
       error.value = String(cause instanceof Error ? cause.message : cause)
     })
@@ -3255,6 +3260,29 @@ function batchCandidatePoolFingerprint(snapshot: Record<string, unknown>): strin
   })
 }
 
+function staleCollectingPoolIds(pool?: BatchCandidatePool): string[] {
+  if (!pool || pool.status !== 'collecting') return []
+  const now = Date.now()
+  return pool.rows.filter((row) => {
+    const captured = Date.parse(row.capturedAt ?? '')
+    return !Number.isFinite(captured) || captured > now || now - captured > 24 * 60 * 60 * 1000
+  }).map((row) => row.productId)
+}
+
+function preferredSavedPoolIds(batch: SelectionRecoveryBatch, pool?: BatchCandidatePool): string[] {
+  const hints = Array.isArray(batch.payload.candidatePoolReuseHints) ? batch.payload.candidatePoolReuseHints : []
+  return [...new Set([
+    ...hints.map(String), ...(pool?.revalidationRows ?? []).map((row) => row.productId),
+    ...staleCollectingPoolIds(pool)
+  ].filter((id) => /^\d+$/.test(id)))].slice(0, 2000)
+}
+
+function restorePoolCollectorCheckpoint(target: object, checkpoint: object): void {
+  const fields = target as Record<string, unknown>
+  for (const key of Object.keys(fields)) delete fields[key]
+  Object.assign(fields, structuredClone(checkpoint))
+}
+
 async function collectBatchCandidatePoolByQuota(
   batch: SelectionRecoveryBatch,
   contexts: Map<number, AccountRunContext>
@@ -3275,6 +3303,9 @@ async function collectBatchCandidatePoolByQuota(
   const matches = oldPool?.mode === 'quota' && oldPool.target === target &&
     oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') &&
     oldPool.filterFingerprint === filterFingerprint
+  const staleIds = matches ? staleCollectingPoolIds(oldPool) : []
+  const staleIdSet = new Set(staleIds)
+  const preferredIds = preferredSavedPoolIds(batch, matches ? oldPool : undefined)
   const quotaTransfers = matches && Array.isArray(oldPool?.quotaTransfers) ? structuredClone(oldPool.quotaTransfers) : []
   const effectiveTargets = new Map(rules.map((rule) => [rule.id, rule.target]))
   for (const transfer of quotaTransfers) {
@@ -3284,14 +3315,30 @@ async function collectBatchCandidatePoolByQuota(
   const excludedProductIds = new Set<string>(matches && Array.isArray(oldPool?.excludedProductIds) ? oldPool.excludedProductIds : [])
   const rowsById = new Map<string, SelectionCandidate>()
   if (matches) for (const row of oldPool?.rows ?? []) {
-    if (/^\d+$/.test(row.productId) && !excludedProductIds.has(row.productId) && rules.some((rule) => rule.id === row.quotaRuleId)) rowsById.set(row.productId, row)
+    if (/^\d+$/.test(row.productId) && !excludedProductIds.has(row.productId) && !staleIdSet.has(row.productId) && rules.some((rule) => rule.id === row.quotaRuleId)) rowsById.set(row.productId, row)
   }
   const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0], batch.batchId)
   for (const productId of occupiedOldIds) rowsById.delete(productId)
   for (const productId of occupiedOldIds) excludedProductIds.add(productId)
+  const eligiblePreferredIds = preferredIds.filter((id) => !excludedProductIds.has(id) && !rowsById.has(id))
   const sourceState: BatchCandidatePool['sourceState'] = matches && oldPool?.sourceState?.collectors
     ? structuredClone(oldPool.sourceState) : { collectors: {} }
   sourceState.autoResumeAllowed = true
+  if (staleIds.length) for (const collector of Object.values(sourceState.collectors)) {
+    collector.tabOffsets = {}
+    collector.scrollPositions = {}
+    collector.nextRetryAt = undefined
+    collector.rateLimitCount = 0
+    collector.detailAttemptedIds = []
+    for (const state of Object.values(collector.ruleStates ?? {})) {
+      state.exhausted = false
+      state.nextRetryAt = undefined
+      state.samePoolCount = 0
+      state.scrollPosition = 0
+      state.categoryTabOffset = 0
+      state.detailAttemptedIds = []
+    }
+  }
   const legacyCategoryCursors = matches && Object.values(sourceState.collectors).some((collector) =>
     collector.scrollPositions?.['selectionSquare:categoryPlanVersion'] !== 2
   )
@@ -3313,7 +3360,7 @@ async function collectBatchCandidatePoolByQuota(
   )
   const countFor = (ruleId: string): number => [...rowsById.values()].filter((row) => row.quotaRuleId === ruleId).length
   const ready = (): boolean => rules.every((rule) => countFor(rule.id) >= (effectiveTargets.get(rule.id) ?? rule.target))
-  const savePool = async (newRows: SelectionCandidate[], collectorId: number): Promise<void> => {
+  const savePool = async (newRows: SelectionCandidate[], collectorId: number, revalidateProductIds: string[] = []): Promise<void> => {
     const capturedAt = new Date().toISOString()
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
       mode: 'quota', quotaRules: rules, quotaTransfers, target, collectorAccountIds: collectorIds,
@@ -3322,14 +3369,14 @@ async function collectBatchCandidatePoolByQuota(
         ...row, collectedByAccountId: row.collectedByAccountId ?? collectorId,
         capturedAt: row.capturedAt ?? capturedAt
       })),
-      excludedProductIds: [...excludedProductIds], sourceState
+      excludedProductIds: [...excludedProductIds], revalidateProductIds, sourceState
     })
     const result = saved.pool as { count?: number; status?: string } | undefined
     if (Number(result?.count) !== rowsById.size) throw new Error('品类配额候选池落盘数量不一致，未进入消费阶段。')
     showConfirmedPoolSave(batch.batchId, target, 'quota', result?.status === 'ready' ? 'ready' : 'collecting',
       [...rowsById.values()], rules, quotaTransfers)
   }
-  if (occupiedOldIds.size || legacyCategoryCursors || legacyHotSpotCursors) await savePool([], collectorIds[0])
+  if (occupiedOldIds.size || legacyCategoryCursors || legacyHotSpotCursors || staleIds.length) await savePool([], collectorIds[0], staleIds)
   if (!ready() && collectorIds.some((id) => !contexts.has(id))) {
     throw new Error('采集账号缺少可用的本地资源，已保留品类配额检查点。')
   }
@@ -3364,6 +3411,7 @@ async function collectBatchCandidatePoolByQuota(
           let newlyAssignedCount = 0
           let reassignedCount = 0
           let persisted = false
+          const beforeCommandState = structuredClone(collectorState)
           const priorTabOffset = Number(state.categoryTabOffset ?? 0)
           reportSelectionProgress(collectorId, '按品类只读采集共享候选池', {
             itemIndex: countFor(rule.id), itemTotal: effectiveTargets.get(rule.id) ?? rule.target,
@@ -3401,6 +3449,7 @@ async function collectBatchCandidatePoolByQuota(
                   Math.ceil((effectiveTargets.get(rule.id) ?? rule.target) / 20)
                 )),
                 _candidatePoolScrollPosition: state.scrollPosition ?? 0,
+                _candidatePoolPreferredProductIds: eligiblePreferredIds,
                 _categoryDetailSkipIds: state.detailAttemptedIds ?? [],
                 _sourceCategoryTabOffsets: { [rule.sourceKey]: priorTabOffset }
               }, previewOnly: true, closeAfterAutomation: true
@@ -3514,19 +3563,26 @@ async function collectBatchCandidatePoolByQuota(
             })
             if (!newlyAssignedCount && !reassignedCount) break
           } catch (cause) {
-            if (!persisted) for (const [productId, original] of priorRows) {
-              if (original) rowsById.set(productId, original)
-              else rowsById.delete(productId)
+            if (!persisted) {
+              for (const [productId, original] of priorRows) {
+                if (original) rowsById.set(productId, original)
+                else rowsById.delete(productId)
+              }
+              restorePoolCollectorCheckpoint(collectorState, beforeCommandState)
             }
             const rawError = String(cause instanceof Error ? cause.message : cause)
             const isRateLimit = /11001|RATE_LIMIT|限流/i.test(rawError)
             const requiresAttention = /验证码|安全验证|需要登录|未登录|环境危险|环境异常|DETAIL_ENVIRONMENT_RISK_REQUIRED/i.test(rawError)
-            state.exhausted = false
+            collectorState.ruleStates ??= {}
+            const retryState: NonNullable<BatchCandidatePool['sourceState']['collectors'][string]['ruleStates']>[string] =
+              collectorState.ruleStates[rule.id] ?? { samePoolCount: 0 }
+            collectorState.ruleStates[rule.id] = retryState
+            retryState.exhausted = false
             if (isRateLimit) {
-              state.nextRetryAt = pauseCandidatePoolAfterRateLimit(sourceState, collectorIds)
+              retryState.nextRetryAt = pauseCandidatePoolAfterRateLimit(sourceState, collectorIds)
               rateLimited = true
             } else {
-              state.nextRetryAt = new Date(Date.now() + 5 * 60_000).toISOString()
+              retryState.nextRetryAt = new Date(Date.now() + 5 * 60_000).toISOString()
             }
             if (requiresAttention) sourceState.autoResumeAllowed = false
             lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
@@ -3617,11 +3673,14 @@ async function collectBatchCandidatePool(
       filterFingerprint: batchCandidatePoolFingerprint(snapshot),
       sourceBatchId: selectedSourceBatchId
     })
-    const summary = reused.pool as { count?: number; sourceBatchId?: string; detail?: string } | undefined
-    if (selectedSourceBatchId && Number(summary?.count) < 1) {
-      throw new Error(`所选本机候选池已过期或与本次选品条件不符${summary?.detail ? `：${summary.detail}` : ''}；新批次检查点已保存，未重新抓取来源或启动消费账号。`)
+    const summary = reused.pool as { count?: number; recheckCount?: number; sourceBatchIds?: string[]; detail?: string } | undefined
+    const directCount = Number(summary?.count) || 0
+    const recheckCount = Number(summary?.recheckCount) || 0
+    const sourceIds = summary?.sourceBatchIds ?? []
+    if (selectedSourceBatchId && directCount < 1 && recheckCount < 1) {
+      throw new Error(`所选本机候选池没有可保存或待重核的商品 ID${summary?.detail ? `：${summary.detail}` : ''}；新批次检查点已保存，未启动消费账号。`)
     }
-    if (Number(summary?.count) > 0) {
+    if (directCount > 0 || recheckCount > 0) {
       const refreshed = await runRecovery(['batch', 'latest'])
       const checkpoint = refreshed.batch as SelectionRecoveryBatch | null
       if (!checkpoint || checkpoint.batchId !== batch.batchId) {
@@ -3630,9 +3689,9 @@ async function collectBatchCandidatePool(
       batch = checkpoint
       showSavedPoolCheckpoint(batch)
       await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
-        stage: '候选池采集', code: 'INFO_LOCAL_CANDIDATE_POOL_REUSED',
-        message: `从本机历史批次复用 ${summary?.count} 件候选商品；消费账号仍将按 ID 重新核验。`,
-        detail: `来源批次 ${summary?.sourceBatchId ?? '未知'}；历史采集游标及账号加车结果未复用。`
+        stage: '候选池采集', code: directCount ? 'INFO_LOCAL_CANDIDATE_POOL_REUSED' : 'INFO_LOCAL_CANDIDATE_POOL_RECHECK_QUEUED',
+        message: `本机历史池直接复用 ${directCount} 件，另有 ${recheckCount} 个旧商品 ID 等待当前来源重新核验；消费账号仍须按 ID 核验。`,
+        detail: `来源批次 ${sourceIds.slice(0, 5).join('、') || '未知'}${sourceIds.length > 5 ? ` 等共 ${sourceIds.length} 批` : ''}；历史采集游标及账号加车结果未复用。`
       })
     }
   }
@@ -3644,6 +3703,9 @@ async function collectBatchCandidatePool(
   const oldPool = batch.payload.candidatePool as BatchCandidatePool | undefined
   const poolConfigMatches = oldPool?.target === target && oldPool.collectorAccountIds?.join(',') === collectorIds.join(',') &&
     oldPool.filterFingerprint === filterFingerprint
+  const staleIds = poolConfigMatches ? staleCollectingPoolIds(oldPool) : []
+  const staleIdSet = new Set(staleIds)
+  const preferredIds = preferredSavedPoolIds(batch, poolConfigMatches ? oldPool : undefined)
   if (!Number.isInteger(target) || target < 1 || target > 2000 || ![1, 2].includes(collectorIds.length) ||
       new Set(collectorIds).size !== collectorIds.length) {
     throw new Error('批次候选池缺少有效的目标数量或 1–2 个已启用采集账号；未开始消费账号选品。')
@@ -3653,14 +3715,23 @@ async function collectBatchCandidatePool(
     ? oldPool.excludedProductIds : [])
   if (poolConfigMatches && oldPool) {
     for (const row of oldPool.rows ?? []) {
-      if (/^\d+$/.test(String(row.productId ?? '')) && !excludedProductIds.has(row.productId)) rowsById.set(row.productId, row)
+      if (/^\d+$/.test(String(row.productId ?? '')) && !excludedProductIds.has(row.productId) && !staleIdSet.has(row.productId)) rowsById.set(row.productId, row)
     }
   }
   const occupiedOldIds = await occupiedPoolProductIds([...rowsById.values()], collectorIds[0], batch.batchId)
   for (const productId of occupiedOldIds) { rowsById.delete(productId); excludedProductIds.add(productId) }
+  const eligiblePreferredIds = preferredIds.filter((id) => !excludedProductIds.has(id) && !rowsById.has(id))
   const sourceState: BatchCandidatePool['sourceState'] = oldPool && poolConfigMatches && oldPool.sourceState?.collectors
     ? structuredClone(oldPool.sourceState) : { collectors: {} }
   sourceState.autoResumeAllowed = true
+  if (staleIds.length) for (const collector of Object.values(sourceState.collectors)) {
+    collector.tabOffsets = {}
+    collector.scrollPositions = {}
+    collector.nextRetryAt = undefined
+    collector.rateLimitCount = 0
+    collector.detailAttemptedIds = []
+    collector.samePoolCount = 0
+  }
   const legacyCategoryCursors = poolConfigMatches && Object.values(sourceState.collectors).some((collector) =>
     collector.scrollPositions?.['selectionSquare:categoryPlanVersion'] !== 2
   )
@@ -3671,12 +3742,12 @@ async function collectBatchCandidatePool(
     collector.nextRetryAt = undefined
   }
   const legacyHotSpotCursors = poolConfigMatches && resetHotSpotRootOnlyCursors(sourceState, new Set())
-  const savePool = async (rows: SelectionCandidate[], collectorAccountId: number): Promise<void> => {
+  const savePool = async (rows: SelectionCandidate[], collectorAccountId: number, revalidateProductIds: string[] = []): Promise<void> => {
     const capturedAt = new Date().toISOString()
     const saved = await runRecovery(['batch', 'pool-save', '--batch-id', batch.batchId], {
       target, collectorAccountIds: collectorIds, collectorAccountId, capturedAt, filterFingerprint,
       rows: rows.map((row) => ({ ...row, collectedByAccountId: collectorAccountId, capturedAt })),
-      excludedProductIds: [...excludedProductIds], sourceState
+      excludedProductIds: [...excludedProductIds], revalidateProductIds, sourceState
     })
     const summary = saved.pool as { count?: number; status?: string } | undefined
     if (Number(summary?.count) !== rowsById.size) {
@@ -3685,7 +3756,7 @@ async function collectBatchCandidatePool(
     showConfirmedPoolSave(batch.batchId, target, 'total', summary?.status === 'ready' ? 'ready' : 'collecting',
       [...rowsById.values()])
   }
-  if (occupiedOldIds.size || legacyCategoryCursors || legacyHotSpotCursors) await savePool([], collectorIds[0])
+  if (occupiedOldIds.size || legacyCategoryCursors || legacyHotSpotCursors || staleIds.length) await savePool([], collectorIds[0], staleIds)
   if (rowsById.size < target && collectorIds.some((id) => !contexts.has(id))) {
     throw new Error('剔除已登记商品后候选池未达目标，采集账号资源不可用；已保留检查点。')
   }
@@ -3720,6 +3791,7 @@ async function collectBatchCandidatePool(
         const priorOffsets = JSON.stringify(collectorState.tabOffsets)
         const newRows: SelectionCandidate[] = []
         let persisted = false
+        const beforeCommandState = structuredClone(collectorState)
         reportSelectionProgress(collectorId, '只读采集共享候选池', {
           itemIndex: before, itemTotal: target,
           message: `采集账号 ${collectorId}：候选池 ${before}/${target}，第 ${round + 1} 轮读取 ${sourceKey}。`
@@ -3745,6 +3817,7 @@ async function collectBatchCandidatePool(
                 collectorState.scrollSteps ?? 0, 6, Math.ceil(target / 20)
               )),
               _candidatePoolScrollPositions: collectorState.scrollPositions ?? {},
+              _candidatePoolPreferredProductIds: eligiblePreferredIds,
               _categoryDetailSkipIds: collectorState.detailAttemptedIds ?? [],
               _sourceCategoryTabOffsets: collectorState.tabOffsets
             },
@@ -3843,7 +3916,10 @@ async function collectBatchCandidatePool(
             await new Promise<void>((resolve) => window.setTimeout(resolve, 2_000))
           }
         } catch (cause) {
-          if (!persisted) for (const row of newRows) rowsById.delete(row.productId)
+          if (!persisted) {
+            for (const row of newRows) rowsById.delete(row.productId)
+            restorePoolCollectorCheckpoint(collectorState, beforeCommandState)
+          }
           const rawError = String(cause instanceof Error ? cause.message : cause)
           lastError = String(toUserSelectionError(cause).classification || 'COLLECTOR_READ_FAILED')
           await runRecovery(['log', 'append', '--batch-id', batch.batchId, '--account-id', '0'], {
@@ -8628,8 +8704,8 @@ onUnmounted(() => {
       <summary>查看错误详情</summary><pre>{{ selectionErrorPresentation.diagnostic }}</pre>
     </details>
     <p v-if="notice" class="notice selection-top-feedback" role="status">{{ selectionNoticePresentation.userMessage }}</p>
-    <div v-if="savedLocalPools[0]?.recentCount" class="saved-local-pool-banner" role="status">
-      <span>本机已有候选池：{{ savedLocalPools[0].count }} 件已存，{{ savedLocalPools[0].recentCount }} 件在 24 小时内。可先从池内按商品 ID 选品。</span>
+    <div v-if="savedLocalPools[0] && savedLocalPools[0].count + savedLocalPools[0].pendingRevalidationCount > 0" class="saved-local-pool-banner" role="status">
+      <span>本机已有候选池：{{ savedLocalPools[0].count + savedLocalPools[0].pendingRevalidationCount }} 件已存；24 小时内 {{ savedLocalPools[0].recentCount }} 件。未确认仍有效的旧 ID 将先重核。</span>
       <button class="btn" type="button" :disabled="busy" @click="openSelectionSettingsDialog">查看并使用</button>
     </div>
     <details class="client-advanced">
@@ -8820,18 +8896,18 @@ onUnmounted(() => {
           </div>
           <p class="hint">这里显示已落盘的商品 ID。使用时会把该池的筛选条件保存为当前通用设置，保留当前账号目标与执行设置；启动后先剔除已登记商品，再由当前启用账号逐个核验详情。池内数量不等于已加车数量。</p>
           <p v-if="savedLocalPoolLoading" class="hint">正在读取本机候选池…</p>
-          <p v-else-if="!savedLocalPools.length" class="hint">本机还没有达到目标并保存的候选池。</p>
+          <p v-else-if="!savedLocalPools.length" class="hint">本机还没有已保存商品的候选池。</p>
           <article v-for="pool in savedLocalPools.slice(0, 3)" :key="pool.batchId" class="saved-local-pool">
             <div class="saved-local-pool-heading">
               <div>
-                <strong>已存 {{ pool.count }} 件 / 原目标 {{ pool.target }} 件</strong>
-                <span>24 小时内 {{ pool.recentCount }} 件 · {{ pool.mode === 'quota' ? '按来源与类目配额' : '总数目标' }}</span>
+                <strong>{{ pool.status === 'ready' ? '原池曾达标' : '原池采集中' }} · 历史保存 {{ pool.count + pool.pendingRevalidationCount }} 件 / 原目标 {{ pool.target }} 件</strong>
+                <span>原池当前计数 {{ pool.count }} 件 · 24 小时内 {{ pool.recentCount }} 件 · 需重核 {{ pool.count - pool.recentCount + pool.pendingRevalidationCount }} 件 · {{ pool.mode === 'quota' ? '按来源与类目配额' : '总数目标' }}</span>
                 <small>佣金 {{ pool.minimumCommissionRate ?? '不限' }}%–{{ pool.maximumCommissionRate ?? '不限' }}% · 排除类目 {{ pool.excludedCategoryCount }} 项</small>
                 <small>采集于 {{ pool.capturedAt ? new Date(pool.capturedAt).toLocaleString('zh-CN') : '时间未知' }} · 原批次 {{ pool.batchId }}</small>
               </div>
-              <button class="btn primary" type="button" :disabled="busy || savedLocalPoolLoading || pool.recentCount < 1 || ['in_progress', 'needs_retry'].includes(recoveryBatch?.state ?? '')" @click="useSavedLocalPool(pool)">使用此池开始选品</button>
+              <button class="btn primary" type="button" :disabled="busy || savedLocalPoolLoading || pool.count + pool.pendingRevalidationCount < 1 || ['in_progress', 'needs_retry'].includes(recoveryBatch?.state ?? '')" @click="useSavedLocalPool(pool)">使用此池继续选品</button>
             </div>
-            <div class="saved-local-pool-meter" :aria-label="`已存 ${pool.count} 件，原目标 ${pool.target} 件`">
+            <div class="saved-local-pool-meter" :aria-label="`原批次已存 ${pool.count} 件，原目标 ${pool.target} 件`">
               <span :style="{ width: `${Math.min(100, Math.round(pool.count / Math.max(1, pool.target) * 100))}%` }"></span>
             </div>
             <div class="saved-local-pool-sources">
@@ -8850,7 +8926,7 @@ onUnmounted(() => {
             </details>
             <div class="saved-pool-browser">
               <button class="btn" type="button" :aria-expanded="savedPoolBrowserBatchId === pool.batchId" @click="toggleSavedPoolBrowser(pool)">
-                {{ savedPoolBrowserBatchId === pool.batchId ? '收起商品列表' : `查看全部 ${pool.count} 件商品` }}
+                {{ savedPoolBrowserBatchId === pool.batchId ? '收起商品列表' : `查看全部 ${pool.count + pool.pendingRevalidationCount} 件已存商品` }}
               </button>
               <div v-if="savedPoolBrowserBatchId === pool.batchId" class="saved-pool-browser-content">
                 <form class="saved-pool-search" @submit.prevent="loadSavedPoolItems(1)">
@@ -8863,7 +8939,7 @@ onUnmounted(() => {
                 <ul v-if="savedPoolItems.length" class="saved-pool-items">
                   <li v-for="item in savedPoolItems" :key="item.productId">
                     <button type="button" class="candidate-detail-trigger" @click="openCandidateDetails(item, $event)">
-                      <strong :title="item.title">{{ item.title }}</strong><small>商品 ID：{{ item.productId }} · {{ localPoolSourceLabels[item.sourceKey ?? ''] ?? item.sourceKey ?? '来源未采集' }}</small>
+                      <strong :title="item.title">{{ item.title }}</strong><small>商品 ID：{{ item.productId }} · {{ localPoolSourceLabels[item.sourceKey ?? ''] ?? item.sourceKey ?? '来源未采集' }}{{ item.revalidationPending ? ' · 待重核' : '' }}</small>
                     </button>
                   </li>
                 </ul>

@@ -169,6 +169,9 @@ async function runOneUploadCore(rawJobId: unknown): Promise<Json> {
   const binding = targetRows.find((row) => Number(row['account_id']) === accountId &&
     Number(row['qianchuan_account_id']) === qcId)
   const advertiserId = stringValue(binding?.['qc_id'])
+  if (!/^\d{8,20}$/.test(advertiserId)) {
+    return { ok: false, status: 'preflight_failed', error: '计划页上传前须先绑定有效的千川广告主 ID' }
+  }
   const dedicatedConnection = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
   // 同一抖音账号的专属浏览器若已登录目标千川，可复用其登录态；浏览器执行器还会
   // 在选文件前核对页面显示的广告主 ID，绝不借用其他账号的登录态。
@@ -278,149 +281,6 @@ async function runOneUpload(rawJobId: unknown): Promise<Json> {
   finally { pendingJobs.delete(id) }
 }
 
-async function runBatchUpload(jobs: Json[]): Promise<Json> {
-  const ids = jobs.map((job) => jobIdFrom(job['id']))
-  if (ids.length < 2 || ids.length > 10 || ids.some((id) => pendingJobs.has(id) || activeJobs.has(id))) {
-    return { ok: false, status: 'preflight_failed', error: '批量任务数量或状态无效' }
-  }
-  const first = jobs[0]
-  const qcId = numericField(first, 'qianchuanAccountId', 'qianchuan_account_id')
-  const accountId = numericField(first, 'accountId', 'account_id')
-  const productId = stringValue(first['productId'])
-  if (jobs.some((job) => numericField(job, 'qianchuanAccountId', 'qianchuan_account_id') !== qcId ||
-      numericField(job, 'accountId', 'account_id') !== accountId || stringValue(job['productId']) !== productId)) {
-    return { ok: false, status: 'preflight_failed', error: '批量素材必须属于同一账号和商品' }
-  }
-  if (preflightQianchuanAccounts.has(qcId) || activeQianchuanAccounts.has(qcId) ||
-      !reserveQianchuanAccount(qcId)) {
-    return { ok: false, status: 'preflight_failed', error: '该千川账号正在处理其他任务' }
-  }
-  ids.forEach((id) => pendingJobs.add(id))
-  preflightQianchuanAccounts.add(qcId)
-  let claimed = false
-  try {
-    const config = await queueCommand('quota-config', ['--account-id', String(accountId)])
-    const limits = asObject(config['limits'])
-    if (activeCount >= Number(limits['maxConcurrentUploads'] ?? 1)) {
-      return { ok: false, status: 'preflight_failed', error: '当前上传并发已满' }
-    }
-    const targets = await queueCommand('targets')
-    const rows = Array.isArray(targets['rows']) ? targets['rows'] as Json[] : []
-    const binding = rows.find((row) => Number(row['account_id']) === accountId &&
-      Number(row['qianchuan_account_id']) === qcId)
-    const advertiserId = stringValue(binding?.['qc_id'])
-    const dedicated = await existingManagedBrowserConnection(`qianchuan-${qcId}`)
-    const accountBrowser = !dedicated && /^\d{8,20}$/.test(advertiserId)
-      ? await existingManagedBrowserConnection(`account-${accountId}`) : null
-    const connection = dedicated ?? accountBrowser
-    if (!connection) return { ok: false, status: 'preflight_failed', error: '目标千川账号的专属浏览器未打开' }
-
-    activeQianchuanAccounts.add(qcId)
-    preflightQianchuanAccounts.delete(qcId)
-    ids.forEach((id) => activeJobs.add(id))
-    activeCount += 1
-    const response = await queueCommand('claim-batch', ['--ids', ids.join(',')], true)
-    if (response['rejected'] === true) {
-      return { ok: false, status: 'preflight_failed', error: response['error'] }
-    }
-    claimed = true
-    const claimedJobs = Array.isArray(response['jobs']) ? response['jobs'] as Json[] : []
-    if (claimedJobs.length !== ids.length) throw new Error('批量领取结果与请求数量不一致')
-    const assets = claimedJobs.map((job) => ({
-      filePath: stringValue(job['filePath']), materialName: stringValue(job['materialName']),
-      productId: stringValue(job['productId'] ?? job['product_id'])
-    }))
-    if (assets.some((asset) => !asset.filePath || !asset.materialName)) {
-      throw new Error('批量任务缺少本地文件路径或素材名')
-    }
-    const diagnosticsDir = join(getClientPaths().dataDir, 'diagnostics', 'qianchuan-upload')
-    mkdirSync(diagnosticsDir, { recursive: true })
-    const browserArgs = [
-      'batch-upload', '--cdp-port', String(connection.port), '--profile-path', connection.profilePath,
-      '--qianchuan-account-id', String(qcId), '--batch-assets-json', JSON.stringify(assets),
-      '--diagnostics-dir', diagnosticsDir,
-      '--min-delay-ms', String(limits['minStepDelayMs'] ?? 800),
-      '--max-delay-ms', String(limits['maxStepDelayMs'] ?? 2000)
-    ]
-    if (/^\d{8,20}$/.test(advertiserId)) browserArgs.push('--advertiser-id', advertiserId)
-    if (accountBrowser) browserArgs.push('--douyin-account-id', String(accountId))
-    const browserOutcome = await runEngineCommand('qianchuan_browser.py', browserArgs)
-    const browser = asObject(browserOutcome.result)
-    const browserItems = Array.isArray(browser['items']) ? browser['items'] as Json[] : []
-    const manualActionRequired = browserItems.some((item) => item['manualActionRequired'] === true)
-    const byName = new Map(browserItems.map((item) => [stringValue(item['assetName']), item]))
-    // 浏览器在文件选择前失败时，队列仍可安全回排并走原单条路径；一旦
-    // 有文件已选择、提交已开始或回执缺失，则绝不回退，交由待核查流程处理。
-    const noTouchFailedIds: number[] = []
-    const confirmedItems: Array<{ id: number; remoteId: string }> = []
-    let hasUncertainItem = false
-    for (const job of claimedJobs) {
-      const item = byName.get(stringValue(job['materialName']))
-      const remoteId = stringValue(item?.['remoteMaterialId'])
-      if (browserOutcome.ok && item?.['status'] === 'succeeded' && remoteId) {
-        confirmedItems.push({ id: jobIdFrom(job['id']), remoteId })
-      } else if (browserOutcome.ok && item?.['status'] === 'failed' &&
-                 item['submitAttempted'] !== true && !remoteId) {
-        noTouchFailedIds.push(jobIdFrom(job['id']))
-      } else {
-        hasUncertainItem = true
-      }
-    }
-    if (browserOutcome.ok && noTouchFailedIds.length > 0 && !hasUncertainItem) {
-      for (const item of confirmedItems) {
-        await queueCommand('complete', ['--id', String(item.id), '--remote-material-id', item.remoteId])
-      }
-      await queueCommand('requeue-preflight-batch', ['--ids', noTouchFailedIds.join(',')])
-      return { ok: false, status: 'preflight_failed', error: '批量尚未选择文件，已安全回退单条上传路径' }
-    }
-    const results: Json[] = []
-    for (const job of claimedJobs) {
-      const id = jobIdFrom(job['id'])
-      const item = byName.get(stringValue(job['materialName']))
-      const remoteId = stringValue(item?.['remoteMaterialId'])
-      if (browserOutcome.ok && item?.['status'] === 'succeeded' && remoteId) {
-        const completed = await queueCommand('complete', ['--id', String(id), '--remote-material-id', remoteId])
-        results.push({ id, status: 'succeeded', job: completed['job'], remoteMaterialId: remoteId })
-        continue
-      }
-      const reason = browserOutcome.ok
-        ? stringValue(item?.['reason']) || '批量提交后未确认该素材的远端 ID'
-        : browserOutcome.error ?? '批量浏览器进程异常，远端提交状态未知'
-      const stage = browserOutcome.ok ? stringValue(item?.['stage']) || 'verification' : 'browser_process'
-      const failArgs = ['--id', String(id), '--reason', reason, '--stage', stage]
-      const screenshot = stringValue(item?.['screenshotPath'])
-      if (screenshot) failArgs.push('--screenshot-path', screenshot)
-      if (!browserOutcome.ok || !item || item['submitAttempted'] === true || item['status'] === 'needs_review') {
-        failArgs.push('--submit-attempted')
-      }
-      const failed = await queueCommand('fail', failArgs)
-      results.push({ id, status: asObject(failed['job'])['status'], reason })
-    }
-    const needsReview = results.some((row) => row['status'] === 'needs_review')
-    return { ok: !needsReview && results.every((row) => row['status'] === 'succeeded'),
-      status: needsReview ? 'needs_review' : results.every((row) => row['status'] === 'succeeded') ? 'succeeded' : 'failed',
-      count: results.filter((row) => row['status'] === 'succeeded').length,
-      manualActionRequired, jobs: results }
-  } catch (error) {
-    if (claimed) {
-      for (const id of ids) {
-        try {
-          const current = await readJob(id)
-          if (current['status'] === 'uploading') {
-            await queueCommand('fail', ['--id', String(id), '--reason', String(error),
-              '--stage', 'batch_orchestration', '--submit-attempted'])
-          }
-        } catch { /* 下次启动时 recover-interrupted 会隔离仍在上传中的任务。 */ }
-      }
-    }
-    return { ok: false, status: claimed ? 'needs_review' : 'preflight_failed', error: String(error) }
-  } finally {
-    ids.forEach((id) => { activeJobs.delete(id); pendingJobs.delete(id) })
-    if (activeQianchuanAccounts.delete(qcId)) activeCount -= 1
-    preflightQianchuanAccounts.delete(qcId)
-    releaseQianchuanAccount(qcId)
-  }
-}
 
 function reply<T>(operation: () => Promise<T>): Promise<T | Json> {
   return operation().catch((error) => ({ ok: false, error: String(error) }))
@@ -636,24 +496,23 @@ async function schedulerTick(): Promise<void> {
           stringValue(candidate['nextRetryAt']) <= new Date().toLocaleString('sv-SE').replace(' ', 'T'))
       ).slice(0, 10)
       group.forEach((candidate) => processed.add(jobIdFrom(candidate['id'])))
-      const batchOutcome = group.length > 1 ? await runBatchUpload(group) : null
-      // 批量预检查尚未触及远端时，安全地回退到现有逐条上传。
+      // 计划页须逐件核对投放商品、素材所属商品及上传回执；旧素材库批量入口不再调用。
+      // 每件素材各自取得远端 ID；出现待核查时停止本组后续上传。
       const outcomes: Json[] = []
-      if (!batchOutcome || batchOutcome['status'] === 'preflight_failed') {
-        for (const candidate of group) {
-          const single = await runOneUpload(candidate['id'])
-          outcomes.push(single)
-          if (single['status'] === 'needs_review' || single['manualActionRequired'] === true) break
-        }
-      } else {
-        outcomes.push(batchOutcome)
+      for (const candidate of group) {
+        const single = await runOneUpload(candidate['id'])
+        outcomes.push(single)
+        if (single['status'] === 'needs_review' || single['manualActionRequired'] === true) break
       }
       for (const outcome of outcomes) {
+        if (outcome['status'] === 'needs_review' || outcome['manualActionRequired'] === true) {
+          schedulerBlockedQianchuanAccounts.add(qcId)
+          break
+        }
         if (outcome['ok'] !== false || outcome['status'] === 'deferred') continue
         const stage = stringValue(outcome['stage'])
         const error = stringValue(outcome['error'])
-        if (outcome['status'] === 'needs_review' || outcome['manualActionRequired'] === true ||
-            /登录|验证码|无权限/.test(error) || /login|captcha/.test(stage)) {
+        if (/登录|验证码|无权限/.test(error) || /login|captcha/.test(stage)) {
           schedulerBlockedQianchuanAccounts.add(qcId)
           break
         }

@@ -43,6 +43,7 @@ interface WorkflowRun {
 }
 interface WorkflowPlanJob {
   id: number
+  publish_queue_id: number
   account_id: number
   qianchuan_account_id: number
   product_id: string
@@ -121,9 +122,7 @@ async function runWorkflow(): Promise<void> {
   }
   workflowBusy.value = true
   workflowMessage.value = ''
-  const queryLabel = productSearch.value.trim() ? `，按商品 ID ${productSearch.value.trim()} 搜索` : ''
-  workflowProgress.value = `第 1/7 步：进入工具 → 全域投放 → 素材管理 → 视频库${queryLabel}…`
-  const createdPlanIds: number[] = []
+  workflowProgress.value = '正在核对已发布商品、千川账户和计划配置…'
   const createdQueueIds = new Set<number>()
   const blocked: string[] = []
   let publishedCount = 0
@@ -136,13 +135,21 @@ async function runWorkflow(): Promise<void> {
       ) === index)
     if (!bindings.length) throw new Error('没有找到已启用且绑定有效千川广告主 ID 的账号，请先完成账号绑定和登录。')
 
-    // 一键流程明确要求自动下载；下载器本身仍按账号、商品、额度和远端去重规则运行。
-    checked(await window.api.qianchuan.setPostPublishEnabled(true))
-    const runs = rows<WorkflowRun>(checked(await window.api.qianchuan.postPublishRuns()))
-
-    // 先启动发布成功后的自动下载。已有上传队列或正在处理的任务不重复启动。
+    const videoSources = new Map<number, string>()
     for (const binding of bindings) {
-      workflowProgress.value = `第 2/7 步：启动 ${binding.account_name} 的自动下载…`
+      const config = checked(await window.api.qianchuan.planSettings(Number(binding.qianchuan_account_id)))
+      const settings = config.settings as Record<string, unknown> | undefined
+      videoSources.set(Number(binding.qianchuan_account_id), String(settings?.video_source ?? 'uploaded'))
+    }
+    const needsUploadedVideos = bindings.some((binding) => videoSources.get(Number(binding.qianchuan_account_id)) !== 'my_video')
+    if (needsUploadedVideos) checked(await window.api.qianchuan.setPostPublishEnabled(true))
+    const runs = needsUploadedVideos
+      ? rows<WorkflowRun>(checked(await window.api.qianchuan.postPublishRuns())) : []
+
+    // 只有配置了计划页上传视频的账户才需要本地下载与上传队列。
+    for (const binding of bindings) {
+      if (videoSources.get(Number(binding.qianchuan_account_id)) === 'my_video') continue
+      workflowProgress.value = `正在准备 ${binding.account_name} 的本地视频…`
       const candidateResult = checked(await window.api.qianchuan.planCandidates({
         accountId: binding.account_id,
         qianchuanAccountId: Number(binding.qianchuan_account_id)
@@ -167,31 +174,36 @@ async function runWorkflow(): Promise<void> {
     // 下载编排是异步的；循环复用现有 Step17 上传锁，直到计划资格出现或发现需要人工核查。
     const deadline = Date.now() + 10 * 60 * 1000
     let lastReadyCount = -1
+    let pendingAtExit = 0
     while (Date.now() < deadline) {
       const readyCandidates: WorkflowCandidate[] = []
       let pending = 0
-      const currentRuns = rows<WorkflowRun>(checked(await window.api.qianchuan.postPublishRuns()))
+      const currentRuns = needsUploadedVideos
+        ? rows<WorkflowRun>(checked(await window.api.qianchuan.postPublishRuns())) : []
       for (const binding of bindings) {
         const qcId = Number(binding.qianchuan_account_id)
+        const usesUploadedVideo = videoSources.get(qcId) !== 'my_video'
         const candidateResult = checked(await window.api.qianchuan.planCandidates({ accountId: binding.account_id, qianchuanAccountId: qcId }))
         const candidates = rows<WorkflowCandidate>(candidateResult).filter(matchesProduct)
-        const jobs = rows<WorkflowJob>(checked(await window.api.qianchuan.uploadJobs(binding.account_id)))
+        const jobs = usesUploadedVideo
+          ? rows<WorkflowJob>(checked(await window.api.qianchuan.uploadJobs(binding.account_id))) : []
         for (const candidate of candidates) {
+          if (createdQueueIds.has(candidate.publishQueueId)) continue
           const productJobs = jobs.filter((job) => job.productId === candidate.productId && Number(job.qianchuanAccountId) === qcId)
-          const reviewJob = productJobs.find((job) => job.status === 'needs_review')
+          const reviewJob = usesUploadedVideo ? productJobs.find((job) => job.status === 'needs_review') : undefined
           if (reviewJob) {
             if (!blocked.some((item) => item.includes(candidate.productId))) {
               blocked.push(`${binding.account_name} / ${candidate.productName || candidate.productId}：任务 #${reviewJob.id} 待核查`)
             }
             continue
           }
-          const dueJobs = productJobs.filter((job) => job.status === 'queued' &&
+          const dueJobs = productJobs.filter((job) => usesUploadedVideo && job.status === 'queued' &&
             (!job.scheduledDate || job.scheduledDate <= today()) &&
             (!job.nextRetryAt || job.nextRetryAt <= new Date().toLocaleString('sv-SE').replace(' ', 'T')))
           if (dueJobs.length) {
             pending += dueJobs.length
             for (const job of dueJobs) {
-              workflowProgress.value = `第 3/7 步：上传 ${binding.account_name} 的素材任务 #${job.id}…`
+              workflowProgress.value = `正在计划页为 ${binding.account_name} 上传视频任务 #${job.id}…`
               const result = await window.api.qianchuan.runUpload(job.id)
               if (result.status === 'needs_review' || result.manualActionRequired === true) {
                 blocked.push(`${binding.account_name} / ${candidate.productName || candidate.productId}：任务 #${job.id} 上传结果待核查`)
@@ -199,10 +211,11 @@ async function runWorkflow(): Promise<void> {
             }
           }
           if (candidate.canCreate) readyCandidates.push(candidate)
-          else if (productJobs.some((job) => ['queued', 'uploading'].includes(job.status))) pending += 1
+          else if (usesUploadedVideo && productJobs.some((job) => ['queued', 'uploading'].includes(job.status))) pending += 1
           else {
             const currentRun = currentRuns.find((item) => item.publishQueueId === candidate.publishQueueId)
-            const terminalDownload = currentRun && ['candidate_exhausted', 'skipped_no_video', 'failed_query', 'failed_download'].includes(currentRun.status)
+            const terminalDownload = usesUploadedVideo && currentRun &&
+              ['candidate_exhausted', 'skipped_no_video', 'failed_query', 'failed_download'].includes(currentRun.status)
             if (terminalDownload) {
               if (!blocked.some((item) => item.includes(candidate.productId))) {
                 blocked.push(`${binding.account_name} / ${candidate.productName || candidate.productId}：${currentRun.reason || '自动下载未得到可用素材'}`)
@@ -211,19 +224,19 @@ async function runWorkflow(): Promise<void> {
               if (!blocked.some((item) => item.includes(candidate.productId))) {
                 blocked.push(`${binding.account_name} / ${candidate.productName || candidate.productId}：${candidate.reason}`)
               }
-            } else if (!candidate.reason?.includes('待核查')) pending += 1
+            } else if (usesUploadedVideo && !candidate.reason?.includes('待核查')) pending += 1
           }
         }
       }
       const uniqueReady = [...new Map(readyCandidates.map((item) => [item.publishQueueId, item])).values()]
       if (uniqueReady.length !== lastReadyCount) {
         lastReadyCount = uniqueReady.length
-        workflowProgress.value = `第 4/7 步：已回读 ${uniqueReady.length} 个商品的千川素材 ID…`
+        workflowProgress.value = `已有 ${uniqueReady.length} 个商品具备建计划条件…`
       }
       for (const candidate of uniqueReady) {
         if (createdQueueIds.has(candidate.publishQueueId)) continue
         try {
-          workflowProgress.value = `第 5/7 步：为 ${candidate.productName || candidate.productId} 创建待发布计划…`
+          workflowProgress.value = `正在为 ${candidate.productName || candidate.productId} 创建本机待发布计划…`
           const result = checked(await window.api.qianchuan.createManualPlan({
             publishQueueId: candidate.publishQueueId,
             qianchuanAccountId: candidate.qianchuanAccountId
@@ -231,7 +244,6 @@ async function runWorkflow(): Promise<void> {
           const job = result.job as Record<string, unknown> | undefined
           const id = Number(job?.id)
           if (Number.isSafeInteger(id) && id > 0) {
-            createdPlanIds.push(id)
             createdQueueIds.add(candidate.publishQueueId)
           }
         } catch (error) {
@@ -239,40 +251,43 @@ async function runWorkflow(): Promise<void> {
           if (!/已有计划任务/.test(message)) blocked.push(`${candidate.productName || candidate.productId}：${message}`)
         }
       }
-      if (createdPlanIds.length || (pending === 0 && uniqueReady.length === 0)) break
+      pendingAtExit = pending
+      if (pending === 0) break
       await sleep(5000)
     }
 
-    if (!createdPlanIds.length) {
+    const planResult = checked(await window.api.qianchuan.planJobs({ limit: 200 }))
+    const plans = rows<WorkflowPlanJob>(planResult).filter((job) => job.status === 'ready' &&
+      createdQueueIds.has(job.publish_queue_id) &&
+      bindings.some((binding) => binding.account_id === job.account_id &&
+        Number(binding.qianchuan_account_id) === job.qianchuan_account_id) &&
+      (!productSearch.value.trim() || job.product_id.includes(productSearch.value.trim())))
+    if (!plans.length) {
       workflowProgress.value = ''
       workflowMessage.value = blocked.length
         ? `流程已停止，需先处理：${blocked.slice(0, 3).join('；')}${blocked.length > 3 ? `；另有 ${blocked.length - 3} 项` : ''}`
-        : '当前没有商品完成素材下载和上传，流程已保留在队列中，可稍后再次点击。'
+        : '当前没有可安全提交的计划；素材或我的视频尚未就绪时，请先查看具体账号的任务状态。'
       return
     }
-
-    const planResult = checked(await window.api.qianchuan.planJobs({ limit: 200 }))
-    const plans = rows<WorkflowPlanJob>(planResult).filter((job) => createdPlanIds.includes(job.id) && job.status === 'ready')
-    if (!plans.length) {
-      workflowMessage.value = '计划已经进入队列，但当前没有可安全提交的计划，请刷新计划列表查看状态。'
-      return
-    }
+    if (pendingAtExit > 0) blocked.push(`另有 ${pendingAtExit} 个素材任务仍在处理，本次只提交已就绪计划`)
     const summary = plans.map((job) => `${job.product_name || job.product_id}：预算 ${job.daily_budget_yuan} 元，保本 ROI ${Number(job.roi_target).toFixed(2)}`).join('\n')
-    workflowProgress.value = '第 6/7 步：等待甲方确认预算和 ROI…'
-    if (!window.confirm(`素材下载、上传、素材 ID 回读和计划创建已完成。\n\n即将提交以下千川付费计划：\n${summary}\n\n确认预算和 ROI 后现在发布？`)) {
+    workflowProgress.value = '正在确认千川计划预算和 ROI…'
+    if (!window.confirm(`以下商品已具备计划发布条件：\n\n${summary}\n\n确认预算和 ROI 后现在发布？`)) {
       workflowMessage.value = `已创建 ${plans.length} 个待发布计划，已暂停在预算确认前。`
       return
     }
     for (const plan of plans) {
-      workflowProgress.value = `第 7/7 步：发布计划 ${plan.product_name || plan.product_id}…`
+      workflowProgress.value = `正在商品全域投放页发布 ${plan.product_name || plan.product_id}…`
       const result = await window.api.qianchuan.runPlan(plan.id, plan.daily_budget_yuan)
-      if (result.ok === false) blocked.push(`${plan.product_name || plan.product_id}：${String(result.error ?? '发布失败')}`)
-      else publishedCount += 1
+      const outcome = result.job as Record<string, unknown> | undefined
+      if (result.ok === false || outcome?.status !== 'published' || !/^\d{8,20}$/.test(String(outcome.remote_plan_id ?? ''))) {
+        blocked.push(`${plan.product_name || plan.product_id}：${String(result.error ?? outcome?.reason ?? '尚未回读到唯一千川计划 ID')}`)
+      } else publishedCount += 1
     }
     workflowProgress.value = ''
     workflowMessage.value = blocked.length
       ? `已发布 ${publishedCount}/${plans.length} 个计划；${blocked.slice(0, 3).join('；')}`
-      : `全流程完成：已下载、上传、回读素材并发布 ${publishedCount} 个千川计划。`
+      : `已回读 ${publishedCount} 个千川计划 ID，计划发布完成。`
   } catch (error) {
     workflowProgress.value = ''
     workflowMessage.value = error instanceof Error ? error.message : String(error)
@@ -289,7 +304,7 @@ onMounted(() => { void refreshBindingGate() })
     <header class="workflow-heading">
       <div>
         <h1>千川投放</h1>
-        <p>按真实千川顺序进入视频库，按商品 ID 搜索，再完成下载、上传、素材 ID 回读和计划发布。</p>
+        <p>进入商品全域投放，先选投放商品与控成本投放，再为同一商品添加视频、确认预算并发布计划。</p>
       </div>
       <div class="workflow-actions">
         <label class="product-search">商品 ID 搜索<input v-model="productSearch" inputmode="numeric" maxlength="30" placeholder="输入商品 ID" @input="productSearch = productSearch.replace(/\D/g, '').slice(0, 30)" /></label>
@@ -310,25 +325,25 @@ onMounted(() => { void refreshBindingGate() })
       <span v-if="workflowMessage">{{ workflowMessage }}</span>
     </div>
 
-    <ol class="platform-flow" aria-label="千川真实投放步骤">
-      <li><b>1</b><span>工具 → 全域投放 → 视频库<br><small>按商品 ID 搜索</small></span></li>
-      <li><b>2</b><span>自动下载本地视频<br><small>只使用当前账号商品素材</small></span></li>
-      <li><b>3</b><span>上传千川素材<br><small>文件上传后等待回执</small></span></li>
-      <li><b>4</b><span>回读远端素材 ID<br><small>没有 ID 就停在待核查</small></span></li>
-      <li><b>5</b><span>生成待发布计划<br><small>上传成功后才创建</small></span></li>
-      <li><b>6</b><span>确认预算和 ROI<br><small>甲方确认后才提交</small></span></li>
-      <li><b>7</b><span>发布千川计划<br><small>回读千川计划 ID</small></span></li>
+    <ol class="platform-flow" aria-label="千川商品全域投放步骤">
+      <li><b>1</b><span>进入商品全域投放<br><small>核对目标广告主</small></span></li>
+      <li><b>2</b><span>选择投放商品<br><small>核对精确商品 ID</small></span></li>
+      <li><b>3</b><span>控成本投放<br><small>设置预算和保本 ROI</small></span></li>
+      <li><b>4</b><span>选择素材所属商品<br><small>再次核对同一商品 ID</small></span></li>
+      <li><b>5</b><span>添加视频<br><small>我的视频或计划页上传</small></span></li>
+      <li><b>6</b><span>确认计划设置<br><small>提交前确认预算</small></span></li>
+      <li><b>7</b><span>发布并回读<br><small>取得唯一千川计划 ID</small></span></li>
     </ol>
 
     <div class="workflow-scroll">
       <section class="workflow-step">
-        <header class="workflow-step-head"><span class="step-number">1</span><div><strong>全域投放与素材处理</strong><small>按商品 ID 定位投放商品；自动下载、上传或复用素材，并回读千川素材 ID</small></div></header>
-        <QianchuanOverviewView @navigate="emit('navigate', $event)" @open-qianchuan-accounts="emit('open-qianchuan-accounts')" />
+        <header class="workflow-step-head"><span class="step-number">1</span><div><strong>投放商品与计划设置</strong><small>选择目标商品、控成本投放、视频来源及预算</small></div></header>
+        <QianchuanPlansView @open-qianchuan-accounts="emit('open-qianchuan-accounts')" />
       </section>
 
       <section class="workflow-step">
-        <header class="workflow-step-head"><span class="step-number">2</span><div><strong>投放设置与计划发布</strong><small>控成本投放、标题、计划名称、预算确认后发布</small></div></header>
-        <QianchuanPlansView @open-qianchuan-accounts="emit('open-qianchuan-accounts')" />
+        <header class="workflow-step-head"><span class="step-number">2</span><div><strong>视频准备与上传记录</strong><small>仅使用计划页上传视频时需要本地文件和素材 ID；我的视频直接在计划页核对</small></div></header>
+        <QianchuanOverviewView @navigate="emit('navigate', $event)" @open-qianchuan-accounts="emit('open-qianchuan-accounts')" />
       </section>
     </div>
   </section>

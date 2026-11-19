@@ -449,6 +449,20 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
     incoming_rows = value.get("rows")
     if not isinstance(incoming_rows, list):
         raise ValueError("候选池商品列表格式无效")
+    revalidate_ids = value.get("revalidateProductIds", [])
+    if not isinstance(revalidate_ids, list) or any(not isinstance(item, str) or not item.isdigit() for item in revalidate_ids):
+        raise ValueError("待重核商品 ID 格式无效")
+    revalidate = set(revalidate_ids)
+    pending_rows = previous.get("revalidationRows") if isinstance(previous.get("revalidationRows"), list) else []
+    pending_by_id = {
+        str(item.get("productId")): item for item in pending_rows
+        if isinstance(item, dict) and str(item.get("productId") or "").isdigit()
+    }
+    for item in existing_rows:
+        if isinstance(item, dict) and str(item.get("productId") or "") in revalidate:
+            pending_by_id[str(item["productId"])] = item
+    existing_rows = [item for item in existing_rows if isinstance(item, dict) and
+                     str(item.get("productId") or "") not in revalidate]
     excluded_ids = value.get("excludedProductIds", [])
     if not isinstance(excluded_ids, list) or any(not isinstance(item, str) or not item.isdigit() for item in excluded_ids):
         raise ValueError("候选池防重剔除 ID 格式无效")
@@ -456,6 +470,8 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
     if not isinstance(prior_excluded, list) or any(not isinstance(item, str) or not item.isdigit() for item in prior_excluded):
         prior_excluded = []
     excluded = set(prior_excluded) | set(excluded_ids)
+    for product_id in excluded:
+        pending_by_id.pop(product_id, None)
     by_product: dict[str, dict[str, Any]] = {}
     origin_rows_by_batch: dict[str, dict[str, dict[str, Any]]] = {}
     excluded_branches: Optional[tuple[set[str], set[tuple[str, str]]]] = None
@@ -521,7 +537,7 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
                 ).fetchone()
                 origin_payload = decode_json(origin_row["payload_json"], {}) if origin_row else {}
                 origin_pool = origin_payload.get("candidatePool") if isinstance(origin_payload, dict) else None
-                origin_rows = origin_pool.get("rows") if isinstance(origin_pool, dict) and origin_pool.get("status") == "ready" else None
+                origin_rows = origin_pool.get("rows") if isinstance(origin_pool, dict) and origin_pool.get("status") in {"ready", "collecting"} else None
                 origin_rows_by_batch[origin_batch_id] = {
                     str(item.get("productId")): item for item in origin_rows if isinstance(item, dict)
                 } if isinstance(origin_rows, list) else {}
@@ -533,6 +549,8 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         elif safe["collectedByAccountId"] not in collector_ids:
             raise ValueError("候选商品来源账号不属于本批采集账号")
         previous_candidate = by_product.get(product_id)
+        if not is_existing:
+            pending_by_id.pop(product_id, None)
         if previous_candidate is None:
             by_product[product_id] = safe
         else:
@@ -668,6 +686,7 @@ def save_candidate_pool(connection: sqlite3.Connection, batch_id: str, value: An
         "collectorAccountIds": collector_ids,
         "filterFingerprint": fingerprint,
         "rows": list(by_product.values()),
+        "revalidationRows": list(pending_by_id.values()),
         "sourceState": {
             "autoResumeAllowed": state.get("autoResumeAllowed") is not False,
             "collectors": clean_collectors,
@@ -717,13 +736,17 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
     if not isinstance(payload, dict):
         return None
     pool = payload.get("candidatePool")
-    if not isinstance(pool, dict) or pool.get("status") != "ready":
+    if not isinstance(pool, dict) or pool.get("status") not in {"ready", "collecting"}:
         return None
     rows = pool.get("rows")
-    if not isinstance(rows, list) or not rows:
+    pending = pool.get("revalidationRows") if isinstance(pool.get("revalidationRows"), list) else []
+    if not isinstance(rows, list):
+        return None
+    saved_rows = [item for item in [*rows, *pending] if isinstance(item, dict)]
+    if not saved_rows:
         return None
     product_ids = sorted({str(item.get("productId") or "").strip()
-                          for item in rows if isinstance(item, dict) and str(item.get("productId") or "").strip()})
+                          for item in saved_rows if str(item.get("productId") or "").strip()})
     pool_fingerprint = hashlib.sha256("\n".join(product_ids).encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc)
     earliest = now - timedelta(hours=24)
@@ -731,7 +754,7 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
                 (captured := _candidate_captured_at(item.get("capturedAt"))) is not None and
                 earliest <= captured <= now]
     source_counts: dict[str, int] = {}
-    for item in rows:
+    for item in saved_rows:
         if isinstance(item, dict):
             source = str(item.get("sourceKey") or "unknown")
             source_counts[source] = source_counts.get(source, 0) + 1
@@ -742,7 +765,9 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
         "batchId": batch_id,
         "poolFingerprint": pool_fingerprint,
         "duplicateBatches": [],
+        "status": pool["status"],
         "count": len(rows), "recentCount": len(eligible),
+        "pendingRevalidationCount": len(pending),
         "target": pool.get("target"), "mode": pool.get("mode", "total"),
         "capturedAt": pool.get("capturedAt"), "updatedAt": updated_at,
         "collectorAccountIds": pool.get("collectorAccountIds", []),
@@ -754,7 +779,7 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
         "preview": [
             {"productId": str(item.get("productId") or ""), "title": str(item.get("title") or "")[:120],
              "sourceKey": str(item.get("sourceKey") or "")}
-            for item in rows[:20] if isinstance(item, dict)
+            for item in saved_rows[:20]
         ],
     }
 
@@ -763,7 +788,8 @@ def list_saved_candidate_pools(connection: sqlite3.Connection, limit: int = 10) 
     output: list[Dict[str, Any]] = []
     by_fingerprint: dict[str, Dict[str, Any]] = {}
     for row in connection.execute(
-        "SELECT batch_id,payload_json,updated_at FROM selection_run_batches ORDER BY updated_at DESC LIMIT 200"
+        "SELECT batch_id,payload_json,updated_at FROM selection_run_batches "
+        "WHERE payload_json LIKE '%\"candidatePool\"%' ORDER BY updated_at DESC"
     ):
         summary = saved_candidate_pool_summary(
             row["batch_id"], decode_json(row["payload_json"], {}), row["updated_at"]
@@ -790,10 +816,12 @@ def list_saved_candidate_pool_items(connection: sqlite3.Connection, batch_id: st
     ).fetchone()
     payload = decode_json(row["payload_json"], {}) if row else {}
     if not row or not saved_candidate_pool_summary(batch_id, payload, row["updated_at"]):
-        raise ValueError("所选本机候选池不存在或未达标")
-    rows = payload["candidatePool"]["rows"]
+        raise ValueError("所选本机候选池不存在或没有已存商品")
+    pool = payload["candidatePool"]
+    pending_rows = pool.get("revalidationRows") if isinstance(pool.get("revalidationRows"), list) else []
+    rows = [(item, False) for item in pool["rows"]] + [(item, True) for item in pending_rows]
     keyword = query.strip().casefold()[:120]
-    matching = [item for item in rows if isinstance(item, dict) and (
+    matching = [(item, pending) for item, pending in rows if isinstance(item, dict) and (
         not keyword or keyword in str(item.get("productId") or "").casefold() or
         keyword in str(item.get("title") or "").casefold()
     )]
@@ -802,8 +830,8 @@ def list_saved_candidate_pool_items(connection: sqlite3.Connection, batch_id: st
     visible_fields = POOL_CANDIDATE_FIELDS | {"capturedAt", "collectedByAccountId"}
     return {
         "batchId": batch_id, "total": len(matching), "limit": page_size, "offset": start,
-        "rows": [{key: item[key] for key in visible_fields if key in item}
-                 for item in matching[start:start + page_size]],
+        "rows": [{**{key: item[key] for key in visible_fields if key in item}, "revalidationPending": pending}
+                 for item, pending in matching[start:start + page_size]],
     }
 
 
@@ -815,7 +843,7 @@ def saved_candidate_pool_settings(connection: sqlite3.Connection, batch_id: str)
     summary = saved_candidate_pool_summary(batch_id, payload, row["updated_at"]) if row else None
     settings = payload.get("settingsSnapshot") if isinstance(payload, dict) else None
     if not summary or not isinstance(settings, dict):
-        raise ValueError("所选本机候选池不存在或未达标")
+        raise ValueError("所选本机候选池不存在或没有已存商品")
     summary.pop("poolFingerprint", None)
     return {
         "pool": summary, "settingsSnapshot": settings,
@@ -826,7 +854,7 @@ def saved_candidate_pool_settings(connection: sqlite3.Connection, batch_id: str)
 def reuse_candidate_pool(
     connection: sqlite3.Connection, batch_id: str, fingerprint: Any, source_batch_id: str = ""
 ) -> Dict[str, Any]:
-    """新批次复用本机近期同条件候选；只搬运发现数据，绝不搬运采集游标或账号加车结果。"""
+    """合并本机已存候选；旧值仅作重核线索，不复制采集游标或加车结果。"""
     if not isinstance(fingerprint, str) or not fingerprint or len(fingerprint) > 100_000:
         raise ValueError("候选池复用缺少有效的筛选指纹")
     current_row = connection.execute(
@@ -859,14 +887,33 @@ def reuse_candidate_pool(
         ("sources", "thresholds", "filters", "bannedWords", "selectionMode", "categoryMode",
          "categorySelection", "excludedCategorySelection", "candidatePoolMode", "candidatePoolQuotas")
     )
-    historical_sql = "SELECT batch_id,payload_json FROM selection_run_batches WHERE batch_id<>?"
-    historical_params: tuple[Any, ...] = (batch_id,)
+    historical_rows = connection.execute(
+        "SELECT batch_id,payload_json FROM selection_run_batches "
+        "WHERE batch_id<>? AND payload_json LIKE '%\"candidatePool\"%' "
+        "ORDER BY updated_at DESC", (batch_id,),
+    ).fetchall()
     if source_batch_id:
-        historical_sql += " AND batch_id=?"
-        historical_params += (source_batch_id,)
-    historical_sql += " ORDER BY updated_at DESC"
-    validation_error = ""
-    for historical in connection.execute(historical_sql, historical_params).fetchall():
+        if not any(row["batch_id"] == source_batch_id for row in historical_rows):
+            selected_row = connection.execute(
+                "SELECT batch_id,payload_json FROM selection_run_batches WHERE batch_id=? AND batch_id<>?",
+                (source_batch_id, batch_id),
+            ).fetchone()
+            if selected_row:
+                historical_rows.insert(0, selected_row)
+        historical_rows.sort(key=lambda row: row["batch_id"] != source_batch_id)
+    rule_targets = {
+        str(rule.get("id")): rule.get("target")
+        for rule in settings.get("candidatePoolQuotas", []) if isinstance(rule, dict)
+    } if mode == "quota" else {}
+    rule_counts = {rule_id: 0 for rule_id in rule_targets}
+    direct_rows: list[dict[str, Any]] = []
+    recheck_ids: list[str] = []
+    seen_ids: set[str] = set()
+    source_batches: list[str] = []
+    selected_found = not source_batch_id
+    target = int(settings.get("candidatePoolTarget") or 0)
+    history_candidates: list[tuple[datetime, dict[str, Any], bool, bool, str]] = []
+    for historical in historical_rows:
         previous = decode_json(historical["payload_json"], {})
         if not isinstance(previous, dict):
             continue
@@ -874,52 +921,66 @@ def reuse_candidate_pool(
         old_settings = previous.get("settingsSnapshot")
         if not isinstance(old_pool, dict) or not isinstance(old_settings, dict):
             continue
-        if old_pool.get("status") != "ready" or old_pool.get("filterFingerprint") != fingerprint:
-            continue
-        if old_pool.get("mode", "total") != mode:
-            continue
-        if not source_batch_id and old_pool.get("collectorAccountIds") != collector_ids:
-            continue
-        if any(settings.get(field) != old_settings.get(field) for field in comparable_fields):
-            continue
-        if settings.get("categoryTree") != old_settings.get("categoryTree"):
-            continue
-        if not source_batch_id and not _same_collector_profiles(current, previous, collector_ids):
+        if old_pool.get("status") not in {"ready", "collecting"}:
             continue
         old_rows = old_pool.get("rows")
         if not isinstance(old_rows, list):
             continue
-        rule_targets = {
-            str(rule.get("id")): rule.get("target")
-            for rule in settings.get("candidatePoolQuotas", [])
-            if isinstance(rule, dict)
-        } if mode == "quota" else {}
-        rule_counts = {rule_id: 0 for rule_id in rule_targets}
-        eligible_rows = []
-        for candidate in old_rows:
+        pending_rows = old_pool.get("revalidationRows") if isinstance(old_pool.get("revalidationRows"), list) else []
+        if historical["batch_id"] == source_batch_id:
+            selected_found = True
+        same_rules = (
+            old_pool.get("filterFingerprint") == fingerprint and old_pool.get("mode", "total") == mode and
+            all(settings.get(field) == old_settings.get(field) for field in comparable_fields) and
+            settings.get("categoryTree") == old_settings.get("categoryTree") and
+            old_pool.get("collectorAccountIds") == collector_ids and
+            _same_collector_profiles(current, previous, collector_ids)
+        )
+        for candidate, is_pending in ([(item, False) for item in old_rows] +
+                                      [(item, True) for item in pending_rows]):
             if not isinstance(candidate, dict):
                 continue
             captured = _candidate_captured_at(candidate.get("capturedAt"))
-            source_path = candidate.get("sourceCategoryIds")
-            if captured is None or not earliest <= captured <= current_time:
-                continue
-            if not isinstance(source_path, list) or not 1 <= len(source_path) <= 3 or any(
-                _pool_category_id(part) in {"", "0"} for part in source_path
-            ):
-                continue
-            if candidate.get("categoryStatus") not in {"source_level", "known"}:
-                continue
-            if not source_batch_id and candidate.get("collectedByAccountId") not in collector_ids:
-                continue
-            if mode == "quota":
-                rule_id = str(candidate.get("quotaRuleId") or "")
-                target = rule_targets.get(rule_id)
-                if not isinstance(target, int) or rule_counts.get(rule_id, 0) >= target:
-                    continue
-                rule_counts[rule_id] += 1
-            eligible_rows.append({**candidate, "reusedFromBatchId": historical["batch_id"]})
-        if not eligible_rows:
+            history_candidates.append((captured or datetime.min.replace(tzinfo=timezone.utc),
+                                       candidate, is_pending, same_rules, historical["batch_id"]))
+    history_candidates.sort(key=lambda entry: (entry[0], entry[4] == source_batch_id), reverse=True)
+    for captured, candidate, is_pending, same_rules, source_id in history_candidates:
+        product_id = str(candidate.get("productId") or "").strip()
+        if not product_id.isdigit() or product_id in seen_ids:
             continue
+        seen_ids.add(product_id)
+        if source_id not in source_batches:
+            source_batches.append(source_id)
+        source_path = candidate.get("sourceCategoryIds")
+        path_confirmed = isinstance(source_path, list) and 1 <= len(source_path) <= 3 and not any(
+            _pool_category_id(part) in {"", "0"} for part in source_path
+        ) and candidate.get("categoryStatus") in {"source_level", "known"}
+        direct = (not is_pending and same_rules and captured is not None and
+                  earliest <= captured <= current_time and path_confirmed and len(direct_rows) < target)
+        if direct and mode == "quota":
+            rule_id = str(candidate.get("quotaRuleId") or "")
+            rule_target = rule_targets.get(rule_id)
+            direct = isinstance(rule_target, int) and rule_counts.get(rule_id, 0) < rule_target
+        if direct:
+            if mode == "quota":
+                rule_id = str(candidate["quotaRuleId"])
+                rule_counts[rule_id] += 1
+            direct_rows.append({**candidate, "reusedFromBatchId": source_id})
+        elif len(recheck_ids) < 2000:
+            recheck_ids.append(product_id)
+    if not selected_found:
+        return {"count": 0, "reason": "selected_pool_unavailable"}
+    if not direct_rows and not recheck_ids:
+        return {"count": 0, "reason": "no_saved_pool_items"}
+    # 重核线索必须先随批次落盘；即使随后采集进程中断，下次仍能优先核对旧 ID。
+    current["candidatePoolReuseHints"] = recheck_ids
+    with connection:
+        connection.execute(
+            "UPDATE selection_run_batches SET payload_json=?,updated_at=? WHERE batch_id=?",
+            (json.dumps(current, ensure_ascii=False, separators=(",", ":")), now_text(), batch_id),
+        )
+    validation_error = ""
+    if direct_rows:
         value = {
             "target": settings.get("candidatePoolTarget"),
             "mode": mode,
@@ -929,21 +990,25 @@ def reuse_candidate_pool(
             "collectorAccountId": collector_ids[0],
             "filterFingerprint": fingerprint,
             "capturedAt": current_time.isoformat(),
-            "rows": eligible_rows,
+            "rows": direct_rows,
             "sourceState": {"collectors": {}},
         }
         try:
             saved = save_candidate_pool(connection, batch_id, value)
+            return {"count": saved["count"], "status": saved["status"],
+                    "recheckCount": len(recheck_ids), "sourceBatchIds": source_batches}
         except ValueError as cause:
-            # 历史池可能由旧版类目规则产生；不要让旧数据阻断新批次正常采集。
+            # 旧版来源路径不满足当前保存规则时，保留旧 ID 等待当前来源重核。
             validation_error = str(cause)[:240]
-            continue
-        return {"count": saved["count"], "status": saved["status"], "sourceBatchId": historical["batch_id"]}
-    return {
-        "count": 0,
-        "reason": "selected_pool_unavailable" if source_batch_id else "no_compatible_recent_pool",
-        "detail": validation_error,
-    }
+            recheck_ids = list(dict.fromkeys([*recheck_ids, *(str(item["productId"]) for item in direct_rows)]))[:2000]
+            current["candidatePoolReuseHints"] = recheck_ids
+            with connection:
+                connection.execute(
+                    "UPDATE selection_run_batches SET payload_json=?,updated_at=? WHERE batch_id=?",
+                    (json.dumps(current, ensure_ascii=False, separators=(",", ":")), now_text(), batch_id),
+                )
+    return {"count": 0, "status": "collecting", "recheckCount": len(recheck_ids),
+            "sourceBatchIds": source_batches, "detail": validation_error}
 
 
 def latest_incomplete_batch(connection: sqlite3.Connection) -> Optional[Dict[str, Any]]:
@@ -1713,6 +1778,22 @@ def refresh_candidate_fetch_batch(
         raise ValueError("找不到可安全刷新设置的未完成批次")
     previous_payload = decode_json(row["payload_json"], {})
     previous_accounts = previous_payload.get("accounts", []) if isinstance(previous_payload, dict) else []
+    previous_pool = previous_payload.get("candidatePool") if isinstance(previous_payload, dict) else None
+    old_settings = previous_payload.get("settingsSnapshot") if isinstance(previous_payload, dict) else None
+    new_settings = payload.get("settingsSnapshot")
+    pool_fields = (
+        "sources", "thresholds", "filters", "bannedWords", "selectionMode", "categoryMode",
+        "categorySelection", "excludedCategorySelection", "candidatePoolMode", "candidatePoolQuotas",
+        "candidatePoolTarget", "candidateCollectorAccountIds", "categoryTree",
+    )
+    collector_ids = old_settings.get("candidateCollectorAccountIds") if isinstance(old_settings, dict) else None
+    same_pool_inputs = (
+        isinstance(old_settings, dict) and isinstance(new_settings, dict) and
+        all(old_settings.get(field) == new_settings.get(field) for field in pool_fields) and
+        isinstance(collector_ids, list) and _same_collector_profiles(payload, previous_payload, collector_ids)
+    )
+    if isinstance(previous_pool, dict) and (previous_pool.get("rows") or previous_pool.get("revalidationRows")) and not same_pool_inputs:
+        raise ValueError("原批次已有候选商品；筛选条件或采集账号资料变化时不能覆盖原池，请结束旧批次后新建批次重核已存 ID")
     requested_accounts = payload.get("accounts", [])
     if not isinstance(previous_accounts, list) or not isinstance(requested_accounts, list):
         raise ValueError("批次账号快照无效，不能刷新")
@@ -1737,7 +1818,12 @@ def refresh_candidate_fetch_batch(
                 raise ValueError("任务已保存候选或执行结果，不能刷新原批次设置")
 
     refreshed_payload = dict(payload)
-    refreshed_payload.pop("candidatePool", None)
+    if isinstance(previous_pool, dict) and same_pool_inputs:
+        refreshed_payload["candidatePool"] = previous_pool
+        if isinstance(previous_payload.get("candidatePoolReuseHints"), list):
+            refreshed_payload["candidatePoolReuseHints"] = previous_payload["candidatePoolReuseHints"]
+    else:
+        refreshed_payload.pop("candidatePool", None)
     # 同一批次保留原账号集合和幂等事件键；新设置只替换尚未执行账号的输入快照。
     refreshed_payload["accounts"] = previous_accounts
     timestamp = now_text()

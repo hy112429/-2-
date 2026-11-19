@@ -10610,6 +10610,11 @@ def _visible_source_candidate_result(
 
     raw_rows = list(merged_raw.values())
     raw_ids = set(merged_raw)
+    preferred_values = settings.get("_candidatePoolPreferredProductIds")
+    preferred_rank = {
+        str(product_id): index for index, product_id in enumerate(preferred_values[:2000])
+        if str(product_id).isdigit()
+    } if settings.get("_candidatePoolCollectOnly") is True and isinstance(preferred_values, list) else {}
     if preserve_product_ids:
         wanted = {str(value).strip() for value in preserve_product_ids if str(value).strip()}
         raw_rows = [row for row in raw_rows if str(row.get("product_id") or "").strip() in wanted]
@@ -10792,6 +10797,7 @@ def _visible_source_candidate_result(
     raw_rows.sort(key=lambda row: (
         str(row.get("product_id") or "") in pre_blocked_ids,
         not source_category_satisfies_general_exclusions(str(row.get("product_id") or "")),
+        preferred_rank.get(str(row.get("product_id") or ""), len(preferred_rank)),
         pre_rank.get(str(row.get("product_id") or ""), len(pre_rank)),
     ))
 
@@ -11251,11 +11257,13 @@ def _visible_source_candidate_result(
     category_rank = {str(row["categoryId"]): index for index, row in enumerate(recommendations)}
     if category_logic_enabled:
         candidates.sort(key=lambda row: (
+            preferred_rank.get(str(row.get("productId") or ""), len(preferred_rank)),
             category_rank.get(str((row.get("sourceCategoryIds") or [row.get("leafCategoryId") or ""])[-1]), len(category_rank)),
             -(float(_number(row.get("unifiedScore")) or 0)),
         ))
     else:
         candidates.sort(key=lambda row: (
+            preferred_rank.get(str(row.get("productId") or ""), len(preferred_rank)),
             -(float(_number(row.get("unifiedScore")) or 0)),
             str(row.get("productId") or ""),
         ))

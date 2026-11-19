@@ -237,7 +237,8 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
         params.append(qianchuan_account_id)
     query = f"""SELECT p.id publish_queue_id,p.account_id,p.product_id,p.product_name,p.title,
         q.id qianchuan_account_id,q.qc_id advertiser_id,
-        COALESCE(s.daily_budget_yuan,0) daily_budget_yuan,{commission} commission_rate
+        COALESCE(s.daily_budget_yuan,0) daily_budget_yuan,
+        COALESCE(s.video_source,'uploaded') video_source,{commission} commission_rate
         FROM publish_queue p JOIN accounts a ON a.id=p.account_id
         JOIN account_qianchuan aq ON aq.account_row_id=p.account_id
         JOIN qianchuan_accounts q ON q.id=aq.qianchuan_row_id
@@ -256,9 +257,12 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
         product_id = str(row["product_id"])
         queue_id = int(row["publish_queue_id"])
         advertiser = str(row["advertiser_id"] or "")
+        source = str(row["video_source"] or "uploaded")
         ids = usable_material_ids(db, account, qc_id, product_id)
-        duplicate_ids = duplicate_material_ids(db, account, qc_id, product_id)
-        settled = uploads_settled(db, account, qc_id, product_id, queue_id)
+        duplicate_ids = (duplicate_material_ids(db, account, qc_id, product_id)
+                         if source != "my_video" else [])
+        settled = (uploads_settled(db, account, qc_id, product_id, queue_id)
+                   if source != "my_video" else True)
         try:
             rate = float(row["commission_rate"])
         except (TypeError, ValueError):
@@ -274,7 +278,9 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
             reason = "素材上传或发布后素材处理尚未完成，暂不可建计划"
         elif duplicate_ids:
             reason = "远端素材 ID 重复，暂不可建计划：" + ",".join(duplicate_ids[:5])
-        elif not ids:
+        elif source == "my_video" and not str(row["title"] or "").strip():
+            reason = "抖音已发布作品缺少可核对标题，无法在计划页选择我的视频"
+        elif source != "my_video" and not ids:
             reason = "该商品在目标千川账户没有可用的已上传素材"
         elif not roi:
             reason = "该账号该商品佣金率缺失或无效，暂不能计算 ROI"
@@ -289,7 +295,7 @@ def plan_candidates(db: sqlite3.Connection, account_id: int = 0,
             "publishedVideoTitle": str(row["title"] or ""),
             "dailyBudgetYuan": int(row["daily_budget_yuan"] or 0),
             "commissionRate": rate, "roiTarget": roi,
-            "materialCount": len(ids), "remoteMaterialIds": ids,
+            "videoSource": source, "materialCount": len(ids), "remoteMaterialIds": ids,
             "existingPlanId": int(existing["id"]) if existing else 0,
             "existingPlanStatus": str(existing["status"]) if existing else "",
             "canCreate": not reason, "reason": reason,
@@ -323,18 +329,22 @@ def create_manual_plan(db: sqlite3.Connection, publish_queue_id: int,
     product_id = str(row["product_id"])
     advertiser = str(row["advertiser_id"] or "")
     settings = _settings(db, qc_id)
+    source = str(settings["video_source"] or "uploaded")
     if int(settings["daily_budget_yuan"] or 0) < 50:
         raise ValueError("请先在千川计划工作区设置日预算，至少 50 元")
     if not re.fullmatch(r"\d{8,20}", advertiser):
         raise ValueError("目标千川档案的广告主 ID 未填写或格式无效（需 8–20 位数字）；请核对账号管理中的千川账户档案")
-    if not uploads_settled(db, account_id, qc_id, product_id, publish_queue_id):
+    if source != "my_video" and not uploads_settled(db, account_id, qc_id, product_id, publish_queue_id):
         raise ValueError("该商品的素材上传或发布后处理尚未完成")
-    duplicate_ids = duplicate_material_ids(db, account_id, qc_id, product_id)
+    duplicate_ids = (duplicate_material_ids(db, account_id, qc_id, product_id)
+                     if source != "my_video" else [])
     if duplicate_ids:
         raise ValueError("目标千川账户内发现重复远端素材 ID，暂不可建计划：" + ",".join(duplicate_ids[:5]))
     material_ids = usable_material_ids(db, account_id, qc_id, product_id)
-    if not material_ids:
+    if source != "my_video" and not material_ids:
         raise ValueError("该商品在目标千川账户没有可用的已上传素材")
+    if source == "my_video" and not str(row["title"] or "").strip():
+        raise ValueError("抖音已发布作品缺少可核对标题，无法在计划页选择我的视频")
     try:
         commission_rate = float(row["commission_rate"])
     except (TypeError, ValueError):
@@ -586,7 +596,7 @@ def sync(db: sqlite3.Connection) -> dict[str, Any]:
         advertiser_id = str(row["advertiser_id"] or "")
         if not re.fullmatch(r"\d{8,20}", advertiser_id):
             continue
-        if duplicate_material_ids(db, account_id, qc_id, product_id):
+        if row["video_source"] != "my_video" and duplicate_material_ids(db, account_id, qc_id, product_id):
             with db:
                 db.execute("""UPDATE qianchuan_plan_jobs SET status='blocked',
                     reason='目标千川账户内发现重复远端素材 ID，请先核对素材归属',updated_at=?
@@ -680,9 +690,13 @@ def claim(db: sqlite3.Connection, job_id: int, expected_daily_budget_yuan: int =
         account = db.execute("SELECT status FROM accounts WHERE id=?", (row["account_id"],)).fetchone()
         if not account or account["status"] != "active":
             raise ValueError("抖音账号已停用")
-        if duplicate_material_ids(db, int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"])):
+        if settings["video_source"] != "my_video" and duplicate_material_ids(
+                db, int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"])):
             raise ValueError("目标千川账户内发现重复远端素材 ID，请先核对素材归属")
-        ids = usable_material_ids(db, int(row["account_id"]), int(row["qianchuan_account_id"]), str(row["product_id"]))
+        ids = (usable_material_ids(db, int(row["account_id"]), int(row["qianchuan_account_id"]),
+                                   str(row["product_id"])) if settings["video_source"] != "my_video" else [])
+        if settings["video_source"] == "my_video" and not str(row["published_video_title"] or "").strip():
+            raise ValueError("抖音作品标题缺失，无法在计划页选择我的视频")
         if settings["video_source"] in ("uploaded", "both") and not ids:
             raise ValueError("已上传素材尚未就绪")
         if settings["video_source"] in ("uploaded", "both") and not uploads_settled(
