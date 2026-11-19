@@ -1,5 +1,11 @@
 # 投广管理客户端 —— 项目状态 · 待办与已知风险
 
+**2026-11-20 搜索词修复受限复测（局部通过，候选池完整采集待验）**：本轮在账号 1 的已登录托管 Chrome 中，仅对保存检查点 `371f6a23-8053-424e-96ca-87e95b07b463` 执行选品广场只读预览；SQLite 以只读方式打开，候选上限 1，不加车、不下载、不创建正式批次、不写业务库。真实追踪确认：保存搜索词为空时，`search_text` 为空的列表请求返回 HTTP 200、业务码 0、每次 30 行；筛选交互会重新带入旧搜索词。源码现于选品广场请求路由层拦截不匹配请求，并在拦截后重新同步搜索框，再最多重试一次；被本机拦截的 `ERR_BLOCKED_BY_CLIENT.Inspector` 不再记作网络失败。受限复测中不匹配请求未发送到百应；没有观察到 11001。第二次复测追踪在重新同步后再次看到空搜索词请求返回 200/码 0，但测试用类目路径扩展为 14 个查询，手动在第 4 个查询期间中止以限制请求量，故没有最终 `candidateCount`；此前较早一轮返回 0 候选。**这只证明错误关键词已被拦截且空词请求可成功，不证明候选池能达标或可加车/发布。**
+
+本轮修改仅 `engine/browser_cdp.py` 和本文件。`py_compile` 通过；4 个搜索词/恢复相关单测通过；隔离模拟输出 `collector_blocked_keyword=PASS failure_count=0 mismatch_count=1 matching_request=tracked`；`git diff --check` 通过。此前完整 `test_browser_cdp_recovery` 与 `test_selection_recovery` 合计 156 项有 13 failures、14 errors（旧测试数据缺少 `search_text`、过期分类/探测预期等），本轮未重跑完整套件。**候选池完整复采仍需 B 电脑或甲方按真实设置验证；不宣称本轮恢复选品。**
+
+真实追踪证据：`D:\software\codex\evidence\selection-fix-retest-20261120-run2\trace.ndjson`、`D:\software\codex\evidence\selection-fix-retest-20261120-run3\trace.ndjson`、`D:\software\codex\evidence\selection-fix-retest-20261120-run4\trace.ndjson`。run4 另记录测试页已关闭、原有托管 Chrome 页面保留。分支 `codex/pc-a/commission-confirm-20261116`；本轮未 fetch，未 reset/clean/stash，后续 Git 交接只包含上述两个已改文件。
+
 **2026-11-20 选品广场错误关键词导致 11001 的定位与源码修正（待静态检查/真实平台验收）**：根据本机 2026-11-19 23:44 的只读单轮采集追踪，百应选品广场 `/pc/selection/common/material_list` 前四次请求的 `search_text` 均为空，筛选条件逐步应用且响应均为 HTTP 200 / 业务码 0 / 30 行；筛选后第五个请求却带入旧搜索词“诺贝达手撕面包”，响应 HTTP 200 / 业务码 `11001`，平台原文是“当前网络不稳定，请稍后再试”。因此这次现场证据指向筛选控件异步重渲染恢复了旧词，错误提示被旧逻辑笼统标成“限流”；它不证明所有甲方失败都由同一原因导致。
 
 源码现改为：筛选操作完成后再次回读并校正搜索词；列表采集只接受百应精确 `material_list` 接口、且请求体类目与搜索词均匹配当前批次的响应，异步旧词响应不计作候选成功或当前查询错误；只把匹配当前查询的 11001 送入冷却和候选池指数退避。错误归类依据百应原始响应说明区分网络错误、明确频控和原因未确认。候选池已落盘检查点及原有退避节奏保持不变；本次没有调整筛选门槛、排除类目、消费账号搜索重试、加车或发布行为。

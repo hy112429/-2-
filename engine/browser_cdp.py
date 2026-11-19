@@ -6518,9 +6518,8 @@ def _expected_category_ids(settings: Dict[str, Any]) -> set[str]:
     return set()
 
 
-def _response_request_body(response: Any) -> Optional[Any]:
+def _request_post_body(request: Any) -> Optional[Any]:
     """兼容 CDP 未能预解析 JSON 的请求，回退读取 Playwright 原始请求体。"""
-    request = getattr(response, "request", None)
     if request is None:
         return None
     try:
@@ -6542,6 +6541,10 @@ def _response_request_body(response: Any) -> Optional[Any]:
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
         return None
     return body if isinstance(body, (dict, list)) else None
+
+
+def _response_request_body(response: Any) -> Optional[Any]:
+    return _request_post_body(getattr(response, "request", None))
 
 
 def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
@@ -6597,14 +6600,19 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
     return bool(expected_ids.intersection(category_values))
 
 
-def _response_matches_search_keyword(response: Any, settings: Dict[str, Any]) -> bool:
-    """只接受请求词与当前批次设置完全相同的商品列表响应。"""
-    body = _response_request_body(response)
+def _request_matches_search_keyword(request: Any, settings: Dict[str, Any]) -> bool:
+    """只允许请求词与当前批次设置完全相同的商品列表查询继续。"""
+    body = _request_post_body(request)
     if not isinstance(body, dict) or "search_text" not in body:
         return False
     expected = str(settings.get("searchKeyword") or "").strip()
     actual = str(body.get("search_text") or "").strip()
     return actual == expected
+
+
+def _response_matches_search_keyword(response: Any, settings: Dict[str, Any]) -> bool:
+    """只接受请求词与当前批次设置完全相同的商品列表响应。"""
+    return _request_matches_search_keyword(getattr(response, "request", None), settings)
 
 
 def _title_banned_word(title: Any, settings: Optional[Dict[str, Any]]) -> str:
@@ -9966,6 +9974,41 @@ def _collect_selection_square_rows(
     settings: Dict[str, Any],
     progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    """整个选品广场类目扫描期间拦截不符合当前查询词的请求。"""
+    blocked_requests = {"count": 0}
+    route_pattern = re.compile(
+        r"^https://buyin\.jinritemai\.com/pc/selection/common/material_list(?:\?.*)?$", re.I
+    )
+
+    def guard_material_list_query(route: Any) -> None:
+        request = route.request
+        if not _MaterialListCollector._is_material_request(request):
+            route.continue_()
+            return
+        if _request_matches_search_keyword(request, settings):
+            route.continue_()
+            return
+        blocked_requests["count"] += 1
+        route.abort("blockedbyclient")
+
+    page.route(route_pattern, guard_material_list_query)
+    try:
+        rows, result = _collect_selection_square_rows_impl(page, settings, progress)
+        if blocked_requests["count"]:
+            result.setdefault("warnings", []).append(
+                f"已在本机拦截 {blocked_requests['count']} 个搜索词与当前设置不一致的请求，未发送到百应。"
+            )
+            result["blockedSearchKeywordRequestCount"] = blocked_requests["count"]
+        return rows, result
+    finally:
+        page.unroute(route_pattern, guard_material_list_query)
+
+
+def _collect_selection_square_rows_impl(
+    page: Page,
+    settings: Dict[str, Any],
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
     """读取选品广场筛选结果及实际滚动产生的新列表响应。"""
     label, url = BAIYING_SELECTION_SQUARE_SOURCE
     parsed_current = urlparse(page.url)
@@ -11368,6 +11411,7 @@ class _MaterialListCollector:
         self.request_events: list[Dict[str, Any]] = []
         self.request_event_by_key: Dict[int, Dict[str, Any]] = {}
         self.request_started_monotonic: Dict[int, float] = {}
+        self.blocked_search_keyword_request_ids: set[int] = set()
         self.pending: set[int] = set()
         self.successes: list[tuple[int, Any]] = []
         self.errors: list[tuple[int, Any, str]] = []
@@ -11399,7 +11443,13 @@ class _MaterialListCollector:
         sequence = self._next_sequence()
         self.request_sequences[key] = sequence
         self.request_objects[key] = request
-        self.pending.add(key)
+        keyword_matched = _request_matches_search_keyword(request, self.settings)
+        blocked = not keyword_matched
+        if blocked:
+            self.blocked_search_keyword_request_ids.add(key)
+            self.search_keyword_mismatch_count += 1
+        if not blocked:
+            self.pending.add(key)
         self.request_started_monotonic[key] = time.monotonic()
         try:
             parsed_url = urlparse(str(getattr(request, "url", "")))
@@ -11417,15 +11467,17 @@ class _MaterialListCollector:
             "host": host,
             "path": path,
             "startedAt": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-            "completion": "pending",
+            "completion": "blocked_keyword_mismatch" if blocked else "pending",
             "httpStatus": None,
             "businessCode": None,
             "businessMessage": "",
             "categoryMatched": None,
-            "searchKeywordMatched": None,
-            "queryMatched": None,
-            "failure": "",
+            "searchKeywordMatched": keyword_matched,
+            "queryMatched": False if not keyword_matched else None,
+            "failure": "已在本机拦截与当前设置不一致的搜索词请求" if blocked else "",
         }
+        if blocked:
+            event["finishedAt"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
         self.request_events.append(event)
         self.request_event_by_key[key] = event
         self.last_activity_at = time.time()
@@ -11518,6 +11570,11 @@ class _MaterialListCollector:
         self.pending.discard(key)
         self.last_activity_at = time.time()
         event = self.request_event_by_key.get(key)
+        if key in self.blocked_search_keyword_request_ids:
+            if event is not None:
+                event["completion"] = "blocked_keyword_mismatch"
+                event["finishedAt"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
+            return
         if event is not None:
             event["completion"] = "failed" if error else "finished"
             event["finishedAt"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
@@ -11916,6 +11973,7 @@ def search_baiying_candidates(
         for attempt in range(attempt_limit):
             attempts_made = attempt + 1
             attempt_start = prepared_mark if attempt == 0 else collector.mark()
+            mismatch_count_before_attempt = collector.search_keyword_mismatch_count
             search.click(timeout=8_000, no_wait_after=True)
             deadline = min(time.time() + 18, overall_deadline)
             status = _wait_for_material_list_settled(
@@ -11945,8 +12003,44 @@ def search_baiying_candidates(
                     f"百应自动请求 {attempts_made} 次后仍未返回商品列表："
                     f"{str(detail)[:160]}；已停止自动补发。"
                 )
+            if (
+                attempt + 1 < attempt_limit
+                and collector.search_keyword_mismatch_count > mismatch_count_before_attempt
+            ):
+                # 类目切换后页面可能恢复旧搜索词。先用页面内置清除动作重新同步，
+                # 若清除动作本身产生了正确列表响应就直接消费，避免再点一次搜索。
+                recovery_mark = collector.mark()
+                keyword_changed = _apply_search_keyword(
+                    page, settings, collector=collector, collector_mark=recovery_mark
+                )
+                if keyword_changed:
+                    recovery_status = _wait_for_material_list_settled(
+                        page, collector, recovery_mark,
+                        min(time.time() + 8, overall_deadline), quiet_seconds=1.0,
+                    )
+                    recovery_rate_limit = collector.rate_limit_error_since(recovery_mark)
+                    if recovery_rate_limit:
+                        _mark_page_rate_limited(id(page))
+                        raise RuntimeError(
+                            f"百应搜索词重新同步后返回业务错误 11001；已进入 "
+                            f"{BAIYING_RATE_LIMIT_COOLDOWN_SECONDS} 秒查询冷却。"
+                            f"百应响应诊断：{recovery_rate_limit[2][:320]}"
+                        )
+                    recovery_outcome, recovery_value = collector.latest_outcome_since(recovery_mark)
+                    if recovery_status == "settled" and recovery_outcome == "success":
+                        payload = recovery_value[1]
+                        break
+                    if recovery_status in {"pending", "unstable"}:
+                        raise RuntimeError(
+                            "百应旧搜索词已触发本机清除，但列表请求仍未稳定；已停止本次查询并保留候选检查点。"
+                        )
+                    if recovery_outcome in {"error", "failure"}:
+                        recovery_detail = recovery_value[2] if recovery_outcome == "error" else recovery_value[1]
+                        raise RuntimeError(
+                            f"百应搜索词重新同步后未返回有效列表：{str(recovery_detail)[:160]}"
+                        )
             if attempt + 1 < attempt_limit and time.time() < overall_deadline:
-                # 只有本次点击完全没有发出 material_list 请求时，才允许一次短退避补发。
+                # 只在没有有效列表结果且完成一次搜索词重新同步后，才允许一次短退避重试。
                 delay = min(retry_backoff_ms[attempt], int((overall_deadline - time.time()) * 1000))
                 if delay > 0:
                     page.wait_for_timeout(delay)
@@ -11957,6 +12051,11 @@ def search_baiying_candidates(
             if error:
                 raise RuntimeError(
                     f"百应自动请求 {attempts_made} 次后仍未返回商品列表：{error[2][:160]}"
+                )
+            if collector.search_keyword_mismatch_count:
+                raise RuntimeError(
+                    "百应列表请求的搜索词与当前保存设置不一致；不匹配请求已在本机拦截，未发送到百应。"
+                    "已保留候选检查点，请稍后继续采集。"
                 )
             expected_ids = sorted(_expected_category_ids(settings))
             if collector.category_mismatch_count and expected_ids:
@@ -12654,9 +12753,10 @@ def _apply_one_category_and_collect_candidates(
             warnings = apply_filter_settings(page, settings, replace_category_selection=True)
         else:
             warnings = apply_filter_settings(page, settings)
-        # 百应筛选控件会触发异步重渲染；在选项变更后重新核对关键词，
+        # 百应筛选控件会触发异步重渲染；仅在本轮确实重放筛选后再次核对关键词，
         # 避免页面恢复旧的推荐词并将它带入后续 material_list 请求。
-        _apply_search_keyword(page, settings, collector=collector, collector_mark=apply_mark)
+        if not filters_already_applied:
+            _apply_search_keyword(page, settings, collector=collector, collector_mark=apply_mark)
         collection_status = "idle"
         if not filters_already_applied:
             # pending 时不重复发送 material_list，按三个有界窗口继续等同一请求，避免请求重叠/触发 11001。
@@ -12758,7 +12858,7 @@ def _apply_one_category_and_collect_candidates(
         )
     if collector.search_keyword_mismatch_count:
         warnings.append(
-            f"已忽略 {collector.search_keyword_mismatch_count} 个搜索词与当前设置不一致的商品列表响应，正在按当前搜索词重新查询。"
+            f"已拦截或忽略 {collector.search_keyword_mismatch_count} 个搜索词与当前设置不一致的商品列表请求/响应，正在按当前搜索词重新查询。"
         )
     if collection_status == "settled" and outcome in {"error", "failure"}:
         detail = value[2] if outcome == "error" else value[1]
