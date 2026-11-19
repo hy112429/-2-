@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { useAppRefresh } from '../utils/app_refresh'
 
 interface Violation { remoteMaterialId: string; materialName: string; verdict: string; reason: string; detectedAt: string; deletable: boolean }
 interface Item { id: number; remote_material_id: string; material_name: string; status: string; outcome_reason: string; screenshot_path: string }
@@ -32,11 +33,13 @@ function checked(data: Record<string, unknown>): Record<string, unknown> {
 }
 function toggle(id: string): void { const next = new Set(selected.value); if (next.has(id)) next.delete(id); else next.add(id); selected.value = next }
 async function loadHistory(): Promise<void> {
+  const accountId = props.qianchuanAccountId
   try {
-    const data = checked(await window.api.qianchuan.violationHistory(props.qianchuanAccountId))
-    pastBatches.value = Array.isArray(data.rows) ? data.rows as History[] : []
-  } catch (error) { message.value = String(error) }
+    const data = checked(await window.api.qianchuan.violationHistory(accountId))
+    if (props.qianchuanAccountId === accountId) pastBatches.value = Array.isArray(data.rows) ? data.rows as History[] : []
+  } catch (error) { if (props.qianchuanAccountId === accountId) message.value = String(error) }
 }
+useAppRefresh(() => !busy.value && props.qianchuanAccountId ? loadHistory() : undefined)
 async function openBatch(id: number): Promise<void> {
   try { const data = checked(await window.api.qianchuan.violationBatch(id)); batch.value = data.batch as Batch; items.value = data.items as Item[] }
   catch (error) { message.value = String(error) }

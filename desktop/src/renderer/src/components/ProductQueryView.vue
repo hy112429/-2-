@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 import QianchuanVideoQueryPanel from './QianchuanVideoQueryPanel.vue'
 
 /**
@@ -1407,6 +1408,12 @@ async function downloadDyItems(okItems: DyParsedItem[]): Promise<void> {
 
 // ---------------------------------------------------------------- 生命周期
 
+useAppRefresh(async () => {
+  const [directory] = await Promise.all([
+    window.api.dir.getDownloadDir(), loadQueueHistory(), refreshCached(), loadBaiyingBatchAccounts()
+  ])
+  downloadDir.value = directory
+})
 onMounted(async () => {
   downloadDir.value = await window.api.dir.getDownloadDir()
   bindQueueEvents()

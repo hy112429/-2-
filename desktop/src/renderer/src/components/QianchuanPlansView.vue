@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useAppRefresh } from '../utils/app_refresh'
 
 interface Target {
   account_id: number
@@ -299,6 +300,7 @@ watch(planStatus, () => {
 })
 watch(planPage, () => { void refreshPlanData(false).catch(error => { message.value = String(error) }) })
 let refreshTimer: ReturnType<typeof setInterval> | null = null
+useAppRefresh(() => refresh())
 onMounted(() => {
   void refresh()
   refreshTimer = setInterval(() => {

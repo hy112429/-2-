@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useAppRefresh } from '../utils/app_refresh'
 
 interface PlanLogSummary {
   id: number
@@ -162,6 +163,7 @@ async function openScreenshot(path: string): Promise<void> {
   if (!result.ok) error.value = result.error ?? '无法打开诊断截图'
 }
 
+useAppRefresh(() => load())
 onMounted(() => { void load() })
 </script>
 

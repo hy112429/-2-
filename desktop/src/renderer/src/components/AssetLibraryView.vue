@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 
 /**
  * 本地素材库（「素材与工具」导航）
@@ -309,6 +310,7 @@ function fmtSize(bytes: number): string {
 // ---------------------------------------------------------------- 生命周期
 
 let offEngine: (() => void) | undefined
+useAppRefresh(() => refresh())
 onMounted(async () => {
   await refresh()
 })

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 import QianchuanViolationsView from './QianchuanViolationsView.vue'
 
 interface Target { account_id: number; account_name: string; qianchuan_account_id: number | null; qc_name: string | null; qc_id: string | null }
@@ -256,6 +257,7 @@ async function retryPostPublish(run: PostPublishRun): Promise<void> {
   } catch (error) { message.value = String(error) }
 }
 let refreshTimer: ReturnType<typeof setInterval> | null = null
+useAppRefresh(() => refresh())
 onMounted(() => {
   void refresh()
   refreshTimer = setInterval(() => {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { useAppRefresh } from '../utils/app_refresh'
 import BrowserPane from './BrowserPane.vue'
 import SelectionFilterEditor from './SelectionFilterEditor.vue'
 import { createSelectionFilterSettings } from '../utils/selection_filters'
@@ -8350,6 +8351,10 @@ watch([() => props.active, selectionInitialized], ([active, initialized]) => {
   if (active && initialized) void ensureSelectionUiData()
 })
 
+useAppRefresh(async () => {
+  if ((!props.active && !(props.dialogOnly && selectionSettingsDialogOpen.value)) || busy.value) return
+  await Promise.all([refreshSelectionAccounts(false), loadSavedLocalPools()])
+})
 onMounted(async () => {
   selectionViewUnmounted = false
   if (!props.dialogOnly) stopSelectionCooldownExpired = window.api.selectionCooldown.onExpired(onSelectionCooldownExpired)

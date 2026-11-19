@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 
 interface QueueRow {
   id: number
@@ -203,6 +204,7 @@ function fileName(value: string): string {
   return value.split(/[\\/]/).filter(Boolean).pop() ?? '视频文件未读取'
 }
 
+useAppRefresh(() => refresh())
 onMounted(() => void refresh())
 </script>
 

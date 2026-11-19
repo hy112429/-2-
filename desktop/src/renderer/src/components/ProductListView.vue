@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 import { createSelectionFilterSettings } from '../utils/selection_filters'
 
 const emit = defineEmits<{
@@ -427,6 +428,7 @@ async function addAllPending(): Promise<void> {
 
 function goPage(next: number): void { page.value = Math.max(1, Math.min(pageCount.value, next)); void load() }
 
+useAppRefresh(() => load())
 onMounted(() => { void load() })
 </script>
 

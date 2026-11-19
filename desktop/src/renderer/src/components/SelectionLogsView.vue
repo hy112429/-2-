@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { toUserSelectionError, toUserSelectionMessage } from '../utils/selection_error_ux'
+import { useAppRefresh } from '../utils/app_refresh'
 
 interface SelectionBatchSummary {
   batchId: string
@@ -290,6 +291,7 @@ function changePage(nextPage: number): void {
   void loadBatches()
 }
 
+useAppRefresh(() => loadBatches())
 onMounted(async () => {
   try {
     const paths = await window.api.appPaths.get()

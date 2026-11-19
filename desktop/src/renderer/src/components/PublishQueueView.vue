@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 
 const props = defineProps<{ productDraft?: { accountId: number; productId: string; title: string; sourceUrl: string } | null }>()
 const emit = defineEmits<{ (event: 'product-draft-consumed'): void }>()
@@ -266,7 +267,7 @@ function runCli(args: string[], timeoutMs = 30_000, script = 'publish_queue.py')
   })
 }
 
-async function refresh(): Promise<void> {
+async function refreshList(preserveDraft: boolean): Promise<void> {
   loading.value = true
   try {
     const result = await runCli(['list'])
@@ -276,9 +277,11 @@ async function refresh(): Promise<void> {
     products.value = (result.products ?? []) as SelectedProductOption[]
     autoPublishEnabled.value = publishSettings.autoPublishEnabled === true
     manualReviewActive.value = publishSettings.manualReviewEnabled === true
-    schedulerSettings.jitterMinSeconds = Number(publishSettings.publishJitterMinSeconds ?? 5)
-    schedulerSettings.jitterMaxSeconds = Number(publishSettings.publishJitterMaxSeconds ?? 15)
-    schedulerSettings.catchupMaxLateHours = Number(publishSettings.publishCatchupMaxLateHours ?? 0)
+    if (!preserveDraft) {
+      schedulerSettings.jitterMinSeconds = Number(publishSettings.publishJitterMinSeconds ?? 5)
+      schedulerSettings.jitterMaxSeconds = Number(publishSettings.publishJitterMaxSeconds ?? 15)
+      schedulerSettings.catchupMaxLateHours = Number(publishSettings.publishCatchupMaxLateHours ?? 0)
+    }
     for (const account of accounts.value) {
       if (!forms[account.id]) forms[account.id] = createForm()
     }
@@ -304,6 +307,8 @@ async function refresh(): Promise<void> {
     loading.value = false
   }
 }
+
+function refresh(): Promise<void> { return refreshList(false) }
 
 async function resumeAutoPublishIfClear(): Promise<string> {
   if (autoPublishEnabled.value) return ''
@@ -1103,6 +1108,7 @@ function platformStatusLabel(status: QueueRow['platform_status']): string {
   return '未上传'
 }
 
+useAppRefresh(() => refreshList(true))
 onMounted(() => {
   stopAutoProgress = window.api.publish.onProgress(receivePublishProgress)
   stopBrowserProgress = window.api.browser.onPublishProgress(receivePublishProgress)

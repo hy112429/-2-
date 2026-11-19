@@ -6,6 +6,7 @@ import WorkArea from './components/WorkArea.vue'
 import StatusBar from './components/StatusBar.vue'
 import ToastHost from './components/ToastHost.vue'
 import { notifyGlobal } from './utils/notifications'
+import { refreshMountedViews } from './utils/app_refresh'
 
 // 当前选中的顶部菜单与左侧导航。
 const activeTop = ref('百应工作台')
@@ -22,6 +23,7 @@ const recordCount = ref(0)
 const downloadDir = ref('')
 const startupReady = ref(false)
 const startupError = ref('')
+const refreshing = ref(false)
 let databasePath = ''
 let stopDownloadDirChanged: (() => void) | undefined
 let stopAutoPublishNotification: (() => void) | undefined
@@ -119,6 +121,23 @@ async function refreshAssetCount(): Promise<void> {
   assetCount.value = await queryAssetCount()
 }
 
+async function refreshApp(): Promise<void> {
+  if (!startupReady.value || refreshing.value) return
+  refreshing.value = true
+  try {
+    const [views, assets, directory] = await Promise.allSettled([
+      refreshMountedViews(), refreshAssetCount(), window.api.dir.getDownloadDir()
+    ])
+    if (directory.status === 'fulfilled') downloadDir.value = directory.value
+    const failure = [views, assets, directory].find((result): result is PromiseRejectedResult => result.status === 'rejected')
+    if (failure) throw failure.reason
+  } catch (error) {
+    notifyGlobal(`刷新失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+  } finally {
+    refreshing.value = false
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('asset-library-changed', refreshAssetCount)
   stopDownloadDirChanged = window.api.dir.onDownloadDirChanged((path) => { downloadDir.value = path })
@@ -158,7 +177,7 @@ onBeforeUnmount(() => {
         第 2 行 左侧导航 + 中部工作区（两列网格）
         第 3 行 底部状态栏（横跨整宽）
     -->
-    <TopMenu v-model:active="activeTop" />
+    <TopMenu v-model:active="activeTop" :refreshing="refreshing" :refresh-disabled="!startupReady" @refresh="refreshApp" />
 
     <div class="body">
       <SideNav :active="activeTop === '商品查询' ? '' : activeNav" @update:active="activateNav" />

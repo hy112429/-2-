@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 
 const props = defineProps<{ defaultTarget?: string; profileKey?: string; profilePath?: string }>()
 
@@ -125,6 +126,12 @@ const backupText = computed(() => {
 
 // ---------------------------------------------------------------- 生命周期
 
+useAppRefresh(async () => {
+  const [nextTargets, nextLoginState] = await Promise.all([window.api.browser.getTargets(), window.api.login.check()])
+  targets.value = nextTargets
+  if (!targets.value.some((target) => target.id === targetId.value)) targetId.value = targets.value[0]?.id ?? ''
+  loginState.value = nextLoginState
+})
 onMounted(async () => {
   // 切换版本后若进程里还挂着旧内置登录视图，先摘除覆盖层；登录缓存本身不清除。
   await window.api.browser.close()

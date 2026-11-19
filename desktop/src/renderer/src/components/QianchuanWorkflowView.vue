@@ -2,6 +2,7 @@
 import { onMounted, ref } from 'vue'
 import QianchuanOverviewView from './QianchuanOverviewView.vue'
 import QianchuanPlansView from './QianchuanPlansView.vue'
+import { useAppRefresh } from '../utils/app_refresh'
 
 interface WorkflowBinding {
   account_id: number
@@ -87,14 +88,19 @@ function matchesProduct(candidate: WorkflowCandidate): boolean {
 async function refreshBindingGate(): Promise<void> {
   try {
     const result = checked(await window.api.qianchuan.uploadTargets())
-    const valid = rows<WorkflowBinding>(result).filter((row) =>
-      row.account_status === 'active' && Number(row.qianchuan_account_id) > 0 &&
+    const active = rows<WorkflowBinding>(result).filter((row) => row.account_status === 'active')
+    const bound = active.filter((row) => Number(row.qianchuan_account_id) > 0)
+    const valid = bound.filter((row) =>
       /^\d{8,20}$/.test(String(row.qc_id ?? '').trim())
     )
     bindingReady.value = valid.length > 0
     bindingMessage.value = valid.length
       ? `已绑定 ${valid.length} 个有效千川广告主 ID，可进入千川发布。`
-      : '必须先绑定有效千川广告主 ID，选品发布成功后才能进入千川素材和计划发布。'
+      : bound.length
+        ? '已关联千川账户，但广告主 ID 缺失或格式无效（需 8–20 位数字）；请在账号管理核对后刷新。'
+        : active.length
+          ? '启用中的抖音账号尚未绑定千川账户；请在账号管理绑定后刷新。'
+          : '当前没有启用中的抖音账号；请在账号管理核对账号状态后刷新。'
   } catch (error) {
     bindingReady.value = false
     bindingMessage.value = `无法确认千川 ID 绑定状态：${error instanceof Error ? error.message : String(error)}`
@@ -274,6 +280,7 @@ async function runWorkflow(): Promise<void> {
     workflowBusy.value = false
   }
 }
+useAppRefresh(() => refreshBindingGate())
 onMounted(() => { void refreshBindingGate() })
 </script>
 

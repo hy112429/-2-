@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 
 /**
  * 单条链接解析下载工具（T-11 真实任务接入 UI）
@@ -236,6 +237,7 @@ function onEngineEvent(e: EngineEventPayload): void {
   }
 }
 
+useAppRefresh(async () => { downloadDir.value = await window.api.dir.getDownloadDir() })
 onMounted(async () => {
   downloadDir.value = await window.api.dir.getDownloadDir()
   off = window.api.engine.onEvent(onEngineEvent)

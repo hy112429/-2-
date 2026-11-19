@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import SelectionSettingsView from './SelectionSettingsView.vue'
 import { notifyGlobal } from '../utils/notifications'
+import { useAppRefresh } from '../utils/app_refresh'
 
 /**
  * 账号管理（Step 11 · 多账号矩阵）
@@ -805,6 +806,7 @@ async function openMaterialFolder(row: AccountRow): Promise<void> {
 
 // ---------------------------------------------------------------- 生命周期
 
+useAppRefresh(() => loadAll())
 onMounted(() => {
   window.addEventListener('resize', updateCompactLayout)
   void loadAll()

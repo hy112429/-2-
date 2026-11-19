@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 
-const props = defineProps<{ active: string }>()
+const props = defineProps<{ active: string; refreshing?: boolean; refreshDisabled?: boolean }>()
 
 const emit = defineEmits<{
   (e: 'update:active', value: string): void
+  (e: 'refresh'): void
 }>()
 
 const MENU_ITEMS = [
@@ -41,6 +42,7 @@ onMounted(() => {
       </button>
     </nav>
 
+    <button class="refresh-button" type="button" :disabled="props.refreshing || props.refreshDisabled" title="刷新共享状态与当前页面" @click="emit('refresh')">{{ props.refreshing ? '刷新中…' : '刷新' }}</button>
     <div class="version">v{{ appVersion }}</div>
   </header>
 </template>
@@ -114,8 +116,10 @@ onMounted(() => {
   font-weight: 600;
 }
 
+.refresh-button { margin-left: auto; min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface); color: var(--text); white-space: nowrap; }
+.refresh-button:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); }
+.refresh-button:disabled { opacity: .55; cursor: not-allowed; }
 .version {
-  margin-left: auto;
   padding: 3px 8px;
   border: 1px solid var(--border);
   border-radius: 999px;
