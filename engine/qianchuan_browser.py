@@ -29,7 +29,7 @@ REMOTE_ID = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 SUCCESS_TEXT = re.compile(r"上传成功|提交成功|保存成功|创建成功")
 FAIL_TEXT = re.compile(r"上传失败|上传中断|网络异常|请求失败|操作被拦截")
 CAPTCHA_TEXT = re.compile(r"请完成验证|滑动验证|安全验证|人机验证|验证码错误")
-UPLOAD_LABELS = ("点击上传", "上传视频", "上传")
+UPLOAD_LABELS = ("点击上传", "选择视频", "上传本地视频", "上传")
 
 
 @dataclass(frozen=True)
@@ -120,6 +120,8 @@ def _validate(options: UploadOptions) -> None:
         raise UploadStopped("计划页上传必须有有效的千川广告主 ID", stage="input")
     if not re.fullmatch(r"\d{1,30}", options.product_id):
         raise UploadStopped("计划页上传必须有精确商品 ID", stage="input")
+    if options.asset_path.parent.name != options.product_id:
+        raise UploadStopped("本地视频不在该商品 ID 文件夹中，未选择上传文件", stage="input")
     if options.douyin_account_id and (options.douyin_account_id <= 0 or not options.advertiser_id):
         raise UploadStopped("复用抖音账号浏览器时必须指定账号和千川广告主 ID", stage="input")
     if not options.asset_name.strip():
@@ -222,9 +224,18 @@ def _select_page(browser: Any, advertiser_id: str = "") -> Any:
 
 
 def _has_upload_action(page: Any) -> bool:
-    if page.locator('input[type="file"]').count() > 0:
+    scope = _upload_dialog(page)
+    if any(_named_control(page, label, scope=scope) is not None for label in UPLOAD_LABELS):
         return True
-    return any(_named_control(page, label) is not None for label in UPLOAD_LABELS)
+    inputs = scope.locator('input[type="file"]')
+    return any(inputs.nth(index).is_visible() for index in range(inputs.count()))
+
+
+def _upload_dialog(page: Any) -> Any:
+    """优先在当前可见的添加视频弹窗/抽屉中定位上传控件。"""
+    dialogs = page.get_by_role("dialog")
+    visible = [dialogs.nth(index) for index in range(dialogs.count()) if dialogs.nth(index).is_visible()]
+    return visible[-1] if visible else page
 
 
 def _open_material_area(page: Any, options: UploadOptions) -> Any:
@@ -259,15 +270,22 @@ def _open_material_area(page: Any, options: UploadOptions) -> Any:
     if not add_video.is_enabled():
         raise UploadStopped("素材所属商品选中后仍无法添加视频", stage="navigate")
     add_video.click(timeout=8_000)
-    upload_tab = one(plan_page.get_by_text("上传视频", exact=True), "上传视频页签")
+    upload_tabs = plan_page.get_by_text("上传视频", exact=True)
+    upload_tabs.first.wait_for(state="visible", timeout=15_000)
+    upload_tab = one(upload_tabs, "上传视频页签")
     upload_tab.click(timeout=8_000)
+    # 弹窗内容异步切换；必须看到上传面板自己的控件后才允许选择本地文件。
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline and not _has_upload_action(plan_page):
+        _check_page_gate(plan_page, "file_input")
+        time.sleep(0.25)
     if not _has_upload_action(plan_page):
         raise UploadStopped("计划页上传视频页签没有唯一可用的文件入口", stage="file_input")
     return plan_page
 
 
 def _file_input(page: Any) -> Any | None:
-    all_inputs = page.locator('input[type="file"]')
+    all_inputs = _upload_dialog(page).locator('input[type="file"]')
     candidates = []
     for index in range(all_inputs.count()):
         item = all_inputs.nth(index)
