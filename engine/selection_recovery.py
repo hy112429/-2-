@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import ntpath
 import re
@@ -721,6 +722,9 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
     rows = pool.get("rows")
     if not isinstance(rows, list) or not rows:
         return None
+    product_ids = sorted({str(item.get("productId") or "").strip()
+                          for item in rows if isinstance(item, dict) and str(item.get("productId") or "").strip()})
+    pool_fingerprint = hashlib.sha256("\n".join(product_ids).encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc)
     earliest = now - timedelta(hours=24)
     eligible = [item for item in rows if isinstance(item, dict) and
@@ -736,6 +740,8 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
     excluded = settings.get("excludedCategorySelection") if isinstance(settings.get("excludedCategorySelection"), dict) else {}
     return {
         "batchId": batch_id,
+        "poolFingerprint": pool_fingerprint,
+        "duplicateBatches": [],
         "count": len(rows), "recentCount": len(eligible),
         "target": pool.get("target"), "mode": pool.get("mode", "total"),
         "capturedAt": pool.get("capturedAt"), "updatedAt": updated_at,
@@ -755,6 +761,7 @@ def saved_candidate_pool_summary(batch_id: str, payload: Any, updated_at: str) -
 
 def list_saved_candidate_pools(connection: sqlite3.Connection, limit: int = 10) -> list[Dict[str, Any]]:
     output: list[Dict[str, Any]] = []
+    by_fingerprint: dict[str, Dict[str, Any]] = {}
     for row in connection.execute(
         "SELECT batch_id,payload_json,updated_at FROM selection_run_batches ORDER BY updated_at DESC LIMIT 200"
     ):
@@ -762,10 +769,18 @@ def list_saved_candidate_pools(connection: sqlite3.Connection, limit: int = 10) 
             row["batch_id"], decode_json(row["payload_json"], {}), row["updated_at"]
         )
         if summary:
-            output.append(summary)
-        if len(output) >= limit:
-            break
-    return output
+            fingerprint = str(summary.pop("poolFingerprint"))
+            existing = by_fingerprint.get(fingerprint)
+            if existing:
+                existing["duplicateBatches"].append({
+                    "batchId": summary["batchId"],
+                    "capturedAt": summary["capturedAt"],
+                    "updatedAt": summary["updatedAt"],
+                })
+            else:
+                by_fingerprint[fingerprint] = summary
+                output.append(summary)
+    return output[:max(1, limit)]
 
 
 def list_saved_candidate_pool_items(connection: sqlite3.Connection, batch_id: str,
@@ -801,6 +816,7 @@ def saved_candidate_pool_settings(connection: sqlite3.Connection, batch_id: str)
     settings = payload.get("settingsSnapshot") if isinstance(payload, dict) else None
     if not summary or not isinstance(settings, dict):
         raise ValueError("所选本机候选池不存在或未达标")
+    summary.pop("poolFingerprint", None)
     return {
         "pool": summary, "settingsSnapshot": settings,
         "filterFingerprint": payload["candidatePool"].get("filterFingerprint"),

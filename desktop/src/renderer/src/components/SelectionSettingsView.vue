@@ -322,6 +322,7 @@ interface BatchCandidatePool {
 
 interface SavedLocalCandidatePool {
   batchId: string
+  duplicateBatches: Array<{ batchId: string; capturedAt: string; updatedAt: string }>
   count: number
   recentCount: number
   target: number
@@ -8834,6 +8835,14 @@ onUnmounted(() => {
                 <div class="saved-local-pool-source-meter"><span :style="{ width: `${localPoolSourcePercent(pool, count)}%` }"></span></div>
               </div>
             </div>
+            <details v-if="pool.duplicateBatches.length" class="saved-pool-duplicates">
+              <summary>同商品池的其他历史批次（{{ pool.duplicateBatches.length }}）</summary>
+              <ul>
+                <li v-for="duplicate in pool.duplicateBatches" :key="duplicate.batchId">
+                  {{ duplicate.capturedAt ? new Date(duplicate.capturedAt).toLocaleString('zh-CN') : '时间未知' }} · 批次 {{ duplicate.batchId }}
+                </li>
+              </ul>
+            </details>
             <div class="saved-pool-browser">
               <button class="btn" type="button" :aria-expanded="savedPoolBrowserBatchId === pool.batchId" @click="toggleSavedPoolBrowser(pool)">
                 {{ savedPoolBrowserBatchId === pool.batchId ? '收起商品列表' : `查看全部 ${pool.count} 件商品` }}
@@ -9609,6 +9618,9 @@ onUnmounted(() => {
 .saved-local-pool-sources { display: flex; flex-wrap: wrap; gap: 8px; }
 .saved-local-pool-sources > div { min-width: 130px; flex: 1 1 130px; font-size: 12px; color: var(--text-muted); }
 .saved-local-pool-source-meter { height: 5px; margin-top: 4px; }
+.saved-pool-duplicates { margin-top: 9px; color: var(--text-muted); font-size: 12px; }
+.saved-pool-duplicates summary { cursor: pointer; }
+.saved-pool-duplicates ul { margin: 6px 0 0; padding-left: 20px; }
 .saved-pool-browser { margin-top: 12px; }
 .saved-pool-browser-content { margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-panel); }
 .active-pool-search { display: flex; flex-direction: column; gap: 6px; max-width: 380px; margin-top: 12px; color: var(--text-muted); font-size: 12px; }
