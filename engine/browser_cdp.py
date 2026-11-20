@@ -6518,6 +6518,30 @@ def _expected_category_ids(settings: Dict[str, Any]) -> set[str]:
     return set()
 
 
+def _selected_category_filter_path(settings: Dict[str, Any]) -> Optional[list[str]]:
+    """从当前筛选设置解析唯一稳定类目路径，供页面筛选结果绑定来源类目。"""
+    selection = settings.get("categorySelection")
+    tree = settings.get("categoryTree")
+    if not isinstance(selection, dict) or not isinstance(tree, list) or not tree:
+        return None
+    path: list[str] = []
+    for level in ("level1", "level2", "level3"):
+        values = selection.get(level)
+        values = [str(value).strip() for value in values if str(value).strip()] if isinstance(values, list) else []
+        if len(values) > 1 or (values and len(path) != ("level1", "level2", "level3").index(level)):
+            return None
+        if values:
+            path.append(values[0])
+    if not path:
+        return None
+    resolved, resolved_level = _resolve_single_category_id(path[-1], tree)
+    if resolved_level != len(path) or len(resolved) != len(path):
+        return None
+    if any(not _category_id_matches(actual, expected) for actual, expected in zip(resolved, path)):
+        return None
+    return resolved
+
+
 def _request_post_body(request: Any) -> Optional[Any]:
     """兼容 CDP 未能预解析 JSON 的请求，回退读取 Playwright 原始请求体。"""
     if request is None:
@@ -6547,8 +6571,13 @@ def _response_request_body(response: Any) -> Optional[Any]:
     return _request_post_body(getattr(response, "request", None))
 
 
-def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
-    """只接受请求体明确包含当前选中类目 ID 的商品列表响应。"""
+def _response_matches_category(
+    response: Any,
+    settings: Dict[str, Any],
+    *,
+    allow_page_filter_context: bool = False,
+) -> bool:
+    """优先核对请求类目 ID；平台未重复携带时可用已确认的页面筛选路径绑定结果。"""
     expected_ids = _expected_category_ids(settings)
     if not expected_ids:
         return True
@@ -6557,6 +6586,7 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
         return False
 
     category_values: list[str] = []
+    category_field_seen = False
 
     def collect_values(value: Any) -> None:
         if isinstance(value, dict):
@@ -6571,6 +6601,7 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
                 category_values.append(_category_id_tail(text))
 
     def find_category(node: Any) -> None:
+        nonlocal category_field_seen
         if isinstance(node, dict):
             selector_name = next((
                 str(node.get(name, "")).casefold()
@@ -6578,9 +6609,11 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
                 if str(node.get(name, "")).casefold() in {"mendelcid", "mendel_cid"}
             ), None)
             if selector_name:
+                category_field_seen = True
                 collect_values(node.get("value"))
             for key, value in node.items():
                 if str(key).casefold() in {"mendelcid", "mendel_cid"}:
+                    category_field_seen = True
                     collect_values(value)
                 else:
                     find_category(value)
@@ -6589,6 +6622,8 @@ def _response_matches_category(response: Any, settings: Dict[str, Any]) -> bool:
                 find_category(value)
 
     find_category(body)
+    if not category_values:
+        return allow_page_filter_context and not category_field_seen
     selected = settings.get("categorySelection") if isinstance(settings.get("categorySelection"), dict) else {}
     selected_path = [str(selected[level][0]) for level in ("level1", "level2", "level3")
                      if isinstance(selected.get(level), list) and len(selected[level]) == 1]
@@ -9763,6 +9798,8 @@ def _scroll_selection_square_rows(
 ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], bool]:
     """只滚动现有选品广场页面，收集实际产生的新 material_list 响应。"""
     collector = _MaterialListCollector(settings)
+    if _page_applied_filter_signature(page) == _selection_filter_signature(settings):
+        collector.begin_page_category_context()
     rows: list[Dict[str, Any]] = []
     reads: list[Dict[str, Any]] = []
     unchanged = 0
@@ -10155,7 +10192,7 @@ def _collect_selection_square_rows_impl(
         payload = _get_cached_material_list(id(page), _selection_filter_signature(query_settings))
         if payload is None:
             warnings.append(
-                f"选品广场类目查询 {index}/{len(queries)} 未收到匹配类目请求的列表响应，结果不计入候选池"
+                f"选品广场类目查询 {index}/{len(queries)} 未收到与当前筛选类目路径关联的列表响应，结果不计入候选池"
             )
             continue
         raw_rows = _promotion_items(payload)
@@ -11420,6 +11457,24 @@ class _MaterialListCollector:
         self.category_mismatch_count = 0
         self.search_keyword_mismatch_count = 0
         self.last_activity_at = time.time()
+        self.page_category_filter_path = _selected_category_filter_path(settings)
+        self.page_category_context_mark: Optional[int] = None
+
+    def begin_page_category_context(self) -> bool:
+        """记录类目筛选开始时的请求序号；后续列表响应可绑定到这条已解析 ID 路径。"""
+        if not self.page_category_filter_path:
+            return False
+        self.page_category_context_mark = self.sequence
+        return True
+
+    def _request_uses_page_category_context(self, request: Any, sequence: int) -> bool:
+        key = id(request)
+        return (
+            self.page_category_context_mark is not None
+            and sequence > self.page_category_context_mark
+            and self.request_sequences.get(key) == sequence
+            and bool(self.page_category_filter_path)
+        )
 
     @staticmethod
     def _is_material_request(request: Any) -> bool:
@@ -11518,11 +11573,16 @@ class _MaterialListCollector:
                 event["jsonParseError"] = "material_list 响应体无法解析"
             return
 
-        is_matching_category = _response_matches_category(response, self.settings)
+        page_category_context = self._request_uses_page_category_context(request, sequence)
+        is_matching_category = _response_matches_category(
+            response, self.settings, allow_page_filter_context=page_category_context
+        )
         is_matching_search_keyword = _response_matches_search_keyword(response, self.settings)
         is_matching_query = is_matching_category and is_matching_search_keyword
         if event is not None:
             event["categoryMatched"] = is_matching_category
+            if page_category_context and is_matching_category:
+                event["categoryEvidence"] = "page_filter_id_path"
             event["searchKeywordMatched"] = is_matching_search_keyword
             event["queryMatched"] = is_matching_query
             if isinstance(result, dict):
@@ -11951,12 +12011,18 @@ def search_baiying_candidates(
     settings: Dict[str, Any],
     preserve_product_ids: Optional[Sequence[str]] = None,
     max_attempts: int = 2,
+    page_category_filter_applied: bool = False,
 ) -> Dict[str, Any]:
     """触发百应搜索并等待 material_list 请求全部落地；只有无请求时才允许补发。"""
     collector = _MaterialListCollector(settings)
     _listen_to_material_list(page, collector)
     try:
         prepared_mark = collector.mark()
+        if (
+            page_category_filter_applied
+            and _page_applied_filter_signature(page) == _selection_filter_signature(settings)
+        ):
+            collector.begin_page_category_context()
         _apply_search_keyword(page, settings, collector=collector, collector_mark=prepared_mark)
         search = page.get_by_text("搜 索", exact=True).first
         if search.count() == 0:
@@ -12060,8 +12126,8 @@ def search_baiying_candidates(
             expected_ids = sorted(_expected_category_ids(settings))
             if collector.category_mismatch_count and expected_ids:
                 raise RuntimeError(
-                    f"百应自动请求 {attempts_made} 次后仍未收到与所选类目匹配的商品列表；"
-                    f"已忽略 {collector.category_mismatch_count} 个其他类目或未带类目 ID 的响应（目标 ID：{'、'.join(expected_ids)}）"
+                    f"百应自动请求 {attempts_made} 次后仍未收到与所选类目筛选路径匹配的商品列表；"
+                    f"已忽略 {collector.category_mismatch_count} 个显式类目冲突或无法关联筛选路径的响应（目标 ID：{'、'.join(expected_ids)}）"
                 )
             raise RuntimeError(f"百应自动请求 {attempts_made} 次后仍未捕获商品列表响应")
     finally:
@@ -12561,6 +12627,7 @@ def apply_filter_settings(
     settings: Dict[str, Any],
     preserve_other_filters: bool = False,
     replace_category_selection: bool = False,
+    category_context_callback: Optional[Callable[[], Any]] = None,
 ) -> list[str]:
     values = _effective_selection_filters(settings)
     warnings: list[str] = []
@@ -12587,6 +12654,8 @@ def apply_filter_settings(
     if preserve_other_filters:
         # 同一批次的多个末级类目查询共享完全相同的非类目筛选；百应切换类目会替换 MendelCid，
         # 不需要每次重置整页并重新点选销售额、流量等条件。
+        if category_context_callback is not None:
+            category_context_callback()
         if replace_category_selection:
             warnings.extend(apply_category_settings(page, settings, replace_existing=True))
         else:
@@ -12676,6 +12745,8 @@ def apply_filter_settings(
     # 先完成佣金、体验分、带货情况等平台筛选，再逐个应用类目。
     # 百应类目级联会触发一次新的 material_list 请求；把类目放在最后，
     # 可以避免每次切换类目时把前面已经确认的筛选条件重置或覆盖。
+    if category_context_callback is not None:
+        category_context_callback()
     if replace_category_selection:
         warnings.extend(apply_category_settings(page, settings, replace_existing=True))
     else:
@@ -12746,13 +12817,24 @@ def _apply_one_category_and_collect_candidates(
                 warnings = apply_filter_settings(
                     page, settings, preserve_other_filters=True,
                     replace_category_selection=True,
+                    category_context_callback=collector.begin_page_category_context,
                 )
             else:
-                warnings = apply_filter_settings(page, settings, preserve_other_filters=True)
+                warnings = apply_filter_settings(
+                    page, settings, preserve_other_filters=True,
+                    category_context_callback=collector.begin_page_category_context,
+                )
         elif replace_category_selection:
-            warnings = apply_filter_settings(page, settings, replace_category_selection=True)
+            warnings = apply_filter_settings(
+                page, settings, replace_category_selection=True,
+                category_context_callback=collector.begin_page_category_context,
+            )
         else:
-            warnings = apply_filter_settings(page, settings)
+            warnings = apply_filter_settings(
+                page, settings, category_context_callback=collector.begin_page_category_context,
+            )
+        if filters_already_applied:
+            collector.begin_page_category_context()
         # 百应筛选控件会触发异步重渲染；仅在本轮确实重放筛选后再次核对关键词，
         # 避免页面恢复旧的推荐词并将它带入后续 material_list 请求。
         if not filters_already_applied:
@@ -12842,8 +12924,8 @@ def _apply_one_category_and_collect_candidates(
         )
     outcome, value = collector.latest_outcome_since(apply_mark)
     if collection_status == "settled" and outcome == "success":
-        # 类目筛选存在旧卡片过渡期；以请求体明确包含当前类目 ID 的响应作为候选来源，
-        # 不把尚未刷新完成的旧 DOM 卡片归到新类目下。
+        # 类目筛选存在旧卡片过渡期；仅使用请求 ID 匹配或在本轮类目筛选边界后发起、
+        # 且搜索词匹配的列表响应，不把旧 DOM 卡片归到新类目下。
         payload = value[1]
     else:
         payload = None
@@ -12854,7 +12936,7 @@ def _apply_one_category_and_collect_candidates(
         return result
     if collector.category_mismatch_count and _expected_category_ids(settings):
         warnings.append(
-            f"已忽略 {collector.category_mismatch_count} 个未匹配当前类目 ID 的旧商品列表响应，正在按当前筛选重新搜索。"
+            f"已忽略 {collector.category_mismatch_count} 个未匹配当前类目路径的旧商品列表响应，正在按当前筛选重新搜索。"
         )
     if collector.search_keyword_mismatch_count:
         warnings.append(
@@ -12864,7 +12946,8 @@ def _apply_one_category_and_collect_candidates(
         detail = value[2] if outcome == "error" else value[1]
         try:
             result = search_baiying_candidates(
-                page, settings, preserve_product_ids, max_attempts=2
+                page, settings, preserve_product_ids, max_attempts=2,
+                page_category_filter_applied=True,
             )
         except Exception as retry_error:
             if "11001" in str(retry_error):
@@ -12880,7 +12963,9 @@ def _apply_one_category_and_collect_candidates(
         ))
         return result
     try:
-        result = search_baiying_candidates(page, settings, preserve_product_ids)
+        result = search_baiying_candidates(
+            page, settings, preserve_product_ids, page_category_filter_applied=True,
+        )
     except Exception as error:
         if "11001" in str(error):
             if _page_rate_limit_remaining(page_key) <= 0:
